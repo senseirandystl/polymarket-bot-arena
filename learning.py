@@ -138,7 +138,7 @@ def record_outcome(bot_name, features, side, won):
     """
     with db.get_conn() as conn:
         for feat in features:
-            if side == "yes":
+            if side.lower() == "yes":
                 if won:
                     conn.execute("""
                         INSERT INTO bot_learning (bot_name, feature_key, wins, losses)
@@ -242,14 +242,6 @@ def backfill_from_resolved_trades():
         logger.info(f"Backfilled learning from {count} resolved trades")
     return count
 
-def suggest_mutations(bot_name, current_params):
-    summary = get_bot_learning_summary(bot_name)
-    # Example: If low WR in high momentum, reduce aggression
-    adjustments = {}
-    for feat in summary:
-        if feat['yes_win_rate'] < 0.5 and 'mom_up' in feat['feature']:
-            adjustments['aggression'] = current_params.get('aggression', 1.0) * 0.9  # Reduce
-    return adjustments
 
 def get_bot_learning_summary(bot_name):
     """Get a summary of what the bot has learned."""
@@ -271,3 +263,13 @@ def get_bot_learning_summary(bot_name):
             "yes_win_rate": round(wr, 3),
         })
     return summary
+
+
+def suggest_mutations(bot_name, current_params):
+    summary = get_bot_learning_summary(bot_name)
+    # Example: If low WR in high momentum, reduce aggression
+    adjustments = {}
+    for feat in summary:
+        if feat['yes_win_rate'] < 0.5 and 'mom_up' in feat['feature']:
+            adjustments['aggression'] = current_params.get('aggression', 1.0) * 0.9  # Reduce
+    return adjustments
