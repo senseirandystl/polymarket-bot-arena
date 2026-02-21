@@ -29,36 +29,34 @@ TARGET_MARKET_QUERY = "btc"  # Search term for market discovery
 TARGET_MARKET_KEYWORDS = ["5 min", "5-min", "5min", "up or down", "up/down"]
 BTC_5MIN_MARKET_ID = None  # Will be populated by setup.py
 
-# Risk Limits - Paper Mode (default) — no caps, let bots compete freely
-PAPER_MAX_POSITION = 1.0  # $SIM per trade
-PAPER_MAX_DAILY_LOSS_PER_BOT = 10.0  # Uncapped for paper
-PAPER_MAX_DAILY_LOSS_TOTAL = 30.0  # Uncapped for paper
-PAPER_MAX_CONCURRENT_TRADES = 10 # New, max concurrent trades
+# Risk Limits - Paper Mode
+PAPER_MAX_POSITION = 1.0  # $1 per market
+PAPER_MAX_DAILY_LOSS_PER_BOT = 10.0
+PAPER_MAX_DAILY_LOSS_TOTAL = 30.0
+PAPER_MAX_CONCURRENT_TRADES = 10  # New: max open trades per bot
 PAPER_STARTING_BALANCE = 10000.0  # $SIM
 
-# Risk Limits - Live Mode (stricter)
-LIVE_MAX_POSITION = 1.0  # USDC per trade
-LIVE_MAX_DAILY_LOSS_PER_BOT = 10.0  # USDC
-LIVE_MAX_DAILY_LOSS_TOTAL = 30.0  # USDC
-LIVE_MAX_CONCURRENT_TRADES = 10 #New, max concurrent trades
+# Risk Limits - Live Mode
+LIVE_MAX_POSITION = 1.0
+LIVE_MAX_DAILY_LOSS_PER_BOT = 10.0
+LIVE_MAX_DAILY_LOSS_TOTAL = 30.0
+LIVE_MAX_CONCURRENT_TRADES = 10
 
 # General Risk Rules (both modes)
 MAX_POSITION_PCT_OF_BALANCE = 0.10  # Never bet more than 10% of balance
 MAX_TRADES_PER_HOUR_PER_BOT = 60  # Bots trade every 5-min market they find
 
 # Evolution Settings
-# NEW
-INDIVIDUAL_EVOLUTION_INTERVAL_HOURS = 2
-OVERALL_EVOLUTION_INTERVAL_HOURS = 4
-MIN_TRADES_FOR_INDIVIDUAL = 20
-MIN_WIN_RATE_FOR_SURVIVAL = 0.55  # If below, evolve individually
-# OLD
 EVOLUTION_INTERVAL_HOURS = 2
 MUTATION_RATE = 0.15  # 15% random adjustment to params
 NUM_BOTS = 4
 SURVIVORS_PER_CYCLE = 1  # Top 1 survives, bottom 3 replaced
 MIN_TRADES_FOR_JUDGMENT = 20   # Bots with fewer resolved trades are immune
 MIN_WIN_RATE = 0.70            # 70% WR threshold to survive evolution
+INDIVIDUAL_EVOLUTION_INTERVAL_HOURS = 2
+OVERALL_EVOLUTION_INTERVAL_HOURS = 4
+MIN_TRADES_FOR_INDIVIDUAL = 20
+MIN_WIN_RATE_FOR_SURVIVAL = 0.55  # If below, evolve individually
 
 # Signal Feed Settings
 BINANCE_WS_URL = "wss://stream.binance.com:9443/ws"
@@ -97,8 +95,10 @@ def get_max_daily_loss_total():
     """Get max total daily loss based on current mode"""
     return LIVE_MAX_DAILY_LOSS_TOTAL if TRADING_MODE == "live" else PAPER_MAX_DAILY_LOSS_TOTAL
 
+
 def get_max_concurrent_trades():
     return LIVE_MAX_CONCURRENT_TRADES if TRADING_MODE == "live" else PAPER_MAX_CONCURRENT_TRADES
+
 
 def get_venue():
     """Get trading venue based on current mode"""
