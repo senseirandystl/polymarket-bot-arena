@@ -30,15 +30,17 @@ TARGET_MARKET_KEYWORDS = ["5 min", "5-min", "5min", "up or down", "up/down"]
 BTC_5MIN_MARKET_ID = None  # Will be populated by setup.py
 
 # Risk Limits - Paper Mode (default) — no caps, let bots compete freely
-PAPER_MAX_POSITION = 50.0  # $SIM per trade
-PAPER_MAX_DAILY_LOSS_PER_BOT = 999999.0  # Uncapped for paper
-PAPER_MAX_DAILY_LOSS_TOTAL = 999999.0  # Uncapped for paper
+PAPER_MAX_POSITION = 1.0  # $SIM per trade
+PAPER_MAX_DAILY_LOSS_PER_BOT = 10.0  # Uncapped for paper
+PAPER_MAX_DAILY_LOSS_TOTAL = 30.0  # Uncapped for paper
+PAPER_MAX_CONCURRENT_TRADES = 10 # New, max concurrent trades
 PAPER_STARTING_BALANCE = 10000.0  # $SIM
 
 # Risk Limits - Live Mode (stricter)
-LIVE_MAX_POSITION = 10.0  # USDC per trade
-LIVE_MAX_DAILY_LOSS_PER_BOT = 50.0  # USDC
-LIVE_MAX_DAILY_LOSS_TOTAL = 100.0  # USDC
+LIVE_MAX_POSITION = 1.0  # USDC per trade
+LIVE_MAX_DAILY_LOSS_PER_BOT = 10.0  # USDC
+LIVE_MAX_DAILY_LOSS_TOTAL = 30.0  # USDC
+LIVE_MAX_CONCURRENT_TRADES = 10 #New, max concurrent trades
 
 # General Risk Rules (both modes)
 MAX_POSITION_PCT_OF_BALANCE = 0.10  # Never bet more than 10% of balance
@@ -89,6 +91,8 @@ def get_max_daily_loss_total():
     """Get max total daily loss based on current mode"""
     return LIVE_MAX_DAILY_LOSS_TOTAL if TRADING_MODE == "live" else PAPER_MAX_DAILY_LOSS_TOTAL
 
+def get_max_concurrent_trades():
+    return LIVE_MAX_CONCURRENT_TRADES if TRADING_MODE == "live" else PAPER_MAX_CONCURRENT_TRADES
 
 def get_venue():
     """Get trading venue based on current mode"""
