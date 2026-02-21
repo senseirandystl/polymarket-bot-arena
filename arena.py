@@ -822,6 +822,11 @@ def main_loop(bots, api_key):
                     key = (bot.name, market_id)
                     if key in traded:
                         continue
+                    # Check for max concurrent trades    
+                    current_open = len([t for t in db.get_bot_trades(bot.name) if t['outcome'] is None])
+                    if current_open >= config.get_max_concurrent_trades():
+                        logger.debug(f"[{bot.name}] Skipping: max concurrent trades reached ({current_open})")
+                        continue
 
                     try:
                         signal = bot.make_decision(market, combined_signals)
