@@ -47,6 +47,12 @@ MAX_POSITION_PCT_OF_BALANCE = 0.10  # Never bet more than 10% of balance
 MAX_TRADES_PER_HOUR_PER_BOT = 60  # Bots trade every 5-min market they find
 
 # Evolution Settings
+# NEW
+INDIVIDUAL_EVOLUTION_INTERVAL_HOURS = 2
+OVERALL_EVOLUTION_INTERVAL_HOURS = 4
+MIN_TRADES_FOR_INDIVIDUAL = 20
+MIN_WIN_RATE_FOR_SURVIVAL = 0.55  # If below, evolve individually
+# OLD
 EVOLUTION_INTERVAL_HOURS = 2
 MUTATION_RATE = 0.15  # 15% random adjustment to params
 NUM_BOTS = 4
