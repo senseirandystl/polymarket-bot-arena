@@ -53,308 +53,7 @@ td { padding: 6px 4px; border-bottom: 1px solid #21262d; }
 .bot-balance { color: #8b949e; font-size: 12px; }
 .market-row { display: flex; justify-content: space-between; align-items: center; padding: 8px 0; border-bottom: 1px solid #21262d; }
 .market-row:last-child { border-bottom: none; }
-.market-question { color: #c9d1d9; font-size: 13px; flex: 1; }
-.market-timer { font-size: 20px; font-weight: bold; font-family: 'SF Mono', monospace; min-width: 80px; text-align: right; }
-.market-timer.urgent { color: #f85149; }
-.market-timer.warning { color: #f0883e; }
-.market-timer.normal { color: #3fb950; }
-.market-price { color: #8b949e; font-size: 12px; margin-left: 16px; min-width: 60px; text-align: right; }
-</style>
-</head>
-<body>
-
-<div class="header">
-    <h1>Polymarket Bot Arena</h1>
-    <div>
-        <span id="mode-text" style="margin-right: 12px; color: #8b949e;">Mode:</span>
-        <button id="mode-btn" class="mode-badge mode-paper" onclick="toggleMode()">PAPER</button>
-    </div>
-</div>
-
-<div class="container">
-    <!-- Active Markets Timer -->
-    <div class="card" id="markets-card" style="margin-bottom: 20px; border-left: 3px solid #f0883e;">
-        <h2>BTC 5-Min Markets</h2>
-        <div id="markets-timers"></div>
-        <div id="no-markets" style="color: #484f58;">Checking for active markets...</div>
-    </div>
-
-    <!-- Overview Stats -->
-    <div class="grid" id="overview-grid">
-        <div class="card">
-            <h2>Today</h2>
-            <div class="stat-row"><span class="stat-label">Trades</span><span class="stat-value" id="today-trades">-</span></div>
-            <div class="stat-row"><span class="stat-label">P&L</span><span class="stat-value" id="today-pnl">-</span></div>
-            <div class="stat-row"><span class="stat-label">Win Rate</span><span class="stat-value" id="today-wr">-</span></div>
-        </div>
-        <div class="card">
-            <h2>This Week</h2>
-            <div class="stat-row"><span class="stat-label">Trades</span><span class="stat-value" id="week-trades">-</span></div>
-            <div class="stat-row"><span class="stat-label">P&L</span><span class="stat-value" id="week-pnl">-</span></div>
-            <div class="stat-row"><span class="stat-label">Win Rate</span><span class="stat-value" id="week-wr">-</span></div>
-        </div>
-        <div class="card">
-            <h2>All Time</h2>
-            <div class="stat-row"><span class="stat-label">Trades</span><span class="stat-value" id="all-trades">-</span></div>
-            <div class="stat-row"><span class="stat-label">P&L</span><span class="stat-value" id="all-pnl">-</span></div>
-            <div class="stat-row"><span class="stat-label">Win Rate</span><span class="stat-value" id="all-wr">-</span></div>
-        </div>
-    </div>
-
-    <!-- Bot Cards -->
-    <div class="section-title">Active Bots</div>
-    <div class="grid" id="bots-grid"></div>
-
-    <!-- Evolution History -->
-    <div class="section-title">Evolution History</div>
-    <div class="card" id="evolution-card">
-        <table id="evolution-table">
-            <thead><tr><th>Cycle</th><th>Survivors</th><th>Killed (WR / P&L)</th><th>New Bots</th><th>Time</th></tr></thead>
-            <tbody></tbody>
-        </table>
-    </div>
-
-    <!-- Recent Trades -->
-    <div class="section-title">Recent Trades</div>
-    <div class="card">
-        <table id="trades-table">
-            <thead><tr><th>Bot</th><th>Market</th><th>Side</th><th>Amount</th><th>P&L</th><th>Time</th></tr></thead>
-            <tbody></tbody>
-        </table>
-    </div>
-
-    <!-- Earnings -->
-    <div class="section-title">Daily Earnings</div>
-    <div class="card">
-        <div id="earnings-sparkline" class="sparkline"></div>
-        <table id="earnings-table" style="margin-top: 12px;">
-            <thead><tr><th>Date</th><th>Trades</th><th>Wins</th><th>P&L</th></tr></thead>
-            <tbody></tbody>
-        </table>
-    </div>
-
-    <div class="refresh-info">Auto-refreshes every 10 seconds</div>
-</div>
-
-<!-- Confirm Modal (global mode) -->
-<div class="confirm-modal" id="confirm-modal">
-    <div class="confirm-box">
-        <h3>Switch to LIVE Trading?</h3>
-        <p>This will trade with real USDC on Polymarket. Make sure you understand the risks.</p>
-        <button class="btn btn-danger" onclick="confirmLive()">YES — Go Live</button>
-        <button class="btn btn-cancel" onclick="cancelModal()">Cancel</button>
-    </div>
-</div>
-
-<!-- Confirm Modal (per-bot mode) -->
-<div class="confirm-modal" id="bot-confirm-modal">
-    <div class="confirm-box">
-        <h3>Switch <span id="bot-confirm-name"></span> to LIVE?</h3>
-        <p>This bot will start trading with real USDC on Polymarket. Other bots remain unchanged.</p>
-        <button class="btn btn-danger" onclick="confirmBotLive()">YES — Go Live</button>
-        <button class="btn btn-cancel" onclick="cancelBotModal()">Cancel</button>
-    </div>
-</div>
-
-<script>
-let currentMode = 'paper';
-
-async function fetchJSON(url) {
-    const resp = await fetch(url);
-    return resp.json();
-}
-
-function pnlClass(val) {
-    if (val > 0) return 'positive';
-    if (val < 0) return 'negative';
-    return 'neutral';
-}
-
-function fmtPnl(val) {
-    const prefix = val >= 0 ? '+$' : '-$';
-    return prefix + Math.abs(val).toFixed(2);
-}
-
-function winRate(wins, losses) {
-    const total = (wins || 0) + (losses || 0);
-    return total > 0 ? ((wins / total) * 100).toFixed(1) + '%' : '-';
-}
-
-function updateOverview(stats) {
-    for (const [period, el] of [['today', stats.today], ['week', stats.week], ['all', stats.all_time]]) {
-        document.getElementById(`${period}-trades`).textContent = el.trades || 0;
-        const pnlEl = document.getElementById(`${period}-pnl`);
-        pnlEl.textContent = fmtPnl(el.pnl || 0);
-        pnlEl.className = 'stat-value ' + pnlClass(el.pnl);
-        document.getElementById(`${period}-wr`).textContent = winRate(el.wins, el.losses);
-    }
-}
-
-function updateBots(bots) {
-    const grid = document.getElementById('bots-grid');
-    grid.innerHTML = '';
-    bots.sort((a, b) => (b.performance_12h?.total_pnl || 0) - (a.performance_12h?.total_pnl || 0));
-
-    bots.forEach((bot, i) => {
-        const cfg = bot.config;
-        const p12 = bot.performance_12h || {};
-        const trades = bot.recent_trades || [];
-        const params = typeof cfg.params === 'string' ? JSON.parse(cfg.params) : cfg.params;
-        const botMode = bot.trading_mode || 'paper';
-        const balance = bot.balance;
-        const balanceStr = balance != null ? '$' + Number(balance).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2}) + ' SIM' : 'N/A';
-
-        const pending = bot.pending_trades || 0;
-        const card = document.createElement('div');
-        card.className = 'card bot-card' + (i < 2 ? ' top' : '');
-        card.innerHTML = `
-            <div class="bot-header">
-                <div class="bot-name">${cfg.bot_name}</div>
-                <button class="bot-mode-btn bot-mode-${botMode}" onclick="toggleBotMode('${cfg.bot_name}', '${botMode}')">${botMode.toUpperCase()}</button>
-            </div>
-            <div class="bot-meta">${cfg.strategy_type} | Gen ${cfg.generation} | ${cfg.lineage || '-'}</div>
-            <div class="stat-row"><span class="stat-label">Balance</span><span class="stat-value bot-balance">${balanceStr}</span></div>
-            <div class="stat-row"><span class="stat-label">12h P&L</span><span class="stat-value ${pnlClass(p12.total_pnl)}">${fmtPnl(p12.total_pnl || 0)}</span></div>
-            <div class="stat-row"><span class="stat-label">Win Rate</span><span class="stat-value">${winRate(p12.wins, p12.losses)}</span></div>
-            <div class="stat-row"><span class="stat-label">Trades (12h)</span><span class="stat-value">${p12.total_trades || 0}${pending ? ' <span style="color:#f0883e">+' + pending + ' pending</span>' : ''}</span></div>
-            <div class="trade-list">${trades.slice(0, 5).map(t => `
-                <div class="trade-item">
-                    <span>${t.side} ${(t.market_question || '').slice(0, 30)}</span>
-                    <span class="${pnlClass(t.pnl)}">${t.pnl != null ? fmtPnl(t.pnl) : 'pending'}</span>
-                </div>
-            `).join('')}</div>
-        `;
-        grid.appendChild(card);
-    });
-}
-
-function updateEvolution(events) {
-    const tbody = document.querySelector('#evolution-table tbody');
-    tbody.innerHTML = events.map(e => {
-        // Build killed bots display with WR and P&L from rankings
-        const rankings = e.rankings || [];
-        const replaced = e.replaced || [];
-        const killedInfo = replaced.map(name => {
-            const r = rankings.find(x => x.name === name);
-            if (r) return `${name} <span class="neutral">(${(r.win_rate * 100).toFixed(0)}% ${fmtPnl(r.pnl)})</span>`;
-            return name;
-        }).join(', ');
-        return `<tr>
-            <td>#${e.cycle_number}</td>
-            <td>${(e.survivors || []).join(', ')}</td>
-            <td>${killedInfo}</td>
-            <td>${(e.new_bots || []).join(', ')}</td>
-            <td>${(e.created_at || '').slice(0, 16)}</td>
-        </tr>`;
-    }).join('');
-}
-
-function updateTrades(trades) {
-    const tbody = document.querySelector('#trades-table tbody');
-    tbody.innerHTML = trades.slice(0, 20).map(t => `
-        <tr>
-            <td>${t.bot_name}</td>
-            <td>${(t.market_question || '').slice(0, 40)}</td>
-            <td>${t.side}</td>
-            <td>$${(t.amount || 0).toFixed(2)}</td>
-            <td class="${pnlClass(t.pnl)}">${t.pnl != null ? fmtPnl(t.pnl) : 'pending'}</td>
-            <td>${(t.created_at || '').slice(11, 19)}</td>
-        </tr>
-    `).join('');
-}
-
-function updateEarnings(data) {
-    const daily = data.daily || [];
-    const sparkline = document.getElementById('earnings-sparkline');
-    if (daily.length > 0) {
-        const maxAbs = Math.max(...daily.map(d => Math.abs(d.pnl)), 1);
-        sparkline.innerHTML = daily.reverse().map(d => {
-            const h = Math.max(2, Math.abs(d.pnl) / maxAbs * 40);
-            const cls = d.pnl >= 0 ? '' : 'neg';
-            return `<div class="spark-bar ${cls}" style="height:${h}px" title="${d.day}: ${fmtPnl(d.pnl)}"></div>`;
-        }).join('');
-    }
-
-    const tbody = document.querySelector('#earnings-table tbody');
-    tbody.innerHTML = (data.daily || []).map(d => `
-        <tr>
-            <td>${d.day}</td>
-            <td>${d.trades}</td>
-            <td>${d.wins || 0}</td>
-            <td class="${pnlClass(d.pnl)}">${fmtPnl(d.pnl)}</td>
-        </tr>
-    `).join('');
-}
-
-let activeMarkets = [];
-
-function parseEndTime(question) {
-    // Extract end time from question like "Bitcoin Up or Down - February 14, 10:30PM-10:45PM ET"
-    // Also handles "10PM ET" (no minutes) and "10:00PM-10:05PM ET"
-    let hours, mins;
-    let match = question.match(/(\d{1,2}):(\d{2})(AM|PM)\s*ET$/i);
-    if (match) {
-        hours = parseInt(match[1]);
-        mins = parseInt(match[2]);
-        const ampm = match[3].toUpperCase();
-        if (ampm === 'PM' && hours !== 12) hours += 12;
-        if (ampm === 'AM' && hours === 12) hours = 0;
-    } else {
-        // Try format without minutes like "10PM ET"
-        match = question.match(/(\d{1,2})(AM|PM)\s*ET$/i);
-        if (!match) return null;
-        hours = parseInt(match[1]);
-        mins = 0;
-        const ampm = match[2].toUpperCase();
-        if (ampm === 'PM' && hours !== 12) hours += 12;
-        if (ampm === 'AM' && hours === 12) hours = 0;
-    }
-
-    // Parse date from question
-    const dateMatch = question.match(/(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{1,2})/i);
-    const now = new Date();
-
-    // Build a UTC date from the ET time (ET = UTC-5 in winter / UTC-4 in summer)
-    // Use UTC-5 (EST) since these are Feb markets
-    const months = {january:0,february:1,march:2,april:3,may:4,june:5,july:6,august:7,september:8,october:9,november:10,december:11};
-    let year = now.getFullYear();
-    let month = dateMatch ? months[dateMatch[1].toLowerCase()] : now.getMonth();
-    let day = dateMatch ? parseInt(dateMatch[2]) : now.getDate();
-
-    // Create UTC timestamp: ET hour + 5 = UTC hour
-    const utcMs = Date.UTC(year, month, day, hours + 5, mins, 0);
-    return new Date(utcMs);
-}
-
-function formatCountdown(ms) {
-    if (ms <= 0) return 'CLOSED';
-    const totalSec = Math.floor(ms / 1000);
-    const min = Math.floor(totalSec / 60);
-    const sec = totalSec % 60;
-    return `${min}:${sec.toString().padStart(2, '0')}`;
-}
-
-function updateMarketTimers() {
-    const container = document.getElementById('markets-timers');
-    const noMarkets = document.getElementById('no-markets');
-    if (!activeMarkets.length) {
-        noMarkets.style.display = 'block';
-        noMarkets.textContent = 'No active BTC 5-min markets right now';
-        container.innerHTML = '';
-        return;
-    }
-
-    const now = Date.now();
-    // Parse end times, filter out closed markets, sort by soonest
-    const withTimes = activeMarkets
-        .map(m => ({ ...m, endTime: parseEndTime(m.question) }))
-        .filter(m => m.endTime && m.endTime.getTime() > now)
-        .sort((a, b) => a.endTime.getTime() - b.endTime.getTime());
-
-    if (!withTimes.length) {
-        noMarkets.style.display = 'block';
-        noMarkets.textContent = 'No active BTC 5-min markets right now';
-        container.innerHTML = '';
+....(truncated 13405 characters)...ner.innerHTML = '';
         return;
     }
     noMarkets.style.display = 'none';
@@ -379,10 +78,19 @@ function updateMarketTimers() {
 
 async function fetchMarkets() {
     try {
-        activeMarkets = await fetchJSON('/api/markets');
+        const response = await fetch(`/api/markets?page=${currentPage}&limit=${limit}`);
+        const data = await response.json();
+        activeMarkets = data.markets;
         if (activeMarkets.error) activeMarkets = [];
+        
+        // Update pagination buttons
+        document.getElementById('prev-btn').disabled = currentPage === 1;
+        document.getElementById('next-btn').disabled = currentPage >= data.pages;
     } catch(e) { activeMarkets = []; }
 }
+
+function prevPage() { if (currentPage > 1) { currentPage--; fetchMarkets(); updateMarketTimers(); } }
+function nextPage() { currentPage++; fetchMarkets(); updateMarketTimers(); }
 
 function updateMode(mode) {
     currentMode = mode;
@@ -467,5 +175,10 @@ setInterval(refresh, 10000);
 // Tick countdown every second for smooth timers
 setInterval(updateMarketTimers, 1000);
 </script>
+
+<!-- Add buttons in HTML -->
+<button id="prev-btn" onclick="prevPage()">Previous</button>
+<button id="next-btn" onclick="nextPage()">Next</button>
+
 </body>
 </html>
