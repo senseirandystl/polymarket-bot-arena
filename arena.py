@@ -789,6 +789,9 @@ def main_loop(bots, api_key):
                         if time_remaining < 90:
                             logger.debug(f"Skipping late-window market (remaining={time_remaining:.0f}s): {m.get('question', '')[:50]}")
                             continue
+                        if time_remaining is not None and time_remaining >= 3600:
+                            logger.debug(f"Skipping long-horizon market (remaining={time_remaining:.0f}s > 60min): {m.get('question', '')[:50]}")
+                            continue
                     except (ValueError, TypeError) as e:
                         logger.debug(f"Could not parse resolves_at '{resolves_at_str}': {e}")
                         # Still tradeable, just without time context
