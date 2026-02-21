@@ -7,12 +7,13 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Query
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 import config
 import db
 import learning
+from datetime import datetime
 
 app = FastAPI(title="Polymarket Bot Arena Dashboard")
 
@@ -92,7 +93,7 @@ async def set_bot_mode(bot_name: str, request: Request):
 
 
 @app.get("/api/markets")
-async def get_markets():
+async def get_markets(page: int = Query(1, ge=1), limit: int = Query(5, ge=1, le=20)):
     """Get active BTC 5-min markets with close times."""
     import requests as req
     try:
@@ -101,7 +102,7 @@ async def get_markets():
         resp = req.get(
             f"{config.SIMMER_BASE_URL}/api/sdk/markets",
             headers=headers,
-            params={"status": "active", "limit": 50},
+            params={"status": "active", "limit": 100},
             timeout=10,
         )
         data = resp.json()
@@ -117,7 +118,29 @@ async def get_markets():
                     "resolves_at": m.get("resolves_at"),
                     "url": m.get("url"),
                 })
-        return JSONResponse(btc_markets)
+        
+        # Sort by resolves_at (soonest first)
+        def get_resolve_time(m):
+            resolves_at = m.get("resolves_at")
+            if resolves_at:
+                resolves_at = resolves_at.replace("Z", "+00:00").replace(" ", "T")
+                return datetime.fromisoformat(resolves_at)
+            return datetime.max  # Push invalid to end
+        
+        btc_markets.sort(key=get_resolve_time)
+        
+        # Pagination
+        total = len(btc_markets)
+        start = (page - 1) * limit
+        end = start + limit
+        paginated = btc_markets[start:end]
+        
+        return JSONResponse({
+            "markets": paginated,
+            "total": total,
+            "page": page,
+            "pages": (total + limit - 1) // limit
+        })
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
 
