@@ -53,44 +53,212 @@ td { padding: 6px 4px; border-bottom: 1px solid #21262d; }
 .bot-balance { color: #8b949e; font-size: 12px; }
 .market-row { display: flex; justify-content: space-between; align-items: center; padding: 8px 0; border-bottom: 1px solid #21262d; }
 .market-row:last-child { border-bottom: none; }
-....(truncated 13405 characters)...ner.innerHTML = '';
-        return;
-    }
-    noMarkets.style.display = 'none';
-
-    container.innerHTML = withTimes.map(m => {
-        const remaining = m.endTime.getTime() - now;
-        const countdown = formatCountdown(remaining);
-        let timerClass = 'normal';
-        if (remaining < 60000) timerClass = 'urgent';
-        else if (remaining < 180000) timerClass = 'warning';
-
-        const price = m.current_price ? (m.current_price * 100).toFixed(1) + '%' : '-';
-        // Shorten question for display
-        const shortQ = m.question.replace('Bitcoin Up or Down - ', '');
-        return `<div class="market-row">
-            <span class="market-question">${shortQ}</span>
-            <span class="market-price">YES ${price}</span>
-            <span class="market-timer ${timerClass}">${countdown}</span>
-        </div>`;
-    }).join('');
-}
+.market-question { flex: 1; color: #58a6ff; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-right: 12px; }
+.market-price { color: #8b949e; min-width: 80px; text-align: center; }
+.market-timer { color: #c9d1d9; font-weight: bold; min-width: 60px; text-align: right; }
+.market-timer.warning { color: #f0f6fc; }
+.market-timer.urgent { color: #f85149; }
+.no-markets { color: #8b949e; text-align: center; padding: 16px 0; }
+</style>
+</head>
+<body>
+<div class="header">
+    <h1>Polymarket Bot Arena</h1>
+    <button id="mode-btn" class="mode-badge mode-paper" onclick="toggleMode()">PAPER</button>
+</div>
+<div class="container">
+    <div class="card" id="overview-card">
+        <h2>Overview</h2>
+        <div class="stat-row"><span class="stat-label">Today Trades</span><span class="stat-value" id="today-trades">0</span></div>
+        <div class="stat-row"><span class="stat-label">Today P&L</span><span class="stat-value" id="today-pnl">$0.00</span></div>
+        <div class="stat-row"><span class="stat-label">Week Trades</span><span class="stat-value" id="week-trades">0</span></div>
+        <div class="stat-row"><span class="stat-label">Week P&L</span><span class="stat-value" id="week-pnl">$0.00</span></div>
+        <div class="stat-row"><span class="stat-label">All Time Trades</span><span class="stat-value" id="all-trades">0</span></div>
+        <div class="stat-row"><span class="stat-label">All Time P&L</span><span class="stat-value" id="all-pnl">$0.00</span></div>
+    </div>
+    <div class="section-title">Bots</div>
+    <div class="grid" id="bots-grid"></div>
+    <div class="section-title">Active Markets</div>
+    <div class="card">
+        <div id="market-countdowns"></div>
+        <p id="no-markets" class="no-markets" style="display: none;">No active BTC 5-min markets</p>
+    </div>
+    <div class="section-title">Evolution History</div>
+    <div class="card">
+        <table id="evolution-table">
+            <thead><tr><th>Cycle</th><th>Survivors</th><th>Replaced</th><th>New Bots</th></tr></thead>
+            <tbody></tbody>
+        </table>
+    </div>
+    <div class="section-title">Recent Trades</div>
+    <div class="card">
+        <table id="trades-table">
+            <thead><tr><th>Bot</th><th>Market</th><th>Side</th><th>Amount</th><th>Outcome</th><th>P&L</th></tr></thead>
+            <tbody></tbody>
+        </table>
+    </div>
+    <div class="section-title">Earnings</div>
+    <div class="grid">
+        <div class="card">
+            <h2>Daily Earnings</h2>
+            <div id="daily-sparkline" class="sparkline"></div>
+        </div>
+        <div class="card">
+            <h2>Best Trades</h2>
+            <table id="best-trades"><tbody></tbody></table>
+        </div>
+        <div class="card">
+            <h2>Worst Trades</h2>
+            <table id="worst-trades"><tbody></tbody></table>
+        </div>
+    </div>
+</div>
+<div class="confirm-modal" id="confirm-modal">
+    <div class="confirm-box">
+        <h3>Confirm Live Trading</h3>
+        <p>Switch to LIVE mode with real USDC? All bots will trade on Polymarket CLOB.</p>
+        <button class="btn btn-danger" onclick="confirmLive()">Confirm</button>
+        <button class="btn btn-cancel" onclick="cancelModal()">Cancel</button>
+    </div>
+</div>
+<div class="confirm-modal" id="bot-confirm-modal">
+    <div class="confirm-box">
+        <h3>Confirm Live for <span id="bot-confirm-name"></span></h3>
+        <p>Switch this bot to LIVE trading with real USDC on Polymarket?</p>
+        <button class="btn btn-danger" onclick="confirmBotLive()">Confirm</button>
+        <button class="btn btn-cancel" onclick="cancelBotModal()">Cancel</button>
+    </div>
+</div>
+<script>
+let currentPage = 1;
+const limit = 5;
 
 async function fetchMarkets() {
-    try {
-        const response = await fetch(`/api/markets?page=${currentPage}&limit=${limit}`);
-        const data = await response.json();
-        activeMarkets = data.markets;
-        if (activeMarkets.error) activeMarkets = [];
+    const response = await fetch(`/api/markets?page=\( {currentPage}&limit= \){limit}`);
+    const data = await response.json();
+    
+    // Clear existing countdowns
+    const container = document.getElementById('market-countdowns');  // Assume ID for container
+    container.innerHTML = '';
+    
+    data.markets.forEach(market => {
+        const div = document.createElement('div');
+        div.innerHTML = `
+            <h3>${market.question}</h3>
+            <p>Resolves at: ${market.resolves_at || 'N/A'}</p>
+            <p>Countdown: <span id="countdown-${market.id}"></span></p>
+        `;
+        container.appendChild(div);
         
-        // Update pagination buttons
-        document.getElementById('prev-btn').disabled = currentPage === 1;
-        document.getElementById('next-btn').disabled = currentPage >= data.pages;
-    } catch(e) { activeMarkets = []; }
+        // Start countdown timer (existing logic, e.g., using setInterval)
+        startCountdown(market.id, market.resolves_at);
+    });
+    
+    // Update pagination buttons
+    document.getElementById('prev-btn').disabled = currentPage === 1;
+    document.getElementById('next-btn').disabled = currentPage >= data.pages;
 }
 
-function prevPage() { if (currentPage > 1) { currentPage--; fetchMarkets(); updateMarketTimers(); } }
-function nextPage() { currentPage++; fetchMarkets(); updateMarketTimers(); }
+function prevPage() { if (currentPage > 1) { currentPage--; fetchMarkets(); } }
+function nextPage() { currentPage++; fetchMarkets(); }
+
+// Call on load
+fetchMarkets();
+
+let currentMode = 'paper';
+
+async function fetchJSON(url) {
+    const response = await fetch(url);
+    return await response.json();
+}
+
+function formatCountdown(ms) {
+    if (ms <= 0) return 'Expired';
+    const seconds = Math.floor(ms / 1000);
+    const m = Math.floor(seconds / 60);
+    const s = seconds % 60;
+    return `\( {m}: \){s.toString().padStart(2, '0')}`;
+}
+
+function updateOverview(stats) {
+    document.getElementById('today-trades').textContent = stats.today.trades;
+    document.getElementById('today-pnl').textContent = `\[ {stats.today.pnl.toFixed(2)}`;
+    document.getElementById('week-trades').textContent = stats.week.trades;
+    document.getElementById('week-pnl').textContent = ` \]{stats.week.pnl.toFixed(2)}`;
+    document.getElementById('all-trades').textContent = stats.all_time.trades;
+    document.getElementById('all-pnl').textContent = `\[ {stats.all_time.pnl.toFixed(2)}`;
+}
+
+function updateBots(bots) {
+    const grid = document.getElementById('bots-grid');
+    grid.innerHTML = '';
+    bots.forEach(bot => {
+        const card = document.createElement('div');
+        card.className = 'bot-card';
+        const perf = bot.performance_24h;
+        const wr = perf.win_rate * 100;
+        card.innerHTML = `
+            <div class="bot-header">
+                <span class="bot-name">${bot.config.bot_name}</span>
+                <button class="bot-mode-btn bot-mode-\( {bot.trading_mode}" onclick="toggleBotMode(' \){bot.config.bot_name}', '\( {bot.trading_mode}')"> \){bot.trading_mode.toUpperCase()}</button>
+            </div>
+            <span class="bot-meta">${bot.config.strategy_type} gen ${bot.config.generation}</span>
+            <div class="stat-row"><span class="stat-label">24h Trades</span><span class="stat-value">${perf.total_trades}</span></div>
+            <div class="stat-row"><span class="stat-label">24h Win Rate</span><span class="stat-value">${wr.toFixed(1)}%</span></div>
+            <div class="stat-row"><span class="stat-label">24h P&L</span><span class="stat-value ${perf.total_pnl > 0 ? 'positive' : 'negative'}"> \]{perf.total_pnl.toFixed(2)}</span></div>
+            <div class="stat-row"><span class="stat-label">Balance</span><span class="stat-value">\[ {bot.balance !== null ? bot.balance.toFixed(2) : 'N/A'}</span></div>
+            <div class="progress-bar"><div class="progress-fill" style="width: ${wr}%; background: ${wr > 50 ? '#3fb950' : '#f85149'};"></div></div>
+            <div class="section-title small">Recent Trades</div>
+            <div class="trade-list">
+                \( {bot.recent_trades.map(t => `<div class="trade-item"><span> \){t.market_question.slice(0,30)}...</span><span class="\( {t.pnl > 0 ? 'positive' : 'negative'}"> \){t.pnl !== null ? ` \]{t.pnl.toFixed(2)}` : 'Pending'}</span></div>`).join('')}
+            </div>
+        `;
+        grid.appendChild(card);
+    });
+}
+
+function updateEvolution(history) {
+    const tbody = document.getElementById('evolution-table').querySelector('tbody');
+    tbody.innerHTML = history.map(h => `
+        <tr>
+            <td>${h.cycle_number}</td>
+            <td>${h.survivors.join(', ')}</td>
+            <td>${h.replaced.join(', ')}</td>
+            <td>${h.new_bots.join(', ')}</td>
+        </tr>
+    `).join('');
+}
+
+function updateTrades(trades) {
+    const tbody = document.getElementById('trades-table').querySelector('tbody');
+    tbody.innerHTML = trades.map(t => `
+        <tr>
+            <td>${t.bot_name}</td>
+            <td>${t.market_question.slice(0,30)}...</td>
+            <td>${t.side.toUpperCase()}</td>
+            <td>\[ {t.amount.toFixed(2)}</td>
+            <td>${t.outcome || 'Pending'}</td>
+            <td class="\( {t.pnl > 0 ? 'positive' : 'negative'}"> \){t.pnl !== null ? ` \]{t.pnl.toFixed(2)}` : '-'}</td>
+        </tr>
+    `).join('');
+}
+
+function updateEarnings(earnings) {
+    const sparkline = document.getElementById('daily-sparkline');
+    sparkline.innerHTML = earnings.daily.map(d => {
+        const height = Math.abs(d.pnl) * 2 + 2;  // Scale for visualization
+        return `<div class="spark-bar ${d.pnl >= 0 ? '' : 'neg'}" style="height: ${height}px;"></div>`;
+    }).join('');
+    document.getElementById('best-trades').innerHTML = earnings.best_trades.map(t => `<tr><td>${t.bot_name}</td><td>\[ {t.pnl.toFixed(2)}</td></tr>`).join('');
+    document.getElementById('worst-trades').innerHTML = earnings.worst_trades.map(t => `<tr><td>${t.bot_name}</td><td> \]{t.pnl.toFixed(2)}</td></tr>`).join('');
+}
+
+let currentMode = 'paper';
+
+async function fetchJSON(url) {
+    const response = await fetch(url);
+    return await response.json();
+}
 
 function updateMode(mode) {
     currentMode = mode;
