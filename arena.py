@@ -3,12 +3,31 @@
 import argparse
 import json
 import logging
+import subprocess
 import sys
 import time
 import random
 import threading
+import webbrowser
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+try:
+    from zoneinfo import ZoneInfo as _ZoneInfo
+    _ET = _ZoneInfo("America/New_York")
+    def _to_et(dt_utc: datetime) -> datetime:
+        return dt_utc.astimezone(_ET)
+except Exception:
+    # Windows without tzdata package — compute ET offset from US DST rules
+    def _to_et(dt_utc: datetime) -> datetime:  # type: ignore[misc]
+        year = dt_utc.year
+        # DST start: 2nd Sunday of March at 07:00 UTC (= 2:00 AM EST)
+        mar1 = datetime(year, 3, 1, tzinfo=timezone.utc)
+        dst_start = mar1 + timedelta(days=(6 - mar1.weekday()) % 7) + timedelta(weeks=1, hours=7)
+        # DST end: 1st Sunday of November at 06:00 UTC (= 2:00 AM EDT)
+        nov1 = datetime(year, 11, 1, tzinfo=timezone.utc)
+        dst_end = nov1 + timedelta(days=(6 - nov1.weekday()) % 7) + timedelta(hours=6)
+        offset = timedelta(hours=-4 if dst_start <= dt_utc < dst_end else -5)
+        return dt_utc + offset
 
 import config
 import db
@@ -307,30 +326,90 @@ def load_api_key():
         return None
 
 
+def _is_btc_updown(m: dict) -> bool:
+    """Return True if this market is a BTC up/down (any window size)."""
+    q = m.get("question", "").lower()
+    tags = m.get("tags") or []
+    # Match by tag (most reliable — Simmer tags these "fast-5m")
+    if "fast-5m" in tags or "fast" in tags:
+        if "bitcoin" in q or "btc" in q:
+            return True
+    # Match by question text as fallback
+    is_btc = "bitcoin" in q or "btc" in q
+    is_updown = ("up or down" in q or "up/down" in q
+                 or "higher or lower" in q or "above or below" in q)
+    return is_btc and is_updown
+
+
 def discover_markets(api_key):
-    """Find the active BTC 5-min up/down market."""
+    """Find BTC up/down markets from two complementary sources:
+
+    Source 1 — /api/sdk/markets?tags=fast-5m  : upcoming fast-5m markets (Simmer SDK)
+    Source 2 — /api/markets                   : currently-live markets
+
+    The SDK endpoint structurally excludes markets once they enter their live
+    window (status changes, tag dropped).  The public /api/markets endpoint
+    exposes them.  Both are queried every cycle and results are merged.
+    """
     import requests
-    markets = []
+    headers = {"Authorization": f"Bearer {api_key}"}
+    seen_ids: dict = {}
+
+    def _scan_page(page, source=""):
+        found = []
+        for m in page:
+            mid = m.get("id") or m.get("market_id", "unknown")
+            if mid in seen_ids:
+                continue
+            if _is_btc_updown(m):
+                tag = f" [{source}]" if source else ""
+                logger.info(f"  CANDIDATE{tag}: {mid[:12]}... | {m.get('question')} | resolves_at={m.get('resolves_at')}")
+                seen_ids[mid] = m
+                found.append(m)
+        return found
+
+    # --- Source 1: SDK upcoming markets ---
     try:
-        headers = {"Authorization": f"Bearer {api_key}"}
         resp = requests.get(
             f"{config.SIMMER_BASE_URL}/api/sdk/markets",
             headers=headers,
-            params={"status": "active", "limit": 100},
-            timeout=15,
+            params={"limit": 50, "tags": "fast-5m"},
+            timeout=20,
         )
         if resp.status_code == 200:
             data = resp.json()
-            markets_list = data if isinstance(data, list) else data.get("markets", [])
-            for m in markets_list:
-                q = m.get("question", "").lower()
-                has_btc = "btc" in q or "bitcoin" in q
-                has_5min = any(kw in q for kw in config.TARGET_MARKET_KEYWORDS)
-                if has_btc and has_5min:
-                    markets.append(m)
+            page = data if isinstance(data, list) else data.get("markets", [])
+            found = _scan_page(page, "upcoming")
+            if found:
+                logger.info(f"SDK: {len(found)} upcoming BTC markets")
+            elif page:
+                logger.debug(f"SDK tags=fast-5m: {len(page)} markets, none matched BTC filter")
+        else:
+            logger.debug(f"SDK tags=fast-5m HTTP {resp.status_code}")
     except Exception as e:
-        logger.error(f"Market discovery error: {e}")
-    logger.info(f"Discovered {len(markets)} BTC 5-min markets")
+        logger.warning(f"SDK market query failed: {e}")
+
+    # --- Source 2: public endpoint for currently-live markets ---
+    try:
+        resp = requests.get(
+            f"{config.SIMMER_BASE_URL}/api/markets",
+            headers=headers,
+            params={"limit": 20},
+            timeout=10,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            page = data if isinstance(data, list) else data.get("markets", [])
+            found = _scan_page(page, "live")
+            if found:
+                logger.info(f"Public API: {len(found)} additional BTC markets (live/resolving)")
+        else:
+            logger.debug(f"Public /api/markets HTTP {resp.status_code}")
+    except Exception as e:
+        logger.warning(f"Public market query failed: {e}")
+
+    markets = list(seen_ids.values())
+    logger.info(f"Discovery: {len(markets)} total BTC markets")
     return markets
 
 
@@ -339,7 +418,7 @@ def is_5min_market(question):
     import re
     q = question.lower()
     # Match patterns like "10:00PM-10:05PM" (5-min range)
-    range_match = re.search(r'(\d{1,2}):(\d{2})(am|pm)-(\d{1,2}):(\d{2})(am|pm)', q)
+    range_match = re.search(r'(\d{1,2}):(\d{2})\s*(am|pm)\s*[-–]\s*(\d{1,2}):(\d{2})\s*(am|pm)', q)
     if range_match:
         h1, m1 = int(range_match.group(1)), int(range_match.group(2))
         h2, m2 = int(range_match.group(4)), int(range_match.group(5))
@@ -353,6 +432,33 @@ def is_5min_market(question):
         if diff < 0: diff += 24 * 60
         return diff == 5
     return False
+
+
+def _window_contains_now(question: str, now_utc: datetime) -> bool:
+    """Return True if the question's ET time range contains the current ET time.
+
+    Simmer labels windows in Eastern Time (e.g. "9:00PM-9:05PM ET").
+    We convert now_utc to ET (handles EST/EDT automatically via zoneinfo)
+    and compare against the parsed window.
+    """
+    import re
+    q = question.lower()
+    m = re.search(r'(\d{1,2}):(\d{2})\s*(am|pm)\s*[-–]\s*(\d{1,2}):(\d{2})\s*(am|pm)', q)
+    if not m:
+        return False
+    h1, m1, ap1 = int(m.group(1)), int(m.group(2)), m.group(3)
+    h2, m2, ap2 = int(m.group(4)), int(m.group(5)), m.group(6)
+    if ap1 == 'pm' and h1 != 12: h1 += 12
+    if ap1 == 'am' and h1 == 12: h1 = 0
+    if ap2 == 'pm' and h2 != 12: h2 += 12
+    if ap2 == 'am' and h2 == 12: h2 = 0
+    start_min, end_min = h1 * 60 + m1, h2 * 60 + m2
+    now_et = _to_et(now_utc)
+    now_min = now_et.hour * 60 + now_et.minute
+    if end_min > start_min:
+        return start_min <= now_min < end_min
+    else:  # window crosses midnight ET
+        return now_min >= start_min or now_min < end_min
 
 
 def expire_stale_trades():
@@ -966,57 +1072,82 @@ def main_loop(bots, api_key):
             # (Simmer has 5-min, 15-min, hourly, and multi-hour markets — trade whatever is nearest)
             five_min_markets = markets
 
-            # Filter and select the *next* tradeable BTC market
-            # Window: reject if <60s remaining, reject if >60min away
+            # --- Select exactly ONE market to trade ---
+            # Priority 1: the market whose 5-min window contains now
+            # Priority 2: the soonest upcoming market that closes within 20 min
+            #             (allows pre-positioning before a window opens)
+            # If no market qualifies, sleep and try again.
             now_utc = datetime.now(timezone.utc)
-            tradeable_markets = []
-            past_markets = 0
-            future_markets = 0
 
+            # Stamp time_remaining on every market
             for m in five_min_markets:
                 resolves_at_str = m.get("resolves_at") or m.get("end_time")
+                time_remaining = 300  # safe default
                 if resolves_at_str:
                     try:
-                        # Parse ISO format: "2026-02-17 03:10:00Z" or "2026-02-17T03:10:00Z"
-                        rat = resolves_at_str.replace("Z", "+00:00").replace(" ", "T")
-                        resolves_at = datetime.fromisoformat(rat)
+                        resolves_at_str = resolves_at_str.replace("Z", "+00:00").replace(" ", "T")
+                        resolves_at = datetime.fromisoformat(resolves_at_str)
+                        if resolves_at.tzinfo is None:
+                            resolves_at = resolves_at.replace(tzinfo=timezone.utc)
                         time_remaining = (resolves_at - now_utc).total_seconds()
-                        window_age = 300 - time_remaining  # 5-min windows = 300s
+                    except Exception:
+                        pass
+                m["time_remaining_seconds"] = time_remaining
+                m["window_age_seconds"] = max(0, 300 - time_remaining)
 
-                        m["time_remaining_seconds"] = time_remaining
-                        m["window_age_seconds"] = window_age
+            non_expired = [m for m in five_min_markets if m.get("time_remaining_seconds", 0) > 0]
+            past_markets = len(five_min_markets) - len(non_expired)
 
-                        # Reject expired or almost-expired markets
-                        if time_remaining < 0:
-                            past_markets += 1
-                            continue
-                        if time_remaining < 60:
-                            # <60s remaining — too late to trade reliably
-                            past_markets += 1
-                            continue
+            # Priority 1: market window is open now.
+            # Use resolves_at (timestamp, TZ-independent) as primary: if a market
+            # resolves within 5 min its window is definitionally open.  Keep the
+            # question-text check as a secondary fallback for markets whose
+            # resolves_at might be set to the wrong window.
+            current_candidates = [
+                m for m in non_expired
+                if m.get("time_remaining_seconds", 999) <= 300
+                or _window_contains_now(m.get("question", ""), now_utc)
+            ]
+            current_market = (
+                min(current_candidates, key=lambda m: m.get("time_remaining_seconds", 999))
+                if current_candidates else None
+            )
 
-                        # Reject markets too far in the future (>60 min)
-                        if time_remaining > 3600:
-                            future_markets += 1
-                            continue
+            if current_market:
+                tradeable_markets = [current_market]
+            else:
+                # Priority 2: soonest market closing within 20 min
+                upcoming_soon = sorted(
+                    [m for m in non_expired if m.get("time_remaining_seconds", 0) <= 1200],
+                    key=lambda x: x["time_remaining_seconds"]
+                )
+                tradeable_markets = upcoming_soon[:1]
 
-                    except (ValueError, TypeError) as e:
-                        logger.debug(f"Could not parse resolves_at '{resolves_at_str}': {e}")
-                        # Still tradeable, just without time context
-                        m["time_remaining_seconds"] = None
-                        m["window_age_seconds"] = None
-
-                tradeable_markets.append(m)
+            future_markets = len(non_expired) - len(tradeable_markets)
 
             logger.info(
                 f"Market filter: {len(five_min_markets)} total BTC, "
-                f"{past_markets} expired/too-late, {future_markets} too-far-future (>60min), "
+                f"{past_markets} expired, {future_markets} queued, "
                 f"{len(tradeable_markets)} eligible"
             )
 
             if not tradeable_markets:
-                logger.debug("No eligible markets found, waiting...")
-                time.sleep(TRADE_INTERVAL)
+                secs_to_next = min(
+                    (m.get("time_remaining_seconds", 0) for m in non_expired),
+                    default=0
+                ) if non_expired else 0
+                # Wake 60s before the 20-min pre-trade window opens.
+                # Cap at 120s so we catch markets Simmer publishes mid-gap within
+                # 2 minutes — long sleeps caused the dashboard to see live markets
+                # that the arena missed entirely.
+                secs_until_prewindow = secs_to_next - 1200 - 60
+                sleep_secs = min(120, max(TRADE_INTERVAL, secs_until_prewindow))
+                if secs_to_next > 1200 + 60:
+                    logger.info(
+                        f"Next BTC window in ~{secs_to_next/60:.0f} min — "
+                        f"sleeping {sleep_secs:.0f}s (rechecking for new markets)"
+                    )
+                time.sleep(sleep_secs)
                 continue
 
             # Trade ALL eligible markets, sorted soonest-first
@@ -1120,6 +1251,18 @@ def main_loop(bots, api_key):
             time.sleep(10)
 
 
+def start_dashboard():
+    """Launch dashboard server in a new console window and open the browser."""
+    dashboard_script = Path(__file__).parent / "dashboard" / "server.py"
+    subprocess.Popen(
+        [sys.executable, str(dashboard_script)],
+        creationflags=subprocess.CREATE_NEW_CONSOLE,
+    )
+    url = f"http://localhost:{config.DASHBOARD_PORT}/"
+    threading.Timer(2.0, webbrowser.open, args=[url]).start()
+    logger.info(f"Dashboard starting at {url}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Polymarket Bot Arena")
     parser.add_argument("--mode", choices=["paper", "live"], default=None,
@@ -1164,6 +1307,7 @@ def main():
     if backfilled:
         logger.info(f"Backfilled learning from {backfilled} trades for active bots: {active_names}")
 
+    start_dashboard()
     main_loop(bots, api_key)
 
 

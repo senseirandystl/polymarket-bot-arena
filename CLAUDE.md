@@ -6,7 +6,7 @@ An automated trading bot arena that runs 4 competing bots on Polymarket's BTC 5-
 
 ## Current State (v4 — Feb 15, 2026)
 
-**GitHub:** https://github.com/ThinkEnigmatic/polymarket-bot-arena.git (branch: main)
+**GitHub:** https://github.com/senseirandystl/polymarket-bot-arena.git (branch: main)
 
 ### Performance (276 real trades)
 - **Total P&L: -$52.10** (mostly from old contrarian/overconfident bets)

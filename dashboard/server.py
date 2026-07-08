@@ -19,7 +19,7 @@ import learning
 security = HTTPBasic()
 
 DASHBOARD_USER = "admin"
-DASHBOARD_PASS = "Hemingway"
+DASHBOARD_PASS = "Thor"
 
 
 def verify_auth(credentials: HTTPBasicCredentials = Depends(security)):
@@ -153,33 +153,144 @@ async def set_bot_mode(bot_name: str, request: Request):
     return {"bot_name": bot_name, "trading_mode": mode}
 
 
+def _to_et(dt_utc):
+    """Convert UTC datetime to ET, handling EST/EDT without requiring tzdata."""
+    try:
+        from zoneinfo import ZoneInfo
+        return dt_utc.astimezone(ZoneInfo("America/New_York"))
+    except Exception:
+        from datetime import timedelta, timezone, datetime
+        year = dt_utc.year
+        mar1 = datetime(year, 3, 1, tzinfo=timezone.utc)
+        dst_start = mar1 + timedelta(days=(6 - mar1.weekday()) % 7) + timedelta(weeks=1, hours=7)
+        nov1 = datetime(year, 11, 1, tzinfo=timezone.utc)
+        dst_end = nov1 + timedelta(days=(6 - nov1.weekday()) % 7) + timedelta(hours=6)
+        return dt_utc + timedelta(hours=-4 if dst_start <= dt_utc < dst_end else -5)
+
+
+def _window_contains_now(question: str, now_utc) -> bool:
+    """Return True if the question's ET time range contains the current ET time."""
+    import re
+    q = question.lower()
+    match = re.search(r'(\d{1,2}):(\d{2})\s*(am|pm)\s*[-–]\s*(\d{1,2}):(\d{2})\s*(am|pm)', q)
+    if not match:
+        return False
+    h1, m1, ap1 = int(match.group(1)), int(match.group(2)), match.group(3)
+    h2, m2, ap2 = int(match.group(4)), int(match.group(5)), match.group(6)
+    if ap1 == 'pm' and h1 != 12: h1 += 12
+    if ap1 == 'am' and h1 == 12: h1 = 0
+    if ap2 == 'pm' and h2 != 12: h2 += 12
+    if ap2 == 'am' and h2 == 12: h2 = 0
+    start_min, end_min = h1 * 60 + m1, h2 * 60 + m2
+    now_et = _to_et(now_utc)
+    now_min = now_et.hour * 60 + now_et.minute
+    if end_min > start_min:
+        return start_min <= now_min < end_min
+    else:  # crosses midnight ET
+        return now_min >= start_min or now_min < end_min
+
+
 @app.get("/api/markets")
 async def get_markets():
-    """Get active BTC 5-min markets with close times."""
+    """Get active BTC fast markets as {current, upcoming_count, upcoming}.
+
+    Queries two sources: SDK (upcoming tagged markets) + public API (live markets).
+    The SDK endpoint drops live markets from its results once they enter their window.
+    """
     import requests as req
+    from datetime import datetime, timezone
     try:
         api_key = json.load(open(config.SIMMER_API_KEY_PATH))["api_key"]
         headers = {"Authorization": f"Bearer {api_key}"}
-        resp = req.get(
+
+        seen_ids: set = set()
+        markets_list = []
+
+        # Source 1: SDK upcoming markets
+        r1 = req.get(
             f"{config.SIMMER_BASE_URL}/api/sdk/markets",
             headers=headers,
-            params={"status": "active", "limit": 50},
+            params={"limit": 50, "tags": "fast-5m"},
             timeout=10,
         )
-        data = resp.json()
-        markets_list = data if isinstance(data, list) else data.get("markets", [])
+        if r1.status_code == 200:
+            d = r1.json()
+            for m in (d if isinstance(d, list) else d.get("markets", [])):
+                mid = m.get("id")
+                if mid and mid not in seen_ids:
+                    seen_ids.add(mid)
+                    markets_list.append(m)
+
+        # Source 2: public endpoint for currently-live markets
+        r2 = req.get(
+            f"{config.SIMMER_BASE_URL}/api/markets",
+            headers=headers,
+            params={"limit": 20},
+            timeout=10,
+        )
+        if r2.status_code == 200:
+            d = r2.json()
+            for m in (d if isinstance(d, list) else d.get("markets", [])):
+                mid = m.get("id")
+                if mid and mid not in seen_ids:
+                    seen_ids.add(mid)
+                    markets_list.append(m)
+
+        now_utc = datetime.now(timezone.utc)
         btc_markets = []
         for m in markets_list:
             q = m.get("question", "").lower()
-            if "bitcoin" in q and "up or down" in q:
-                btc_markets.append({
-                    "id": m.get("id"),
-                    "question": m.get("question"),
-                    "current_price": m.get("current_price"),
-                    "resolves_at": m.get("resolves_at"),
-                    "url": m.get("url"),
-                })
-        return JSONResponse(btc_markets)
+            tags = m.get("tags") or []
+            is_btc_updown = (
+                ("bitcoin" in q or "btc" in q)
+                and ("up or down" in q or "up/down" in q)
+            ) or ("fast-5m" in tags and ("bitcoin" in q or "btc" in q))
+            if not is_btc_updown:
+                continue
+
+            resolves_at_str = m.get("resolves_at")
+            time_remaining = None
+            if resolves_at_str:
+                try:
+                    rs = resolves_at_str.replace("Z", "+00:00").replace(" ", "T")
+                    resolves_at = datetime.fromisoformat(rs)
+                    if resolves_at.tzinfo is None:
+                        resolves_at = resolves_at.replace(tzinfo=timezone.utc)
+                    time_remaining = (resolves_at - now_utc).total_seconds()
+                except Exception:
+                    pass
+
+            if time_remaining is not None and time_remaining < 0:
+                continue
+
+            btc_markets.append({
+                "id": m.get("id"),
+                "question": m.get("question"),
+                "current_price": m.get("current_price"),
+                "resolves_at": m.get("resolves_at"),
+                "time_remaining_seconds": time_remaining,
+                "is_current_window": (
+                    (time_remaining is not None and 0 < time_remaining <= 300)
+                    or _window_contains_now(m.get("question", ""), now_utc)
+                ),
+                "url": m.get("url"),
+            })
+
+        btc_markets.sort(key=lambda x: x.get("time_remaining_seconds") or 999999)
+
+        # Priority 1: market whose question window contains now
+        current = next((m for m in btc_markets if m["is_current_window"]), None)
+        # Priority 2: soonest market closing within 20 min
+        if not current:
+            soon = [m for m in btc_markets if (m.get("time_remaining_seconds") or 999999) <= 1200]
+            current = soon[0] if soon else None
+
+        upcoming = [m for m in btc_markets if m is not current]
+        return JSONResponse({
+            "current": current,
+            "upcoming_count": len(upcoming),
+            "upcoming": upcoming,
+        })
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
 

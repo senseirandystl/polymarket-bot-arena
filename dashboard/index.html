@@ -59,6 +59,7 @@ td { padding: 6px 4px; border-bottom: 1px solid #21262d; }
 .market-timer.warning { color: #f0883e; }
 .market-timer.normal { color: #3fb950; }
 .market-price { color: #8b949e; font-size: 12px; margin-left: 16px; min-width: 60px; text-align: right; }
+.market-upcoming-pill { margin-top: 8px; font-size: 12px; color: #8b949e; text-align: center; padding: 4px 0; border-top: 1px solid #21262d; }
 </style>
 </head>
 <body>
@@ -295,45 +296,7 @@ function updateEarnings(data) {
     `).join('');
 }
 
-let activeMarkets = [];
-
-function parseEndTime(question) {
-    // Extract end time from question like "Bitcoin Up or Down - February 14, 10:30PM-10:45PM ET"
-    // Also handles "10PM ET" (no minutes) and "10:00PM-10:05PM ET"
-    let hours, mins;
-    let match = question.match(/(\d{1,2}):(\d{2})(AM|PM)\s*ET$/i);
-    if (match) {
-        hours = parseInt(match[1]);
-        mins = parseInt(match[2]);
-        const ampm = match[3].toUpperCase();
-        if (ampm === 'PM' && hours !== 12) hours += 12;
-        if (ampm === 'AM' && hours === 12) hours = 0;
-    } else {
-        // Try format without minutes like "10PM ET"
-        match = question.match(/(\d{1,2})(AM|PM)\s*ET$/i);
-        if (!match) return null;
-        hours = parseInt(match[1]);
-        mins = 0;
-        const ampm = match[2].toUpperCase();
-        if (ampm === 'PM' && hours !== 12) hours += 12;
-        if (ampm === 'AM' && hours === 12) hours = 0;
-    }
-
-    // Parse date from question
-    const dateMatch = question.match(/(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{1,2})/i);
-    const now = new Date();
-
-    // Build a UTC date from the ET time (ET = UTC-5 in winter / UTC-4 in summer)
-    // Use UTC-5 (EST) since these are Feb markets
-    const months = {january:0,february:1,march:2,april:3,may:4,june:5,july:6,august:7,september:8,october:9,november:10,december:11};
-    let year = now.getFullYear();
-    let month = dateMatch ? months[dateMatch[1].toLowerCase()] : now.getMonth();
-    let day = dateMatch ? parseInt(dateMatch[2]) : now.getDate();
-
-    // Create UTC timestamp: ET hour + 5 = UTC hour
-    const utcMs = Date.UTC(year, month, day, hours + 5, mins, 0);
-    return new Date(utcMs);
-}
+let activeMarkets = { current: null, upcoming_count: 0, upcoming: [] };
 
 function formatCountdown(ms) {
     if (ms <= 0) return 'CLOSED';
@@ -346,21 +309,9 @@ function formatCountdown(ms) {
 function updateMarketTimers() {
     const container = document.getElementById('markets-timers');
     const noMarkets = document.getElementById('no-markets');
-    if (!activeMarkets.length) {
-        noMarkets.style.display = 'block';
-        noMarkets.textContent = 'No active BTC 5-min markets right now';
-        container.innerHTML = '';
-        return;
-    }
+    const market = activeMarkets && activeMarkets.current;
 
-    const now = Date.now();
-    // Parse end times, filter out closed markets, sort by soonest
-    const withTimes = activeMarkets
-        .map(m => ({ ...m, endTime: parseEndTime(m.question) }))
-        .filter(m => m.endTime && m.endTime.getTime() > now)
-        .sort((a, b) => a.endTime.getTime() - b.endTime.getTime());
-
-    if (!withTimes.length) {
+    if (!market) {
         noMarkets.style.display = 'block';
         noMarkets.textContent = 'No active BTC 5-min markets right now';
         container.innerHTML = '';
@@ -368,29 +319,41 @@ function updateMarketTimers() {
     }
     noMarkets.style.display = 'none';
 
-    container.innerHTML = withTimes.map(m => {
-        const remaining = m.endTime.getTime() - now;
-        const countdown = formatCountdown(remaining);
-        let timerClass = 'normal';
+    const now = Date.now();
+    let endMs = null;
+    if (market.resolves_at) {
+        // resolves_at is "2026-07-07 23:30:00Z" — normalize to ISO and parse as UTC
+        const s = market.resolves_at.replace(' ', 'T').replace(/([^Z])$/, '$1Z');
+        endMs = new Date(s).getTime();
+    }
+
+    const remaining = endMs !== null ? endMs - now : null;
+    const countdown = remaining !== null ? formatCountdown(remaining) : '--:--';
+    let timerClass = 'normal';
+    if (remaining !== null) {
         if (remaining < 60000) timerClass = 'urgent';
         else if (remaining < 180000) timerClass = 'warning';
+    }
 
-        const price = m.current_price ? (m.current_price * 100).toFixed(1) + '%' : '-';
-        // Shorten question for display
-        const shortQ = m.question.replace('Bitcoin Up or Down - ', '');
-        return `<div class="market-row">
-            <span class="market-question">${shortQ}</span>
-            <span class="market-price">YES ${price}</span>
-            <span class="market-timer ${timerClass}">${countdown}</span>
-        </div>`;
-    }).join('');
+    const price = market.current_price ? (market.current_price * 100).toFixed(1) + '%' : '-';
+    const shortQ = market.question.replace('Bitcoin Up or Down - ', '');
+    const upcomingCount = activeMarkets.upcoming_count || 0;
+    const upcomingPill = upcomingCount > 0
+        ? `<div class="market-upcoming-pill">+${upcomingCount} future window${upcomingCount !== 1 ? 's' : ''} queued</div>`
+        : '';
+
+    container.innerHTML = `<div class="market-row">
+        <span class="market-question">${shortQ}</span>
+        <span class="market-price">YES ${price}</span>
+        <span class="market-timer ${timerClass}">${countdown}</span>
+    </div>${upcomingPill}`;
 }
 
 async function fetchMarkets() {
     try {
-        activeMarkets = await fetchJSON('/api/markets');
-        if (activeMarkets.error) activeMarkets = [];
-    } catch(e) { activeMarkets = []; }
+        const data = await fetchJSON('/api/markets');
+        activeMarkets = (data && !data.error) ? data : { current: null, upcoming_count: 0, upcoming: [] };
+    } catch(e) { activeMarkets = { current: null, upcoming_count: 0, upcoming: [] }; }
 }
 
 function updateMode(mode) {
