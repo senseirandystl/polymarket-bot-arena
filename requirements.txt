@@ -1,0 +1,32 @@
+# Polymarket Bot Arena — runtime dependencies
+#
+# Install into a project-local venv (the launchd plists point at
+# .venv/bin/python3 so this is the interpreter that actually serves the
+# dashboard and runs the arena):
+#
+#   python3 -m venv .venv
+#   .venv/bin/pip install --upgrade pip
+#   .venv/bin/pip install -r requirements.txt
+#
+# Versions are unpinned to match the airy `pip install ...` line in README.md.
+# If you need reproducibility, add pins here or generate a `pip freeze`
+# snapshot alongside this file.
+
+# --- Dashboard server (FastAPI + ASGI) ---
+fastapi
+uvicorn[standard]
+
+# --- HTTP clients (arena, dashboard, signals, copytrading, setup) ---
+requests
+
+# --- Realtime feeds ---
+websocket-client   # signals/price_feed.py  — Binance 1-min candles (Binance WS)
+websockets         # signals/wallet_monitor.py — Polygon newHeads (Polygon WS)
+
+# --- Live trading (only used by polymarket_client.py; included so the
+#     venv is "complete" even when running in paper mode) ---
+py-clob-client
+py-order-utils
+
+# --- Encrypted credential store (credentials_store.py; used by arena + dashboard) ---
+cryptography>=42.0

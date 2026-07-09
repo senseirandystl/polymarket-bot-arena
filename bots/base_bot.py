@@ -430,18 +430,57 @@ class BaseBot(ABC):
         return result
 
     def _load_api_key(self):
-        import json as _json
-        # Try per-bot key first, then fall back to default
+        """Load the Simmer API key for this bot.
+
+        Lookup priority (most-specific wins):
+          1. Per-bot key from the encrypted credentials store, keyed by bot name.
+          2. Per-bot key from the encrypted store, keyed by slot — used by evolved
+             bots that inherited an API slot from a retired parent.
+          3. Default Simmer key from the encrypted store (single-account mode).
+          4. Legacy plaintext fallback at ``~/.config/simmer/{bot_keys,
+             simmer_api_key}.json`` for installs that have not migrated to the
+             encrypted store yet.
+
+        Returns the key string, or ``None`` if nothing is configured anywhere.
+        """
+        # Encrypted credentials store is the canonical source after the v5
+        # migration — legacy plaintext paths are renamed to .bak on first run of
+        # credentials_store._migrate_legacy, so an unmigrated install will
+        # always fall through to step 4 below.
+        bot_keys: dict = {}
+        raw_bot_keys = config.get_credential("simmer_bot_keys")
+        if raw_bot_keys:
+            try:
+                parsed = json.loads(raw_bot_keys)
+                if isinstance(parsed, dict):
+                    bot_keys = parsed
+            except (json.JSONDecodeError, TypeError):
+                logger.warning(
+                    f"[{self.name}] simmer_bot_keys in encrypted store is not valid JSON; ignoring."
+                )
+        if self.name in bot_keys:
+            return bot_keys[self.name]
+        if hasattr(self, '_api_key_slot') and self._api_key_slot in bot_keys:
+            return bot_keys[self._api_key_slot]
+
+        default_key = config.get_credential("simmer_api_key")
+        if default_key:
+            return default_key
+
+        # Legacy plaintext fallback — only reached when the encrypted store has
+        # no Simmer key at all (rare: a fresh clone that has not yet run the
+        # auto-migration in credentials_store).
         try:
             with open(config.SIMMER_BOT_KEYS_PATH) as f:
-                bot_keys = _json.load(f)
+                bot_keys = json.load(f)
             if self.name in bot_keys:
                 return bot_keys[self.name]
-            # Check by slot assignment (for evolved bots inheriting a slot)
             if hasattr(self, '_api_key_slot') and self._api_key_slot in bot_keys:
                 return bot_keys[self._api_key_slot]
         except (FileNotFoundError, json.JSONDecodeError):
             pass
-        # Fallback: default key
-        with open(config.SIMMER_API_KEY_PATH) as f:
-            return _json.load(f).get("api_key")
+        try:
+            with open(config.SIMMER_API_KEY_PATH) as f:
+                return json.load(f).get("api_key")
+        except (FileNotFoundError, json.JSONDecodeError):
+            return None

@@ -55,7 +55,7 @@ trading_bot/
 ### Install
 
 ```bash
-pip install websocket-client requests fastapi uvicorn
+pip install -r requirements.txt
 ```
 
 ### Configure
@@ -64,7 +64,7 @@ pip install websocket-client requests fastapi uvicorn
 2. Save it:
 ```bash
 mkdir -p ~/.config/simmer
-echo '{"api_key": "your-key-here"}' > ~/.config/simmer/credentials.json
+echo '{"api_key": "your-key-here"}' > ~/.config/simmer/simmer_api_key.json
 ```
 
 3. Run setup to verify:
@@ -74,13 +74,46 @@ python setup.py
 
 ### Run
 
+Use the `bin/arena` wrapper whenever you want to start the stack from a terminal. It does two things beyond just resolving the venv pitfall:
+
+1. Auto-selects the project-local venv's Python interpreter — system `python3` doesn't have `cryptography`, but the wrapper picks `<repo>/.venv/bin/python3` so you stop hitting `ModuleNotFoundError`.
+2. Auto-spawns `dashboard/server.py` in the background if port 8501 isn't already serving, then waits up to ~3s for the endpoint to come up before launching `arena.py` — so the wrapper's `webbrowser.open("http://localhost:8501/")` actually lands on a running server rather than restoring the browser's previous-session tabs from before.
+
+```bash
+# From the repo root (most common)
+./bin/arena
+
+# Or if you've symlinked it into ~/bin/ (absolute symlink only — see header
+# in bin/arena for the relative-symlink caveat)
+arena
+```
+
+Useful env-var overrides:
+
+```bash
+ARENA_NO_DASHBOARD=1 ./bin/arena     # already have the dashboard running on :8501 (e.g. via launchd) — leave it alone
+DASHBOARD_PORT=8502     ./bin/arena   # probe + spawn on a non-default port (both sides honor the same env var)
+DASHBOARD_LOG=$HOME/var/log/arena-dash.log ./bin/arena  # override the per-run dashboard log path
+```
+
+The wrapper also sets `PYTHONUNBUFFERED=1` so output line-flushes when redirected to a log file — without it, `bin/arena > /tmp/run.log` looks empty until ~4KB of output accumulates (same env var the launchd plists set).
+
+If you can't or don't want to use the wrapper — e.g. you're debugging from an inner shell that strips the wrapper — the equivalent calls are the venv python explicitly:
+
 ```bash
 # Start the arena (paper trading)
-python arena.py
+.venv/bin/python3 arena.py
 
 # Start the dashboard (separate terminal)
-python dashboard/server.py
+.venv/bin/python3 dashboard/server.py
 # Open http://localhost:8501
+```
+
+Or with the venv activated:
+
+```bash
+source .venv/bin/activate
+python3 arena.py
 ```
 
 ## Dashboard

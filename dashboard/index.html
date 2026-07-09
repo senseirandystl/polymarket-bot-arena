@@ -45,6 +45,8 @@ td { padding: 6px 4px; border-bottom: 1px solid #21262d; }
 .btn { padding: 8px 20px; border-radius: 6px; border: none; cursor: pointer; font-family: inherit; font-size: 14px; margin: 4px; }
 .btn-danger { background: #da3633; color: #fff; }
 .btn-cancel { background: #30363d; color: #c9d1d9; }
+.btn-primary { background: #238636; color: #fff; }
+.btn-secondary { background: #30363d; color: #c9d1d9; }
 .refresh-info { color: #484f58; font-size: 11px; text-align: right; margin-top: 8px; }
 .bot-mode-btn { padding: 3px 10px; border-radius: 12px; font-size: 11px; font-weight: bold; cursor: pointer; border: none; font-family: inherit; }
 .bot-mode-paper { background: #238636; color: #fff; }
@@ -60,6 +62,130 @@ td { padding: 6px 4px; border-bottom: 1px solid #21262d; }
 .market-timer.normal { color: #3fb950; }
 .market-price { color: #8b949e; font-size: 12px; margin-left: 16px; min-width: 60px; text-align: right; }
 .market-upcoming-pill { margin-top: 8px; font-size: 12px; color: #8b949e; text-align: center; padding: 4px 0; border-top: 1px solid #21262d; }
+
+/* --- Tabs --- */
+.tab-bar { display: flex; border-bottom: 1px solid #30363d; margin-bottom: 16px; background: #161b22; border-radius: 8px 8px 0 0; padding: 0 8px; }
+.tab-button { background: transparent; color: #8b949e; border: none; padding: 12px 20px; cursor: pointer; font-family: inherit; font-size: 14px; font-weight: bold; border-bottom: 2px solid transparent; }
+.tab-button:hover { color: #c9d1d9; }
+.tab-button.active { color: #f0f6fc; border-bottom-color: #58a6ff; }
+.tab-content.hidden { display: none; }
+
+/* --- Warning banner --- */
+.warning-banner { display: none; background: #2d1417; border-bottom: 1px solid #da3633; padding: 12px 24px; color: #ffb3b3; font-size: 13px; }
+.warning-banner.visible { display: block; }
+.warning-row { display: flex; justify-content: space-between; align-items: center; padding: 4px 0; }
+.warning-row.error { color: #ffb3b3; }
+.warning-row.warning { color: #f0c674; }
+.warning-row + .warning-row { border-top: 1px solid #3d1c20; }
+.warning-row .btn-dismiss { background: transparent; border: 1px solid #ffb3b3; color: #ffb3b3; padding: 2px 8px; border-radius: 4px; cursor: pointer; font-family: inherit; font-size: 11px; }
+
+/* --- Settings tab --- */
+.settings-section { margin-bottom: 24px; }
+.settings-section h3 { margin: 0 0 4px; color: #f0f6fc; font-size: 14px; }
+.settings-section .settings-blurb { color: #8b949e; font-size: 12px; margin-bottom: 12px; }
+.cred-row { display: grid; grid-template-columns: 220px 1fr auto; gap: 12px; align-items: center; margin-bottom: 8px; }
+.cred-row label { color: #c9d1d9; font-size: 12px; }
+.cred-row label small { display: block; color: #8b949e; font-size: 10px; margin-top: 2px; letter-spacing: 0; text-transform: none; }
+.cred-row input, .cred-row textarea { background: #0d1117; border: 1px solid #30363d; color: #f0f6fc; padding: 8px 10px; border-radius: 4px; font-family: inherit; font-size: 13px; width: 100%; }
+.cred-row input:focus, .cred-row textarea:focus { border-color: #58a6ff; outline: none; }
+.cred-row .cred-status { font-size: 11px; padding: 2px 8px; border-radius: 10px; white-space: nowrap; }
+.cred-status.configured { background: #238636; color: #fff; }
+.cred-status.missing { background: #30363d; color: #8b949e; }
+.test-result { margin-top: 8px; padding: 8px 12px; border-radius: 4px; font-size: 12px; display: none; }
+.test-result.ok { background: #0d2818; border: 1px solid #238636; color: #3fb950; display: block; }
+.test-result.fail { background: #2d1417; border: 1px solid #da3633; color: #f85149; display: block; }
+.test-hint { color: #8b949e; font-size: 11px; margin: 8px 0 0; }
+.storage-info { background: #0d1117; border: 1px solid #21262d; border-radius: 6px; padding: 10px 12px; margin-bottom: 16px; font-size: 11px; color: #8b949e; }
+.storage-info code { color: #c9d1d9; background: #161b22; padding: 1px 4px; border-radius: 3px; }
+.actions-row { display: flex; gap: 8px; margin-top: 16px; padding-top: 16px; border-top: 1px solid #30363d; }
+
+/* --- Maker Section card (LIVE / PRE-WINDOW / IDLE / STALE) --- */
+.maker-card { position: relative; overflow: hidden; transition: border-color 0.4s ease, opacity 0.4s ease; }
+.maker-card.mode-LIVE { border-left: 3px solid #3fb950; box-shadow: inset 3px 0 18px rgba(63, 185, 80, 0.25); }
+.maker-card.mode-PRE-WINDOW { border-left: 3px solid #f0883e; box-shadow: inset 3px 0 18px rgba(240, 136, 62, 0.20); }
+.maker-card.mode-IDLE { border-left: 3px solid #484f58; }
+.maker-card.mode-STALE { border-left: 3px solid #f85149; box-shadow: inset 3px 0 18px rgba(248, 81, 73, 0.25); opacity: 0.85; }
+.maker-card.stale {
+    /* IMPORTANT: this opacity dim is the legacy "old data" indicator, kept
+       ONLY for non-STALE display modes (e.g. IDLE+stale, or future modes).
+       When the card is rendered in .mode-STALE, renderMakerCard skips
+       this class entirely so it doesn't fight `.mode-STALE { opacity:
+       0.85 }` on cascade tie-breakers (same specificity, this rule
+       declared later -- it would otherwise dim STALE to 0.55 instead
+       of the intended 0.85).  Don't consolidate this away thinking
+       it's redundant with .mode-STALE: the two serve different states.
+    */
+    opacity: 0.55;
+}
+.maker-mode-badge { display: inline-block; padding: 4px 12px; border-radius: 12px; font-weight: bold; font-size: 12px; letter-spacing: 1.5px; margin-right: 12px; transition: background 0.3s ease, box-shadow 0.3s ease; }
+.maker-mode-badge.mode-LIVE { background: #1a472a; color: #3fb950; border: 1px solid #3fb950; animation: maker-pulse-live 2.4s ease-in-out infinite; }
+.maker-mode-badge.mode-PRE-WINDOW { background: #4a2e0a; color: #f0883e; border: 1px solid #f0883e; animation: maker-pulse-pre 3.2s ease-in-out infinite; }
+.maker-mode-badge.mode-IDLE { background: #21262d; color: #8b949e; border: 1px solid #30363d; }
+.maker-mode-badge.mode-STALE { background: #2d1417; color: #f85149; border: 1px solid #da3633; }
+.maker-mode-badge.just-changed { animation: maker-mode-flash 0.9s ease-out 1; }
+@keyframes maker-pulse-live {
+    0%, 100% { box-shadow: 0 0 6px rgba(63, 185, 80, 0.35); }
+    50%      { box-shadow: 0 0 14px rgba(63, 185, 80, 0.85); }
+}
+@keyframes maker-pulse-pre {
+    0%, 100% { box-shadow: 0 0 4px rgba(240, 136, 62, 0.22); }
+    50%      { box-shadow: 0 0 11px rgba(240, 136, 62, 0.55); }
+}
+@keyframes maker-mode-flash {
+    0%   { transform: scale(1.0); }
+    40%  { transform: scale(1.12); }
+    100% { transform: scale(1.0); }
+}
+.maker-question { color: #f0f6fc; font-size: 14px; margin-top: 8px; line-height: 1.4; word-break: break-word; }
+.maker-question.idle { color: #484f58; font-style: italic; }
+.maker-question.stale { color: #f85149; }
+.maker-meta { color: #8b949e; font-size: 12px; margin-top: 4px; }
+.maker-row { display: grid; grid-template-columns: 1fr auto; gap: 18px; align-items: center; margin-top: 4px; }
+.maker-countdown { font-size: 30px; font-weight: bold; font-family: 'SF Mono', monospace; text-align: right; min-width: 110px; transition: color 0.3s ease; }
+.maker-countdown.urgent { color: #f85149; }
+.maker-countdown.warning { color: #f0883e; }
+.maker-countdown.normal { color: #3fb950; }
+.maker-countdown.idle { color: #484f58; }
+.maker-help { position: absolute; top: 12px; right: 14px; color: #8b949e; font-size: 13px; cursor: help; user-select: none; }
+.maker-help-icon { display: inline-block; width: 18px; height: 18px; line-height: 16px; text-align: center; border: 1px solid #8b949e; border-radius: 50%; }
+.maker-help:hover .maker-tooltip, .maker-help:focus-within .maker-tooltip { display: block; }
+.maker-tooltip { display: none; position: absolute; top: 28px; right: 0; width: 290px; background: #0d1117; border: 1px solid #30363d; border-radius: 6px; padding: 10px 12px; color: #8b949e; font-size: 11px; z-index: 10; line-height: 1.55; box-shadow: 0 4px 12px rgba(0,0,0,0.4); }
+.maker-tooltip b { color: #f0f6fc; }
+.maker-tooltip .tt-row { margin-bottom: 6px; }
+.maker-tooltip .tt-row:last-child { margin-bottom: 0; }
+
+/* --- Arena clock-drift chip (operator diagnostics) ---
+ * Colour-coded chip showing the RAW signed skew between the dashboard
+ * process's wall clock and the arena's last-update timestamp.  Exposed
+ * separately from the (clamped) staleness_seconds because the display cap
+ * sanitises forward skew into an honest range, hiding real drift from
+ * operators -- this chip lets them see the actual delta.
+ *
+ * 4 tiers, signed:
+ *   - aligned (<1s abs):  muted gray       "drift aligned"
+ *   - small   (1-5s abs): neutral gray     "drift: +2.3s"
+ *   - medium  (5-60s abs):amber            "drift: +12s"
+ *   - large   (>=60s):    bold red chip with warning glyph & "(clamped)"
+ *                         suffix when staleness was sanitised server-side
+ *                         ("drift: +5m22s (clamped)").
+ */
+.maker-drift-hint {
+    display: inline-block;
+    padding: 1px 6px;
+    border-radius: 6px;
+    font-size: 11px;
+    font-family: 'SF Mono', monospace;
+    vertical-align: 1px;
+}
+.maker-drift-hint.drift-aligned { color: #484f58; }
+.maker-drift-hint.drift-small   { color: #8b949e; }
+.maker-drift-hint.drift-medium  { color: #f0883e; }
+.maker-drift-hint.drift-large   {
+    color: #f85149;
+    background: #2d1417;
+    border: 1px solid #da3633;
+    font-weight: bold;
+}
 </style>
 </head>
 <body>
@@ -72,70 +198,180 @@ td { padding: 6px 4px; border-bottom: 1px solid #21262d; }
     </div>
 </div>
 
+<div class="warning-banner" id="warning-banner"></div>
+
 <div class="container">
-    <!-- Active Markets Timer -->
-    <div class="card" id="markets-card" style="margin-bottom: 20px; border-left: 3px solid #f0883e;">
-        <h2>BTC 5-Min Markets</h2>
-        <div id="markets-timers"></div>
-        <div id="no-markets" style="color: #484f58;">Checking for active markets...</div>
+    <div class="tab-bar">
+        <button class="tab-button active" onclick="switchTab('overview')">Overview</button>
+        <button class="tab-button" onclick="switchTab('bots')">Bots</button>
+        <button class="tab-button" onclick="switchTab('earnings')">Earnings</button>
+        <button class="tab-button" onclick="switchTab('settings')">Settings</button>
     </div>
 
-    <!-- Overview Stats -->
-    <div class="grid" id="overview-grid">
-        <div class="card">
-            <h2>Today</h2>
-            <div class="stat-row"><span class="stat-label">Trades</span><span class="stat-value" id="today-trades">-</span></div>
-            <div class="stat-row"><span class="stat-label">P&L</span><span class="stat-value" id="today-pnl">-</span></div>
-            <div class="stat-row"><span class="stat-label">Win Rate</span><span class="stat-value" id="today-wr">-</span></div>
+    <!-- ===== OVERVIEW TAB ===== -->
+    <div class="tab-content" id="tab-overview">
+        <!-- Maker Section: live status card -->
+        <div class="card maker-card mode-IDLE" id="maker-card" style="margin-bottom: 20px;">
+            <h2>Maker Section <span style="color: #8b949e; font-size: 12px; text-transform: none; letter-spacing: 0; margin-left: 4px;">&mdash; target market</span></h2>
+            <div class="maker-help" tabindex="0">
+                <span class="maker-help-icon">?</span>
+                <div class="maker-tooltip">
+                    <div class="tt-row"><b>LIVE</b> &mdash; a 5-min BTC window is currently open and the maker is actively quoting on it.</div>
+                    <div class="tt-row"><b>PRE-WINDOW</b> &mdash; no live window; the maker is warming up on the soonest upcoming market resolving within 20 min (its bid/ask quotes begin before the window opens).</div>
+                    <div class="tt-row"><b>IDLE</b> &mdash; no eligible target. No market whose window is currently open, and no upcoming market within the 20-min cap.</div>
+                    <div class="tt-row"><b>STALE</b> &mdash; last snapshot from the arena is &gt;2min old. Discovery thread may be down.</div>
+                </div>
+            </div>
+            <div class="maker-row">
+                <div>
+                    <div><span class="maker-mode-badge mode-IDLE" id="maker-mode-badge">IDLE</span><span id="maker-meta" class="maker-meta">awaiting first discovery cycle</span></div>
+                    <div class="maker-question idle" id="maker-question">No target market available.</div>
+                </div>
+                <div class="maker-countdown idle" id="maker-countdown">--:--</div>
+            </div>
+            <div class="refresh-info">Updated by the discovery thread every 60s &middot; polled every 5s &middot; countdown ticks 1&times;/s</div>
         </div>
-        <div class="card">
-            <h2>This Week</h2>
-            <div class="stat-row"><span class="stat-label">Trades</span><span class="stat-value" id="week-trades">-</span></div>
-            <div class="stat-row"><span class="stat-label">P&L</span><span class="stat-value" id="week-pnl">-</span></div>
-            <div class="stat-row"><span class="stat-label">Win Rate</span><span class="stat-value" id="week-wr">-</span></div>
+
+        <!-- Active Markets Timer -->
+        <div class="card" id="markets-card" style="margin-bottom: 20px; border-left: 3px solid #f0883e;">
+            <h2>BTC 5-Min Markets</h2>
+            <div id="markets-timers"></div>
+            <div id="no-markets" style="color: #484f58;">Checking for active markets...</div>
         </div>
-        <div class="card">
-            <h2>All Time</h2>
-            <div class="stat-row"><span class="stat-label">Trades</span><span class="stat-value" id="all-trades">-</span></div>
-            <div class="stat-row"><span class="stat-label">P&L</span><span class="stat-value" id="all-pnl">-</span></div>
-            <div class="stat-row"><span class="stat-label">Win Rate</span><span class="stat-value" id="all-wr">-</span></div>
+
+        <!-- Overview Stats -->
+        <div class="grid" id="overview-grid">
+            <div class="card">
+                <h2>Today</h2>
+                <div class="stat-row"><span class="stat-label">Trades</span><span class="stat-value" id="today-trades">-</span></div>
+                <div class="stat-row"><span class="stat-label">P&L</span><span class="stat-value" id="today-pnl">-</span></div>
+                <div class="stat-row"><span class="stat-label">Win Rate</span><span class="stat-value" id="today-wr">-</span></div>
+            </div>
+            <div class="card">
+                <h2>This Week</h2>
+                <div class="stat-row"><span class="stat-label">Trades</span><span class="stat-value" id="week-trades">-</span></div>
+                <div class="stat-row"><span class="stat-label">P&L</span><span class="stat-value" id="week-pnl">-</span></div>
+                <div class="stat-row"><span class="stat-label">Win Rate</span><span class="stat-value" id="week-wr">-</span></div>
+            </div>
+            <div class="card">
+                <h2>All Time</h2>
+                <div class="stat-row"><span class="stat-label">Trades</span><span class="stat-value" id="all-trades">-</span></div>
+                <div class="stat-row"><span class="stat-label">P&L</span><span class="stat-value" id="all-pnl">-</span></div>
+                <div class="stat-row"><span class="stat-label">Win Rate</span><span class="stat-value" id="all-wr">-</span></div>
+            </div>
         </div>
     </div>
 
-    <!-- Bot Cards -->
-    <div class="section-title">Active Bots</div>
-    <div class="grid" id="bots-grid"></div>
+    <!-- ===== BOTS TAB ===== -->
+    <div class="tab-content hidden" id="tab-bots">
+        <div class="section-title">Active Bots</div>
+        <div class="grid" id="bots-grid"></div>
 
-    <!-- Copy Bots -->
-    <div class="section-title" id="copy-section" style="display:none">Copy Bots</div>
-    <div class="grid" id="copy-grid"></div>
-
-    <!-- Evolution History -->
-    <div class="section-title">Evolution History</div>
-    <div class="card" id="evolution-card">
-        <table id="evolution-table">
-            <thead><tr><th>Cycle</th><th>Survivors</th><th>Killed (WR / P&L)</th><th>New Bots</th><th>Time</th></tr></thead>
-            <tbody></tbody>
-        </table>
+        <div class="section-title" id="copy-section" style="display:none">Copy Bots</div>
+        <div class="grid" id="copy-grid"></div>
     </div>
 
-    <!-- Recent Trades -->
-    <div class="section-title">Recent Trades</div>
-    <div class="card">
-        <table id="trades-table">
-            <thead><tr><th>Bot</th><th>Market</th><th>Side</th><th>Amount</th><th>P&L</th><th>Time</th></tr></thead>
-            <tbody></tbody>
-        </table>
+    <!-- ===== EARNINGS TAB ===== -->
+    <div class="tab-content hidden" id="tab-earnings">
+        <div class="section-title">Recent Trades</div>
+        <div class="card">
+            <table id="trades-table">
+                <thead><tr><th>Bot</th><th>Market</th><th>Side</th><th>Amount</th><th>P&L</th><th>Time</th></tr></thead>
+                <tbody></tbody>
+            </table>
+        </div>
+
+        <div class="section-title">Evolution History</div>
+        <div class="card" id="evolution-card">
+            <table id="evolution-table">
+                <thead><tr><th>Cycle</th><th>Survivors</th><th>Killed (WR / P&L)</th><th>New Bots</th><th>Time</th></tr></thead>
+                <tbody></tbody>
+            </table>
+        </div>
+
+        <div class="section-title">Daily Earnings</div>
+        <div class="card">
+            <div id="earnings-sparkline" class="sparkline"></div>
+            <table id="earnings-table" style="margin-top: 12px;">
+                <thead><tr><th>Date</th><th>Trades</th><th>Wins</th><th>P&L</th></tr></thead>
+                <tbody></tbody>
+            </table>
+        </div>
     </div>
 
-    <!-- Earnings -->
-    <div class="section-title">Daily Earnings</div>
-    <div class="card">
-        <div id="earnings-sparkline" class="sparkline"></div>
-        <table id="earnings-table" style="margin-top: 12px;">
-            <thead><tr><th>Date</th><th>Trades</th><th>Wins</th><th>P&L</th></tr></thead>
-            <tbody></tbody>
-        </table>
+    <!-- ===== SETTINGS TAB ===== -->
+    <div class="tab-content hidden" id="tab-settings">
+        <div class="storage-info" id="storage-info">Loading credential store info...</div>
+
+        <div class="settings-section">
+            <h3>Simmer</h3>
+            <div class="settings-blurb">Required for any trading. Get a key from simmer.markets &rarr; Settings &rarr; Agents.</div>
+
+            <div class="cred-row">
+                <label>Simmer API key<small>Single-account default</small></label>
+                <input type="password" id="creds-simmer_api_key" placeholder="Paste Simmer API key" autocomplete="off">
+                <span class="cred-status missing" id="status-simmer_api_key">Missing</span>
+            </div>
+
+            <div class="cred-row">
+                <label>Simmer per-bot keys<small>Optional JSON: {"slot_0":"key","slot_1":"key",...}</small></label>
+                <textarea id="creds-simmer_bot_keys" placeholder='{"slot_0":"...", "slot_1":"..."}' rows="3" style="font-family: inherit; font-size: 12px;"></textarea>
+                <span class="cred-status missing" id="status-simmer_bot_keys">Missing</span>
+            </div>
+
+            <div class="test-result" id="test-simmer"></div>
+            <div class="test-hint">Test reads only the SAVED credentials &mdash; form values are NOT submitted by this button. Save first if you just typed a new value.</div>
+            <div class="actions-row">
+                <button class="btn btn-secondary" onclick="testCredentials('simmer')">Test Simmer</button>
+            </div>
+        </div>
+
+        <div class="settings-section">
+            <h3>Polymarket</h3>
+            <div class="settings-blurb">Required for live USDC trading. Live mode is gated on these being set.</div>
+
+            <div class="cred-row">
+                <label>API key<small>Polymarket CLOB L2</small></label>
+                <input type="password" id="creds-polymarket_api_key" placeholder="Polymarket L2 API key" autocomplete="off">
+                <span class="cred-status missing" id="status-polymarket_api_key">Missing</span>
+            </div>
+
+            <div class="cred-row">
+                <label>API secret<small>Base64 HMAC secret</small></label>
+                <input type="password" id="creds-polymarket_api_secret" placeholder="Polymarket L2 API secret" autocomplete="off">
+                <span class="cred-status missing" id="status-polymarket_api_secret">Missing</span>
+            </div>
+
+            <div class="cred-row">
+                <label>API passphrase<small>Bound to L2 key</small></label>
+                <input type="password" id="creds-polymarket_passphrase" placeholder="Polymarket L2 passphrase" autocomplete="off">
+                <span class="cred-status missing" id="status-polymarket_passphrase">Missing</span>
+            </div>
+
+            <div class="cred-row">
+                <label>Signer address<small>Proxy / funder 0x&hellip;</small></label>
+                <input type="password" id="creds-polymarket_signer_address" placeholder="0x&hellip; signer / funder address" autocomplete="off">
+                <span class="cred-status missing" id="status-polymarket_signer_address">Missing</span>
+            </div>
+
+            <div class="cred-row">
+                <label>Private key<small>Signs on-chain orders</small></label>
+                <input type="password" id="creds-polymarket_private_key" placeholder="0x&hellip; private key" autocomplete="off">
+                <span class="cred-status missing" id="status-polymarket_private_key">Missing</span>
+            </div>
+
+            <div class="test-result" id="test-polymarket"></div>
+            <div class="test-hint">Test reads only the SAVED credentials &mdash; form values are NOT submitted by this button. Save first if you just typed new values.</div>
+            <div class="actions-row">
+                <button class="btn btn-secondary" onclick="testCredentials('polymarket')">Test Polymarket</button>
+            </div>
+        </div>
+
+        <div class="actions-row" style="border-top: 1px solid #30363d; padding-top: 16px;">
+            <button class="btn btn-primary" onclick="saveCredentials()">Save All</button>
+            <button class="btn btn-secondary" onclick="refreshSettings()">Reload From Disk</button>
+            <span id="save-status" style="color: #8b949e; align-self: center;"></span>
+        </div>
     </div>
 
     <div class="refresh-info">Auto-refreshes every 10 seconds</div>
@@ -146,7 +382,7 @@ td { padding: 6px 4px; border-bottom: 1px solid #21262d; }
     <div class="confirm-box">
         <h3>Switch to LIVE Trading?</h3>
         <p>This will trade with real USDC on Polymarket. Make sure you understand the risks.</p>
-        <button class="btn btn-danger" onclick="confirmLive()">YES — Go Live</button>
+        <button class="btn btn-danger" onclick="confirmLive()">YES &mdash; Go Live</button>
         <button class="btn btn-cancel" onclick="cancelModal()">Cancel</button>
     </div>
 </div>
@@ -156,16 +392,31 @@ td { padding: 6px 4px; border-bottom: 1px solid #21262d; }
     <div class="confirm-box">
         <h3>Switch <span id="bot-confirm-name"></span> to LIVE?</h3>
         <p>This bot will start trading with real USDC on Polymarket. Other bots remain unchanged.</p>
-        <button class="btn btn-danger" onclick="confirmBotLive()">YES — Go Live</button>
+        <button class="btn btn-danger" onclick="confirmBotLive()">YES &mdash; Go Live</button>
         <button class="btn btn-cancel" onclick="cancelBotModal()">Cancel</button>
     </div>
 </div>
 
 <script>
 let currentMode = 'paper';
+let bannerDismissed = false;  // session-only — clear on page reload
 
 async function fetchJSON(url) {
     const resp = await fetch(url, { credentials: 'include' });
+    return resp.json();
+}
+
+// POST + parse JSON. The dashboard's credential endpoints (`save`, `test`)
+// are POST-only — calling them via `fetchJSON` (which omits `method`) sends
+// a GET, FastAPI returns 405, and downstream `resp.saved.length` threw
+// `TypeError: Cannot read properties of undefined (reading 'length')`.
+async function postJSON(url, body) {
+    const resp = await fetch(url, {
+        method: 'POST',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+    });
     return resp.json();
 }
 
@@ -185,6 +436,311 @@ function winRate(wins, losses) {
     return total > 0 ? ((wins / total) * 100).toFixed(1) + '%' : '-';
 }
 
+// ---------- Tabs ----------
+function switchTab(name) {
+    document.querySelectorAll('.tab-content').forEach(el => el.classList.add('hidden'));
+    document.querySelectorAll('.tab-button').forEach(b => b.classList.remove('active'));
+    document.getElementById('tab-' + name).classList.remove('hidden');
+    // Re-find buttons in case DOM order changed
+    const btns = document.querySelectorAll('.tab-button');
+    btns.forEach(b => {
+        if (b.textContent.trim().toLowerCase() === name) b.classList.add('active');
+    });
+    if (name === 'settings') refreshSettings();
+}
+
+// ---------- Warning banner ----------
+function updateBanner(warnings) {
+    if (!warnings || warnings.length === 0) {
+        bannerDismissed = false;  // reset — issues resolved
+        document.getElementById('warning-banner').classList.remove('visible');
+        document.getElementById('warning-banner').innerHTML = '';
+        return;
+    }
+    if (bannerDismissed) return;
+    const rows = warnings.map(w => `
+        <div class="warning-row ${w.level}">
+            <span>${w.message}</span>
+            <span style="color:#8b949e;font-size:10px">[${w.category}]</span>
+        </div>
+    `).join('');
+    document.getElementById('warning-banner').innerHTML = rows +
+        `<button class="btn-dismiss" onclick="dismissBanner()" style="margin-top:8px">Dismiss</button>`;
+    document.getElementById('warning-banner').classList.add('visible');
+}
+
+function dismissBanner() {
+    bannerDismissed = true;
+    document.getElementById('warning-banner').classList.remove('visible');
+}
+
+// ---------- Settings tab ----------
+async function refreshSettings() {
+    try {
+        const data = await fetchJSON('/api/credentials/status');
+        document.getElementById('storage-info').innerHTML = `
+            Credentials are stored in an encrypted file inside the repo
+            (<code>.credentials.enc</code>, gitignored). The encryption key lives outside the repo
+            at <code>${data.key_file}</code> (chmod 0600). Both paths are shown here for reference.
+        `;
+        for (const c of data.credentials) {
+            const input = document.getElementById('creds-' + c.key);
+            const statusEl = document.getElementById('status-' + c.key);
+            if (!input || !statusEl) continue;
+            statusEl.textContent = c.configured ? 'Configured' : 'Missing';
+            statusEl.className = 'cred-status ' + (c.configured ? 'configured' : 'missing');
+            input.placeholder = c.configured
+                ? '(saved — leave blank to keep, type new value to replace)'
+                : c.label + ' not yet configured';
+        }
+    } catch (e) {
+        console.error('refreshSettings error:', e);
+    }
+}
+
+function collectCredentialUpdates() {
+    const updates = {};
+    document.querySelectorAll('input[id^="creds-"], textarea[id^="creds-"]').forEach(el => {
+        const key = el.id.replace('creds-', '');
+        if (el.value.trim() !== '') updates[key] = el.value;
+    });
+    return updates;
+}
+
+async function saveCredentials() {
+    const updates = collectCredentialUpdates();
+    const statusEl = document.getElementById('save-status');
+    if (Object.keys(updates).length === 0) {
+        statusEl.textContent = 'No changes to save';
+        statusEl.style.color = '#8b949e';
+        return;
+    }
+    try {
+        // POST (NOT GET — the server endpoint is POST-only); send as JSON.
+        const resp = await postJSON('/api/credentials/save', updates);
+        if (resp && resp.error) {
+            statusEl.textContent = 'Save failed: ' + resp.error;
+            statusEl.style.color = '#f85149';
+            return;
+        }
+        const savedCount = (resp && Array.isArray(resp.saved)) ? resp.saved.length : 0;
+        statusEl.textContent = `Saved ${savedCount} field(s).`;
+        statusEl.style.color = '#3fb950';
+        // Clear inputs and update status dots
+        document.querySelectorAll('input[id^="creds-"], textarea[id^="creds-"]').forEach(el => el.value = '');
+        await refreshSettings();
+        await refresh();  // refresh status / banner
+    } catch (e) {
+        statusEl.textContent = 'Save error: ' + e;
+        statusEl.style.color = '#f85149';
+    }
+}
+
+async function testCredentials(which) {
+    const box = document.getElementById('test-' + which);
+    box.className = 'test-result';
+    box.textContent = 'Testing…';
+    try {
+        // POST (NOT GET — the server endpoint is POST-only);
+        // tell the server which section to test.
+        const resp = await postJSON('/api/credentials/test', { which: which });
+        const r = (resp && typeof resp === 'object') ? resp[which] : undefined;
+        if (!r) {
+            box.className = 'test-result fail';
+            box.textContent = `Server returned no result for "${which}".`;
+            return;
+        }
+        if (r.ok) {
+            box.className = 'test-result ok';
+            if (which === 'simmer') {
+                const bal = (r.balance != null) ? `$${Number(r.balance).toLocaleString()} $SIM` : '(balance unknown)';
+                box.textContent = `✓ Simmer OK — agent "${r.agent_name}" (${r.agent_id}), balance ${bal}.`;
+            } else {
+                const usdc = (r.balance_usdc != null) ? `$${r.balance_usdc.toFixed(2)} USDC` : '(balance unknown)';
+                box.textContent = `✓ Polymarket OK — signer ${r.signer_address}, balance ${usdc}.`;
+            }
+        } else {
+            box.className = 'test-result fail';
+            box.textContent = `✗ ${which} test failed: ${r.error}`;
+        }
+    } catch (e) {
+        box.className = 'test-result fail';
+        box.textContent = `✗ Network error: ${e}`;
+    }
+}
+
+// ---------- Maker Section card ----------
+// Snapshot state: latest /api/maker-status response + wall clock at fetch
+let makerLatest = null;
+let makerLatestFetchedAt = null;
+let makerPrevMode = null;  // detect transitions for the flash animation
+
+function _isMakerStale(latest) {
+    if (!latest) return false;
+    const st = latest.staleness_seconds;
+    return st == null || st > 120;
+}
+
+async function fetchMakerStatus() {
+    try {
+        const data = await fetchJSON('/api/maker-status');
+        makerLatest = data;
+        makerLatestFetchedAt = Date.now();
+        renderMakerCard();
+    } catch (e) {
+        console.error('maker fetch error:', e);
+    }
+}
+
+function formatResolvesAt(s) {
+    try {
+        const ss = s.replace(' ', 'T').replace(/([^Z])$/, '$1Z');
+        return new Date(ss).toLocaleTimeString(
+            'en-US', { hour: '2-digit', minute: '2-digit', timeZone: 'America/New_York' }
+        );
+    } catch (e) { return '?'; }
+}
+
+function renderMakerCard() {
+    if (!makerLatest) return;
+    const card = document.getElementById('maker-card');
+    const badge = document.getElementById('maker-mode-badge');
+    const meta = document.getElementById('maker-meta');
+    const question = document.getElementById('maker-question');
+
+    const mode = makerLatest.mode || 'IDLE';
+    const isStale = _isMakerStale(makerLatest);
+
+    // Stale-display override: when the arena's last snapshot is >2min old
+    // and the underlying mode is something the operator might mistake for
+    // live (LIVE / PRE-WINDOW), flip the badge to STALE so the card can't
+    // be read as current truth.  Genuine IDLE remains IDLE.
+    const displayMode = (isStale && mode !== 'IDLE') ? 'STALE' : mode;
+
+    card.className = 'card maker-card mode-' + displayMode;
+    // Only apply the legacy `.stale` opacity dim when NOT in the dedicated
+    // mode-STALE display.  The mode-STALE styling (red border, red text,
+    // "Discovery thread may be down" message) already conveys staleness;
+    // adding both `.stale { opacity: 0.55 }` AND `.mode-STALE { opacity: 0.85 }`
+    // at the same time created a cascade-tiebreaker conflict where .stale
+    // won and rendered STALE cards at 55% opacity (the intent was 85%).
+    card.classList.toggle('stale', isStale && displayMode !== 'STALE');
+    const modeChanged = makerPrevMode !== null && makerPrevMode !== displayMode;
+    badge.className = 'maker-mode-badge mode-' + displayMode + (modeChanged ? ' just-changed' : '');
+    badge.textContent = displayMode;
+    makerPrevMode = displayMode;
+
+    if (mode === 'IDLE' || !makerLatest.market_id) {
+        meta.textContent = 'no target market in scope';
+        question.textContent = 'No eligible target market right now (no live window, none within the 20-min pre-window cap).';
+        question.className = 'maker-question idle';
+        return;
+    }
+
+    if (displayMode === 'STALE') {
+        const ageLabel = makerLatest.staleness_seconds != null
+            ? `${Math.floor(makerLatest.staleness_seconds)}s`
+            : 'unknown time';
+        question.textContent = `Stale snapshot \u2014 last arena update ${ageLabel} ago. Discovery thread may be down.`;
+        question.className = 'maker-question stale';
+        meta.textContent = '';
+        return;
+    }
+
+    const rawQuestion = makerLatest.market_question || 'Unknown market';
+    question.textContent = rawQuestion.replace(/^Bitcoin Up or Down - /, '').slice(0, 110);
+    question.className = 'maker-question';
+
+    const st = makerLatest.staleness_seconds;
+    const ageText = st != null ? `snapshot ${Math.floor(st)}s ago` : 'just now';
+    const ro = makerLatest.resolves_at ? `resolves ${formatResolvesAt(makerLatest.resolves_at)} ET` : '';
+    const driftChip = _renderDriftChip(makerLatest.clock_drift_seconds, st);
+    const bits = [ageText, driftChip, ro].filter(s => s);
+    meta.innerHTML = bits.join(' &middot; ');
+}
+
+/**
+ * Format the arena-vs-dashboard clock delta as a colour-coded chip.
+ * 4 tiers: aligned (<1s -- gray), small (1-5s -- neutral gray),
+ * medium (5-60s -- amber), large (>=60s -- bold red chip with warning
+ * symbol).  Adds "(clamped)" suffix whenever the displayed staleness
+ * was clamped on the server (drift != staleness within 0.5s, OR drift
+ * negative) so operators notice when skew is being sanitised away.
+ */
+function _renderDriftChip(drift, displayedStaleness) {
+    if (typeof drift !== 'number' || !isFinite(drift)) return '';
+    const abs = Math.abs(drift);
+    let cls, label, icon = '';
+    if (abs < 1.0) {
+        cls = 'drift-aligned';
+        label = 'drift aligned';
+    } else if (abs < 5.0) {
+        cls = 'drift-small';
+        label = 'drift: ' + (drift >= 0 ? '+' : '') + drift.toFixed(1) + 's';
+    } else if (abs < 60.0) {
+        cls = 'drift-medium';
+        label = 'drift: ' + (drift >= 0 ? '+' : '') + Math.round(drift) + 's';
+    } else {
+        // Big drift -- bucket into m/h so the chip stays compact.
+        cls = 'drift-large';
+        icon = ' &#9888;';
+        const sign = drift >= 0 ? '+' : '-';
+        const m = Math.floor(abs / 60);
+        const s = Math.round(abs % 60);
+        if (m >= 60) {
+            label = 'drift: ' + sign + Math.floor(m / 60) + 'h' + (m % 60) + 'm';
+        } else {
+            label = 'drift: ' + sign + m + 'm' + s + 's';
+        }
+    }
+    const wasClamped = typeof displayedStaleness === 'number'
+        && (Math.abs(drift - displayedStaleness) > 0.5 || drift < 0);
+    const tag = wasClamped ? ' (clamped)' : '';
+    return '<span class="maker-drift-hint ' + cls + '">' + label + tag + icon + '</span>';
+}
+
+function tickMakerCountdown() {
+    const countdownEl = document.getElementById('maker-countdown');
+    if (!makerLatest || makerLatest.mode === 'IDLE' || !makerLatest.time_remaining_seconds) {
+        countdownEl.textContent = '--:--';
+        countdownEl.className = 'maker-countdown idle';
+        return;
+    }
+    // Don't trust the underlying timer when the arena is stale -- blank it
+    // so the STALE label clearly means "no live signal".
+    if (_isMakerStale(makerLatest)) {
+        countdownEl.textContent = '--:--';
+        countdownEl.className = 'maker-countdown idle';
+        return;
+    }
+    // Decrement the server-provided "time remaining until resolution" by
+    // wall-clock elapsed since we fetched the snapshot.
+    //   LIVE        -> "RESOLVES in MM:SS" (window is open)
+    //   PRE-WINDOW  -> "OPENS in MM:SS"    (window hasn't started yet;
+    //                                       BTC windows are 300s, so
+    //                                       open-time = remaining - 300s)
+    const elapsedSinceFetch = (Date.now() - makerLatestFetchedAt) / 1000;
+    const resolveIn = Math.max(0, makerLatest.time_remaining_seconds - elapsedSinceFetch);
+    let labelPrefix, valueSec;
+    if (makerLatest.mode === 'PRE-WINDOW') {
+        valueSec = Math.max(0, resolveIn - 300);
+        labelPrefix = 'OPENS';
+    } else {
+        valueSec = resolveIn;
+        labelPrefix = 'RESOLVES';
+    }
+    const totalSec = Math.floor(valueSec);
+    const min = Math.floor(totalSec / 60);
+    const sec = totalSec % 60;
+    countdownEl.textContent = `${min}:${sec.toString().padStart(2, '0')}`;
+    let cls = 'normal';
+    if (totalSec < 60) cls = 'urgent';
+    else if (totalSec < 180) cls = 'warning';
+    countdownEl.className = 'maker-countdown ' + cls;
+    countdownEl.title = `${labelPrefix} in ${min}m ${sec.toString().padStart(2,'0')}s`;
+}
+
+// ---------- Overview / Bots / Earnings ----------
 function updateOverview(stats) {
     for (const [period, el] of [['today', stats.today], ['week', stats.week], ['all', stats.all_time]]) {
         document.getElementById(`${period}-trades`).textContent = el.trades || 0;
@@ -220,7 +776,7 @@ function updateBots(bots) {
         card.innerHTML = `
             <div class="bot-header">
                 <div class="bot-name">${cfg.bot_name}</div>
-                <button class="bot-mode-btn bot-mode-${botMode}" onclick="toggleBotMode('${cfg.bot_name}', '${botMode}')">${botMode.toUpperCase()}</button>
+                <button class="bot-mode-btn bot-mode-${botMode}" onclick="toggleBotMode('${cfg.bot_name}', '${botMode}')\">${botMode.toUpperCase()}</button>
             </div>
             <div class="bot-meta">${cfg.strategy_type} | Gen ${cfg.generation} | ${cfg.lineage || '-'}</div>
             <div class="stat-row"><span class="stat-label">Balance</span><span class="stat-value bot-balance">${balanceStr}</span></div>
@@ -241,7 +797,6 @@ function updateBots(bots) {
 function updateEvolution(events) {
     const tbody = document.querySelector('#evolution-table tbody');
     tbody.innerHTML = events.map(e => {
-        // Build killed bots display with WR and P&L from rankings
         const rankings = e.rankings || [];
         const replaced = e.replaced || [];
         const killedInfo = replaced.map(name => {
@@ -278,7 +833,7 @@ function updateEarnings(data) {
     const sparkline = document.getElementById('earnings-sparkline');
     if (daily.length > 0) {
         const maxAbs = Math.max(...daily.map(d => Math.abs(d.pnl)), 1);
-        sparkline.innerHTML = daily.reverse().map(d => {
+        sparkline.innerHTML = [...daily].reverse().map(d => {
             const h = Math.max(2, Math.abs(d.pnl) / maxAbs * 40);
             const cls = d.pnl >= 0 ? '' : 'neg';
             return `<div class="spark-bar ${cls}" style="height:${h}px" title="${d.day}: ${fmtPnl(d.pnl)}"></div>`;
@@ -322,7 +877,6 @@ function updateMarketTimers() {
     const now = Date.now();
     let endMs = null;
     if (market.resolves_at) {
-        // resolves_at is "2026-07-07 23:30:00Z" — normalize to ISO and parse as UTC
         const s = market.resolves_at.replace(' ', 'T').replace(/([^Z])$/, '$1Z');
         endMs = new Date(s).getTime();
     }
@@ -455,6 +1009,7 @@ async function refresh() {
             fetchJSON('/api/copytrading'),
         ]);
         updateMode(status.mode);
+        updateBanner(status.warnings || []);
         updateOverview(overview.stats);
         updateBots(bots.filter(b => b.config.strategy_type !== 'copy_trade'));
         updateCopyBots(copyBots);
@@ -464,15 +1019,20 @@ async function refresh() {
     } catch (e) {
         console.error('Refresh error:', e);
     }
-    // Refresh market data alongside other data
     await fetchMarkets();
     updateMarketTimers();
+    await fetchMakerStatus();
+    tickMakerCountdown();
 }
 
 refresh();
 setInterval(refresh, 10000);
-// Tick countdown every second for smooth timers
+// Maker-section status fetches faster than the rest of the dashboard so the
+// LIVE/PRE-WINDOW badge keeps up with the 60s discovery cadence without
+// paying the cost of re-hitting every other endpoint on the same schedule.
+setInterval(fetchMakerStatus, 5000);
 setInterval(updateMarketTimers, 1000);
+setInterval(tickMakerCountdown, 1000);
 </script>
 </body>
 </html>

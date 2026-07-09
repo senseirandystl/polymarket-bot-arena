@@ -14,16 +14,17 @@ import sys
 from pathlib import Path
 from datetime import datetime
 import config
+import credentials_store
 
 BASE = config.SIMMER_BASE_URL
 
 
 def load_api_key():
-    try:
-        with open(config.SIMMER_API_KEY_PATH) as f:
-            return json.load(f).get("api_key")
-    except FileNotFoundError:
-        return None
+    """Read the Simmer API key from the encrypted credentials store.
+
+    Returns the key string or None if not configured. Never raises.
+    """
+    return credentials_store.get_credential("simmer_api_key")
 
 
 def check_agent_status(api_key):
@@ -176,8 +177,18 @@ def main():
     print("\n1. Checking Simmer API key...")
     api_key = load_api_key()
     if not api_key:
-        print(f"   No API key at {config.SIMMER_API_KEY_PATH}")
-        sys.exit(1)
+        print(f"   No Simmer API key configured in the encrypted store.")
+        print(f"   Store:   {credentials_store.CREDENTIALS_FILE}")
+        print(f"   Keyfile: {credentials_store.CREDENTIALS_KEY_FILE}")
+        print()
+        print("   Recommended: open the dashboard Settings tab and paste your key.")
+        print(f"   Dashboard URL: http://localhost:{config.DASHBOARD_PORT}/")
+        print()
+        # Don't exit — the arena itself runs without a key now and surfaces the
+        # same warning via the dashboard. Some user may want to use Setup.py
+        # purely as a CLI for the encryption-store flow. Provide a sane default
+        # exit code so launching --setup doesn't crash the arena entry point.
+        sys.exit(2)
     print(f"   API key loaded")
 
     # 2. Agent status

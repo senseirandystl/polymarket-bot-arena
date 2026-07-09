@@ -6,11 +6,9 @@
     <string>com.polymarket.dashboard</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/opt/homebrew/bin/python3</string>
-        <string>/Users/ben/clawd/trading_bot/dashboard/server.py</string>
+        <string>/Users/randalljames/Documents/GitHub/pba/.venv/bin/python3</string>
+        <string>/Users/randalljames/Documents/GitHub/pba/dashboard/server.py</string>
     </array>
-    <key>WorkingDirectory</key>
-    <string>/Users/ben/clawd/trading_bot</string>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
@@ -21,13 +19,15 @@
     <key>ThrottleInterval</key>
     <integer>10</integer>
     <key>StandardOutPath</key>
-    <string>/Users/ben/clawd/trading_bot/logs/dashboard_stdout.log</string>
+    <string>/Users/randalljames/Library/Logs/com.polymarket.dashboard.out.log</string>
     <key>StandardErrorPath</key>
-    <string>/Users/ben/clawd/trading_bot/logs/dashboard_stderr.log</string>
+    <string>/Users/randalljames/Library/Logs/com.polymarket.dashboard.err.log</string>
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
         <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <key>PYTHONUNBUFFERED</key>
+        <string>1</string>
     </dict>
 </dict>
 </plist>

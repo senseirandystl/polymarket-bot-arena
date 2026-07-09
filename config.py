@@ -5,18 +5,39 @@ Polymarket Bot Arena Configuration
 import os
 from pathlib import Path
 
+# Re-export encrypted credentials helpers so callers can
+# `from config import get_credential` (consistent with the rest of the
+# codebase) rather than `import credentials_store`. The Simmer API key,
+# per-bot keys, and the Polymarket L2 credential bundle all live in the
+# encrypted store now; the constants below point at *legacy plaintext
+# locations* which were auto-migrated to the store on first run.
+from credentials_store import (
+    get_credential,
+    set_credentials,
+    credentials_status,
+    is_credential_configured,
+    CREDENTIALS_FILE,
+    CREDENTIALS_KEY_FILE,
+)
+
 # Trading Mode: "paper" (default, uses $SIM) or "live" (real USDC)
 TRADING_MODE = "paper"  # MUST start in paper mode
 
 # Simmer API Configuration
-SIMMER_API_KEY_PATH = Path.home() / ".config/simmer/credentials.json"
+# Legacy plaintext location — kept as a documentation breadcrumb only.
+# The active source of truth is the encrypted credentials store
+# (CREDENTIALS_FILE above). Use `config.get_credential("simmer_api_key")`.
+SIMMER_API_KEY_PATH = Path.home() / ".config/simmer/simmer_api_key.json"
 SIMMER_BASE_URL = "https://api.simmer.markets"
 
 # Multi-agent: each bot gets its own Simmer account for independent trading
 # Keys are mapped bot_name -> api_key. Falls back to the default key.
+# Legacy plaintext location — see SIMMER_API_KEY_PATH note above.
 SIMMER_BOT_KEYS_PATH = Path.home() / ".config/simmer/bot_keys.json"
 
 # Polymarket Direct CLOB (for live trading)
+# Legacy plaintext location — see SIMMER_API_KEY_PATH note above. Reads in
+# the codebase now go through the encrypted store.
 POLYMARKET_KEY_PATH = Path.home() / ".config/polymarket/credentials.json"
 POLYMARKET_HOST = "https://clob.polymarket.com"
 POLYMARKET_CHAIN_ID = 137  # Polygon
@@ -70,6 +91,39 @@ COPYTRADING_BLOCKED_HOURS_UTC = [22]    # UTC hours to skip entirely (22:00 = -$
 # Dashboard Settings
 DASHBOARD_PORT = 8501
 DASHBOARD_HOST = "0.0.0.0"
+
+# Arena Loop Cadences
+# Each loop is its own daemon thread; root arena.py starts them all up.  Before
+# this split, all four concerns ran in one 15s main_loop which (a) re-scanned
+# the same markets every cycle and (b) meant bots only re-evaluated every 15s.
+# After the split:
+#   - discovery : up to 2 HTTPS calls every 60s
+#   - trader    : zero network calls per tick (1s) except on bot.execute
+#   - resolver  : 1 HTTPS call every 60s
+#   - pos monitor: 0.5s SL/TP exit loop (hard-realtime; see arena/position_monitor.py)
+DISCOVERY_INTERVAL_SEC = 60       # market discovery + orderflow refresh
+TRADE_LOOP_INTERVAL_SEC = 1.0     # bot eval / trade-execution loop
+RESOLVE_INTERVAL_SEC = 60         # trade resolution + stale-trade sweep
+ORDERFLOW_CACHE_SECONDS = 30      # per-market /api/sdk/context refresh window
+MAKER_UPCOMING_WINDOW_SEC = 1200  # ≤N seconds in the future the maker section is
+                                  # allowed to fall back to (i.e. quote on a
+                                  # market whose window hasn't opened yet).
+                                  # 1200s = 20min, matches the pre-refactor
+                                  # tradeoff: long enough to warm up bid/ask
+                                  # ahead of the next window, short enough
+                                  # to keep signal convergence meaningful.
+STALENESS_DISPLAY_MAX_SEC = 300  # Upper clamp on the staleness value shown
+                                  # in the dashboard's Maker Section card.
+                                  # Without this, forward clock skew between
+                                  # the arena and the dashboard process inflates
+                                  # observed staleness ("last arena update
+                                  # 5m ago" when it's really 30s ago).  Caps at
+                                  # 5min -- enough headroom beyond the 120s
+                                  # STALE-display threshold that the card still
+                                  # flips to STALE for any snapshot older than
+                                  # that, but values shown to operators stay
+                                  # honest.  Operates as a sanity ceiling, not
+                                  # an STALE policy.
 
 # Logging
 LOG_DIR = Path(__file__).parent / "logs"

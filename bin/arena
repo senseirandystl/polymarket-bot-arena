@@ -1,0 +1,172 @@
+#!/usr/bin/env bash
+# bin/arena -- run the Polymarket Bot Arena via the project-local venv.
+#
+# Why this exists: the encrypted credential store (credentials_store.py)
+# requires the `cryptography` package, which is installed into
+# <repo>/.venv/ but NOT into the host's default system `python3`. A bare
+# `python3 arena.py` from the user's $PATH therefore fails with
+# `ModuleNotFoundError: No module named 'cryptography'`.
+#
+# What this wrapper does:
+#   1. Verifies the venv interpreter exists (and prints a helpful hint if it
+#      does not).
+#   2. Sets PYTHONUNBUFFERED=1 so stdout line-flushes when redirected to a
+#      log file (matches the launchd plists -- otherwise Python's stdout is
+#      block-buffered and `arena > /tmp/run.log` stays empty until ~4KB
+#      accumulates).
+#   3. Reaps any dashboard child orphaned by a previous `bin/arena` that
+#      was killed with SIGKILL (the cleanup trap in step 6 can't fire on
+#      SIGKILL, so we detect and clean stale PID files here).
+#   4. Probes http://localhost:${DASHBOARD_PORT}/api/status. If nothing is
+#      already serving the dashboard (e.g. the launchd plist isn't loaded,
+#      or you've never started it manually), spawns dashboard/server.py in
+#      the background, waits up to ~3s for its endpoint to come up, then
+#      runs the arena. The flag set in step 2 also applies to the
+#      backgrounded dashboard so its log line-flushes.
+#      Set ARENA_NO_DASHBOARD=1 to skip step 4 (you manage the dashboard
+#      yourself, e.g. via com.polymarket.dashboard.plist under launchd).
+#   5. Runs arena.py in the foreground.
+#   6. On wrapper exit (clean stop, Ctrl-C, or kill), kills the
+#      backgrounded dashboard child and removes its PID file.
+#
+# All CLI args are forwarded to arena.py -- e.g. `./bin/arena --mode live`
+# passes `--mode live` through.
+#
+# SYMLINK CAVEAT: this wrapper handles direct invocation and ABSOLUTE
+# symlinks (e.g. `~/bin/arena -> /abs/path/to/repo/bin/arena`). Relative
+# symlinks (e.g. `~/bin/arena -> repo/bin/arena`) resolve through the
+# symlink's own directory and end up at `~/bin/repo/...` -- not the real
+# repo. Use absolute paths when creating symlinks:
+#     ln -sfn /abs/path/to/repo/bin/arena ~/bin/arena
+
+set -euo pipefail
+
+# Resolve our own absolute path so this works whether invoked as
+# `./bin/arena`, `bin/arena`, or via a $PATH symlink (e.g. `~/bin/arena`
+# pointing back at this file). Pure bash 3.2+ compatible -- no
+# `readlink -f`, which doesn't exist on macOS's stock readlink.
+SOURCE="${BASH_SOURCE[0]}"
+while [ -L "$SOURCE" ]; do
+    DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+    SOURCE="$(readlink "$SOURCE")"
+    [[ "$SOURCE" != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+REPO_ROOT="$(cd -P "$(dirname "$SOURCE")/.." && pwd)"
+
+# venv interpreter sanity check. Without this, a missing venv surfaces
+# bash's cryptic `python3: No such file or directory` from inside an
+# `exec` call, with no clue what is missing or how to fix it.
+if [[ ! -x "$REPO_ROOT/.venv/bin/python3" ]]; then
+    echo "bin/arena: cannot find the venv interpreter at:" >&2
+    echo "    $REPO_ROOT/.venv/bin/python3" >&2
+    echo "" >&2
+    echo "Create the venv with:" >&2
+    echo "    python3 -m venv '$REPO_ROOT/.venv'" >&2
+    echo "    '$REPO_ROOT/.venv/bin/pip' install -r '$REPO_ROOT/requirements.txt'" >&2
+    exit 1
+fi
+
+# Match the launchd plist (com.polymarket.botarena.plist). Without this,
+# Python's stdout is block-buffered when redirected to a file, so
+# `arena > /tmp/run.log` looks empty until ~4KB accumulates. That's
+# exactly the failure mode that motivated the PYTHONUNBUFFERED flag in
+# the plist in the first place.
+export PYTHONUNBUFFERED=1
+
+PYTHON_BIN="$REPO_ROOT/.venv/bin/python3"
+DASH_PORT="${DASHBOARD_PORT:-8501}"
+DASH_LOG="${DASHBOARD_LOG:-$REPO_ROOT/dashboard.log}"
+PIDFILE="$REPO_ROOT/.dashboard.pid"
+
+# Note: the HTTP-Basic auth used to probe the dashboard is hardcoded to
+# match DASHBOARD_USER / DASHBOARD_PASS at the top of dashboard/server.py.
+# If those constants change there, update this line. (Wrapping in env vars
+# adds churn for a single-call-site credential pair; a comment is cheaper.)
+
+# --- Orphan reaping at startup ---------------------------------------
+# If a previous `bin/arena` was SIGKILL'd (e.g. via the Activity Monitor
+# "Force Quit" or a stuck `kill -9`), the cleanup trap below never fired
+# and a dashboard/server.py child can be left bound on :$DASH_PORT
+# indefinitely. Our curl probe would see something bound there and
+# quietly defer to it -- a ghost dashboard from a dead wrapper. Detect
+# that case via the PID file, verify the command line still identifies
+# OUR dashboard (guards against PID recycling onto an unrelated process),
+# and clean up before proceeding.
+if [[ -f "$PIDFILE" ]]; then
+    OLD_PID=$(tr -d '[:space:]' < "$PIDFILE" 2>/dev/null || true)
+    if [[ -n "$OLD_PID" ]] && kill -0 "$OLD_PID" 2>/dev/null; then
+        OLD_CMD=$(ps -p "$OLD_PID" -o command= 2>/dev/null || true)
+        if [[ "$OLD_CMD" == *dashboard/server.py* ]]; then
+            echo "bin/arena: reaping stale dashboard from a previous run (pid=$OLD_PID)..." >&2
+            kill "$OLD_PID" 2>/dev/null || true
+            # Give uvicorn up to ~1s to release the port before we
+            # proceed with our own probe below.
+            for _ in 1 2 3 4 5; do
+                sleep 0.2
+                kill -0 "$OLD_PID" 2>/dev/null || break
+            done
+        fi
+    fi
+    rm -f "$PIDFILE" 2>/dev/null || true
+fi
+
+# --- Dashboard co-process --------------------------------------------
+# The dashboard is normally a separate launchd service
+# (com.polymarket.dashboard.plist on port 8501). If it's already up, we
+# leave it alone -- no double-bind on the port, no extra process. If it
+# is NOT up, we spawn it here so manual `bin/arena` runs get the full
+# stack (arena + dashboard) from a single command.
+DASH_CHILD=""
+if [[ "${ARENA_NO_DASHBOARD:-0}" == "1" ]]; then
+    echo "bin/arena: ARENA_NO_DASHBOARD=1 -- skipping dashboard auto-start" >&2
+elif curl -s -o /dev/null -m 1 -u admin:Thor \
+        "http://localhost:${DASH_PORT}/api/status" 2>/dev/null; then
+    echo "bin/arena: dashboard already up on :${DASH_PORT}, leaving it alone" >&2
+else
+    echo "bin/arena: no dashboard on :${DASH_PORT}; starting dashboard/server.py in background" >&2
+    echo "  logs: $DASH_LOG (truncated per run)" >&2
+    PYTHONUNBUFFERED=1 \
+        "$PYTHON_BIN" "$REPO_ROOT/dashboard/server.py" \
+        >"$DASH_LOG" 2>&1 &
+    DASH_CHILD=$!
+    echo "$DASH_CHILD" > "$PIDFILE"
+
+    # Cleanup trap: when this wrapper exits (clean stop OR Ctrl-C), kill
+    # the backgrounded dashboard so its port :${DASH_PORT} releases and
+    # the process doesn't get orphaned. The trap fires on natural EXIT
+    # after arena completes / gets SIGINT (the wrapper bash shares a
+    # process group with arena, so it propagates correctly). kill -0
+    # guards against double-firing the kill.
+    cleanup() {
+        if [[ -n "${DASH_CHILD:-}" ]] && kill -0 "$DASH_CHILD" 2>/dev/null; then
+            echo "bin/arena: stopping background dashboard (pid=${DASH_CHILD})..." >&2
+            kill "$DASH_CHILD" 2>/dev/null || true
+        fi
+        rm -f "$PIDFILE" 2>/dev/null || true
+    }
+    trap cleanup EXIT INT TERM
+
+    # Wait up to ~3s for the dashboard endpoint to come up so arena.py's
+    # `webbrowser.open("http://localhost:8501/")` has something listening.
+    ready=0
+    for _ in 1 2 3 4 5 6; do
+        sleep 0.5
+        if curl -s -o /dev/null -m 1 -u admin:Thor \
+                "http://localhost:${DASH_PORT}/api/status" 2>/dev/null; then
+            ready=1
+            echo "bin/arena: dashboard ready on http://localhost:${DASH_PORT}/" >&2
+            break
+        fi
+    done
+    if [[ "$ready" -ne 1 ]]; then
+        echo "bin/arena: WARNING -- dashboard did not become reachable within 3s" >&2
+        echo "  Check $DASH_LOG for details." >&2
+    fi
+fi
+
+# Run arena.py in the foreground. We deliberately do NOT use `exec` here:
+# we want the wrapper bash to stay alive so the cleanup trap above can
+# fire on the wrapper's EXIT to kill any background dashboard we spawned.
+# The cost is one extra shell process (~1MB) for the lifetime of the
+# arena -- negligible for a long-running bot loop.
+"$PYTHON_BIN" "$REPO_ROOT/arena.py" "$@"
