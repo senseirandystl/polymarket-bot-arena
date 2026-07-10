@@ -87,24 +87,21 @@ class TradeResolver(threading.Thread):
             if not pending:
                 return 0
 
-            market_ids = list({t["market_id"] for t in pending})
-
-            resp = requests.get(
-                f"{config.SIMMER_BASE_URL}/api/sdk/markets",
-                headers=headers,
-                params={"status": "resolved", "limit": 200},
-                timeout=15,
-            )
-            if resp.status_code != 200:
-                return 0
-
-            data = resp.json()
-            markets_list = data if isinstance(data, list) else data.get("markets", [])
-            resolved_map = {
-                (m.get("id") or m.get("market_id")): m
-                for m in markets_list
-                if (m.get("id") or m.get("market_id")) in market_ids
-            }
+            # Resolve each DISTINCT market by direct per-id lookup rather than
+            # scanning the general ``?status=resolved`` list. The BTC 5-min
+            # markets are tagged ``fast-5m`` and never appear in that general
+            # list (the same reason discovery must pass ``tags=fast-5m``), so
+            # the old list scan matched zero pending trades and every trade
+            # expired at $0. ``GET /api/sdk/markets/{id}`` returns the resolved
+            # outcome for these markets reliably. See resolve-troubleshooting
+            # note: Simmer leaves ``resolved_at`` null even after resolution,
+            # so ``status == 'resolved'`` + a non-null boolean ``outcome`` is
+            # the authoritative resolution signal.
+            resolved_map = {}
+            for market_id in {t["market_id"] for t in pending}:
+                outcome = self._fetch_market_outcome(headers, market_id)
+                if outcome is not None:
+                    resolved_map[market_id] = outcome
             if not resolved_map:
                 return 0
 
@@ -113,8 +110,7 @@ class TradeResolver(threading.Thread):
                 market_id = trade["market_id"]
                 if market_id not in resolved_map:
                     continue
-                market = resolved_map[market_id]
-                market_outcome = market.get("outcome")
+                market_outcome = resolved_map[market_id]
                 if market_outcome is None:
                     continue
 
@@ -171,13 +167,46 @@ class TradeResolver(threading.Thread):
             if count > 0:
                 logger.info(
                     f"Resolved {count} trades "
-                    f"({sum(1 for t in pending if resolved_map.get(t['market_id']))} "
+                    f"({sum(1 for t in pending if t['market_id'] in resolved_map)} "
                     f"pending matched {len(resolved_map)} resolved markets)"
                 )
             return count
         except Exception as e:
             logger.error(f"_resolve_pending error: {e}")
             return 0
+
+    def _fetch_market_outcome(self, headers: dict, market_id: str):
+        """Look a single market up by id and return its resolved outcome.
+
+        Returns ``True``/``False`` once the market has resolved to Up/Down,
+        or ``None`` while it is still active (or on any transport error, so
+        the trade simply stays pending for the next cycle). Uses the direct
+        ``/api/sdk/markets/{id}`` endpoint because fast-5m markets are absent
+        from the general market list.
+        """
+        try:
+            resp = requests.get(
+                f"{config.SIMMER_BASE_URL}/api/sdk/markets/{market_id}",
+                headers=headers,
+                timeout=15,
+            )
+            if resp.status_code != 200:
+                return None
+            data = resp.json()
+            # The SDK wraps the payload as {"market": {...}}; older/list
+            # responses return the market object directly.
+            market = data.get("market", data) if isinstance(data, dict) else {}
+            if market.get("status") != "resolved":
+                return None
+            outcome = market.get("outcome")
+            # Only a concrete boolean counts as resolved; null/other means
+            # "not yet decided" — leave the trade pending.
+            return outcome if isinstance(outcome, bool) else None
+        except Exception as e:
+            logger.debug(
+                f"market outcome fetch failed for {market_id[:12]}...: {e}"
+            )
+            return None
 
     def _expire_stale_trades(self) -> None:
         """Move >1h-pending trades to outcome='expired' so they fall off

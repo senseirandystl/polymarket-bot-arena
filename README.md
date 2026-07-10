@@ -102,10 +102,13 @@ If you can't or don't want to use the wrapper — e.g. you're debugging from an 
 
 ```bash
 # Start the arena (paper trading)
-.venv/bin/python3 arena.py
+.venv/bin/python3 arena.py # MacOS
+.venv\Scripts\python.exe arena.py # Windows
 
 # Start the dashboard (separate terminal)
-.venv/bin/python3 dashboard/server.py
+.venv/bin/python3 dashboard/server.py # MacOS
+.venv\Scripts\python.exe dashboard\server.py # Windows
+
 # Open http://localhost:8501
 ```
 

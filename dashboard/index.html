@@ -142,6 +142,8 @@ td { padding: 6px 4px; border-bottom: 1px solid #21262d; }
 .maker-meta { color: #8b949e; font-size: 12px; margin-top: 4px; }
 .maker-row { display: grid; grid-template-columns: 1fr auto; gap: 18px; align-items: center; margin-top: 4px; }
 .maker-countdown { font-size: 30px; font-weight: bold; font-family: 'SF Mono', monospace; text-align: right; min-width: 110px; transition: color 0.3s ease; }
+.maker-countdown-label { display: block; font-size: 10px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; color: #8b949e; font-family: -apple-system, BlinkMacSystemFont, sans-serif; margin-bottom: 2px; min-height: 12px; line-height: 1; }
+.maker-countdown-value { display: block; }
 .maker-countdown.urgent { color: #f85149; }
 .maker-countdown.warning { color: #f0883e; }
 .maker-countdown.normal { color: #3fb950; }
@@ -154,20 +156,17 @@ td { padding: 6px 4px; border-bottom: 1px solid #21262d; }
 .maker-tooltip .tt-row { margin-bottom: 6px; }
 .maker-tooltip .tt-row:last-child { margin-bottom: 0; }
 
-/* --- Arena clock-drift chip (operator diagnostics) ---
- * Colour-coded chip showing the RAW signed skew between the dashboard
- * process's wall clock and the arena's last-update timestamp.  Exposed
- * separately from the (clamped) staleness_seconds because the display cap
- * sanitises forward skew into an honest range, hiding real drift from
- * operators -- this chip lets them see the actual delta.
- *
- * 4 tiers, signed:
- *   - aligned (<1s abs):  muted gray       "drift aligned"
- *   - small   (1-5s abs): neutral gray     "drift: +2.3s"
- *   - medium  (5-60s abs):amber            "drift: +12s"
- *   - large   (>=60s):    bold red chip with warning glyph & "(clamped)"
- *                         suffix when staleness was sanitised server-side
- *                         ("drift: +5m22s (clamped)").
+/* --- Arena clock-skew chip (operator diagnostics) ---
+ * clock_drift_seconds is (dashboard_now - arena_updated_at) BEFORE the
+ * [0, MAX] clamp that produces staleness_seconds. On a single-host deploy it
+ * equals staleness exactly, so _renderDriftChip() SUPPRESSES the chip unless
+ * the raw value actually diverges from the clamped staleness (i.e. real
+ * cross-host clock skew: negative delta, or past the clamp). When shown it is
+ * labelled "clock skew" to reflect what it measures. 3 tiers, signed:
+ *   - small   (<5s abs):  neutral gray  "clock skew: +2.3s"
+ *   - medium  (5-60s):    amber         "clock skew: +12s"
+ *   - large   (>=60s):    bold red chip w/ warning glyph "clock skew: +5m22s"
+ * (.drift-aligned retained for back-compat; no longer emitted.)
  */
 .maker-drift-hint {
     display: inline-block;
@@ -227,7 +226,10 @@ td { padding: 6px 4px; border-bottom: 1px solid #21262d; }
                     <div><span class="maker-mode-badge mode-IDLE" id="maker-mode-badge">IDLE</span><span id="maker-meta" class="maker-meta">awaiting first discovery cycle</span></div>
                     <div class="maker-question idle" id="maker-question">No target market available.</div>
                 </div>
-                <div class="maker-countdown idle" id="maker-countdown">--:--</div>
+                <div class="maker-countdown idle" id="maker-countdown">
+                    <span class="maker-countdown-label" id="maker-countdown-label"></span>
+                    <span class="maker-countdown-value" id="maker-countdown-value">--:--</span>
+                </div>
             </div>
             <div class="refresh-info">Updated by the discovery thread every 60s &middot; polled every 5s &middot; countdown ticks 1&times;/s</div>
         </div>
@@ -669,75 +671,93 @@ function renderMakerCard() {
  */
 function _renderDriftChip(drift, displayedStaleness) {
     if (typeof drift !== 'number' || !isFinite(drift)) return '';
+    // `drift` is (dashboard_now - arena_updated_at) -- the SAME quantity as
+    // staleness, just before the server's [0, MAX] clamp. It therefore only
+    // carries information BEYOND the "snapshot Ns ago" text when clock skew
+    // across hosts pushes it negative (dashboard behind arena) or past the
+    // clamp. On a single-host deploy drift === staleness exactly, so suppress
+    // the chip entirely rather than duplicating the snapshot-age readout.
+    const divergesFromStaleness = typeof displayedStaleness === 'number'
+        && (Math.abs(drift - displayedStaleness) > 0.5 || drift < 0);
+    if (!divergesFromStaleness) return '';
     const abs = Math.abs(drift);
     let cls, label, icon = '';
-    if (abs < 1.0) {
-        cls = 'drift-aligned';
-        label = 'drift aligned';
-    } else if (abs < 5.0) {
+    if (abs < 5.0) {
         cls = 'drift-small';
-        label = 'drift: ' + (drift >= 0 ? '+' : '') + drift.toFixed(1) + 's';
+        label = 'clock skew: ' + (drift >= 0 ? '+' : '') + drift.toFixed(1) + 's';
     } else if (abs < 60.0) {
         cls = 'drift-medium';
-        label = 'drift: ' + (drift >= 0 ? '+' : '') + Math.round(drift) + 's';
+        label = 'clock skew: ' + (drift >= 0 ? '+' : '') + Math.round(drift) + 's';
     } else {
-        // Big drift -- bucket into m/h so the chip stays compact.
+        // Big skew -- bucket into m/h so the chip stays compact.
         cls = 'drift-large';
         icon = ' &#9888;';
         const sign = drift >= 0 ? '+' : '-';
         const m = Math.floor(abs / 60);
         const s = Math.round(abs % 60);
         if (m >= 60) {
-            label = 'drift: ' + sign + Math.floor(m / 60) + 'h' + (m % 60) + 'm';
+            label = 'clock skew: ' + sign + Math.floor(m / 60) + 'h' + (m % 60) + 'm';
         } else {
-            label = 'drift: ' + sign + m + 'm' + s + 's';
+            label = 'clock skew: ' + sign + m + 'm' + s + 's';
         }
     }
-    const wasClamped = typeof displayedStaleness === 'number'
-        && (Math.abs(drift - displayedStaleness) > 0.5 || drift < 0);
-    const tag = wasClamped ? ' (clamped)' : '';
-    return '<span class="maker-drift-hint ' + cls + '">' + label + tag + icon + '</span>';
+    return '<span class="maker-drift-hint ' + cls + '">' + label + icon + '</span>';
 }
 
 function tickMakerCountdown() {
     const countdownEl = document.getElementById('maker-countdown');
-    if (!makerLatest || makerLatest.mode === 'IDLE' || !makerLatest.time_remaining_seconds) {
-        countdownEl.textContent = '--:--';
+    const labelEl = document.getElementById('maker-countdown-label');
+    const valueEl = document.getElementById('maker-countdown-value');
+    const blank = () => {
+        labelEl.textContent = '';
+        valueEl.textContent = '--:--';
         countdownEl.className = 'maker-countdown idle';
+        countdownEl.title = '';
+    };
+    if (!makerLatest || makerLatest.mode === 'IDLE' || !makerLatest.time_remaining_seconds) {
+        blank();
         return;
     }
     // Don't trust the underlying timer when the arena is stale -- blank it
     // so the STALE label clearly means "no live signal".
     if (_isMakerStale(makerLatest)) {
-        countdownEl.textContent = '--:--';
-        countdownEl.className = 'maker-countdown idle';
+        blank();
         return;
     }
-    // Decrement the server-provided "time remaining until resolution" by
-    // wall-clock elapsed since we fetched the snapshot.
-    //   LIVE        -> "RESOLVES in MM:SS" (window is open)
-    //   PRE-WINDOW  -> "OPENS in MM:SS"    (window hasn't started yet;
-    //                                       BTC windows are 300s, so
-    //                                       open-time = remaining - 300s)
-    const elapsedSinceFetch = (Date.now() - makerLatestFetchedAt) / 1000;
-    const resolveIn = Math.max(0, makerLatest.time_remaining_seconds - elapsedSinceFetch);
+    // time_remaining_seconds is a snapshot the arena computed at PUBLISH time,
+    // which is already `staleness_seconds` old by the time the dashboard
+    // fetched it. Anchor the decrement to that publish instant -- staleness at
+    // fetch PLUS wall-clock since fetch -- rather than to fetch time alone.
+    // Anchoring to fetch time (the old bug) made the countdown read ~staleness
+    // too high and jump back up on every poll instead of ticking down; it also
+    // made the Maker number disagree with the live BTC 5-Min card by the
+    // snapshot age. The 300s open/resolve offset below is the *intended*
+    // remaining difference between the two cards while pre-window.
+    const staleAtFetch = (typeof makerLatest.staleness_seconds === 'number')
+        ? makerLatest.staleness_seconds : 0;
+    const elapsedSincePublish = staleAtFetch + (Date.now() - makerLatestFetchedAt) / 1000;
+    const resolveIn = Math.max(0, makerLatest.time_remaining_seconds - elapsedSincePublish);
     let labelPrefix, valueSec;
     if (makerLatest.mode === 'PRE-WINDOW') {
+        // Window hasn't started yet: count down to the window OPENING.
+        // BTC windows are 300s, so open-time = time-to-resolution - 300s.
         valueSec = Math.max(0, resolveIn - 300);
-        labelPrefix = 'OPENS';
+        labelPrefix = 'OPENS IN';
     } else {
+        // LIVE: window is open, count down to resolution (matches BTC card).
         valueSec = resolveIn;
-        labelPrefix = 'RESOLVES';
+        labelPrefix = 'RESOLVES IN';
     }
     const totalSec = Math.floor(valueSec);
     const min = Math.floor(totalSec / 60);
     const sec = totalSec % 60;
-    countdownEl.textContent = `${min}:${sec.toString().padStart(2, '0')}`;
+    labelEl.textContent = labelPrefix;
+    valueEl.textContent = `${min}:${sec.toString().padStart(2, '0')}`;
     let cls = 'normal';
     if (totalSec < 60) cls = 'urgent';
     else if (totalSec < 180) cls = 'warning';
     countdownEl.className = 'maker-countdown ' + cls;
-    countdownEl.title = `${labelPrefix} in ${min}m ${sec.toString().padStart(2,'0')}s`;
+    countdownEl.title = `${labelPrefix} ${min}m ${sec.toString().padStart(2,'0')}s`;
 }
 
 // ---------- Overview / Bots / Earnings ----------

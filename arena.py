@@ -32,13 +32,19 @@ all four workers.  Every actual piece of trading logic lives in the
 """
 
 import argparse
+import atexit
 import json
 import logging
+import os
+import subprocess
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 import webbrowser
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import config
 import db
@@ -678,15 +684,97 @@ def _evolution_check_loop(bots, state, pos_monitor, trader):
 # Bootstrap (signal feeds) + main loop (thread startup) + main entry
 # ----------------------------------------------------------------------
 
+def _dashboard_is_up(port: int, timeout: float = 1.0) -> bool:
+    """True if *something* is already serving on the dashboard port.
+
+    Any HTTP response — including a 401 from the Basic-auth gate — means the
+    server is live.  Only a connection-level failure counts as "down".  This
+    keeps the check independent of the dashboard credentials.
+    """
+    url = f"http://127.0.0.1:{port}/api/status"
+    try:
+        urllib.request.urlopen(url, timeout=timeout)  # noqa: S310 (localhost)
+        return True
+    except urllib.error.HTTPError:
+        return True
+    except Exception:
+        return False
+
+
+def _terminate_dashboard(proc: subprocess.Popen) -> None:
+    """Best-effort shutdown of a dashboard child we spawned (atexit hook)."""
+    if proc.poll() is not None:
+        return
+    proc.terminate()
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+
+
 def start_dashboard() -> None:
-    """Announce the dashboard URL and open it (when interactive)."""
-    url = f"http://localhost:{config.DASHBOARD_PORT}/"
-    if sys.stdin.isatty():
-        threading.Timer(2.0, webbrowser.open, args=[url]).start()
-    logger.info(
-        f"Dashboard URL: {url} "
-        "(runs as launchd service com.polymarket.dashboard)"
-    )
+    """Ensure the dashboard is serving, then open it (when interactive).
+
+    Cross-platform: if the dashboard port is already answering (e.g. a
+    launchd/systemd service, or a manually-started ``dashboard/server.py``),
+    we leave it alone.  Otherwise we spawn ``dashboard/server.py`` using the
+    *same* interpreter running the arena — ``sys.executable`` resolves to the
+    project venv on every OS (``.venv\\Scripts\\python.exe`` on Windows,
+    ``.venv/bin/python3`` on macOS/Linux), so no per-OS command is needed.
+
+    Set ``ARENA_NO_DASHBOARD=1`` to skip auto-spawn (e.g. when the dashboard
+    is managed by its own service and you don't want a duplicate).
+    """
+    port = config.DASHBOARD_PORT
+    url = f"http://localhost:{port}/"
+
+    if _dashboard_is_up(port):
+        logger.info(f"Dashboard already running at {url}")
+    elif os.environ.get("ARENA_NO_DASHBOARD"):
+        logger.info(
+            f"Dashboard not running and ARENA_NO_DASHBOARD is set — "
+            f"start it yourself: {sys.executable} dashboard/server.py"
+        )
+    else:
+        server_path = Path(__file__).resolve().parent / "dashboard" / "server.py"
+        log_path = config.LOG_DIR / "dashboard.log"
+        logger.info(f"Starting dashboard server: {server_path} (logs → {log_path})")
+        try:
+            log_file = open(log_path, "a", encoding="utf-8")
+            proc = subprocess.Popen(
+                [sys.executable, str(server_path)],
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
+                cwd=str(server_path.parent.parent),
+            )
+        except Exception as exc:  # spawn failed outright — don't kill the arena
+            logger.warning(f"Could not launch dashboard server: {exc}")
+        else:
+            atexit.register(_terminate_dashboard, proc)
+            # Wait (up to ~30s) for uvicorn to bind before we report/open.
+            # The child re-imports the heavy trading deps (py-clob-client,
+            # cryptography, ...) before binding, so cold start can be ~15-20s.
+            for _ in range(60):
+                if proc.poll() is not None:
+                    logger.warning(
+                        f"Dashboard server exited early (code {proc.returncode}) "
+                        f"— see {log_path}"
+                    )
+                    break
+                if _dashboard_is_up(port):
+                    logger.info(f"Dashboard is up at {url}")
+                    break
+                time.sleep(0.5)
+            else:
+                logger.warning(
+                    f"Dashboard did not become ready within ~30s — see {log_path}"
+                )
+
+    # Open a browser only for interactive runs, and only once the server is
+    # actually answering (avoids the old "browser opens on a blind timer
+    # before uvicorn has bound" race).
+    if sys.stdin.isatty() and _dashboard_is_up(port):
+        webbrowser.open(url)
 
 
 def main_loop(bots):
