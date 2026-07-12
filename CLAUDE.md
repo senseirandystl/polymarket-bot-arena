@@ -2,7 +2,7 @@
 
 ## What This Is
 
-An automated trading bot arena that runs 4 competing bots on Polymarket's BTC 5-minute up/down markets via the Simmer paper trading platform. Bots evolve every 4 hours — the bottom 2 are replaced by mutated copies of the top 2. Each bot has its own Simmer account for independent trading and real performance comparison.
+An automated trading bot arena that runs 4 competing bots on **Polymarket's** BTC 5-minute up/down markets. Bots evolve every 4 hours — the bottom 2 are replaced by mutated copies of the top 2. **Paper mode simulates against real Polymarket order books** (discovery, prices, depth-based fills, fees, resolution — everything except order submission); **live mode** submits real CLOB orders. Simmer has been fully removed (its 5-min market feed was inconsistent and its free tier capped at 50 buys/day). See [BUG_HISTORY.md](./BUG_HISTORY.md) #10.
 
 ## Current State (v4 — Feb 15, 2026)
 
@@ -49,10 +49,17 @@ combined = (
 - **Daily loss limits:** Uncapped for paper trading (was $10/bot, $25 total)
 - **Dedup:** Loads recent (bot, market) pairs from DB to prevent duplicates across restarts
 
+### Market data (Polymarket-native)
+`polymarket_markets.py` owns all market data (public, no auth):
+- **Discovery:** Gamma `/events?series_id=10684` ("BTC Up or Down 5m") → normalized market dicts; the live window is picked by real `resolves_at` (`market_utils.select_current_market`).
+- **Fresh prices / depth:** CLOB `/book` — normalized so `best_bid`/`best_ask` are correct (the raw feed is worst→best ordered, a trap).
+- **Resolution:** `recent_resolutions()` builds a `condition_id → outcome` map from the series' closed events' `outcomePrices` (`["1","0"]`=Up). The CLOB `tokens[].winner` flag is unreliable — do not use it.
+
 ### Execution venues (paper vs live)
-Order placement is split by venue so the two never intermix — `base_bot.execute()` picks an engine via `venues.get_engine(mode)`:
-- **Paper** (`venues/paper.py`): fills are computed **locally** from the real market price (`shares = amount / entry_price`, `fill_source='local_sim'`) and resolved against the real market outcome. This makes paper trading **unlimited** and independent of Simmer's **50-buys/day free-tier cap** (which previously caused mislogged "phantom" fills — BUG_HISTORY #10). Simmer is an opt-in cross-check only via `config.SIMMER_MIRROR_ENABLED` (default off; checks the response's `success` flag before trusting it).
-- **Live** (`venues/live.py` → `polymarket_client.py`): Polymarket CLOB via `create_market_order`/`MarketOrderArgs` (auto tick-size / neg-risk / fee). Fully wired but only used when a bot's `trading_mode` is `live` (arena starts in paper). The `fill_source`/`entry_price` trade columns record how each trade filled.
+Order placement is split by venue so the two never intermix — `base_bot.execute()` picks an engine via `venues.get_engine(mode)`. Both use identical pricing/fill/fee math (`polymarket_fills.py`):
+- **Paper** (`venues/paper.py`, `fill_source='paper_sim'`): **simulates against the real CLOB order book** — walks the asks for depth/slippage, applies the Polymarket taker fee, and never submits. All paper bots share ONE virtual USDC bankroll (`db.get_paper_bankroll`/`get_paper_available`), set in the dashboard Settings tab; a bot can't spend cash the pool lacks. Resolves against the real market outcome.
+- **Live** (`venues/live.py` → `polymarket_client.py`): real CLOB `create_market_order`/`MarketOrderArgs` (auto tick-size / neg-risk / fee). Uses the real wallet USDC balance. Fully wired but only used when a bot's `trading_mode` is `live` (arena starts in paper).
+- **Fees:** `polymarket_fills.taker_fee()` — makers free, takers pay `rate × shares × p × (1−p)` (symmetric around 50¢; crypto rate `config.POLYMARKET_TAKER_FEE_RATE`). Factored into resolved P&L (`payout − amount − fee`). Trade columns `fill_source`/`entry_price`/`fee` record each fill.
 
 ### Per-Strategy Differentiation
 | Strategy | Aggression | Prior | Min Confidence |
@@ -79,8 +86,10 @@ bots/bot_mean_rev.py  # MeanRevBot (was contrarian, now nearly neutral)
 bots/bot_sentiment.py # SentimentBot
 bots/bot_hybrid.py    # HybridBot
 venues/__init__.py    # get_engine(mode) + TradeResult — paper vs live split
-venues/paper.py       # PaperEngine: local-sim fills (unlimited) + optional Simmer mirror
+venues/paper.py       # PaperEngine: simulate fills vs real CLOB book + shared bankroll
 venues/live.py        # LiveEngine: Polymarket CLOB order placement
+polymarket_markets.py # Market data: discovery (Gamma), book/prices, resolution
+polymarket_fills.py   # Order-book fill simulation + taker fee formula
 polymarket_client.py  # CLOB client: market/limit orders, balances, order book
 config.py             # All config: paths, limits, evolution interval, API URLs, SIMMER_MIRROR_ENABLED
 db.py                 # SQLite: trades (+ fill_source/entry_price), bot_configs, evolution, bot_learning
