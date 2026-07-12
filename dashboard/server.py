@@ -46,24 +46,7 @@ _balance_cache = {}
 BALANCE_CACHE_TTL = 60  # seconds
 
 
-def _fetch_slot_balance(api_key):
-    """Fetch balance for a Simmer account."""
-    import requests
-    try:
-        headers = {"Authorization": f"Bearer {api_key}"}
-        resp = requests.get(
-            f"{config.SIMMER_BASE_URL}/api/sdk/agents/me",
-            headers=headers, timeout=10,
-        )
-        if resp.status_code == 200:
-            data = resp.json()
-            return data.get("balance")
-    except Exception:
-        pass
-    return None
-
-
-def get_bot_balance(slot_name, bot_keys, trading_mode="paper"):
+def get_bot_balance(trading_mode="paper"):
     """Balance for a bot. Paper bots share the virtual bankroll; live bots show
     real Polymarket USDC. Returns ``(balance, is_live)``."""
     # Paper: all bots draw from ONE shared virtual USDC bankroll (set in the
@@ -77,8 +60,8 @@ def get_bot_balance(slot_name, bot_keys, trading_mode="paper"):
     if cached and (now - cached["fetched_at"]) < BALANCE_CACHE_TTL:
         return cached["balance"], True
 
-    if trading_mode == "live":
-        # Read Polymarket L2 credentials from the encrypted store.
+    # Live: query the real Polymarket wallet USDC (paper already returned above).
+    if True:  # noqa: SIM103 - kept for a clear indent level; paper returned early
         api_key = credentials_store.get_credential("polymarket_api_key")
         api_secret = credentials_store.get_credential("polymarket_api_secret")
         api_passphrase = credentials_store.get_credential("polymarket_api_passphrase")
@@ -196,206 +179,74 @@ def _to_et(dt_utc):
 
 @app.get("/api/markets")
 async def get_markets():
-    """Get active BTC fast markets as {current, upcoming_count, upcoming}.
+    """Current + upcoming BTC 5-min markets, from Polymarket (Gamma + CLOB).
 
-    Queries two sources: SDK (upcoming tagged markets) + public API (live markets).
-    The SDK endpoint drops live markets from its results once they enter their window.
-
-    Failure modes (network timeout, JSON decode, malformed market entries) are
-    caught per-source so a single Simmer-side hiccup can never blank the BTC
-    5-Min Markets card. Worst case (both sources unreachable) returns HTTP 200
-    with empty-shape payload + ``warnings`` field; the frontend degrades to a
-    "Simmer unavailable" hint rather than a 500 stack trace in the browser.
+    The dashboard runs as its own process, so it can't read the arena's
+    in-memory discovery snapshot — it does its own Polymarket discovery here,
+    using the same helpers (``select_current_market`` keyed off the real
+    ``resolves_at`` timestamp). No credentials needed; market data is public.
     """
-    import requests as req
     from datetime import datetime, timezone
-
-    api_key = credentials_store.get_credential("simmer_api_key")
-    if not api_key:
-        return JSONResponse({"current": None, "upcoming_count": 0, "upcoming": [],
-                             "error": "No Simmer API key configured"})
-    headers = {"Authorization": f"Bearer {api_key}"}
-
-    markets_list: list = []
-    warnings: list = []
-
-    # Source 1: SDK upcoming markets.
-    # Per-source try/except: if this side fails, source 2 can still populate
-    # the card. Narrow ``requests.RequestException`` instead of bare
-    # ``Exception`` so genuine programming bugs (AttributeError, etc.) still
-    # escalate instead of being silently suppressed.
-    try:
-        r1 = req.get(
-            f"{config.SIMMER_BASE_URL}/api/sdk/markets",
-            headers=headers,
-            params={"limit": 50, "tags": "fast-5m"},
-            timeout=10,
-        )
-        if r1.status_code == 200:
-            d = r1.json()
-            # Three-shape dispatch. Simmer has shipped ``null`` bodies during
-            # outages; we still return 200 with an empty card (the user's
-            # accept criterion), but we now log "shape not recognized" so the
-            # empty card is distinguishable from a real "no markets" case in
-            # the launchd dashboard log.
-            if isinstance(d, dict):
-                for m in d.get("markets") or []:
-                    # Defensive: any non-dict entry (str/None/number) is skipped.
-                    if isinstance(m, dict) and m.get("id"):
-                        markets_list.append(m)
-            elif isinstance(d, list):
-                for m in d:
-                    if isinstance(m, dict) and m.get("id"):
-                        markets_list.append(m)
-            else:
-                warnings.append("sdk_markets: response shape not recognized")
-        else:
-            warnings.append(f"sdk_markets: HTTP {r1.status_code}")
-    except req.RequestException as e:
-        warnings.append(f"sdk_markets: {type(e).__name__}")
-        logger.warning("markets: SDK source1 unreachable: %s", e)
-    except (ValueError, TypeError) as e:
-        # JSONDecodeError is a subclass of ValueError; covers non-JSON bodies.
-        warnings.append(f"sdk_markets: JSON decode error: {e}")
-        logger.warning("markets: SDK source1 bad JSON: %s", e)
-
-    # Source 2: public endpoint for currently-live markets.
-    try:
-        r2 = req.get(
-            f"{config.SIMMER_BASE_URL}/api/markets",
-            headers=headers,
-            params={"limit": 20},
-            timeout=10,
-        )
-        if r2.status_code == 200:
-            d = r2.json()
-            seen_ids = {m.get("id") for m in markets_list if isinstance(m, dict)}
-            # Same three-shape dispatch as Source 1 -- a parsed-null body
-            # (no exception) is logged so operators can tell empty-card from
-            # truly-no-markets.
-            if isinstance(d, dict):
-                for m in d.get("markets") or []:
-                    mid = m.get("id") if isinstance(m, dict) else None
-                    if mid and mid not in seen_ids:
-                        markets_list.append(m)
-                        seen_ids.add(mid)
-            elif isinstance(d, list):
-                for m in d:
-                    mid = m.get("id") if isinstance(m, dict) else None
-                    if mid and mid not in seen_ids:
-                        markets_list.append(m)
-                        seen_ids.add(mid)
-            else:
-                warnings.append("public_markets: response shape not recognized")
-        else:
-            warnings.append(f"public_markets: HTTP {r2.status_code}")
-    except req.RequestException as e:
-        warnings.append(f"public_markets: {type(e).__name__}")
-        logger.warning("markets: SDK source2 unreachable: %s", e)
-    except (ValueError, TypeError) as e:
-        warnings.append(f"public_markets: JSON decode error: {e}")
-        logger.warning("markets: SDK source2 bad JSON: %s", e)
+    import polymarket_markets
+    from arena.market_utils import (
+        compute_time_remaining_seconds, is_5min_market, select_current_market,
+    )
 
     now_utc = datetime.now(timezone.utc)
-    btc_markets: list = []
-    for m in markets_list:
-        try:
-            q = (m.get("question") or "").lower()
-            tags = m.get("tags") or []
-            is_btc_updown = (
-                ("bitcoin" in q or "btc" in q)
-                and ("up or down" in q or "up/down" in q)
-            ) or ("fast-5m" in tags and ("bitcoin" in q or "btc" in q))
-            if not is_btc_updown:
-                continue
-
-            # Only ever surface 5-minute windows -- a 15-min BTC up/down
-            # market must never appear on the card (see the July-2026
-            # next-day 8:15-8:30 regression).
-            if not is_5min_market(m.get("question", "") or ""):
-                continue
-
-            resolves_at_str = m.get("resolves_at")
-            time_remaining = None
-            if resolves_at_str:
-                try:
-                    rs = resolves_at_str.replace("Z", "+00:00").replace(" ", "T")
-                    resolves_at = datetime.fromisoformat(rs)
-                    if resolves_at.tzinfo is None:
-                        resolves_at = resolves_at.replace(tzinfo=timezone.utc)
-                    time_remaining = (resolves_at - now_utc).total_seconds()
-                except (ValueError, TypeError, AttributeError):
-                    # Malformed timestamp -- leave time_remaining=None so the
-                    # market still shows up in the upcoming list rather than
-                    # being silently dropped, and the soonest-fallback filter
-                    # is robust to None entries (it coalesces to 999999).
-                    time_remaining = None
-
-            if time_remaining is not None and time_remaining < 0:
-                continue
-
-            btc_markets.append({
-                "id": m.get("id"),
-                "question": m.get("question"),
-                "current_price": m.get("current_price"),
-                "resolves_at": m.get("resolves_at"),
-                "time_remaining_seconds": time_remaining,
-                # Current iff the REAL resolves_at timestamp puts us inside
-                # its 5-min window (0 < remaining <= 300). Never keyed off ET
-                # time-of-day, so a future-dated window whose clock time
-                # straddles "now" can't masquerade as current.
-                "is_current_window": (
-                    time_remaining is not None and 0 < time_remaining <= 300
-                ),
-                "url": m.get("url"),
-            })
-        except (TypeError, AttributeError, KeyError) as e:
-            # Malformed market dict from Simmer -- skip the one entry, don't
-            # blank the card. Logged at debug so it's traceable without
-            # spamming normal-operation logs.
-            logger.debug("markets: skipping malformed market id=%s: %s",
-                         m.get("id") if isinstance(m, dict) else None, e)
+    btc_markets = []
+    for m in polymarket_markets.discover_markets():
+        if not is_5min_market(m.get("question", "") or ""):
             continue
-
+        tr = compute_time_remaining_seconds(m, now_utc)
+        if tr is not None and tr < 0:
+            continue
+        m["time_remaining_seconds"] = tr
+        btc_markets.append(m)
     btc_markets.sort(key=lambda x: x.get("time_remaining_seconds") or 999999)
 
-    # Priority 1: market whose question window contains now.
-    current = next((m for m in btc_markets if m["is_current_window"]), None)
-    # Priority 2: soonest market closing within 20 min.
-    if not current:
+    # Current = the market whose real window contains now (0 < remaining <= 300).
+    current = select_current_market(btc_markets, now_utc)
+    if current is None:
         soon = [m for m in btc_markets
-                if (m.get("time_remaining_seconds") or 999999) <= 1200]
+                if 0 < (m.get("time_remaining_seconds") or 999999) <= 1200]
         current = soon[0] if soon else None
-
     upcoming = [m for m in btc_markets if m is not current]
 
-    # Attach the trades bots have actually placed on the current + next
-    # market so the Overview cards can show who traded each window. Only the
-    # two visible markets are queried (cheap point lookups by market_id).
-    def _attach_trades(market):
-        if not market or not market.get("id"):
-            return
+    # Fresh CLOB price for just the two visible markets.
+    for mk in (current, upcoming[0] if upcoming else None):
+        if mk:
+            polymarket_markets.refresh_price(mk)
+
+    def _shape(m):
+        if not m:
+            return None
+        tr = m.get("time_remaining_seconds")
+        shaped = {
+            "id": m.get("id"),
+            "question": m.get("question"),
+            "current_price": m.get("current_price"),
+            "resolves_at": m.get("resolves_at"),
+            "time_remaining_seconds": tr,
+            "is_current_window": tr is not None and 0 < tr <= 300,
+            "url": None,
+        }
         with db.get_conn() as conn:
             rows = conn.execute(
                 "SELECT bot_name, side, amount, shares_bought, outcome, pnl, created_at "
                 "FROM trades WHERE market_id=? ORDER BY created_at ASC",
-                (market["id"],),
+                (shaped["id"],),
             ).fetchall()
-        market["trades"] = [dict(r) for r in rows]
+        shaped["trades"] = [dict(r) for r in rows]
+        return shaped
 
-    _attach_trades(current)
-    if upcoming:
-        _attach_trades(upcoming[0])
-
-    payload = {
-        "current": current,
-        "next": upcoming[0] if upcoming else None,
-        "upcoming_count": len(upcoming),
-        "upcoming": upcoming,
-    }
-    if warnings:
-        payload["warnings"] = warnings
-    return JSONResponse(payload)
+    cur_s = _shape(current)
+    upcoming_s = [_shape(m) for m in upcoming]
+    return JSONResponse({
+        "current": cur_s,
+        "next": upcoming_s[0] if upcoming_s else None,
+        "upcoming_count": len(upcoming_s),
+        "upcoming": upcoming_s,
+    })
 
 
 @app.get("/api/maker-status")
@@ -529,17 +380,8 @@ async def set_bankroll(request: Request, _auth: str = Depends(verify_auth)):
 @app.get("/api/bots")
 async def get_bots():
     active = db.get_active_bots()
-
-    # Load bot keys for balance fetching
-    bot_keys = {}
-    try:
-        with open(config.SIMMER_BOT_KEYS_PATH) as f:
-            bot_keys = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        pass
-
     result = []
-    for i, bot_cfg in enumerate(active):
+    for bot_cfg in active:
         # Parse params JSON string if needed
         cfg = dict(bot_cfg)
         if isinstance(cfg.get("params"), str):
@@ -567,9 +409,8 @@ async def get_bots():
             ).fetchone()
             pending_count = dict(row)["c"]
 
-        # Balance: Polymarket USDC for live bots, Simmer SIM for paper bots
-        slot_name = f"slot_{i}"
-        balance, balance_is_live = get_bot_balance(slot_name, bot_keys, trading_mode)
+        # Balance: real wallet USDC for live bots, shared virtual bankroll for paper.
+        balance, balance_is_live = get_bot_balance(trading_mode)
 
         # For live bots, include the trading key address so dashboard can show where to deposit
         trading_key_address = None
@@ -766,7 +607,7 @@ async def credentials_save(request: Request):
 async def credentials_test(request: Request):
     """Test connectivity with currently-configured credentials.
 
-    Body: {"which": "simmer" | "polymarket" | "all"} (default "all").
+    Body: {"which": "polymarket" | "all"} (default "all").
     Returns key-by-key results without persisting anything.
     """
     try:
@@ -775,34 +616,6 @@ async def credentials_test(request: Request):
         body = {}
     which = (body or {}).get("which", "all")
     results = {}
-
-    if which in ("simmer", "all"):
-        api_key = credentials_store.get_credential("simmer_api_key")
-        if not api_key:
-            results["simmer"] = {"ok": False, "error": "Simmer API key not configured"}
-        else:
-            try:
-                import requests as _req
-                resp = _req.get(
-                    f"{config.SIMMER_BASE_URL}/api/sdk/agents/me",
-                    headers={"Authorization": f"Bearer {api_key}"},
-                    timeout=10,
-                )
-                if resp.status_code == 200:
-                    data = resp.json()
-                    results["simmer"] = {
-                        "ok": True,
-                        "agent_name": data.get("name"),
-                        "agent_id": data.get("agent_id"),
-                        "balance": data.get("balance"),
-                    }
-                else:
-                    results["simmer"] = {
-                        "ok": False,
-                        "error": f"HTTP {resp.status_code}: {resp.text[:200]}",
-                    }
-            except Exception as e:
-                results["simmer"] = {"ok": False, "error": str(e)}
 
     if which in ("polymarket", "all"):
         pm_creds = {

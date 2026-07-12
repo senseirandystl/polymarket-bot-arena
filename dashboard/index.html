@@ -425,10 +425,11 @@ function formatEtDateTime(utcStr) {
     const d = _utcDate(utcStr);
     return d ? d.toLocaleString('en-US', { month: '2-digit', day: '2-digit', hour12: false, hour: '2-digit', minute: '2-digit', timeZone: 'America/New_York' }) : '';
 }
-// Expired trades (Simmer never settled) render as a neutral "void", NOT $0.00,
-// so they don't read as a broken calculation or a real win/loss.
+// Legacy 'expired' rows (from the retired Simmer era; no longer produced —
+// pending trades now hold until the market actually resolves) render as a
+// neutral "void" rather than $0.00 so they don't read as a real win/loss.
 function renderTradePnl(t) {
-    if (t.outcome === 'expired') return '<span class="neutral" title="Unsettled — Simmer never resolved this market">— void</span>';
+    if (t.outcome === 'expired') return '<span class="neutral" title="Legacy unsettled row">— void</span>';
     if (t.pnl == null) return '<span class="neutral">pending</span>';
     return '<span class="' + pnlClass(t.pnl) + '">' + fmtPnl(t.pnl) + '</span>';
 }
@@ -584,10 +585,7 @@ async function testCredentials(which) {
         }
         if (r.ok) {
             box.className = 'test-result ok';
-            if (which === 'simmer') {
-                const bal = (r.balance != null) ? `$${Number(r.balance).toLocaleString()} $SIM` : '(balance unknown)';
-                box.textContent = `✓ Simmer OK — agent "${r.agent_name}" (${r.agent_id}), balance ${bal}.`;
-            } else {
+            {
                 const usdc = (r.balance_usdc != null) ? `$${r.balance_usdc.toFixed(2)} USDC` : '(balance unknown)';
                 box.textContent = `✓ Polymarket OK — signer ${r.signer_address}, balance ${usdc}.`;
             }
@@ -641,7 +639,9 @@ function updateBots(bots) {
         const botMode = bot.trading_mode || 'paper';
         const isLive = botMode === 'live';
         const balance = bot.balance;
-        const balanceSuffix = bot.balance_is_live ? ' USDC' : ' SIM';
+        // Paper bots share one virtual USDC bankroll, so the value is the same
+        // shared pool on every tile; live bots show their real wallet USDC.
+        const balanceSuffix = isLive ? ' USDC' : ' USDC (shared)';
         const balanceStr = balance != null
             ? '$' + Number(balance).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2}) + balanceSuffix
             : 'N/A';
