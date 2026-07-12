@@ -28,3 +28,7 @@ setup_log.md
 
 # OS
 .DS_Store
+
+# DB backups
+*.db.bak.*
+bot_arena.db.bak.*

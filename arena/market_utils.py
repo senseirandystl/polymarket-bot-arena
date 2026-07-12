@@ -100,18 +100,30 @@ def is_5min_market(question: str) -> bool:
     return diff == 5
 
 
-def window_contains_now(question: str, now_utc: datetime) -> bool:
-    """True if the ET-window inside ``question`` contains the current ET time."""
-    parsed = _parse_range_minutes(question)
-    if not parsed:
-        return False
-    start_min, end_min = parsed
-    now_et = to_et(now_utc)
-    now_min = now_et.hour * 60 + now_et.minute
-    if end_min > start_min:
-        return start_min <= now_min < end_min
-    # Window crosses midnight (rare but legal in some market labels).
-    return now_min >= start_min or now_min < end_min
+def select_current_market(markets: list, now_utc: datetime) -> dict | None:
+    """Pick the live 5-minute BTC window from *decorated* markets.
+
+    ``markets`` must already carry ``time_remaining_seconds`` (see
+    ``compute_time_remaining_seconds``). A market qualifies as *current* only
+    when BOTH hold:
+
+      * it is a genuine 5-minute window (``is_5min_market`` on its question), and
+      * its real ``resolves_at`` timestamp puts it inside its window right now,
+        i.e. ``0 < time_remaining_seconds <= 300``.
+
+    Selection is by the actual timestamp, never by ET time-of-day, so a
+    future-dated market whose clock window happens to straddle "now" (e.g. a
+    *next-day* 8:15-8:30 window at 8:29 today) is never chosen. Likewise a
+    15-minute window is rejected outright. Returns the soonest-resolving
+    qualifying market, or ``None`` when no 5-minute window is live.
+    """
+    live = [
+        m for m in markets
+        if is_5min_market(m.get("question", "") or "")
+        and 0 < m.get("time_remaining_seconds", 0) <= 300
+    ]
+    live.sort(key=lambda m: m.get("time_remaining_seconds", 999))
+    return live[0] if live else None
 
 
 def compute_time_remaining_seconds(market: dict, now_utc: datetime) -> int:

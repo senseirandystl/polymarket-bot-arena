@@ -39,8 +39,9 @@ import requests
 import config
 from arena.market_utils import (
     compute_time_remaining_seconds,
+    is_5min_market,
     is_btc_updown,
-    window_contains_now,
+    select_current_market,
 )
 
 logger = logging.getLogger("arena.discovery")
@@ -180,25 +181,24 @@ class MarketDiscovery(threading.Thread):
             m["time_remaining_seconds"] = tr
             m["window_age_seconds"] = max(0, 300 - tr)
 
+        # Bots trade ONLY 5-minute windows -- drop any 15-min (or other
+        # non-5-min) BTC up/down markets before anything downstream can
+        # see them.  This gates the trader, the maker fallback AND the
+        # all_markets snapshot, so a 15-min window can never surface.
+        five_min = [
+            m for m in markets if is_5min_market(m.get("question", "") or "")
+        ]
         non_expired = [
-            m for m in markets if m.get("time_remaining_seconds", 0) > 0
+            m for m in five_min if m.get("time_remaining_seconds", 0) > 0
         ]
 
-        # Pick the live market.  Prefer window_contains_now; fall back
-        # to the soonest-resolving market whose remaining lifetime is
-        # in (0, 300].  We deliberately stop here -- per the user's
-        # policy we do NOT pre-pick a speculative next_market so
-        # nothing can leak across the rollover until the next scan
-        # sees the new window for real.
-        candidates = sorted(
-            [
-                m for m in non_expired
-                if m.get("time_remaining_seconds", 999) <= 300
-                or window_contains_now(m.get("question", ""), now_utc)
-            ],
-            key=lambda m: m.get("time_remaining_seconds", 999),
-        )
-        current = candidates[0] if candidates else None
+        # Pick the live market by its REAL resolves_at timestamp
+        # (0 < time_remaining <= 300), never by ET time-of-day -- so a
+        # future-dated window whose clock time straddles "now" is never
+        # chosen.  Per the user's policy we do NOT pre-pick a speculative
+        # next_market; nothing leaks across the rollover until the next
+        # scan sees the new window for real.
+        current = select_current_market(non_expired, now_utc)
 
         # Maker fallback target: if no market currently contains the
         # wall clock, the maker section quotes the soonest non-expired
