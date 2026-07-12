@@ -21,14 +21,18 @@ DEFAULT_PARAMS = {
 
 class PhantomBot(BaseBot):
     def __init__(self, name="phantom-v1", params=None, generation=0, lineage=None):
+        # "phantom" is a first-class strategy_type in base_bot's signal tables
+        # (STRATEGY_PRIORS / MARKET_PRICE_AGGRESSION / MIN_TRADE_CONFIDENCE), so
+        # pass it straight through. The old code passed "hybrid" then reassigned
+        # to "phantom" afterwards — fragile, and wrong if the base ever reads
+        # strategy_type during __init__.
         super().__init__(
             name=name,
-            strategy_type="hybrid", # Using hybrid type for similar signal weight
+            strategy_type="phantom",
             params=params or DEFAULT_PARAMS.copy(),
             generation=generation,
             lineage=lineage,
         )
-        self.strategy_type = "phantom"
 
     def _calc_ema(self, prices, period):
         if len(prices) < period:

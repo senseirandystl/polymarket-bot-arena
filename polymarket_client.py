@@ -2,12 +2,8 @@
 
 import json
 import logging
-import math
-from pathlib import Path
 
 from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import OrderArgs, OrderType
-from py_clob_client.order_builder.constants import BUY
 from py_order_utils.model import POLY_PROXY
 
 import config
@@ -71,48 +67,59 @@ def get_market_info(token_id: str) -> dict:
         return {}
 
 
-def place_market_order(token_id: str, side: str, amount: float) -> dict:
-    """Place a market buy order on Polymarket.
+def place_market_order(token_id: str, side: str, amount: float,
+                       *, neg_risk: bool = False) -> dict:
+    """Place a marketable BUY order on Polymarket for ``amount`` USDC of a token.
+
+    Uses the CLOB ``create_market_order`` / ``MarketOrderArgs`` path (v0.34+),
+    which auto-resolves tick size, neg-risk and fee rate and computes the
+    marketable price from the live book. Submitted FOK so it either fills
+    immediately at the available price or is killed (no resting exposure).
 
     Args:
-        token_id: The YES or NO token ID from the market
-        side: "yes" or "no"
-        amount: USDC amount to spend
+        token_id: The YES or NO token ID to BUY (caller picks the side's token).
+        side:     "yes"/"no" — informational only; the token_id encodes the side.
+        amount:   USDC notional to spend.
+        neg_risk: True for neg-risk (multi-outcome) markets. Passed through as a
+                  hint; the client verifies against the token if omitted.
+
+    Returns:
+        {"success", "order_id", "price", "size", "result"} on success, else
+        {"success": False, "error": ...}.
     """
     try:
+        from py_clob_client.clob_types import (
+            MarketOrderArgs, OrderType, PartialCreateOrderOptions,
+        )
+        from py_clob_client.order_builder.constants import BUY
+
         client = get_client()
 
-        # Get the best price from the order book
+        # Reference price for reporting/share math (best ask). The order itself
+        # is priced by the client's calculate_market_price.
         book = client.get_order_book(token_id)
+        ref_price = float(book.asks[0].price) if getattr(book, "asks", None) else 0.0
 
-        if side.lower() == "yes":
-            # Buying YES tokens — take the best ask
-            if not book.asks:
-                return {"success": False, "error": "No asks in order book"}
-            price = float(book.asks[0].price)
-        else:
-            # Buying NO tokens — the NO token_id should be used
-            if not book.asks:
-                return {"success": False, "error": "No asks in order book"}
-            price = float(book.asks[0].price)
-
-        # Build and sign the order
-        order_args = OrderArgs(
-            price=price,
-            size=math.ceil(amount / price * 100) / 100,  # Round UP so cost >= amount (avoids $0.9999 rejection)
-            side=BUY,
+        order_args = MarketOrderArgs(
             token_id=token_id,
+            amount=round(amount, 2),   # USDC to spend on a market BUY
+            side=BUY,
+            order_type=OrderType.FOK,
         )
+        options = PartialCreateOrderOptions(neg_risk=neg_risk) if neg_risk else None
+        signed_order = client.create_market_order(order_args, options)
+        result = client.post_order(signed_order, OrderType.FOK)
 
-        signed_order = client.create_order(order_args)
-        result = client.post_order(signed_order, OrderType.GTC)
+        # Prefer the price the client computed on the signed order.
+        fill_price = float(getattr(signed_order, "price", 0) or ref_price)
+        size = float(getattr(signed_order, "size", 0) or (amount / fill_price if fill_price else 0))
 
-        logger.info(f"Polymarket order placed: {side} ${amount} at {price}")
+        logger.info(f"Polymarket market order: {side} ${amount} ~@ {fill_price}")
         return {
             "success": True,
             "order_id": result.get("orderID"),
-            "price": price,
-            "size": order_args.size,
+            "price": fill_price,
+            "size": size,
             "result": result,
         }
 

@@ -1,6 +1,5 @@
 """Abstract base class all arena bots inherit from."""
 
-import json
 import random
 import copy
 import logging
@@ -296,14 +295,36 @@ class BaseBot(ABC):
         amount = min(signal.get("suggested_amount", max_pos * 0.5), max_pos)
 
         try:
-            if mode == "live":
-                return self._execute_live(signal, market, amount, mode)
-            else:
-                return self._execute_paper(signal, market, amount, venue, mode)
-
+            return self._place_via_engine(signal, market, amount, mode)
         except Exception as e:
             logger.error(f"[{self.name}] Trade exception: {e}")
             return {"success": False, "reason": str(e)}
+
+    def _place_via_engine(self, signal, market, amount, mode) -> dict:
+        """Delegate order placement to the paper or live venue engine.
+
+        Paper → local simulated fill (``venues.paper``); live → Polymarket CLOB
+        (``venues.live``). Adapts the engine's ``TradeResult`` to the legacy
+        dict shape callers (trader.py, maker bots) expect.
+        """
+        from venues import get_engine
+
+        res = get_engine(mode).place(
+            bot_name=self.name,
+            side=signal["side"],
+            amount=amount,
+            market=market,
+            mode=mode,
+            confidence=signal.get("confidence"),
+            reasoning=signal.get("reasoning"),
+            features=signal.get("features"),
+        )
+        return {
+            "success": res.success,
+            "trade_id": res.trade_id,
+            "reason": res.reason,
+            "fill_source": res.fill_source,
+        }
 
     def get_performance(self, hours=12) -> dict:
         """Get bot performance stats."""
@@ -346,208 +367,3 @@ class BaseBot(ABC):
     def reset_daily(self):
         """Reset daily pause state."""
         self._paused = False
-
-    def _execute_paper(self, signal, market, amount, venue, mode):
-        """Execute via Simmer (paper trading)."""
-        import requests
-        api_key = self._load_api_key()
-        headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-
-        payload = {
-            "market_id": market.get("id") or market.get("market_id"),
-            "side": signal["side"],
-            "amount": amount,
-            "venue": venue,
-            "source": f"arena:{self.name}",
-            "reasoning": signal.get("reasoning", ""),
-        }
-
-        resp = requests.post(
-            f"{config.SIMMER_BASE_URL}/api/sdk/trade",
-            headers=headers, json=payload, timeout=30
-        )
-
-        if resp.status_code in (200, 201):
-            result = resp.json()
-            shares = self._extract_shares(result, signal["side"], amount, market)
-            db.log_trade(
-                bot_name=self.name,
-                market_id=market.get("id") or market.get("market_id"),
-                market_question=market.get("question"),
-                side=signal["side"],
-                amount=amount,
-                venue=venue,
-                mode=mode,
-                confidence=signal["confidence"],
-                reasoning=signal.get("reasoning"),
-                trade_id=result.get("trade_id"),
-                shares_bought=shares,
-                trade_features=signal.get("features"),
-            )
-            logger.info(f"[{self.name}] Paper trade: {signal['side']} ${amount:.2f} on {market.get('question', '')[:50]} (shares={shares:.4f})")
-            return {"success": True, "trade_id": result.get("trade_id")}
-        else:
-            logger.error(f"[{self.name}] Paper trade failed: {resp.status_code} {resp.text[:200]}")
-            return {"success": False, "reason": f"api_error_{resp.status_code}"}
-
-    def _extract_shares(self, result: dict, side: str, amount: float,
-                        market: dict) -> float:
-        """Determine how many shares a Simmer paper fill bought.
-
-        Simmer's ``/api/sdk/trade`` response reports the executed size under
-        one of a few keys depending on SDK version — ``shares`` /
-        ``shares_filled`` (current) or ``shares_bought`` (older). When none
-        are present (or the fill count is zero), derive shares from the fill
-        price instead. A share count is **mandatory** for P&L: the resolver
-        computes ``pnl = shares - amount`` on a win, so a trade logged with
-        ``shares == 0`` can only ever resolve to $0 profit (see Bug History
-        #2, "P&L always $0"). Each contract pays out $1 on a win, so
-        ``shares = amount / (price of the side we bought)``.
-        """
-        shares = (
-            result.get("shares_bought")
-            or result.get("shares")
-            or result.get("shares_filled")
-            or 0.0
-        )
-        try:
-            shares = float(shares)
-        except (TypeError, ValueError):
-            shares = 0.0
-        if shares > 0:
-            return shares
-
-        # Fallback: reconstruct shares from the effective per-share price.
-        # Prefer the fill price Simmer reports (already side-correct); fall
-        # back to the market's YES probability, converting to the NO side's
-        # cost when we bought NO.
-        fill_price = (
-            result.get("fill_price")
-            or result.get("avg_price")
-            or result.get("price")
-            or result.get("new_price")
-        )
-        try:
-            fill_price = float(fill_price) if fill_price is not None else None
-        except (TypeError, ValueError):
-            fill_price = None
-
-        if fill_price is None or fill_price <= 0:
-            yes_price = market.get("current_price")
-            try:
-                yes_price = float(yes_price) if yes_price is not None else None
-            except (TypeError, ValueError):
-                yes_price = None
-            if yes_price is not None and 0 < yes_price < 1:
-                fill_price = (1.0 - yes_price) if side == "no" else yes_price
-
-        if fill_price and fill_price > 0:
-            shares = amount / fill_price
-            logger.info(
-                f"[{self.name}] Simmer fill omitted share count; derived "
-                f"{shares:.4f} shares from price {fill_price:.4f}"
-            )
-            return shares
-
-        logger.warning(
-            f"[{self.name}] Could not determine share count "
-            f"(response keys={list(result.keys())}); logging 0 — this trade "
-            f"will resolve to $0 P&L."
-        )
-        return 0.0
-
-    def _execute_live(self, signal, market, amount, mode):
-        """Execute directly on Polymarket CLOB (live trading)."""
-        import polymarket_client
-
-        side = signal["side"].lower()
-        if side == "yes":
-            token_id = market.get("polymarket_token_id")
-        else:
-            token_id = market.get("polymarket_no_token_id")
-
-        if not token_id:
-            logger.error(f"[{self.name}] No token ID for side={side} on {market.get('question', '')[:50]}")
-            return {"success": False, "reason": "missing_token_id"}
-
-        result = polymarket_client.place_market_order(
-            token_id=token_id,
-            side=side,
-            amount=amount,
-        )
-
-        if result.get("success"):
-            db.log_trade(
-                bot_name=self.name,
-                market_id=market.get("id") or market.get("market_id"),
-                market_question=market.get("question"),
-                side=signal["side"],
-                amount=amount,
-                venue="polymarket",
-                mode=mode,
-                confidence=signal["confidence"],
-                reasoning=signal.get("reasoning"),
-                trade_id=result.get("order_id"),
-                shares_bought=result.get("size"),
-            )
-            logger.info(f"[{self.name}] LIVE trade: {signal['side']} ${amount} at {result.get('price')} on {market.get('question', '')[:50]}")
-        else:
-            logger.error(f"[{self.name}] LIVE trade failed: {result.get('error')}")
-
-        return result
-
-    def _load_api_key(self):
-        """Load the Simmer API key for this bot.
-
-        Lookup priority (most-specific wins):
-          1. Per-bot key from the encrypted credentials store, keyed by bot name.
-          2. Per-bot key from the encrypted store, keyed by slot — used by evolved
-             bots that inherited an API slot from a retired parent.
-          3. Default Simmer key from the encrypted store (single-account mode).
-          4. Legacy plaintext fallback at ``~/.config/simmer/{bot_keys,
-             simmer_api_key}.json`` for installs that have not migrated to the
-             encrypted store yet.
-
-        Returns the key string, or ``None`` if nothing is configured anywhere.
-        """
-        # Encrypted credentials store is the canonical source after the v5
-        # migration — legacy plaintext paths are renamed to .bak on first run of
-        # credentials_store._migrate_legacy, so an unmigrated install will
-        # always fall through to step 4 below.
-        bot_keys: dict = {}
-        raw_bot_keys = config.get_credential("simmer_bot_keys")
-        if raw_bot_keys:
-            try:
-                parsed = json.loads(raw_bot_keys)
-                if isinstance(parsed, dict):
-                    bot_keys = parsed
-            except (json.JSONDecodeError, TypeError):
-                logger.warning(
-                    f"[{self.name}] simmer_bot_keys in encrypted store is not valid JSON; ignoring."
-                )
-        if self.name in bot_keys:
-            return bot_keys[self.name]
-        if hasattr(self, '_api_key_slot') and self._api_key_slot in bot_keys:
-            return bot_keys[self._api_key_slot]
-
-        default_key = config.get_credential("simmer_api_key")
-        if default_key:
-            return default_key
-
-        # Legacy plaintext fallback — only reached when the encrypted store has
-        # no Simmer key at all (rare: a fresh clone that has not yet run the
-        # auto-migration in credentials_store).
-        try:
-            with open(config.SIMMER_BOT_KEYS_PATH) as f:
-                bot_keys = json.load(f)
-            if self.name in bot_keys:
-                return bot_keys[self.name]
-            if hasattr(self, '_api_key_slot') and self._api_key_slot in bot_keys:
-                return bot_keys[self._api_key_slot]
-        except (FileNotFoundError, json.JSONDecodeError):
-            pass
-        try:
-            with open(config.SIMMER_API_KEY_PATH) as f:
-                return json.load(f).get("api_key")
-        except (FileNotFoundError, json.JSONDecodeError):
-            return None

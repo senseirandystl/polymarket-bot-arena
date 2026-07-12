@@ -35,6 +35,14 @@ SIMMER_BASE_URL = "https://api.simmer.markets"
 # Legacy plaintext location — see SIMMER_API_KEY_PATH note above.
 SIMMER_BOT_KEYS_PATH = Path.home() / ".config/simmer/bot_keys.json"
 
+# Paper fills are computed LOCALLY (venues/paper.py) from the real market
+# price, so paper trading is unlimited and unaffected by Simmer's free-tier
+# 50-buys/day cap. Set this True to ALSO best-effort mirror each paper trade
+# to Simmer for a real-account cross-check (records the Simmer trade_id when
+# it succeeds; silently falls back to the local fill when rate-limited). Off
+# by default so the daily cap never gates strategy evaluation.
+SIMMER_MIRROR_ENABLED = False
+
 # Polymarket Direct CLOB (for live trading)
 # Legacy plaintext location — see SIMMER_API_KEY_PATH note above. Reads in
 # the codebase now go through the encrypted store.
