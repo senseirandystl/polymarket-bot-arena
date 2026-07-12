@@ -45,9 +45,14 @@ combined = (
 ### Safeguards
 - **Market consensus guard:** Never bet against prices >65c or <35c
 - **Bet sizing cap:** Confidence capped at 0.45 for sizing (prevents overconfident large bets)
-- **Stale trade expiry:** Trades pending >1h auto-expire (5-min markets resolve in ~10min)
+- **No stale expiry:** Pending trades stay pending until the market actually resolves (Simmer can take up to a day). The old 1h auto-expire was removed — it threw away real outcomes. See BUG_HISTORY #10.
 - **Daily loss limits:** Uncapped for paper trading (was $10/bot, $25 total)
 - **Dedup:** Loads recent (bot, market) pairs from DB to prevent duplicates across restarts
+
+### Execution venues (paper vs live)
+Order placement is split by venue so the two never intermix — `base_bot.execute()` picks an engine via `venues.get_engine(mode)`:
+- **Paper** (`venues/paper.py`): fills are computed **locally** from the real market price (`shares = amount / entry_price`, `fill_source='local_sim'`) and resolved against the real market outcome. This makes paper trading **unlimited** and independent of Simmer's **50-buys/day free-tier cap** (which previously caused mislogged "phantom" fills — BUG_HISTORY #10). Simmer is an opt-in cross-check only via `config.SIMMER_MIRROR_ENABLED` (default off; checks the response's `success` flag before trusting it).
+- **Live** (`venues/live.py` → `polymarket_client.py`): Polymarket CLOB via `create_market_order`/`MarketOrderArgs` (auto tick-size / neg-risk / fee). Fully wired but only used when a bot's `trading_mode` is `live` (arena starts in paper). The `fill_source`/`entry_price` trade columns record how each trade filled.
 
 ### Per-Strategy Differentiation
 | Strategy | Aggression | Prior | Min Confidence |
@@ -68,13 +73,17 @@ combined = (
 
 ```
 arena.py              # Main loop: discover markets, run bots, resolve trades, evolve
-bots/base_bot.py      # BaseBot with make_decision() signal hierarchy + execute()
+bots/base_bot.py      # BaseBot with make_decision() signal hierarchy + execute() → venue engine
 bots/bot_momentum.py  # MomentumBot (follows trends)
 bots/bot_mean_rev.py  # MeanRevBot (was contrarian, now nearly neutral)
 bots/bot_sentiment.py # SentimentBot
 bots/bot_hybrid.py    # HybridBot
-config.py             # All config: paths, limits, evolution interval, API URLs
-db.py                 # SQLite: trades, bot_configs, evolution_events, bot_learning
+venues/__init__.py    # get_engine(mode) + TradeResult — paper vs live split
+venues/paper.py       # PaperEngine: local-sim fills (unlimited) + optional Simmer mirror
+venues/live.py        # LiveEngine: Polymarket CLOB order placement
+polymarket_client.py  # CLOB client: market/limit orders, balances, order book
+config.py             # All config: paths, limits, evolution interval, API URLs, SIMMER_MIRROR_ENABLED
+db.py                 # SQLite: trades (+ fill_source/entry_price), bot_configs, evolution, bot_learning
 learning.py           # Feature extraction, bias calculation, outcome recording
 signals/price_feed.py # Binance WS for BTC candles (staleness detection)
 signals/sentiment.py  # Sentiment signals
@@ -189,21 +198,7 @@ SQLite at `<repo>/bot_arena.db` (= `config.DB_PATH`) — tables: trades, bot_con
 
 ## Bug History (avoid re-introducing)
 
-1. **Circular learning (v3 bug, CRITICAL):** `resolve_trades()` used `market.get("current_price")` at resolution time. Resolved markets have price ~1.0 or ~0.0, so learning was: "high price = YES wins" (tautology). **Fix:** Store features at trade time in `trade_features` column.
-
-2. **P&L always $0 (v3 bug):** Old `resolve_trades()` SELECT didn't include `shares_bought`, so the try/except defaulted to shares=0, making pnl=0 for all trades. **Fix:** Include shares_bought in SELECT, formula: `pnl = (shares - amount) if won else -amount`.
-
-3. **P&L formula wrong (v3 bug):** Used `pnl = amount` for wins instead of `shares_bought - amount`. In prediction markets, profit = shares * $1 - cost, not 2x the bet.
-
-4. **Stale trades clogging queue:** 5-min market trades that fell off Simmer's resolved API (limit=200) stayed pending forever (425 trades). **Fix:** Auto-expire trades pending >1h.
-
-5. **Duplicate trades on restart:** In-memory `traded` set reset every restart. **Fix:** Load recent (bot, market) pairs from DB on startup.
-
-6. **sqlite3.Row has no .get():** Use `try: val = row["col"] except: val = default` instead of `row.get("col", default)`.
-
-7. **Paper P&L always $0 — resolver scanned a list that excludes fast-5m markets (CRITICAL):** `TradeResolver._resolve_pending()` fetched `/api/sdk/markets?status=resolved&limit=200` and matched pending trades against that list. BTC 5-min markets are tagged `fast-5m` and are **absent from the general market list** (the same reason `discovery.py` must pass `tags=fast-5m`), so the list never contained our markets → `resolved_map` was always empty → every trade sat pending until the 1h stale-sweep expired it at `pnl=0`. The resolver logged only `Expired N`, never `Resolved N`. **Fix:** resolve each distinct pending `market_id` by direct lookup `GET /api/sdk/markets/{id}` (`arena/resolver.py::_fetch_market_outcome`). Note: Simmer leaves `resolved_at` **null even after resolution** on these markets, so the authoritative signal is `status == "resolved"` **and** a non-null boolean `outcome` (JSON `true`/`false` = Up/Down) — do *not* rely on `resolved_at != null` here despite what the Simmer docs suggest.
-
-8. **Paper P&L always $0 — wrong share-count field from Simmer trade response:** `_execute_paper()` logged `shares_bought=result.get("shares_bought")`, but Simmer's `/api/sdk/trade` response reports the fill under `shares` / `shares_filled` (+ `fill_price`/`cost`), *not* `shares_bought`. Missing/zero shares means `pnl = shares - amount` can only ever be $0 (same class as Bug #2). **Fix:** `BaseBot._extract_shares()` reads `shares_bought`/`shares`/`shares_filled`, and if still zero derives shares from the fill price (`amount / fill_price`, or `amount / (1-yes_price)` for NO bets) so a share count is always recorded. Trades already logged with `shares_bought=0` can't be backfilled (entry price is lost) and stay at $0.
+Moved to **[BUG_HISTORY.md](./BUG_HISTORY.md)** to keep this guide lean. Read it before touching the resolver, discovery, learning, or P&L code — it records nine already-fixed bugs (circular learning, the various `$0` P&L causes, stale-trade clogging, and the next-day/15-min market selection bug) and the reasoning behind each fix.
 
 ## Next Steps for Iteration
 
