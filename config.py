@@ -35,20 +35,30 @@ SIMMER_BASE_URL = "https://api.simmer.markets"
 # Legacy plaintext location — see SIMMER_API_KEY_PATH note above.
 SIMMER_BOT_KEYS_PATH = Path.home() / ".config/simmer/bot_keys.json"
 
-# Paper fills are computed LOCALLY (venues/paper.py) from the real market
-# price, so paper trading is unlimited and unaffected by Simmer's free-tier
-# 50-buys/day cap. Set this True to ALSO best-effort mirror each paper trade
-# to Simmer for a real-account cross-check (records the Simmer trade_id when
-# it succeeds; silently falls back to the local fill when rate-limited). Off
-# by default so the daily cap never gates strategy evaluation.
-SIMMER_MIRROR_ENABLED = False
-
-# Polymarket Direct CLOB (for live trading)
+# Polymarket Direct CLOB (live trading + all market data)
 # Legacy plaintext location — see SIMMER_API_KEY_PATH note above. Reads in
 # the codebase now go through the encrypted store.
 POLYMARKET_KEY_PATH = Path.home() / ".config/polymarket/credentials.json"
 POLYMARKET_HOST = "https://clob.polymarket.com"
+POLYMARKET_GAMMA_URL = "https://gamma-api.polymarket.com"  # discovery + resolution
 POLYMARKET_CHAIN_ID = 137  # Polygon
+
+# BTC 5-min up/down markets live under this recurring Gamma series ("BTC Up or
+# Down 5m"). Discovery lists this series' open events; the live 5-min window is
+# then selected by its real resolves_at timestamp (see arena/market_utils).
+POLYMARKET_BTC_5M_SERIES_ID = "10684"
+
+# Taker fee model (makers are never charged). Polymarket's documented taker fee
+# is symmetric around 50c: fee_usdc = rate * shares * price * (1 - price). Crypto
+# is the highest tier. The rate is isolated here so it can be tuned in one place;
+# both paper (simulated) and live use it. See polymarket_fills.taker_fee().
+POLYMARKET_TAKER_FEE_RATE = 0.07
+
+# Paper mode is a full simulation against real Polymarket order books (no order
+# is submitted). All paper bots share ONE virtual USDC bankroll, set by the user
+# in the dashboard Settings tab (arena_state key 'paper_bankroll'); this default
+# is used until they set one. Live mode uses the real wallet USDC balance.
+PAPER_BANKROLL_DEFAULT = 100.0
 
 # Database
 DB_PATH = Path(__file__).parent / "bot_arena.db"
