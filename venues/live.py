@@ -50,8 +50,13 @@ class LiveEngine:
             logger.error(f"[{bot_name}] LIVE order failed: {result.get('error')}")
             return TradeResult(success=False, reason=result.get("error"))
 
+        import polymarket_fills
+
         price = float(result.get("price") or 0.0)
         shares = float(result.get("size") or (amount / price if price else 0.0))
+        # Polymarket charges the taker fee on-chain; record our estimate so
+        # paper and live P&L are computed the same way.
+        fee = polymarket_fills.taker_fee(shares, price)
         row_id = db.log_trade(
             bot_name=bot_name,
             market_id=market_id,
@@ -67,6 +72,7 @@ class LiveEngine:
             trade_features=features,
             fill_source="polymarket",
             entry_price=price,
+            fee=fee,
         )
         logger.info(
             f"[{bot_name}] LIVE fill: {side} ${amount:.2f} @ {price} "

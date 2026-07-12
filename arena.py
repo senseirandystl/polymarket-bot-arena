@@ -780,18 +780,13 @@ def start_dashboard() -> None:
 def main_loop(bots):
     """Wire up everything: feeds, shared state, secondary bots, four
     worker threads, then drive the evolution check on this main thread."""
-    api_key = config.get_credential("simmer_api_key")
-    bot_keys = load_bot_keys()
-    assign_bot_slots(bots, bot_keys, api_key)
-    if len(bot_keys) >= config.NUM_BOTS:
-        logger.info(
-            f"Multi-account mode: {len(bot_keys)} Simmer accounts loaded"
-        )
-    else:
-        logger.info(
-            f"Single-account mode: {len(bot_keys)} bot keys found "
-            f"(need {config.NUM_BOTS} for independent trading)"
-        )
+    # Market data + resolution come from Polymarket (public, no keys). Paper
+    # mode simulates against real order books; live mode needs Polymarket CLOB
+    # credentials, checked lazily when a bot is flipped to live.
+    logger.info(
+        f"Paper mode: shared virtual bankroll ${db.get_paper_bankroll():.2f} "
+        f"(set in dashboard Settings); {len(bots)} bots trade real Polymarket books"
+    )
 
     # Signal feeds are daemons with their own threads; the trader reads
     # their cached state on every 1s tick.

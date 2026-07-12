@@ -172,9 +172,12 @@ def init_db():
             # 'simmer' (confirmed on Simmer with a real trade_id), or
             # 'polymarket' (live CLOB fill). NULL on legacy rows.
             "ALTER TABLE trades ADD COLUMN fill_source TEXT",
-            # Price per share at fill time (used to derive shares for local_sim
-            # fills and to record the real avg fill price for confirmed trades).
+            # Price per share at fill time (avg fill price after walking the
+            # order book for depth/slippage).
             "ALTER TABLE trades ADD COLUMN entry_price REAL",
+            # Polymarket taker fee (USDC) charged on the fill — applied to both
+            # simulated (paper) and live trades; factored into resolved P&L.
+            "ALTER TABLE trades ADD COLUMN fee REAL DEFAULT 0",
         ]:
             try:
                 conn.execute(migration)
@@ -195,23 +198,23 @@ def get_conn():
 
 def log_trade(bot_name, market_id, side, amount, venue, mode, confidence=None,
               reasoning=None, market_question=None, trade_id=None, shares_bought=None,
-              trade_features=None, fill_source=None, entry_price=None):
+              trade_features=None, fill_source=None, entry_price=None, fee=0.0):
     """Insert a filled trade and return its internal row id.
 
-    ``fill_source`` records HOW the trade filled ('local_sim' | 'simmer' |
-    'polymarket'); ``entry_price`` is the per-share fill price. Both are used
-    by the paper local-sim engine and the live engine to keep P&L honest.
+    ``amount`` is the USDC cost actually spent on shares (after order-book
+    walk); ``fee`` is the Polymarket taker fee; ``entry_price`` is the avg fill
+    price; ``fill_source`` records HOW it filled ('paper_sim' | 'polymarket').
     """
     with get_conn() as conn:
         cur = conn.execute(
             """INSERT INTO trades (bot_name, market_id, market_question, side, amount,
                confidence, reasoning, trade_features, venue, mode, trade_id,
-               shares_bought, fill_source, entry_price)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               shares_bought, fill_source, entry_price, fee)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (bot_name, market_id, market_question, side, amount,
              confidence, reasoning,
              json.dumps(trade_features) if trade_features else None,
-             venue, mode, trade_id, shares_bought, fill_source, entry_price)
+             venue, mode, trade_id, shares_bought, fill_source, entry_price, fee)
         )
         return cur.lastrowid
 
@@ -450,6 +453,42 @@ def set_arena_state(key, value):
                ON CONFLICT(key) DO UPDATE SET value=?, updated_at=datetime('now')""",
             (key, str(value), str(value))
         )
+
+
+def get_paper_bankroll():
+    """The shared virtual USDC bankroll for paper mode (set in dashboard Settings)."""
+    v = get_arena_state("paper_bankroll")
+    try:
+        return float(v) if v is not None else config.PAPER_BANKROLL_DEFAULT
+    except (TypeError, ValueError):
+        return config.PAPER_BANKROLL_DEFAULT
+
+
+def set_paper_bankroll(amount):
+    """Set the shared paper bankroll (USDC). Raises ValueError on bad input."""
+    amount = float(amount)
+    if amount < 0:
+        raise ValueError("Bankroll must be non-negative")
+    set_arena_state("paper_bankroll", amount)
+
+
+def get_paper_available():
+    """Available shared paper cash right now.
+
+    cash = bankroll + realized paper P&L (resolved) - open paper cost (pending).
+    All paper bots draw from this one pool.
+    """
+    bankroll = get_paper_bankroll()
+    with get_conn() as conn:
+        realized = conn.execute(
+            "SELECT COALESCE(SUM(pnl), 0) FROM trades "
+            "WHERE mode='paper' AND outcome IN ('win', 'loss')"
+        ).fetchone()[0]
+        open_cost = conn.execute(
+            "SELECT COALESCE(SUM(amount + COALESCE(fee, 0)), 0) FROM trades "
+            "WHERE mode='paper' AND outcome IS NULL"
+        ).fetchone()[0]
+    return bankroll + (realized or 0) - (open_cost or 0)
 
 
 def get_bot_mode(bot_name):

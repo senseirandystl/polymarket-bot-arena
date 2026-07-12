@@ -34,13 +34,11 @@ import time
 from datetime import datetime, timezone
 from typing import Callable, Dict, List, Optional
 
-import requests
-
 import config
+import polymarket_markets
 from arena.market_utils import (
     compute_time_remaining_seconds,
     is_5min_market,
-    is_btc_updown,
     select_current_market,
 )
 
@@ -48,7 +46,7 @@ logger = logging.getLogger("arena.discovery")
 
 
 class MarketDiscovery(threading.Thread):
-    """Background scanner for Simmer BTC 5-min markets."""
+    """Background scanner for Polymarket BTC 5-min up/down markets."""
 
     def __init__(
         self,
@@ -164,12 +162,7 @@ class MarketDiscovery(threading.Thread):
     # ----------------------------------------------------------------------
 
     def _do_scan(self) -> None:
-        api_key = config.get_credential("simmer_api_key")
-        if not api_key:
-            logger.debug("Skipping discovery: no Simmer API key")
-            return
-
-        markets = self._fetch_markets(api_key)
+        markets = polymarket_markets.discover_markets()
         if not markets:
             return
 
@@ -228,11 +221,9 @@ class MarketDiscovery(threading.Thread):
         # re-acquires self._lock for its cache writes.  Wrapping this
         # block in `with self._lock:` would deadlock.
         if current is not None:
-            self._fetch_orderflow_for_market(api_key, current, time.time())
+            self._refresh_market_data(current)
         if maker_fallback is not None and maker_fallback is not current:
-            self._fetch_orderflow_for_market(
-                api_key, maker_fallback, time.time()
-            )
+            self._refresh_market_data(maker_fallback)
 
         with self._lock:
             self._markets_cache = non_expired
@@ -247,93 +238,17 @@ class MarketDiscovery(threading.Thread):
             f"maker_fallback={'yes' if maker_fallback else 'no'}"
         )
 
-    def _fetch_markets(self, api_key: str) -> List[dict]:
-        """Scan both Simmer SDK + public endpoints, dedupe by id."""
-        seen: Dict[str, dict] = {}
+    def _refresh_market_data(self, m: dict) -> None:
+        """Set fresh price + orderflow on a selected market from the CLOB book.
 
-        def _scan_page(page, source: str):
-            for m in page:
-                mid = m.get("id") or m.get("market_id", "unknown")
-                if mid in seen:
-                    continue
-                if is_btc_updown(m):
-                    if logger.isEnabledFor(logging.INFO):
-                        logger.info(
-                            f"  CANDIDATE [{source}]: {mid[:12]}... | "
-                            f"{m.get('question')} | resolves_at={m.get('resolves_at')}"
-                        )
-                    seen[mid] = m
-
-        # --- Source 1: SDK upcoming markets ---
-        try:
-            resp = requests.get(
-                f"{config.SIMMER_BASE_URL}/api/sdk/markets",
-                headers={"Authorization": f"Bearer {api_key}"},
-                params={"limit": 50, "tags": "fast-5m"},
-                timeout=20,
-            )
-            if resp.status_code == 200:
-                data = resp.json()
-                page = data if isinstance(data, list) else data.get("markets", [])
-                _scan_page(page, "upcoming")
-        except Exception as e:
-            logger.warning(f"SDK /api/sdk/markets call failed: {e}")
-
-        # --- Source 2: public endpoint for currently-live markets ---
-        try:
-            resp = requests.get(
-                f"{config.SIMMER_BASE_URL}/api/markets",
-                headers={"Authorization": f"Bearer {api_key}"},
-                params={"limit": 20},
-                timeout=10,
-            )
-            if resp.status_code == 200:
-                data = resp.json()
-                page = data if isinstance(data, list) else data.get("markets", [])
-                _scan_page(page, "live")
-        except Exception as e:
-            logger.warning(f"Public /api/markets call failed: {e}")
-
-        return list(seen.values())
-
-    def _fetch_orderflow_for_market(self, api_key: str, m: dict, now: float) -> None:
-        """Fetch (or reuse cached) ``/api/sdk/context/{id}`` data for one market.
-
-        Cached values stay valid for ``config.ORDERFLOW_CACHE_SECONDS`` so
-        the trader (which runs at 1Hz) can read the same snapshot without
-        triggering a network call per tick.
+        ``current_price`` becomes the live Up-token mid, and ``orderflow`` is
+        populated so the signal stack (which reads ``current_probability`` and
+        ``volume_24h``) has data. Best-effort — leaves the fields untouched if
+        the book is unavailable.
         """
-        mid = m.get("id") or m.get("market_id", "")
-        if not mid:
-            return
-
-        ts = self._orderflow_cache_ts.get(mid, 0.0)
-        if now - ts < config.ORDERFLOW_CACHE_SECONDS:
-            with self._lock:
-                cached = self._orderflow_cache.get(mid)
-            if cached is not None:
-                m["orderflow"] = cached
-            return
-
-        try:
-            resp = requests.get(
-                f"{config.SIMMER_BASE_URL}/api/sdk/context/{mid}",
-                headers={"Authorization": f"Bearer {api_key}"},
-                timeout=10,
-            )
-            if resp.status_code == 200:
-                ctx = resp.json()
-                of = {
-                    "current_probability": ctx.get("current_probability", 0.5),
-                    "volume_24h": ctx.get("volume_24h", 0),
-                    "time_to_resolution": ctx.get("time_to_resolution_seconds", 0),
-                    "warnings": ctx.get("warnings", []),
-                }
-                with self._lock:
-                    self._orderflow_cache[mid] = of
-                    self._orderflow_cache_ts[mid] = now
-                m["orderflow"] = of
-            else:
-                logger.debug(f"orderflow HTTP {resp.status_code} for {mid[:12]}...")
-        except Exception as e:
-            logger.debug(f"orderflow fetch error for {mid[:12]}...: {e}")
+        polymarket_markets.refresh_price(m)  # sets m["current_price"] from CLOB
+        m["orderflow"] = {
+            "current_probability": m.get("current_price") or 0.5,
+            "volume_24h": m.get("volume_24h", 0) or 0,
+            "warnings": [],
+        }
