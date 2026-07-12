@@ -64,12 +64,18 @@ def _fetch_slot_balance(api_key):
 
 
 def get_bot_balance(slot_name, bot_keys, trading_mode="paper"):
-    """Get cached or fresh balance for a bot slot. Live bots show Polymarket USDC balance."""
-    cache_key = "polymarket_live" if trading_mode == "live" else slot_name
+    """Balance for a bot. Paper bots share the virtual bankroll; live bots show
+    real Polymarket USDC. Returns ``(balance, is_live)``."""
+    # Paper: all bots draw from ONE shared virtual USDC bankroll (set in the
+    # dashboard Settings tab). Show the currently-available pool cash.
+    if trading_mode != "live":
+        return db.get_paper_available(), False
+
+    cache_key = "polymarket_live"
     now = time.time()
     cached = _balance_cache.get(cache_key)
     if cached and (now - cached["fetched_at"]) < BALANCE_CACHE_TTL:
-        return cached["balance"], trading_mode == "live"
+        return cached["balance"], True
 
     if trading_mode == "live":
         # Read Polymarket L2 credentials from the encrypted store.
@@ -113,13 +119,6 @@ def get_bot_balance(slot_name, bot_keys, trading_mode="paper"):
         _balance_cache[cache_key] = {"balance": balance, "fetched_at": now}
         return balance, True
 
-    api_key = bot_keys.get(slot_name)
-    if not api_key:
-        return None, False
-    balance = _fetch_slot_balance(api_key)
-    _balance_cache[cache_key] = {"balance": balance, "fetched_at": now}
-    return balance, False
-
 
 @app.get("/", response_class=HTMLResponse)
 async def index():
@@ -130,20 +129,8 @@ async def index():
 @app.get("/api/status")
 async def get_status():
     warnings: list = []
-    if not config.is_credential_configured("simmer_api_key"):
-        warnings.append({
-            "level": "error",
-            "category": "credentials",
-            "message": (
-                "No Simmer API key configured. The arena is running but bots cannot "
-                "trade. Open the Settings tab to enter your Simmer API key."
-            ),
-        })
-    elif not config.is_credential_configured("simmer_bot_keys"):
-        # Single-account mode is fine \u2014 only flag if zero per-bot keys AND no
-        # default key. Actually we already checked the default key above, so
-        # this branch is informational only (multi-account mode is optional).
-        pass
+    # Paper mode needs no credentials \u2014 it simulates against public Polymarket
+    # order books. Only live mode requires Polymarket CLOB credentials.
     if config.get_current_mode() == "live":
         pm_missing = [
             name for name in (
@@ -508,6 +495,34 @@ async def get_overview():
         "stats": stats,
         "active_bots": active_bots,
         "mode": config.get_current_mode(),
+        "paper_bankroll": db.get_paper_bankroll(),
+        "paper_available": db.get_paper_available(),
+    })
+
+
+@app.get("/api/settings/bankroll")
+async def get_bankroll(_auth: str = Depends(verify_auth)):
+    return JSONResponse({
+        "bankroll": db.get_paper_bankroll(),
+        "available": db.get_paper_available(),
+    })
+
+
+@app.post("/api/settings/bankroll")
+async def set_bankroll(request: Request, _auth: str = Depends(verify_auth)):
+    """Set the shared virtual USDC bankroll for paper mode."""
+    body = await request.json()
+    try:
+        amount = float(body.get("amount"))
+    except (TypeError, ValueError):
+        return JSONResponse({"error": "amount must be a number"}, status_code=400)
+    if amount < 0:
+        return JSONResponse({"error": "amount must be non-negative"}, status_code=400)
+    db.set_paper_bankroll(amount)
+    return JSONResponse({
+        "success": True,
+        "bankroll": db.get_paper_bankroll(),
+        "available": db.get_paper_available(),
     })
 
 

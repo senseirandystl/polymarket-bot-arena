@@ -288,31 +288,20 @@ td { padding: 6px 4px; border-bottom: 1px solid #21262d; }
         <div class="storage-info" id="storage-info">Loading credential store info...</div>
 
         <div class="settings-section">
-            <h3>Simmer</h3>
-            <div class="settings-blurb">Required for any trading. Get a key from simmer.markets &rarr; Settings &rarr; Agents.</div>
+            <h3>Paper Bankroll</h3>
+            <div class="settings-blurb">Shared virtual USDC bankroll for paper mode. All bots trade from this one pool against real Polymarket order books. Set it, e.g., to 100 and click Save.</div>
 
             <div class="cred-row">
-                <label>Simmer API key<small>Single-account default</small></label>
-                <input type="password" id="creds-simmer_api_key" placeholder="Paste Simmer API key" autocomplete="off">
-                <span class="cred-status missing" id="status-simmer_api_key">Missing</span>
+                <label>Bankroll (USDC)<small>Available now: <span id="bankroll-available">&mdash;</span></small></label>
+                <input type="number" id="paper-bankroll-input" min="0" step="1" placeholder="100">
+                <button class="btn" onclick="saveBankroll()">Save</button>
             </div>
-
-            <div class="cred-row">
-                <label>Simmer per-bot keys<small>Optional JSON: {"slot_0":"key","slot_1":"key",...}</small></label>
-                <textarea id="creds-simmer_bot_keys" placeholder='{"slot_0":"...", "slot_1":"..."}' rows="3" style="font-family: inherit; font-size: 12px;"></textarea>
-                <span class="cred-status missing" id="status-simmer_bot_keys">Missing</span>
-            </div>
-
-            <div class="test-result" id="test-simmer"></div>
-            <div class="test-hint">Test reads only the SAVED credentials &mdash; form values are NOT submitted by this button. Save first if you just typed a new value.</div>
-            <div class="actions-row">
-                <button class="btn btn-secondary" onclick="testCredentials('simmer')">Test Simmer</button>
-            </div>
+            <div class="test-result" id="bankroll-result"></div>
         </div>
 
         <div class="settings-section">
             <h3>Polymarket</h3>
-            <div class="settings-blurb">Required for live USDC trading. Live mode is gated on these being set.</div>
+            <div class="settings-blurb">Required for live USDC trading. Live mode is gated on these being set. Market data (discovery, prices, resolution) is public and needs no keys.</div>
 
             <div class="cred-row">
                 <label>API key<small>Polymarket CLOB L2</small></label>
@@ -503,6 +492,41 @@ async function refreshSettings() {
         }
     } catch (e) {
         console.error('refreshSettings error:', e);
+    }
+    loadBankroll();
+}
+
+async function loadBankroll() {
+    try {
+        const b = await fetchJSON('/api/settings/bankroll');
+        const input = document.getElementById('paper-bankroll-input');
+        if (input && document.activeElement !== input) input.value = b.bankroll;
+        const avail = document.getElementById('bankroll-available');
+        if (avail) avail.textContent = '$' + Number(b.available).toFixed(2);
+    } catch (e) { console.error('loadBankroll error:', e); }
+}
+
+async function saveBankroll() {
+    const input = document.getElementById('paper-bankroll-input');
+    const resultEl = document.getElementById('bankroll-result');
+    const amount = parseFloat(input.value);
+    if (isNaN(amount) || amount < 0) {
+        resultEl.textContent = 'Enter a non-negative number.';
+        resultEl.style.color = '#f85149';
+        return;
+    }
+    try {
+        const resp = await postJSON('/api/settings/bankroll', { amount });
+        if (resp && resp.error) {
+            resultEl.textContent = 'Save failed: ' + resp.error;
+            resultEl.style.color = '#f85149';
+            return;
+        }
+        resultEl.textContent = `Bankroll set to $${Number(resp.bankroll).toFixed(2)} (available $${Number(resp.available).toFixed(2)}).`;
+        resultEl.style.color = '#3fb950';
+    } catch (e) {
+        resultEl.textContent = 'Save failed: ' + e;
+        resultEl.style.color = '#f85149';
     }
 }
 
