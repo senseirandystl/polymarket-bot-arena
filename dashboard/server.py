@@ -17,6 +17,7 @@ import config
 import credentials_store
 import db
 import learning
+from arena.market_utils import is_5min_market
 
 security = HTTPBasic()
 
@@ -206,28 +207,6 @@ def _to_et(dt_utc):
         return dt_utc + timedelta(hours=-4 if dst_start <= dt_utc < dst_end else -5)
 
 
-def _window_contains_now(question: str, now_utc) -> bool:
-    """Return True if the question's ET time range contains the current ET time."""
-    import re
-    q = question.lower()
-    match = re.search(r'(\d{1,2}):(\d{2})\s*(am|pm)\s*[-–]\s*(\d{1,2}):(\d{2})\s*(am|pm)', q)
-    if not match:
-        return False
-    h1, m1, ap1 = int(match.group(1)), int(match.group(2)), match.group(3)
-    h2, m2, ap2 = int(match.group(4)), int(match.group(5)), match.group(6)
-    if ap1 == 'pm' and h1 != 12: h1 += 12
-    if ap1 == 'am' and h1 == 12: h1 = 0
-    if ap2 == 'pm' and h2 != 12: h2 += 12
-    if ap2 == 'am' and h2 == 12: h2 = 0
-    start_min, end_min = h1 * 60 + m1, h2 * 60 + m2
-    now_et = _to_et(now_utc)
-    now_min = now_et.hour * 60 + now_et.minute
-    if end_min > start_min:
-        return start_min <= now_min < end_min
-    else:  # crosses midnight ET
-        return now_min >= start_min or now_min < end_min
-
-
 @app.get("/api/markets")
 async def get_markets():
     """Get active BTC fast markets as {current, upcoming_count, upcoming}.
@@ -343,6 +322,12 @@ async def get_markets():
             if not is_btc_updown:
                 continue
 
+            # Only ever surface 5-minute windows -- a 15-min BTC up/down
+            # market must never appear on the card (see the July-2026
+            # next-day 8:15-8:30 regression).
+            if not is_5min_market(m.get("question", "") or ""):
+                continue
+
             resolves_at_str = m.get("resolves_at")
             time_remaining = None
             if resolves_at_str:
@@ -362,23 +347,18 @@ async def get_markets():
             if time_remaining is not None and time_remaining < 0:
                 continue
 
-            try:
-                in_window = _window_contains_now(m.get("question", ""), now_utc)
-            except (ValueError, TypeError, AttributeError):
-                # Regex helper hiccup (unlikely but possible if zoneinfo is
-                # unavailable). Fall back to time-only check rather than
-                # raising out of the loop and skipping the rest of the card.
-                in_window = False
-
             btc_markets.append({
                 "id": m.get("id"),
                 "question": m.get("question"),
                 "current_price": m.get("current_price"),
                 "resolves_at": m.get("resolves_at"),
                 "time_remaining_seconds": time_remaining,
+                # Current iff the REAL resolves_at timestamp puts us inside
+                # its 5-min window (0 < remaining <= 300). Never keyed off ET
+                # time-of-day, so a future-dated window whose clock time
+                # straddles "now" can't masquerade as current.
                 "is_current_window": (
-                    (time_remaining is not None and 0 < time_remaining <= 300)
-                    or in_window
+                    time_remaining is not None and 0 < time_remaining <= 300
                 ),
                 "url": m.get("url"),
             })
@@ -401,8 +381,28 @@ async def get_markets():
         current = soon[0] if soon else None
 
     upcoming = [m for m in btc_markets if m is not current]
+
+    # Attach the trades bots have actually placed on the current + next
+    # market so the Overview cards can show who traded each window. Only the
+    # two visible markets are queried (cheap point lookups by market_id).
+    def _attach_trades(market):
+        if not market or not market.get("id"):
+            return
+        with db.get_conn() as conn:
+            rows = conn.execute(
+                "SELECT bot_name, side, amount, shares_bought, outcome, pnl, created_at "
+                "FROM trades WHERE market_id=? ORDER BY created_at ASC",
+                (market["id"],),
+            ).fetchall()
+        market["trades"] = [dict(r) for r in rows]
+
+    _attach_trades(current)
+    if upcoming:
+        _attach_trades(upcoming[0])
+
     payload = {
         "current": current,
+        "next": upcoming[0] if upcoming else None,
         "upcoming_count": len(upcoming),
         "upcoming": upcoming,
     }
@@ -590,17 +590,20 @@ async def get_trades(bot: str = None, limit: int = 50):
     if bot:
         return JSONResponse(db.get_bot_trades(bot, limit=limit))
     with db.get_conn() as conn:
-        # Sort resolved trades first (by resolution time), then pending. Show
-        # every trade, including 1h-stale-expired (outcome='expired', pnl=0)
-        # rows, so the Recent Trades table matches the bot cards in the Bots
-        # tab and the Overview stats. A "phantom pnl=0" filter no longer
-        # applies — vote-era false positives were cleared and the filter was
-        # silently hiding legitimate expired paper trades.
+        # Sort PENDING trades first (newest activity), then resolved by
+        # recency. Previously resolved sorted first and pending last, so with
+        # hundreds of resolved trades the handful of pending rows were pushed
+        # past the LIMIT and never appeared in Recent Trades — even though the
+        # Active Bots cards counted them. Surfacing pending at the top keeps
+        # the two views reconciled. COALESCE(resolved_at, created_at) orders
+        # pending by placement time and resolved by settlement time.
+        # Show every trade, including 1h-stale-expired (outcome='expired',
+        # pnl=0) rows; the "phantom pnl=0" filter no longer applies.
         rows = conn.execute(
             """SELECT * FROM trades
                ORDER BY
-                   CASE WHEN outcome IS NOT NULL THEN 0 ELSE 1 END,
-                   resolved_at DESC, created_at DESC
+                   CASE WHEN outcome IS NULL THEN 0 ELSE 1 END,
+                   COALESCE(resolved_at, created_at) DESC
                LIMIT ?""", (limit,)
         ).fetchall()
         return JSONResponse([dict(r) for r in rows])
@@ -644,13 +647,25 @@ async def get_copytrading():
 @app.get("/api/earnings")
 async def get_earnings():
     with db.get_conn() as conn:
-        daily = conn.execute("""
-            SELECT date(created_at) as day, COALESCE(SUM(pnl), 0) as pnl,
-                   COUNT(*) as trades,
-                   SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) as wins
-            FROM trades WHERE outcome IN ('win', 'loss')
-            GROUP BY date(created_at) ORDER BY day DESC LIMIT 30
-        """).fetchall()
+        # Bucket by ET calendar date (created_at is stored UTC). Grouping in
+        # Python keeps the day boundary DST-correct and consistent with the
+        # ET-anchored "Today" stats on the Overview tab.
+        resolved = conn.execute(
+            "SELECT created_at, pnl FROM trades WHERE outcome IN ('win', 'loss')"
+        ).fetchall()
+        buckets: dict = {}
+        for r in resolved:
+            day = db.utc_to_et_date(r["created_at"])
+            b = buckets.setdefault(day, {"pnl": 0.0, "trades": 0, "wins": 0})
+            pnl = r["pnl"] or 0
+            b["pnl"] += pnl
+            b["trades"] += 1
+            if pnl > 0:
+                b["wins"] += 1
+        daily = [
+            {"day": day, "pnl": round(v["pnl"], 2), "trades": v["trades"], "wins": v["wins"]}
+            for day, v in sorted(buckets.items(), reverse=True)[:30]
+        ]
 
         best = conn.execute(
             "SELECT * FROM trades WHERE pnl IS NOT NULL ORDER BY pnl DESC LIMIT 5"

@@ -1,0 +1,96 @@
+"""Tests for dashboard performance stats and Recent-Trades ordering.
+
+Covers three behaviours added in July 2026:
+
+  1. ``get_dashboard_stats`` reports RESOLVED trade counts in ``trades`` and
+     unresolved ones separately in ``pending`` (so the UI can render "229 +2").
+  2. A "Current Session" period appears only when ``session_start`` is recorded
+     in ``arena_state``, and scopes counts to trades since that instant.
+  3. The Recent-Trades query surfaces PENDING trades first, so a handful of
+     pending rows are never truncated past the LIMIT by hundreds of resolved
+     ones (the Active-Bots vs Recent-Trades reconciliation bug).
+"""
+
+import importlib
+
+import pytest
+
+
+@pytest.fixture()
+def db(tmp_path, monkeypatch):
+    """A fresh db module pointed at an isolated temp SQLite file."""
+    import db as db_module
+
+    test_path = tmp_path / "test_arena.db"
+    monkeypatch.setattr(db_module, "DB_PATH", test_path)
+    db_module.init_db()
+    return db_module
+
+
+def _insert(db, bot, outcome, pnl, created_at, resolved_at=None):
+    with db.get_conn() as conn:
+        conn.execute(
+            """INSERT INTO trades
+               (bot_name, market_id, side, amount, venue, mode,
+                shares_bought, outcome, pnl, created_at, resolved_at)
+               VALUES (?, 'mkt', 'yes', 1.0, 'simmer', 'paper',
+                       2.0, ?, ?, ?, ?)""",
+            (bot, outcome, pnl, created_at, resolved_at),
+        )
+
+
+def test_trades_count_excludes_pending(db):
+    _insert(db, "a", "win", 1.0, "2026-07-12 10:00:00", "2026-07-12 10:05:00")
+    _insert(db, "a", "loss", -1.0, "2026-07-12 10:01:00", "2026-07-12 10:06:00")
+    _insert(db, "a", "expired", 0.0, "2026-07-12 10:02:00", "2026-07-12 10:07:00")
+    _insert(db, "a", None, None, "2026-07-12 10:03:00")  # pending
+
+    stats = db.get_dashboard_stats()["all_time"]
+    assert stats["trades"] == 3      # win + loss + expired (resolved)
+    assert stats["pending"] == 1     # the unresolved trade, counted apart
+    assert stats["wins"] == 1
+    assert stats["losses"] == 1
+
+
+def test_session_absent_without_session_start(db):
+    _insert(db, "a", "win", 1.0, "2026-07-12 10:00:00", "2026-07-12 10:05:00")
+    assert db.get_dashboard_stats()["session"] is None
+
+
+def test_session_scopes_to_session_start(db):
+    # Two trades before the session boot, one after.
+    _insert(db, "a", "win", 1.0, "2026-07-12 09:00:00", "2026-07-12 09:05:00")
+    _insert(db, "a", "loss", -1.0, "2026-07-12 09:30:00", "2026-07-12 09:35:00")
+    db.set_arena_state("session_start", "2026-07-12 10:00:00")
+    _insert(db, "a", "win", 1.0, "2026-07-12 10:15:00", "2026-07-12 10:20:00")
+    _insert(db, "a", None, None, "2026-07-12 10:16:00")  # pending, this session
+
+    session = db.get_dashboard_stats()["session"]
+    assert session is not None
+    assert session["trades"] == 1    # only the post-boot resolved trade
+    assert session["pending"] == 1
+    assert db.get_dashboard_stats()["all_time"]["trades"] == 3
+
+
+def test_recent_trades_orders_pending_first(db):
+    # Many resolved trades, then a couple pending ones placed earlier in time.
+    for i in range(30):
+        _insert(db, "a", "win", 1.0, f"2026-07-12 11:{i:02d}:00",
+                f"2026-07-12 12:{i:02d}:00")
+    _insert(db, "p1", None, None, "2026-07-12 10:00:00")
+    _insert(db, "p2", None, None, "2026-07-12 10:01:00")
+
+    # Mirror the /api/trades ordering with a small LIMIT.
+    with db.get_conn() as conn:
+        rows = conn.execute(
+            """SELECT bot_name, outcome FROM trades
+               ORDER BY
+                   CASE WHEN outcome IS NULL THEN 0 ELSE 1 END,
+                   COALESCE(resolved_at, created_at) DESC
+               LIMIT ?""",
+            (5,),
+        ).fetchall()
+
+    top_bots = {r["bot_name"] for r in rows[:2]}
+    assert top_bots == {"p1", "p2"}         # both pending rows survive the LIMIT
+    assert all(r["outcome"] is None for r in rows[:2])

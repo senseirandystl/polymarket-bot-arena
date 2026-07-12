@@ -3,11 +3,67 @@
 import sqlite3
 import json
 from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from contextlib import contextmanager
 import config
 
 DB_PATH = config.DB_PATH
+
+
+# ---------------------------------------------------------------------------
+# Eastern-Time helpers
+#
+# Timestamps are STORED as UTC (SQLite ``datetime('now')``). All day-boundary
+# and "today/this week" reporting, however, is anchored to America/New_York so
+# the dashboard rolls over at 00:00 ET — matching the BTC 5-min markets, which
+# trade on ET. These helpers return UTC strings (in the same
+# ``YYYY-MM-DD HH:MM:SS`` shape SQLite stores) representing ET day boundaries,
+# so they can be compared directly against ``created_at``.
+# ---------------------------------------------------------------------------
+_ET_ZONE = "America/New_York"
+
+
+def _et_now() -> datetime:
+    """Current time as an aware ET datetime (DST-correct)."""
+    try:
+        from zoneinfo import ZoneInfo
+        return datetime.now(timezone.utc).astimezone(ZoneInfo(_ET_ZONE))
+    except Exception:
+        # zoneinfo/tzdata unavailable — approximate US DST rules (2nd Sun Mar
+        # .. 1st Sun Nov). Good enough for a day-boundary; storage stays UTC.
+        now = datetime.now(timezone.utc)
+        year = now.year
+        mar1 = datetime(year, 3, 1, tzinfo=timezone.utc)
+        dst_start = mar1 + timedelta(days=(6 - mar1.weekday()) % 7) + timedelta(weeks=1, hours=7)
+        nov1 = datetime(year, 11, 1, tzinfo=timezone.utc)
+        dst_end = nov1 + timedelta(days=(6 - nov1.weekday()) % 7) + timedelta(hours=6)
+        offset = -4 if dst_start <= now < dst_end else -5
+        return now + timedelta(hours=offset)
+
+
+def et_day_start_utc(days_ago: int = 0) -> str:
+    """UTC string for 00:00 ET of the day ``days_ago`` days before today (ET)."""
+    et_midnight = (_et_now() - timedelta(days=days_ago)).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+    try:
+        # et_midnight is aware (zoneinfo path) — convert to UTC.
+        return et_midnight.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    except (ValueError, OverflowError):
+        return et_midnight.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def utc_to_et_date(utc_str: str) -> str:
+    """Convert a stored UTC ``created_at`` string to its ET calendar date."""
+    if not utc_str:
+        return ""
+    try:
+        dt = datetime.fromisoformat(utc_str.replace("Z", "").replace("T", " ").strip())
+        dt = dt.replace(tzinfo=timezone.utc)
+        from zoneinfo import ZoneInfo
+        return dt.astimezone(ZoneInfo(_ET_ZONE)).strftime("%Y-%m-%d")
+    except Exception:
+        return (utc_str or "")[:10]
 
 
 def init_db():
@@ -111,6 +167,14 @@ def init_db():
             "ALTER TABLE bot_configs ADD COLUMN trading_mode TEXT DEFAULT 'paper'",
             "ALTER TABLE copytrading_trades ADD COLUMN source_tx_hash TEXT",
             "ALTER TABLE copytrading_wallets ADD COLUMN trading_mode TEXT DEFAULT 'paper'",
+            # How a trade was filled: 'local_sim' (priced locally, unlimited —
+            # the primary paper path now that Simmer caps at 50 buys/day),
+            # 'simmer' (confirmed on Simmer with a real trade_id), or
+            # 'polymarket' (live CLOB fill). NULL on legacy rows.
+            "ALTER TABLE trades ADD COLUMN fill_source TEXT",
+            # Price per share at fill time (used to derive shares for local_sim
+            # fills and to record the real avg fill price for confirmed trades).
+            "ALTER TABLE trades ADD COLUMN entry_price REAL",
         ]:
             try:
                 conn.execute(migration)
@@ -131,17 +195,25 @@ def get_conn():
 
 def log_trade(bot_name, market_id, side, amount, venue, mode, confidence=None,
               reasoning=None, market_question=None, trade_id=None, shares_bought=None,
-              trade_features=None):
+              trade_features=None, fill_source=None, entry_price=None):
+    """Insert a filled trade and return its internal row id.
+
+    ``fill_source`` records HOW the trade filled ('local_sim' | 'simmer' |
+    'polymarket'); ``entry_price`` is the per-share fill price. Both are used
+    by the paper local-sim engine and the live engine to keep P&L honest.
+    """
     with get_conn() as conn:
-        conn.execute(
+        cur = conn.execute(
             """INSERT INTO trades (bot_name, market_id, market_question, side, amount,
-               confidence, reasoning, trade_features, venue, mode, trade_id, shares_bought)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               confidence, reasoning, trade_features, venue, mode, trade_id,
+               shares_bought, fill_source, entry_price)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (bot_name, market_id, market_question, side, amount,
              confidence, reasoning,
              json.dumps(trade_features) if trade_features else None,
-             venue, mode, trade_id, shares_bought)
+             venue, mode, trade_id, shares_bought, fill_source, entry_price)
         )
+        return cur.lastrowid
 
 
 def resolve_trade(internal_id, outcome, pnl):
@@ -322,41 +394,44 @@ def get_bot_daily_loss(bot_name, mode="paper"):
 
 def get_dashboard_stats():
     with get_conn() as conn:
-        today = datetime.utcnow().strftime("%Y-%m-%d")
-        week_ago = (datetime.utcnow() - timedelta(days=7)).isoformat()
+        # ET-anchored day boundaries: "Today" rolls over at 00:00 ET (not
+        # 00:00 UTC), and "This Week" spans the last 7 ET days. created_at is
+        # stored UTC, so we compare it against UTC strings that represent the
+        # ET midnight boundaries. "Current Session" spans since the arena last
+        # booted (session_start written to arena_state on startup) — which may
+        # be shorter or longer than a calendar day; it is omitted when no
+        # session has been recorded (e.g. arena never started this DB).
+        today_start = et_day_start_utc(0)
+        week_start = et_day_start_utc(6)
+        session_start = get_arena_state("session_start")
 
-        # Include every trade in the stats so the Overview panel matches what
-        # the bot cards in the Bots tab and the Recent Trades table show.
-        # Pending (outcome IS NULL) trades count toward the trade total;
-        # 1h-stale-expired trades (outcome='expired', pnl=0) also count since
-        # they are real paper trades that Simmer simply could not resolve in
-        # time. P&L sums and win/loss counts are unchanged either way — 0
-        # values contribute neither profit nor to win/loss buckets.
-        today_stats = conn.execute("""
-            SELECT COUNT(*) as trades, COALESCE(SUM(pnl), 0) as pnl,
-                   SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) as wins,
-                   SUM(CASE WHEN pnl < 0 AND outcome IS NOT NULL THEN 1 ELSE 0 END) as losses
-            FROM trades WHERE date(created_at)=?
-        """, (today,)).fetchone()
-
-        week_stats = conn.execute("""
-            SELECT COUNT(*) as trades, COALESCE(SUM(pnl), 0) as pnl,
-                   SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) as wins,
-                   SUM(CASE WHEN pnl < 0 AND outcome IS NOT NULL THEN 1 ELSE 0 END) as losses
-            FROM trades WHERE created_at>=?
-        """, (week_ago,)).fetchone()
-
-        all_stats = conn.execute("""
-            SELECT COUNT(*) as trades, COALESCE(SUM(pnl), 0) as pnl,
-                   SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) as wins,
-                   SUM(CASE WHEN pnl < 0 AND outcome IS NOT NULL THEN 1 ELSE 0 END) as losses
-            FROM trades
-        """).fetchone()
+        # `trades` counts only RESOLVED trades (win/loss/expired); `pending`
+        # (outcome IS NULL) is reported separately so the dashboard can render
+        # e.g. "229 +2". 1h-stale-expired trades (outcome='expired', pnl=0)
+        # count as resolved — they are real paper trades Simmer could not
+        # settle in time, contributing 0 to P&L and to neither win nor loss.
+        def _period(since):
+            clause = "WHERE created_at>=?" if since else ""
+            params = (since,) if since else ()
+            row = conn.execute(f"""
+                SELECT
+                    SUM(CASE WHEN outcome IS NOT NULL THEN 1 ELSE 0 END) as trades,
+                    SUM(CASE WHEN outcome IS NULL THEN 1 ELSE 0 END) as pending,
+                    COALESCE(SUM(pnl), 0) as pnl,
+                    SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) as wins,
+                    SUM(CASE WHEN pnl < 0 AND outcome IS NOT NULL THEN 1 ELSE 0 END) as losses
+                FROM trades {clause}
+            """, params).fetchone()
+            d = dict(row)
+            for k in ("trades", "pending", "wins", "losses"):
+                d[k] = d[k] or 0
+            return d
 
         return {
-            "today": dict(today_stats),
-            "week": dict(week_stats),
-            "all_time": dict(all_stats),
+            "session": _period(session_start) if session_start else None,
+            "today": _period(today_start),
+            "week": _period(week_start),
+            "all_time": _period(None),
         }
 
 

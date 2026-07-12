@@ -842,6 +842,14 @@ def main_loop(bots):
     trader.set_bots(bots)
     trader.start()
 
+    # Mark the start of this session so the dashboard's "Current Session"
+    # performance row can scope stats to trades placed since this boot.
+    # Stored in the same UTC "%Y-%m-%d %H:%M:%S" format as trades.created_at
+    # so a plain string comparison (created_at >= session_start) works.
+    db.set_arena_state(
+        "session_start", datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    )
+
     logger.info(
         f"Arena started with {len(bots)} bots in {config.get_current_mode()} mode"
     )
