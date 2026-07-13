@@ -731,6 +731,9 @@ function updateEarnings(data) {
 }
 
 let activeMarkets = { current: null, next: null };
+// Fresh YES/NO prices keyed by market id (updated by the 1s/10s pollers). Keeping
+// prices out of the market objects avoids stale-reference races on re-fetch.
+let livePrices = {};
 
 function renderMarketCard(market, bodyId, kind) {
     const body = document.getElementById(bodyId);
@@ -764,11 +767,14 @@ function renderMarketCard(market, bodyId, kind) {
         }
     }
 
-    // Prices shown in cents like Polymarket (YES + NO). NO falls back to the
-    // complement of YES when the Down book is momentarily empty.
-    const yesC = market.current_price != null ? Math.round(market.current_price * 100) : null;
-    const noC = market.no_price != null ? Math.round(market.no_price * 100)
-              : (yesC != null ? 100 - yesC : null);
+    // Prices shown in cents like Polymarket (YES + NO). Read from the livePrices
+    // map (keyed by market id, updated by the 1s poller) so a stale market-object
+    // reference from an in-flight re-fetch can't render the wrong window's price.
+    const lp = livePrices[market.id] || {};
+    const yes = lp.yes != null ? lp.yes : market.current_price;
+    const no = lp.no != null ? lp.no : market.no_price;
+    const yesC = yes != null ? Math.round(yes * 100) : null;
+    const noC = no != null ? Math.round(no * 100) : (yesC != null ? 100 - yesC : null);
     const priceHtml = yesC != null
         ? `<span class="mkt-yes">YES ${yesC}&cent;</span> &nbsp; <span class="mkt-no">NO ${noC}&cent;</span>`
         : '-';
@@ -804,6 +810,14 @@ async function fetchMarkets() {
         activeMarkets = (data && !data.error)
             ? { current: data.current, next: data.next }
             : { current: null, next: null };
+        // Seed livePrices from the (already-fresh) market payload, and drop
+        // entries for windows that are no longer current/next.
+        const keep = {};
+        for (const m of [activeMarkets.current, activeMarkets.next]) {
+            if (m && m.id) keep[m.id] = livePrices[m.id]
+                || { yes: m.current_price, no: m.no_price };
+        }
+        livePrices = keep;
     } catch(e) { activeMarkets = { current: null, next: null }; }
 }
 
@@ -922,50 +936,44 @@ async function refresh() {
 
 // --- Live market-card refresh (independent of the 10s heavy refresh) ---
 
-// Poll the current market's YES/NO prices every 1s; refresh the whole card set
-// on rollover so the swap is seamless.
-async function pollPrice(market, bodyId, kind) {
-    if (!market || !market.id) return;
+// Fetch fresh YES/NO for a market id into livePrices (keyed by id, so it can't
+// bleed into a different window's card), then re-render both cards.
+async function pollPriceById(marketId) {
+    if (!marketId) return;
     try {
-        const p = await fetchJSON('/api/price/' + market.id);
-        if (p.yes != null) market.current_price = p.yes;
-        if (p.no != null) market.no_price = p.no;
+        const p = await fetchJSON('/api/price/' + marketId);
+        if (p.yes != null || p.no != null) {
+            livePrices[marketId] = { yes: p.yes, no: p.no };
+        }
     } catch (e) { /* transient — keep last price */ }
-    renderMarketCard(market, bodyId, kind);
+    updateMarketCards();
 }
 
-let _lastCurrentId = null;
-async function tickMarketCards() {
-    updateMarketCards();  // ticks countdowns every second
+async function tickCurrent() {
+    updateMarketCards();  // countdown ticks every second
     const cur = activeMarkets.current;
-    // Seamless turnover: when the live window closes (or the id changed),
-    // immediately re-pull the market list instead of waiting for the 3s poll.
-    const curId = cur && cur.id;
+    // Seamless turnover: the instant the live window closes, re-pull the list.
     const secLeft = cur && cur.resolves_at
         ? Math.floor((new Date(String(cur.resolves_at).replace(' ', 'T').replace(/([^Z])$/, '$1Z')).getTime() - Date.now()) / 1000)
         : null;
-    if (curId !== _lastCurrentId) _lastCurrentId = curId;
-    if (secLeft !== null && secLeft <= 0) { await fetchMarkets(); updateMarketCards(); }
-    // 1s fresh price for the current market.
-    await pollPrice(activeMarkets.current, 'current-market-body', 'current');
+    if (secLeft !== null && secLeft <= 0) { await fetchMarkets(); }
+    await pollPriceById(activeMarkets.current && activeMarkets.current.id);
 }
 
 let _nextPriceCounter = 0;
-async function tickNextPrice() {
-    // Next market prices every 10s (less critical than the live window).
+async function tickNext() {
     if ((_nextPriceCounter++ % 10) === 0) {
-        await pollPrice(activeMarkets.next, 'next-market-body', 'next');
+        await pollPriceById(activeMarkets.next && activeMarkets.next.id);
     }
 }
 
 refresh();
 setInterval(refresh, 10000);
 // Market list re-pull every 3s keeps current/next turnover snappy.
-setInterval(async () => { await fetchMarkets(); updateMarketCards(); }, 3000);
-// Countdown tick + 1s current-market price.
-setInterval(tickMarketCards, 1000);
-// Next-market price every ~10s.
-setInterval(tickNextPrice, 1000);
+setInterval(fetchMarkets, 3000);
+// 1s: countdown + fresh current-market price. 10s: next-market price.
+setInterval(tickCurrent, 1000);
+setInterval(tickNext, 1000);
 </script>
 </body>
 </html>

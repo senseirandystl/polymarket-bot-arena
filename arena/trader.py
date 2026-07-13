@@ -29,6 +29,7 @@ import threading
 from datetime import datetime, timezone
 
 import db
+import polymarket_markets
 from bots.base_bot import BaseBot
 from config import TRADE_LOOP_INTERVAL_SEC
 from arena.market_utils import compute_time_remaining_seconds
@@ -90,16 +91,19 @@ class Trader(threading.Thread):
             market["time_remaining_seconds"] = compute_time_remaining_seconds(
                 market, datetime.now(timezone.utc)
             )
-        # Per the user's "swap only on actual rollover" policy: stop
-        # trading the moment the current market's residual drops below
-        # 1 s.  No speculative hop to the next window — that trade is
-        # bounded by the live market only.
+        # Stop trading the moment the current market's residual drops below 1s.
         if market is None or market.get("time_remaining_seconds", 0) < 1:
             return
 
         market_id = market.get("id") or market.get("market_id")
         if not market_id:
             return
+
+        # FRESH price every tick: the discovery snapshot's price is up to
+        # DISCOVERY_INTERVAL_SEC old, but bots re-evaluate every second, so pull
+        # the live CLOB midpoint now. Best-effort — keep the snapshot price if
+        # the fetch fails so a transient blip doesn't stall evaluation.
+        polymarket_markets.refresh_price(market)
 
         with self._bots_lock:
             bots = list(self._bots)
@@ -114,28 +118,23 @@ class Trader(threading.Thread):
         new_trades = 0
         for bot in bots:
             key = (bot.name, market_id)
+            # Once a bot has an open position on this market it's done for the
+            # window; otherwise it RE-EVALUATES every tick (a skip is not sticky)
+            # so it enters the moment its edge appears mid-window.
             if self._state.is_traded(key):
                 continue
             try:
                 signal = bot.make_decision(market, combined_signals)
                 if signal.get("action") == "skip":
-                    self._state.mark_traded(key)
-                    bot_mode = db.get_bot_mode(bot.name)
-                    if bot_mode == "live":
-                        logger.info(
-                            f"[{bot.name}] SKIP "
-                            f"price={market.get('current_price', 0):.3f} | "
-                            f"{signal.get('reasoning', '')}"
-                        )
-                    else:
-                        logger.debug(
-                            f"[{bot.name}] skip | {signal.get('reasoning', '')}"
-                        )
+                    # Do NOT mark traded — re-evaluate next tick.
+                    logger.debug(
+                        f"[{bot.name}] skip | {signal.get('reasoning', '')}"
+                    )
                     continue
 
                 result = bot.execute(signal, market)
-                self._state.mark_traded(key)
                 if result.get("success"):
+                    self._state.mark_traded(key)  # one position per market
                     new_trades += 1
                     logger.info(
                         f"[{bot.name}] {signal['side'].upper()} "
@@ -144,13 +143,14 @@ class Trader(threading.Thread):
                         f"{market.get('question', '')[:50]}"
                     )
                 else:
-                    logger.warning(
-                        f"[{bot.name}] Trade failed on {market_id}: "
+                    # Transient (no book / bankroll dry) — don't mark, retry
+                    # next tick. Debug-level so a dry pool doesn't spam warnings.
+                    logger.debug(
+                        f"[{bot.name}] trade not placed on {market_id[:12]}…: "
                         f"{result.get('reason')}"
                     )
             except Exception as e:
                 logger.error(f"[{bot.name}] Error on {market_id}: {e}")
-                self._state.mark_traded(key)
 
         if new_trades > 0:
             logger.debug(
