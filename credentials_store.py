@@ -61,22 +61,11 @@ CREDENTIALS_KEY_FILE = Path.home() / ".config/polymarket/arena_fernet.key"
 # After migration these are renamed to `.bak` so the plaintext copy can never
 # silently drift away from the encrypted store.
 LEGACY_SOURCES = [
-    Path.home() / ".config/simmer/credentials.json",
-    Path.home() / ".config/simmer/bot_keys.json",
     Path.home() / ".config/polymarket/credentials.json",
 ]
 
 # Human-readable labels for the dashboard Settings tab + warning banner.
 CREDENTIAL_LABELS = {
-    "simmer_api_key": (
-        "Simmer API key",
-        "Required for any trading (paper or live). Open simmer.markets → "
-        "Settings → Agents to get a key.",
-    ),
-    "simmer_bot_keys": (
-        "Simmer per-bot API keys (JSON)",
-        "Optional. Multi-account mode — one Simmer key per bot (slot_0..slot_3).",
-    ),
     "polymarket_api_key": (
         "Polymarket API key",
         "Live trading only — Polymarket CLOB L2 auth.",
@@ -328,28 +317,6 @@ def _migrate_legacy(store: CredentialsStore) -> bool:
         return False
 
     migrated: dict = {}
-
-    # Simmer single key
-    legacy = Path.home() / ".config/simmer/credentials.json"
-    if legacy.exists():
-        try:
-            with open(legacy, encoding="utf-8") as f:
-                data = json.load(f)
-            if isinstance(data, dict) and data.get("api_key"):
-                migrated["simmer_api_key"] = data["api_key"]
-        except (OSError, json.JSONDecodeError):
-            pass
-
-    # Simmer multi-account bot keys (already a flat dict; serialize to JSON inside the store)
-    legacy = Path.home() / ".config/simmer/bot_keys.json"
-    if legacy.exists():
-        try:
-            with open(legacy, encoding="utf-8") as f:
-                data = json.load(f)
-            if isinstance(data, dict) and data:
-                migrated["simmer_bot_keys"] = json.dumps(data)
-        except (OSError, json.JSONDecodeError):
-            pass
 
     # Polymarket L2 bundle (flattened into separate store fields)
     _migrate_polymarket_bundle(migrated)

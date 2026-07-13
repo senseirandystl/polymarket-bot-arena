@@ -272,7 +272,7 @@ class BaseBot(ABC):
         }
 
     def execute(self, signal: dict, market: dict) -> dict:
-        """Place a trade via Simmer SDK based on the signal."""
+        """Place a trade via the venue engine (paper sim or live Polymarket)."""
         if self._paused:
             logger.info(f"[{self.name}] Paused, skipping trade")
             return {"success": False, "reason": "bot_paused"}
@@ -280,7 +280,6 @@ class BaseBot(ABC):
         # Per-bot mode: fresh read from DB so dashboard toggles take effect immediately
         self.trading_mode = db.get_bot_mode(self.name)
         mode = self.trading_mode
-        venue = "polymarket" if mode == "live" else "simmer"
         # Use per-bot mode for position limits (global config.TRADING_MODE is always "paper")
         max_pos = config.LIVE_MAX_POSITION if mode == "live" else config.PAPER_MAX_POSITION
 

@@ -59,11 +59,9 @@ from bots.bot_sniper import SniperBot
 from bots.bot_phantom import PhantomBot
 from bots.bot_late_window_maker import LateWindowMakerBot
 from bots.bot_fee_zone_maker import FeeZoneMakerBot
-from bots.bot_copy import CopyBot
 from signals.price_feed import get_feed as get_price_feed
 from signals.sentiment import get_feed as get_sentiment_feed
 from signals.polymarket_prices import get_feed as get_pm_price_feed
-from signals.wallet_monitor import WalletMonitor
 
 from arena.discovery import MarketDiscovery
 from arena.trader import Trader
@@ -258,13 +256,6 @@ def run_evolution(bots, cycle_number):
         parent = random.choice(winners)
         evolved = create_evolved_bot(parent, dead_bot.strategy_type, cycle_number)
 
-        if hasattr(dead_bot, "_api_key_slot"):
-            evolved._api_key_slot = dead_bot._api_key_slot
-            logger.info(
-                f"  {evolved.name} inherits slot {dead_bot._api_key_slot} "
-                f"from {dead_bot.name}"
-            )
-
         if not _validate_bot(evolved):
             logger.warning(
                 f"  {evolved.name} failed validation, recreating with pure defaults"
@@ -292,8 +283,6 @@ def run_evolution(bots, cycle_number):
                 generation=cycle_number,
                 lineage=f"{parent.name} -> fallback",
             )
-            if hasattr(dead_bot, "_api_key_slot"):
-                evolved._api_key_slot = dead_bot._api_key_slot
 
         db.retire_bot(dead_bot.name)
         db.save_bot_config(
@@ -316,73 +305,12 @@ def run_evolution(bots, cycle_number):
     )
 
     for bot in new_bots:
-        slot = getattr(bot, "_api_key_slot", None)
         logger.info(
             f"  Post-evolution: {bot.name} ({bot.strategy_type}) "
-            f"slot={slot} params_keys={list(bot.strategy_params.keys())}"
+            f"params_keys={list(bot.strategy_params.keys())}"
         )
 
     return new_bots
-
-
-# ----------------------------------------------------------------------
-# Credentials / slot assignment
-# ----------------------------------------------------------------------
-
-def load_api_key() -> str:
-    """Read the Simmer default key from the encrypted credentials store."""
-    return config.get_credential("simmer_api_key")
-
-
-def load_bot_keys() -> dict:
-    """Read the per-bot bot_keys map from the encrypted credentials store."""
-    raw = config.get_credential("simmer_bot_keys")
-    if not raw:
-        return {}
-    try:
-        return json.loads(raw)
-    except (json.JSONDecodeError, TypeError):
-        return {}
-
-
-def assign_bot_slots(bots, bot_keys: dict, default_key: str) -> None:
-    """Assign each bot to a Simmer account slot (slot_0..slot_3).
-
-    Bots that already carry a ``_api_key_slot`` (from evolution inheritance
-    or a previous run) keep it; remaining bots grab the next free slot.
-    Surfaces a clear warning if no key was configured anywhere.
-    """
-    all_slots = ["slot_0", "slot_1", "slot_2", "slot_3"]
-
-    used_slots = {
-        bot._api_key_slot for bot in bots
-        if getattr(bot, "_api_key_slot", None)
-    }
-    free_slots = [s for s in all_slots if s not in used_slots]
-    for bot in bots:
-        if not getattr(bot, "_api_key_slot", None):
-            if free_slots:
-                bot._api_key_slot = free_slots.pop(0)
-            else:
-                bot._api_key_slot = all_slots[0]
-
-    if not default_key and not bot_keys:
-        logger.warning(
-            "No Simmer credentials configured -- bots have no keys and "
-            "cannot trade."
-        )
-        logger.warning("Open the dashboard Settings tab to enter your Simmer API key.")
-        return
-
-    for bot in bots:
-        key = bot_keys.get(bot._api_key_slot, default_key)
-        if key:
-            logger.info(f"  {bot.name} -> {bot._api_key_slot} (key: ...{key[-8:]})")
-        else:
-            logger.warning(
-                f"  {bot.name} -> {bot._api_key_slot} "
-                "(NO KEY ASSIGNED -- bot will not trade)"
-            )
 
 
 # ----------------------------------------------------------------------
@@ -404,46 +332,6 @@ def _create_maker_bots() -> list:
             )
             logger.info(f"Registered maker bot: {bot.name} ({bot.strategy_type})")
     return maker_bots
-
-
-def _create_copy_bots() -> list:
-    """Instantiate copy-trade bots from the DB whitelist."""
-    with db.get_conn() as conn:
-        rows = conn.execute(
-            "SELECT address, label, trading_mode FROM copytrading_wallets "
-            "WHERE active=1"
-        ).fetchall()
-
-    bots = []
-    for r in rows:
-        mode = "paper"
-        try:
-            mode = r["trading_mode"] or "paper"
-        except (IndexError, KeyError):
-            pass
-        bot = CopyBot(
-            wallet_address=r["address"],
-            label=r["label"] or r["address"][:16],
-            mode=mode,
-            max_size=5.0,
-            size_fraction=0.10,
-        )
-        bots.append(bot)
-        logger.info(
-            f"Copy bot: [{bot.label}] wallet={r['address'][:16]}... mode={mode}"
-        )
-    return bots
-
-
-def _start_wallet_monitors(copy_bots: list) -> None:
-    """Attach a real-time WalletMonitor to each copy bot and start it."""
-    for bot in copy_bots:
-        try:
-            monitor = WalletMonitor(bot.wallet, label=bot.label)
-            bot.attach_monitor(monitor)
-            monitor.start()
-        except Exception as e:
-            logger.warning(f"WalletMonitor start failed for {bot.label}: {e}")
 
 
 def _make_secondary_hook(maker_bots, copy_bots, signal_feeds, state):
@@ -508,7 +396,6 @@ def _publish_maker_state(discovery, maker_targets):
 
 def _run_secondary_bots(discovery, maker_bots, copy_bots, signal_feeds, state):
     """Maker section + copy bots, all once per discovery cycle."""
-    api_key = config.get_credential("simmer_api_key")
     all_markets = discovery.all_markets_snapshot()
     maker_targets = discovery.maker_target_markets_snapshot()
 
@@ -550,25 +437,7 @@ def _run_secondary_bots(discovery, maker_bots, copy_bots, signal_feeds, state):
                     f"placed {maker_trades} paper trade(s) this cycle"
                 )
 
-    # --- Copy bots: scan every BTC up/down market the discovery surfaced. ---
-    if copy_bots:
-        copy_markets_by_token: dict = {}
-        for m in all_markets:
-            yt = m.get("polymarket_token_id")
-            nt = m.get("polymarket_no_token_id")
-            if yt:
-                copy_markets_by_token[yt] = m
-            if nt:
-                copy_markets_by_token[nt] = m
-        for cb in copy_bots:
-            try:
-                n = cb.check_and_copy(copy_markets_by_token, api_key)
-                if n > 0:
-                    logger.info(
-                        f"Copy bot [{cb.label}]: mirrored {n} trades this cycle"
-                    )
-            except Exception as e:
-                logger.error(f"Copy bot [{cb.label}] error: {e}")
+    # Copy bots are disabled (Simmer removed) — _create_copy_bots returns [].
 
 
 def _run_maker_section(maker_bot, market: dict, signals: dict, state) -> bool:
@@ -670,9 +539,6 @@ def _evolution_check_loop(bots, state, pos_monitor, trader):
                 db.set_arena_state("last_evolution_time", str(last_evolution))
 
                 state.reset()
-                api_key = config.get_credential("simmer_api_key")
-                bot_keys = load_bot_keys()
-                assign_bot_slots(bots, bot_keys, api_key)
                 trader.set_bots(bots)
                 pos_monitor.update_bots(bots)
         except Exception as e:
@@ -805,10 +671,7 @@ def main_loop(bots):
     )
 
     maker_bots = _create_maker_bots()
-    copy_bots = _create_copy_bots()
-    if copy_bots:
-        logger.info(f"Copy bots: {[b.label for b in copy_bots]}")
-        _start_wallet_monitors(copy_bots)
+    copy_bots = []  # Copy-trading was Simmer-based and has been removed.
     logger.info(
         f"Maker bots (experimental, paper-only): {[b.name for b in maker_bots]}"
     )
@@ -868,7 +731,6 @@ def main() -> None:
         "--mode", choices=["paper", "live"], default=None,
         help="Trading mode (default: from config)",
     )
-    parser.add_argument("--setup", action="store_true", help="Run setup verification first")
     args = parser.parse_args()
 
     if args.mode:
@@ -892,27 +754,6 @@ def main() -> None:
                 sys.exit(0)
         config.set_trading_mode(args.mode)
         logger.info(f"Trading mode set to: {args.mode}")
-
-    if args.setup:
-        import setup
-        if not setup.main():
-            sys.exit(1)
-
-    api_key = config.get_credential("simmer_api_key")
-    if not api_key:
-        logger.warning("=" * 80)
-        logger.warning("NO SIMMER API KEY CONFIGURED")
-        logger.warning(
-            "The bot arena will start, but bots will NOT trade until "
-            "you enter a Simmer API key. Open the dashboard:"
-        )
-        logger.warning(
-            f"    http://localhost:{config.DASHBOARD_PORT}/  "
-            "(HTTP-Basic admin / Thor)"
-        )
-        logger.warning("Use the Settings tab to enter your Simmer API key.")
-        logger.warning("=" * 80)
-        logger.info("Continuing in monitoring-only mode. Will retry each cycle.")
 
     bots = create_default_bots()
 

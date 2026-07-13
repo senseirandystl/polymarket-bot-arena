@@ -23,21 +23,9 @@ from credentials_store import (
 # Trading Mode: "paper" (default, uses $SIM) or "live" (real USDC)
 TRADING_MODE = "paper"  # MUST start in paper mode
 
-# Simmer API Configuration
-# Legacy plaintext location — kept as a documentation breadcrumb only.
-# The active source of truth is the encrypted credentials store
-# (CREDENTIALS_FILE above). Use `config.get_credential("simmer_api_key")`.
-SIMMER_API_KEY_PATH = Path.home() / ".config/simmer/simmer_api_key.json"
-SIMMER_BASE_URL = "https://api.simmer.markets"
-
-# Multi-agent: each bot gets its own Simmer account for independent trading
-# Keys are mapped bot_name -> api_key. Falls back to the default key.
-# Legacy plaintext location — see SIMMER_API_KEY_PATH note above.
-SIMMER_BOT_KEYS_PATH = Path.home() / ".config/simmer/bot_keys.json"
-
-# Polymarket Direct CLOB (live trading + all market data)
-# Legacy plaintext location — see SIMMER_API_KEY_PATH note above. Reads in
-# the codebase now go through the encrypted store.
+# Polymarket Direct CLOB (live trading + all market data).
+# Legacy plaintext location — the active source of truth is the encrypted
+# credentials store (CREDENTIALS_FILE above); reads go through get_credential().
 POLYMARKET_KEY_PATH = Path.home() / ".config/polymarket/credentials.json"
 POLYMARKET_HOST = "https://clob.polymarket.com"
 POLYMARKET_GAMMA_URL = "https://gamma-api.polymarket.com"  # discovery + resolution
@@ -179,8 +167,8 @@ def get_max_daily_loss_total():
 
 
 def get_venue():
-    """Get trading venue based on current mode"""
-    return "polymarket" if TRADING_MODE == "live" else "simmer"
+    """Trading venue — always Polymarket now (paper simulates against its books)."""
+    return "polymarket"
 
 
 def set_trading_mode(mode: str):

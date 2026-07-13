@@ -1,11 +1,10 @@
 """Position monitor thread — 0.5s SL/TP exit engine for bots that carry
 an ``exit_strategy``.
 
-Extracted verbatim from the old monolithic ``arena.py``.  Behaviour is
-unchanged: poll Simmer for active-market prices every 0.5s, look at each
-bot's open positions, exit at the configured stop-loss / take-profit
-threshold, write outcome=exit_sl / exit_tp on the trade row, and feed
-the outcome back into the learning system.
+Polls the Polymarket CLOB for the prices of markets where bots hold open
+positions (throttled), looks at each bot's open positions, exits at the
+configured stop-loss / take-profit threshold, writes outcome=exit_sl / exit_tp
+on the trade row, and feeds the outcome back into the learning system.
 
 Kept separate from the ``Trader`` (1s) and ``TradeResolver`` (60s)
 threads so the SL/TP engine can stay hard-realtime without slowing
