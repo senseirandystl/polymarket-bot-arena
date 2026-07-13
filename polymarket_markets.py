@@ -167,65 +167,89 @@ def midpoint(book: dict):
     return ask if ask is not None else bid
 
 
-def current_prices(condition_id: str):
-    """Fresh ``{"yes": up_price, "no": down_price}`` for a market, or ``None``.
+# condition_id -> (up_token_id, down_token_id). Token ids are stable per market,
+# so we resolve them once and cache to avoid a /markets call on every price tick.
+_TOKEN_CACHE: dict = {}
 
-    One CLOB ``/markets/{cond}`` call returns both token midpoints — used by the
-    dashboard to tick the Current/Next market prices without walking two books.
-    """
+
+def _token_ids(condition_id: str):
+    """Return ``(up_token, down_token)`` for a market, cached. ``(None, None)``
+    on failure."""
+    if condition_id in _TOKEN_CACHE:
+        return _TOKEN_CACHE[condition_id]
+    up = down = None
     try:
         resp = requests.get(f"{CLOB}/markets/{condition_id}", timeout=10)
+        if resp.status_code == 200:
+            for t in resp.json().get("tokens", []) or []:
+                oc = str(t.get("outcome", "")).lower()
+                if oc == "up":
+                    up = t.get("token_id")
+                elif oc == "down":
+                    down = t.get("token_id")
+    except Exception as e:
+        logger.debug(f"_token_ids failed for {str(condition_id)[:12]}…: {e}")
+    if up:
+        _TOKEN_CACHE[condition_id] = (up, down)
+    return (up, down)
+
+
+def midpoint_price(token_id: str):
+    """Live CLOB midpoint for a token, or ``None``.
+
+    IMPORTANT: uses the ``/midpoint`` endpoint, which tracks the live order book.
+    The ``/markets/{cond}`` ``tokens[].price`` field is a STALE reference (it
+    sticks near 0.50 and never updates) — do NOT use it for pricing.
+    """
+    if not token_id:
+        return None
+    try:
+        resp = requests.get(f"{CLOB}/midpoint", params={"token_id": token_id}, timeout=10)
         if resp.status_code != 200:
             return None
-        out = {}
-        for t in resp.json().get("tokens", []) or []:
-            oc = str(t.get("outcome", "")).lower()
-            p = t.get("price")
-            if p is None:
-                continue
-            if oc == "up":
-                out["yes"] = float(p)
-            elif oc == "down":
-                out["no"] = float(p)
-        return out or None
+        mid = resp.json().get("mid")
+        return float(mid) if mid is not None else None
     except Exception as e:
-        logger.debug(f"current_prices failed for {str(condition_id)[:12]}…: {e}")
+        logger.debug(f"midpoint_price failed for {str(token_id)[:12]}…: {e}")
         return None
 
 
-def current_up_price(condition_id: str):
-    """Current Up-token (YES) mid price for a market, or ``None``.
+def current_prices(condition_id: str):
+    """Fresh ``{"yes": up_mid, "no": down_mid}`` for a market, or ``None``.
 
-    Reads the CLOB ``/markets/{condition_id}`` token list (``tokens[].price``
-    is the live midpoint). Cheap single call keyed by condition id — used by the
-    position monitor to price open positions for stop-loss / take-profit exits.
+    Uses the live ``/midpoint`` for each token; ``no`` falls back to ``1 - yes``
+    if the Down book is momentarily empty.
     """
-    try:
-        resp = requests.get(f"{CLOB}/markets/{condition_id}", timeout=10)
-        if resp.status_code != 200:
-            return None
-        for t in resp.json().get("tokens", []) or []:
-            if str(t.get("outcome", "")).lower() == "up":
-                p = t.get("price")
-                return float(p) if p is not None else None
-    except Exception as e:
-        logger.debug(f"current_up_price failed for {str(condition_id)[:12]}…: {e}")
-    return None
+    up, down = _token_ids(condition_id)
+    yes = midpoint_price(up)
+    if yes is None:
+        return None
+    no = midpoint_price(down) if down else None
+    if no is None:
+        no = round(1.0 - yes, 4)
+    return {"yes": yes, "no": no}
+
+
+def current_up_price(condition_id: str):
+    """Live Up-token (YES) midpoint for a market, or ``None``.
+
+    Used by the position monitor to price open positions for SL/TP exits.
+    """
+    up, _ = _token_ids(condition_id)
+    return midpoint_price(up)
 
 
 def refresh_price(market: dict) -> dict:
-    """Set ``current_price`` on ``market`` to the fresh YES/Up price. Returns it.
+    """Set ``current_price`` on ``market`` to the fresh YES/Up midpoint.
 
-    Prefers the CLOB ``/markets/{cond}`` token midpoint (stable even when the
-    order book is thin/one-sided near resolution); falls back to the order-book
-    mid only if that's unavailable. ``current_price`` is the probability the
-    signal stack keys off, so a bad value means bad decisions — hence the more
-    robust source. Leaves ``current_price`` as-is if neither source responds.
+    Uses the live ``/midpoint`` endpoint (the ``tokens[].price`` field is stale);
+    falls back to the order-book mid only if ``/midpoint`` is unavailable. Leaves
+    ``current_price`` untouched if neither source responds.
     """
-    cond = market.get("condition_id") or market.get("id")
-    yes = current_up_price(cond) if cond else None
+    tok = market.get("polymarket_token_id")
+    yes = midpoint_price(tok)
     if yes is None:
-        book = get_order_book(market.get("polymarket_token_id"))
+        book = get_order_book(tok)
         yes = midpoint(book) if book.get("valid") else None
     if yes is not None:
         market["current_price"] = yes
