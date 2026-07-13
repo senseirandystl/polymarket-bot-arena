@@ -72,7 +72,9 @@ td { padding: 6px 4px; border-bottom: 1px solid #21262d; }
 .mkt-countdown.urgent .val { color: #f85149; }
 .mkt-countdown.warning .val { color: #f0883e; }
 .mkt-countdown.normal .val { color: #3fb950; }
-.mkt-price { color: #8b949e; font-size: 12px; margin-top: 6px; }
+.mkt-price { color: #8b949e; font-size: 13px; margin-top: 6px; font-weight: 600; }
+.mkt-yes { color: #3fb950; }
+.mkt-no { color: #f85149; }
 .mkt-trades { margin-top: 12px; border-top: 1px solid #21262d; padding-top: 8px; }
 .mkt-trades-title { color: #8b949e; font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 6px; }
 .mkt-trade { display: flex; justify-content: space-between; gap: 8px; font-size: 12px; padding: 3px 0; }
@@ -762,7 +764,14 @@ function renderMarketCard(market, bodyId, kind) {
         }
     }
 
-    const price = market.current_price != null ? (market.current_price * 100).toFixed(1) + '%' : '-';
+    // Prices shown in cents like Polymarket (YES + NO). NO falls back to the
+    // complement of YES when the Down book is momentarily empty.
+    const yesC = market.current_price != null ? Math.round(market.current_price * 100) : null;
+    const noC = market.no_price != null ? Math.round(market.no_price * 100)
+              : (yesC != null ? 100 - yesC : null);
+    const priceHtml = yesC != null
+        ? `<span class="mkt-yes">YES ${yesC}&cent;</span> &nbsp; <span class="mkt-no">NO ${noC}&cent;</span>`
+        : '-';
     const trades = market.trades || [];
     const tradeRows = trades.length
         ? trades.map(t => `
@@ -777,7 +786,7 @@ function renderMarketCard(market, bodyId, kind) {
             <div class="mkt-q">${shortQ}</div>
             <div class="mkt-countdown ${cls}"><span class="lbl">${label}</span><span class="val">${val}</span></div>
         </div>
-        <div class="mkt-price">YES ${price}</div>
+        <div class="mkt-price">${priceHtml}</div>
         <div class="mkt-trades">
             <div class="mkt-trades-title">Trades placed (${trades.length})</div>
             ${tradeRows}
@@ -911,11 +920,52 @@ async function refresh() {
     updateMarketCards();
 }
 
+// --- Live market-card refresh (independent of the 10s heavy refresh) ---
+
+// Poll the current market's YES/NO prices every 1s; refresh the whole card set
+// on rollover so the swap is seamless.
+async function pollPrice(market, bodyId, kind) {
+    if (!market || !market.id) return;
+    try {
+        const p = await fetchJSON('/api/price/' + market.id);
+        if (p.yes != null) market.current_price = p.yes;
+        if (p.no != null) market.no_price = p.no;
+    } catch (e) { /* transient — keep last price */ }
+    renderMarketCard(market, bodyId, kind);
+}
+
+let _lastCurrentId = null;
+async function tickMarketCards() {
+    updateMarketCards();  // ticks countdowns every second
+    const cur = activeMarkets.current;
+    // Seamless turnover: when the live window closes (or the id changed),
+    // immediately re-pull the market list instead of waiting for the 3s poll.
+    const curId = cur && cur.id;
+    const secLeft = cur && cur.resolves_at
+        ? Math.floor((new Date(String(cur.resolves_at).replace(' ', 'T').replace(/([^Z])$/, '$1Z')).getTime() - Date.now()) / 1000)
+        : null;
+    if (curId !== _lastCurrentId) _lastCurrentId = curId;
+    if (secLeft !== null && secLeft <= 0) { await fetchMarkets(); updateMarketCards(); }
+    // 1s fresh price for the current market.
+    await pollPrice(activeMarkets.current, 'current-market-body', 'current');
+}
+
+let _nextPriceCounter = 0;
+async function tickNextPrice() {
+    // Next market prices every 10s (less critical than the live window).
+    if ((_nextPriceCounter++ % 10) === 0) {
+        await pollPrice(activeMarkets.next, 'next-market-body', 'next');
+    }
+}
+
 refresh();
 setInterval(refresh, 10000);
-// Re-render the market cards every second so the countdowns tick smoothly
-// between the 10s data refreshes.
-setInterval(updateMarketCards, 1000);
+// Market list re-pull every 3s keeps current/next turnover snappy.
+setInterval(async () => { await fetchMarkets(); updateMarketCards(); }, 3000);
+// Countdown tick + 1s current-market price.
+setInterval(tickMarketCards, 1000);
+// Next-market price every ~10s.
+setInterval(tickNextPrice, 1000);
 </script>
 </body>
 </html>

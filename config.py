@@ -119,10 +119,20 @@ DASHBOARD_HOST = "0.0.0.0"
 #   - trader    : zero network calls per tick (1s) except on bot.execute
 #   - resolver  : 1 HTTPS call every 60s
 #   - pos monitor: 0.5s SL/TP exit loop (hard-realtime; see arena/position_monitor.py)
-DISCOVERY_INTERVAL_SEC = 60       # market discovery + orderflow refresh
+DISCOVERY_INTERVAL_SEC = 20       # Gamma discovery + CLOB price refresh. 5-min
+                                  # windows roll every 300s; 20s keeps the
+                                  # current/next selection fresh and turnover
+                                  # snappy without hammering the API.
 TRADE_LOOP_INTERVAL_SEC = 1.0     # bot eval / trade-execution loop
-RESOLVE_INTERVAL_SEC = 60         # trade resolution + stale-trade sweep
-ORDERFLOW_CACHE_SECONDS = 30      # per-market /api/sdk/context refresh window
+RESOLVE_INTERVAL_SEC = 60         # trade resolution (Polymarket closed events)
+ORDERFLOW_CACHE_SECONDS = 30      # (unused since Simmer removal; kept for compat)
+
+# Polymarket enforces a per-order minimum of 5 shares. Bet sizing floors the
+# spend so a trade always clears this (5 shares × price × buffer) — otherwise
+# small-edge bets get rejected 'below_min_size' and never fill.
+POLYMARKET_MIN_SHARES = 5
+# How many BTC 5-min markets to pull per discovery cycle (current + next few).
+POLYMARKET_DISCOVERY_LIMIT = 6
 MAKER_UPCOMING_WINDOW_SEC = 1200  # ≤N seconds in the future the maker section is
                                   # allowed to fall back to (i.e. quote on a
                                   # market whose window hasn't opened yet).

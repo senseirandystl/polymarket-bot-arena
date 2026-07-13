@@ -225,18 +225,24 @@ class MarketDiscovery(threading.Thread):
         if maker_fallback is not None and maker_fallback is not current:
             self._refresh_market_data(maker_fallback)
 
+        prev_id = (self._current_market or {}).get("id")
         with self._lock:
             self._markets_cache = non_expired
             self._current_market = current
             self._maker_fallback_market = maker_fallback
             self._last_scan_ts = time.time()
 
-        logger.info(
-            f"Discovery: {len(markets)} BTC candidates, "
-            f"{len(non_expired)} unexpired, "
-            f"current={'yes' if current else 'no'}, "
-            f"maker_fallback={'yes' if maker_fallback else 'no'}"
+        # Only announce (INFO) when the live window actually rolls over;
+        # otherwise stay at DEBUG so the log isn't flooded every cycle.
+        cur_id = (current or {}).get("id")
+        msg = (
+            f"Discovery: {len(non_expired)} unexpired windows, "
+            f"current={current.get('question', '')[:38] if current else 'none'}"
         )
+        if cur_id != prev_id:
+            logger.info(msg)
+        else:
+            logger.debug(msg)
 
     def _refresh_market_data(self, m: dict) -> None:
         """Set fresh price + orderflow on a selected market from the CLOB book.

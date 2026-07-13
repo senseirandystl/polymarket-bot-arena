@@ -51,7 +51,7 @@ def _as_list(v):
 # ---------------------------------------------------------------------------
 # Discovery
 # ---------------------------------------------------------------------------
-def discover_markets(limit: int = 25) -> list:
+def discover_markets(limit: int = None) -> list:
     """Return normalized BTC 5-min markets for the current + upcoming windows.
 
     Orders by ``endDate`` ascending and filters ``end_date_min=now`` so the
@@ -60,6 +60,8 @@ def discover_markets(limit: int = 25) -> list:
     here (that would mean one book call per market); call :func:`refresh_price`
     on the selected current/next market instead.
     """
+    if limit is None:
+        limit = getattr(config, "POLYMARKET_DISCOVERY_LIMIT", 6)
     now = datetime.now(timezone.utc).isoformat()
     try:
         resp = requests.get(
@@ -165,6 +167,32 @@ def midpoint(book: dict):
     return ask if ask is not None else bid
 
 
+def current_prices(condition_id: str):
+    """Fresh ``{"yes": up_price, "no": down_price}`` for a market, or ``None``.
+
+    One CLOB ``/markets/{cond}`` call returns both token midpoints — used by the
+    dashboard to tick the Current/Next market prices without walking two books.
+    """
+    try:
+        resp = requests.get(f"{CLOB}/markets/{condition_id}", timeout=10)
+        if resp.status_code != 200:
+            return None
+        out = {}
+        for t in resp.json().get("tokens", []) or []:
+            oc = str(t.get("outcome", "")).lower()
+            p = t.get("price")
+            if p is None:
+                continue
+            if oc == "up":
+                out["yes"] = float(p)
+            elif oc == "down":
+                out["no"] = float(p)
+        return out or None
+    except Exception as e:
+        logger.debug(f"current_prices failed for {str(condition_id)[:12]}…: {e}")
+        return None
+
+
 def current_up_price(condition_id: str):
     """Current Up-token (YES) mid price for a market, or ``None``.
 
@@ -186,18 +214,21 @@ def current_up_price(condition_id: str):
 
 
 def refresh_price(market: dict) -> dict:
-    """Set ``current_price`` on ``market`` to the fresh Up-token mid. Returns it.
+    """Set ``current_price`` on ``market`` to the fresh YES/Up price. Returns it.
 
-    ``current_price`` is the YES/Up probability the signal stack keys off, so a
-    stale value means stale decisions — this is called right before each trade
-    validation. Returns the market unchanged (current_price stays None) if the
-    book is unavailable.
+    Prefers the CLOB ``/markets/{cond}`` token midpoint (stable even when the
+    order book is thin/one-sided near resolution); falls back to the order-book
+    mid only if that's unavailable. ``current_price`` is the probability the
+    signal stack keys off, so a bad value means bad decisions — hence the more
+    robust source. Leaves ``current_price`` as-is if neither source responds.
     """
-    book = get_order_book(market.get("polymarket_token_id"))
-    if book.get("valid"):
-        mid = midpoint(book)
-        if mid is not None:
-            market["current_price"] = mid
+    cond = market.get("condition_id") or market.get("id")
+    yes = current_up_price(cond) if cond else None
+    if yes is None:
+        book = get_order_book(market.get("polymarket_token_id"))
+        yes = midpoint(book) if book.get("valid") else None
+    if yes is not None:
+        market["current_price"] = yes
     return market
 
 

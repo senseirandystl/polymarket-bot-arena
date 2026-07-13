@@ -248,6 +248,12 @@ class BaseBot(ABC):
             # Weak edge — small bet (still generates learning data)
             amount = max_pos * 0.03
 
+        # Floor the spend so the fill clears Polymarket's 5-share minimum. A
+        # $1.50 bet buys <5 shares above ~30c and gets rejected 'below_min_size';
+        # size up to 5 shares' worth (× buffer for slippage), capped at max_pos.
+        min_notional = config.POLYMARKET_MIN_SHARES * market_price * 1.15
+        amount = min(max(amount, min_notional), max_pos)
+
         reasoning = (
             f"price={market_price:.2f} edge={price_edge:+.3f} "
             f"mom={momentum_signal:+.3f} pm={pm_momentum_signal:+.3f} "

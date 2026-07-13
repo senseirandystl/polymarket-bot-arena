@@ -221,10 +221,12 @@ async def get_markets():
         if not m:
             return None
         tr = m.get("time_remaining_seconds")
+        yes = m.get("current_price")
         shaped = {
             "id": m.get("id"),
             "question": m.get("question"),
-            "current_price": m.get("current_price"),
+            "current_price": yes,                     # YES/Up (0-1)
+            "no_price": (round(1.0 - yes, 4) if yes is not None else None),
             "resolves_at": m.get("resolves_at"),
             "time_remaining_seconds": tr,
             "is_current_window": tr is not None and 0 < tr <= 300,
@@ -247,6 +249,23 @@ async def get_markets():
         "upcoming_count": len(upcoming_s),
         "upcoming": upcoming_s,
     })
+
+
+@app.get("/api/price/{condition_id}")
+async def get_price(condition_id: str):
+    """Fresh YES/NO prices for one market (fast poll for the market cards)."""
+    import polymarket_markets
+    prices = polymarket_markets.current_prices(condition_id)
+    if not prices:
+        return JSONResponse({"yes": None, "no": None})
+    # Fall back to complement if one side's book is momentarily empty.
+    yes = prices.get("yes")
+    no = prices.get("no")
+    if yes is not None and no is None:
+        no = round(1.0 - yes, 4)
+    if no is not None and yes is None:
+        yes = round(1.0 - no, 4)
+    return JSONResponse({"yes": yes, "no": no})
 
 
 @app.get("/api/maker-status")
