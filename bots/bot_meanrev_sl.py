@@ -1,18 +1,24 @@
-"""Mean Reversion bot with 25% stop-loss.
+"""Mean Reversion bot — formerly a 25% stop-loss variant.
 
-Because downside is capped at 25%, this bot trades more aggressively:
-- Takes 1.5x larger positions (max loss per trade = 37.5% of normal)
-- Trades at lower confidence thresholds (0.03 vs 0.06)
-- Willing to take marginal edges that a normal bot would skip
+Stop-loss removed (2026-07-15 root-cause analysis, spec R3): in fully-resolving
+5-min binary markets a stop-loss is net-harmful — the held-to-resolution
+counterfactual (-150.7) beat stopping (-172.3), because a -25% stop just converts
+intra-window price noise into locked losses. Risk is managed at ENTRY (the edge
+gate), not by exiting mid-window.
+
+With the stop-loss gone, the old 1.5x position oversizing (justified only by the
+capped downside) is also removed — it would otherwise be a full-downside bot
+betting oversized. This bot now holds to resolution like the base mean-rev bot;
+the distinct ``strategy_type`` is retained for DB/evolution continuity.
 """
 
-import config
 from bots.bot_mean_rev import MeanRevBot, DEFAULT_PARAMS
 
 
 class MeanRevSLBot(MeanRevBot):
-    exit_strategy = "stop_loss"
-    stop_loss_pct = 0.25
+    # Hold to resolution — no early stop-loss exit (see module docstring).
+    exit_strategy = None
+    stop_loss_pct = 0.0
 
     def __init__(self, name="meanrev-sl25-v1", params=None, generation=0, lineage=None):
         super().__init__(
@@ -22,20 +28,3 @@ class MeanRevSLBot(MeanRevBot):
             lineage=lineage,
         )
         self.strategy_type = "mean_reversion_sl"
-
-    def make_decision(self, market, signals):
-        """SL bot: scale up position size since downside is capped at 25%.
-
-        Respects all base class logic (two-sided net-edge side selection,
-        symmetric price guards). Only scales up bet size on trades the base logic
-        approves — including NO-side entries.
-        """
-        decision = super().make_decision(market, signals)
-
-        if decision.get("action") == "buy":
-            # Scale up position size — max loss is 25% of position, not 100%
-            amount = decision.get("suggested_amount", 0) * 1.5
-            decision["suggested_amount"] = min(amount, config.get_max_position())
-            decision["reasoning"] += " [SL: 1.5x size, loss capped 25%]"
-
-        return decision

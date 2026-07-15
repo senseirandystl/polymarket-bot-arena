@@ -106,17 +106,33 @@ ARBITRAGE_BOOK_CACHE_SEC = 1.0  # micro-cache on the per-leg book reads (hot pat
 MAX_FILL_SLIPPAGE = 0.03
 
 # --- Order-flow signal weights (base_bot.make_decision) ---
-# OBI (order-book imbalance) and CVD (cumulative volume delta) are the two
-# order-flow reads the research favors over price-history indicators. Each is
-# clamped into the same [-0.15, 0.15] band as the other secondary lanes before
-# being weighted, so these are conservative additive nudges, not overrides.
-SIGNAL_WEIGHT_OBI = 0.10
-SIGNAL_WEIGHT_CVD = 0.10
+# Re-weighted from the 2026-07-15 overnight run (460 directional trades):
+# measured per-signal predictiveness (confirms-side WR vs contradicts-side WR):
+#   CVD  66.9% vs 52.4%  -> the ONE real flow edge      -> weighted up
+#   OBI  58.1% vs 66.7%  -> INVERTED (resting-depth fade) -> zeroed out
+# CVD = executed aggression (predicts); OBI = resting depth (fades). See
+# docs/superpowers/specs/2026-07-15-strategy-rootcause-improvements-design.md.
+SIGNAL_WEIGHT_OBI = 0.0
+SIGNAL_WEIGHT_CVD = 0.25
 
 # --- Two-sided (YES/NO) net-edge side selection ---
 # Favorite-following tilt scale. Replaces the old hard-coded price_edge * 0.50
 # lane weight; 0.5 keeps it numerically identical at aggression == 1.0.
 K_TILT = 0.5
+# Cap on the price_tilt contribution to fair value (probability units). The
+# empirical favorite underpricing is ~flat +4-6c across 55-85c, NOT proportional
+# to distance from 0.5 — an uncapped tilt manufactured fake edge at the extremes
+# (>=75c was break-even yet drew big confident bets). Cap models the real,
+# bounded favorite edge and stops overbetting efficient extremes.
+FAVORITE_EDGE_CAP = 0.06
+# Weight of each strategy's analyze() lean in fair value. Raised 0.15 -> 0.30 so
+# momentum/mean_reversion/sentiment/hybrid express genuinely distinct theses
+# (they fired in only 6.6% of trades at the old weight — all bots were clones).
+STRATEGY_SIGNAL_WEIGHT = 0.30
+# Live learning bias: the raw-YES-WR learner was anti-predictive (-24pp) and
+# double-counted price. Disabled in live decisions (outcomes still recorded)
+# pending the edge-calibrated redesign. See spec R5.
+LEARNING_ENABLED = False
 # Fallback minimum cost-adjusted edge (probability units) to place a trade.
 MIN_EDGE_DEFAULT = 0.02
 # Maps the chosen side's edge -> sizing confidence (~0.10 edge -> 0.45 cap).

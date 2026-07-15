@@ -119,8 +119,14 @@ class BaseBot(ABC):
         fair = yes_mid + price_tilt + alpha, where price_tilt is the
         favorite-following lane ((yes_mid-0.5) * aggression * K_TILT) and alpha
         is the summed secondary lanes. Clamped to [0.02, 0.98].
+
+        price_tilt is capped at +/-FAVORITE_EDGE_CAP: the favorite underpricing
+        is empirically flat (~+5c) across the favorite band, so an uncapped tilt
+        manufactured fake edge at the extremes (see spec R2).
         """
+        cap = config.FAVORITE_EDGE_CAP
         price_tilt = (yes_mid - 0.5) * aggression * config.K_TILT
+        price_tilt = max(-cap, min(cap, price_tilt))
         return max(0.02, min(0.98, yes_mid + price_tilt + alpha))
 
     def _side_net_edges(self, fair_yes: float, yes_price: float,
@@ -204,7 +210,14 @@ class BaseBot(ABC):
                 self.name, hours=168
             ).get("total_trades", 0)
             self._perf_cache = (now_ts, total_resolved)
-        learning_weight = min(0.30, 0.05 + total_resolved * 0.005)
+        # Live learning disabled (spec R5): the raw-YES-WR bias was
+        # anti-predictive. Outcomes are still recorded for the redesign, but the
+        # bias contributes 0 to live decisions until the edge-calibrated learner
+        # replaces it.
+        if config.LEARNING_ENABLED:
+            learning_weight = min(0.30, 0.05 + total_resolved * 0.005)
+        else:
+            learning_weight = 0.0
 
         # --- Signal 4b: Polymarket in-market price momentum ---
         # Rate of change of the YES price on Polymarket itself (from price history API).
@@ -228,7 +241,7 @@ class BaseBot(ABC):
         alpha = (
             momentum_signal * 0.15 +
             pm_momentum_signal * 0.10 +
-            strategy_signal * 0.15 +
+            strategy_signal * config.STRATEGY_SIGNAL_WEIGHT +
             obi_signal * config.SIGNAL_WEIGHT_OBI +
             cvd_signal * config.SIGNAL_WEIGHT_CVD +
             learning_signal * learning_weight
