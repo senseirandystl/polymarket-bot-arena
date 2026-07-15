@@ -26,8 +26,9 @@ class MeanRevSLBot(MeanRevBot):
     def make_decision(self, market, signals):
         """SL bot: scale up position size since downside is capped at 25%.
 
-        Respects all base class guards (hours filter, NO ban, confidence,
-        high-price guard). Only scales up bet size on trades the base logic approves.
+        Respects all base class logic (two-sided net-edge side selection,
+        symmetric price guards). Only scales up bet size on trades the base logic
+        approves — including NO-side entries.
         """
         decision = super().make_decision(market, signals)
 

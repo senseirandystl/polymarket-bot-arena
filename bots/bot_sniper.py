@@ -8,6 +8,12 @@ v2 adjustments from sniper-v1 trade data (13 trades):
 - Momentum threshold tightened (0.0005 → 0.0003) to filter marginal trades
 
 Trades less often but with much higher accuracy.
+
+NO side (BUG_HISTORY #20): the old NO ban is removed. The sniper now applies the
+SAME cheap/strong zone rules to the NO token's price (with DOWN-momentum
+confirmation) that it applies to the YES token — a symmetric mirror of its own
+strategy, not a banned side. The NO zones are unvalidated by live data yet
+(mirror assumption); recheck once NO trades accumulate.
 """
 
 import config
@@ -41,20 +47,36 @@ class SniperBot(BaseBot):
         """Only emit a signal when conditions match high-WR patterns."""
         return {"action": "hold", "side": "yes", "confidence": 0, "reasoning": "sniper: no signal"}
 
+    def _zone_signal(self, price):
+        """Snipe-worthiness of a token priced ``price`` (side-agnostic).
+
+        Mirrors the sniper's YES zones onto whichever token is being priced, so
+        the SAME data-driven pattern (cheap favorite / strong signal) is applied
+        to YES and NO alike. Returns ``(tradeable, confidence, label)``.
+        """
+        p = self.strategy_params
+        skip_lo = p.get("skip_zone_low", 0.48)
+        skip_hi = p.get("skip_zone_high", 0.64)
+        max_price = p.get("max_price_yes", 0.78)
+        min_price = p.get("min_price_yes", 0.40)
+        if min_price <= price < skip_lo:
+            # cheap zone: token priced just under 50c, historically wins
+            return True, 0.20 + (0.50 - price) * 2.0, "cheap"
+        if skip_hi < price <= max_price:
+            # strong zone: clear market signal
+            return True, 0.15 + (price - 0.50) * 1.5, "strong"
+        return False, 0.0, "skip"
+
     def make_decision(self, market, signals):
         """Override full decision logic — pure data-driven rules.
 
         Ignores the base class signal hierarchy. Instead uses simple
         rules derived from historical trade data analysis.
         """
-        market_price = market.get("current_price", 0.5)
+        market_price = market.get("current_price") or 0.5  # None if book down
         p = self.strategy_params
 
-        skip_lo = p.get("skip_zone_low", 0.48)
-        skip_hi = p.get("skip_zone_high", 0.58)
-        max_yes = p.get("max_price_yes", 0.85)
-        min_yes = p.get("min_price_yes", 0.40)
-        max_no = p.get("max_price_no", 0.35)
+        # Zone thresholds are applied inside _zone_signal (per token price).
         require_mom = p.get("require_momentum", True)
 
         # Extract BTC momentum from signals
@@ -72,75 +94,40 @@ class SniperBot(BaseBot):
             volume=volume, time_rem=time_rem
         )
 
-        # --- Rule 1: Skip coin-flip zone (50-58c) ---
-        if skip_lo <= market_price <= skip_hi:
-            return {
-                "action": "skip", "side": "yes", "confidence": 0,
-                "reasoning": f"sniper: skip coin-flip zone price={market_price:.2f}",
-                "suggested_amount": 0, "features": features,
-            }
+        # --- Determine side: snipe whichever token's price is in a good zone ---
+        # Evaluate the SAME data-driven zones on both the YES token (yes price)
+        # and the NO token (no price). BTC momentum must confirm the side's
+        # direction: YES needs BTC not dropping, NO needs BTC not rising. Since
+        # yes+no ~= 1, at most one side's price lands in a buy zone.
+        no_price = market.get("no_price")
+        if no_price is None:
+            no_price = round(1.0 - market_price, 4)
 
-        # --- Rule 2: Skip bad risk/reward zone (>85c for YES) ---
-        if market_price > max_yes:
-            # YES shares too expensive, profit tiny on win, loss huge on loss
-            return {
-                "action": "skip", "side": "yes", "confidence": 0,
-                "reasoning": f"sniper: skip bad r/r price={market_price:.2f} (>85c)",
-                "suggested_amount": 0, "features": features,
-            }
+        mom_thresh = p.get("momentum_threshold", 0.0003)
+        yes_ok, yes_conf, yes_label = self._zone_signal(market_price)
+        no_ok, no_conf, no_label = self._zone_signal(no_price)
+        if require_mom:
+            yes_ok = yes_ok and btc_momentum >= -mom_thresh
+            no_ok = no_ok and btc_momentum <= mom_thresh
 
-        # --- Determine side ---
         side = None
         confidence = 0
-        reasoning_parts = [f"price={market_price:.2f}"]
-
-        # YES zone: 40-48c or 58-85c
-        if min_yes <= market_price < skip_lo:
-            # 40-48c: YES is cheap, 69% WR historically
-            side = "yes"
-            # Confidence scales with distance from 50c
-            confidence = 0.20 + (0.50 - market_price) * 2.0
-            reasoning_parts.append(f"cheap-YES zone ({market_price:.0%})")
-
-        elif market_price > skip_hi and market_price <= max_yes:
-            # 58-85c: strong market signal, 60-87% WR
-            side = "yes"
-            confidence = 0.15 + (market_price - 0.50) * 1.5
-            reasoning_parts.append(f"strong-YES zone ({market_price:.0%})")
-
-        # NO zone: banned — NO bets lose at all confidence levels (44% WR, -$132 all-time)
-        elif market_price <= max_no:
-            return {
-                "action": "skip", "side": "no", "confidence": 0,
-                "reasoning": f"sniper: NO ban (price={market_price:.2f} in NO zone, but NO bets lose money)",
-                "suggested_amount": 0, "features": features,
-            }
-
+        reasoning_parts = [f"yes={market_price:.2f} no={no_price:.2f}"]
+        if yes_ok and yes_conf >= no_conf:
+            side, confidence = "yes", yes_conf
+            reasoning_parts.append(f"{yes_label}-YES zone ({market_price:.0%})")
+        elif no_ok:
+            side, confidence = "no", no_conf
+            reasoning_parts.append(f"{no_label}-NO zone ({no_price:.0%})")
         else:
-            # 25-40c: marginal zone, skip
             return {
                 "action": "skip", "side": "yes", "confidence": 0,
-                "reasoning": f"sniper: marginal zone price={market_price:.2f}",
+                "reasoning": (
+                    f"sniper: no snipe zone (yes={market_price:.2f} "
+                    f"no={no_price:.2f} mom={btc_momentum:+.4f})"
+                ),
                 "suggested_amount": 0, "features": features,
             }
-
-        # --- Rule 3: BTC momentum must confirm ---
-        mom_thresh = p.get("momentum_threshold", 0.0003)
-        if require_mom:
-            if side == "yes" and btc_momentum < -mom_thresh:
-                # BTC dropping, don't bet YES
-                return {
-                    "action": "skip", "side": side, "confidence": confidence,
-                    "reasoning": f"sniper: BTC momentum negative ({btc_momentum:+.4f}), skip YES",
-                    "suggested_amount": 0, "features": features,
-                }
-            if side == "no" and btc_momentum > mom_thresh:
-                # BTC rising, don't bet NO
-                return {
-                    "action": "skip", "side": side, "confidence": confidence,
-                    "reasoning": f"sniper: BTC momentum positive ({btc_momentum:+.4f}), skip NO",
-                    "suggested_amount": 0, "features": features,
-                }
 
         # --- Learned bias adjustment ---
         prior = 0.50

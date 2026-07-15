@@ -29,8 +29,9 @@ class MeanRevTPBot(MeanRevBot):
     def make_decision(self, market, signals):
         """TP bot: enter when base logic says buy, monitor for 2x exit.
 
-        Respects all base class guards (hours filter, NO ban, confidence,
-        high-price guard). Only adds TP monitoring annotation.
+        Respects all base class logic (two-sided net-edge side selection,
+        symmetric price guards), including NO-side entries. Only adds TP
+        monitoring annotation.
         """
         decision = super().make_decision(market, signals)
 

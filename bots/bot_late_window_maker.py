@@ -22,11 +22,18 @@ import config
 import learning
 from bots.base_bot import BaseBot
 
+# Retune (was: window=90s, min_mom=0.0008, price [0.58,0.92]): the bot had ZERO
+# trades all session. By T-90s a 5-min BTC market has almost always resolved to
+# an extreme (price near 0 or 1), so the [0.58,0.92] band was rarely occupied
+# that late and only ~4 evaluations fit in 90s at the ~23s maker cadence.
+# Widening the window to 150s lets it catch the market earlier, while it is
+# still in the profitable mid-high band; the max cap stays ≤0.90 to respect the
+# break-even rule (buying YES as a taker above ~0.90 needs an implausible WR).
 DEFAULT_PARAMS = {
-    "entry_window_sec": 90,    # Only activate in the last 90 seconds of a market
-    "min_momentum": 0.0008,    # Require |BTC momentum| ≥ 0.08% (avg over lookback)
-    "min_price_yes": 0.58,     # Market price must be ≥ 58¢ to confirm YES direction
-    "max_price_yes": 0.92,     # Cap: above 92¢ profit margin is too thin
+    "entry_window_sec": 150,   # Activate in the last 150s (more shots, less extreme prices)
+    "min_momentum": 0.0005,    # Require |BTC momentum| ≥ 0.05% (avg over lookback)
+    "min_price_yes": 0.56,     # Market price must be ≥ 56¢ to confirm YES direction
+    "max_price_yes": 0.90,     # Cap: above 90¢ taker margin is too thin to profit
     "maker_offset_pct": 0.06,  # Simulated limit = market_price + 6¢ (captures spread)
     "position_size_pct": 0.10, # 10% of max — large because entries are highly selective
     "lookback_candles": 3,     # BTC candles used for momentum calculation
@@ -34,7 +41,8 @@ DEFAULT_PARAMS = {
 
 
 class LateWindowMakerBot(BaseBot):
-    """Posts directional YES in the final 90s when BTC momentum and price align."""
+    """Posts a directional maker quote in the final window when BTC momentum and
+    price align — YES on up-momentum, NO on down-momentum (symmetric mirror)."""
 
     strategy_type = "late_window_maker"
 
@@ -50,7 +58,7 @@ class LateWindowMakerBot(BaseBot):
     def analyze(self, market: dict, signals: dict) -> dict:
         p = self.strategy_params
         time_rem = market.get("time_remaining_seconds")
-        market_price = market.get("current_price", 0.5)
+        market_price = market.get("current_price") or 0.5  # None if book down
 
         # Maker quote fields always returned so run_maker_section() can log them
         def _hold(reason):
@@ -81,24 +89,32 @@ class LateWindowMakerBot(BaseBot):
         if abs(momentum) < min_mom:
             return _hold(f"lwm: weak momentum ({momentum:+.5f} < {min_mom})")
 
-        # ── NO ban ───────────────────────────────────────────────────────────
-        # Data: NO bets 44% WR all-time. Don't trade NO even with downward momentum.
-        if momentum < 0:
-            return _hold(f"lwm: NO side banned (mom={momentum:+.5f})")
-
-        # ── Market price confirmation ────────────────────────────────────────
+        # ── Side selection: quote whichever side momentum + price confirm ─────
+        # UP momentum → quote YES on the YES price; DOWN momentum → quote NO on
+        # the NO price. The SAME price band confirms each side's own token price
+        # (yes+no ~= 1, so only one side's price sits in the band). NO is a
+        # first-class mirror of the YES entry, not a banned side.
         min_price = p["min_price_yes"]
         max_price = p["max_price_yes"]
+        if momentum > 0:
+            side, side_price = "yes", market_price
+        else:
+            no_price = market.get("no_price")
+            if no_price is None:
+                no_price = round(1.0 - market_price, 4)
+            side, side_price = "no", no_price
 
-        if market_price < min_price:
-            return _hold(f"lwm: price {market_price:.2f} < {min_price} (no YES confirmation)")
-        if market_price > max_price:
-            return _hold(f"lwm: price {market_price:.2f} > {max_price} (margin too thin)")
+        if side_price < min_price:
+            return _hold(
+                f"lwm: {side} price {side_price:.2f} < {min_price} (no confirmation)")
+        if side_price > max_price:
+            return _hold(
+                f"lwm: {side} price {side_price:.2f} > {max_price} (margin too thin)")
 
-        # ── Maker quote computation ───────────────────────────────────────────
+        # ── Maker quote computation (on the chosen side's price) ──────────────
         # What we'd post as a limit order: slightly ahead of market to capture spread
-        maker_ask = round(min(max_price, market_price + p["maker_offset_pct"]), 2)
-        maker_bid = round(max(0.01, market_price - 0.02), 2)
+        maker_ask = round(min(max_price, side_price + p["maker_offset_pct"]), 2)
+        maker_bid = round(max(0.01, side_price - 0.02), 2)
         maker_mid = round((maker_bid + maker_ask) / 2, 3)
         edge_bps = p["maker_offset_pct"] * 10000  # spread captured if filled
 
@@ -119,17 +135,20 @@ class LateWindowMakerBot(BaseBot):
 
         return {
             "action": "buy",
-            "side": "yes",
+            "side": side,
             "confidence": confidence,
             "reasoning": (
                 f"lwm: time={time_rem:.0f}s mom={momentum:+.5f} "
-                f"price={market_price:.2f} limit={maker_ask:.2f} "
+                f"{side} price={side_price:.2f} limit={maker_ask:.2f} "
                 f"edge={edge_bps:.0f}bps tw={time_weight:.2f}"
             ),
             "suggested_amount": amount,
+            # Expected taker price = the ask we'd cross; feeds the execute()
+            # slippage guard (config.MAX_FILL_SLIPPAGE).
+            "entry_price": maker_ask,
             "features": features,
             "maker_bid": maker_bid,
             "maker_ask": maker_ask,
             "maker_mid": maker_mid,
-            "maker_side": "yes",
+            "maker_side": side,
         }
