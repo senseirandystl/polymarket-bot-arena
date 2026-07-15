@@ -112,10 +112,12 @@ MAX_FILL_SLIPPAGE = 0.03
 #   OBI  58.1% vs 66.7%  -> INVERTED (resting-depth fade) -> zeroed out
 # CVD = executed aggression (predicts); OBI = resting depth (fades). See
 # docs/superpowers/specs/2026-07-15-strategy-rootcause-improvements-design.md.
-# OBI restored (2026-07-15): the warmer computes it fresh from the 1s YES book
-# (best-first normalized), so it is a true, non-stale order-book imbalance read
-# (bid-heavy = upward/YES pressure). Modest weight; natural sign, no bias.
-SIGNAL_WEIGHT_OBI = 0.10
+# OBI re-disabled (2026-07-15): restored at 0.10 with natural sign, but it
+# measured anti-predictive AGAIN (confirms-side WR 22% vs contradicts 50%) — the
+# same inversion as the pre-#21 clean run. So OBI as computed here (top-of-book
+# resting depth) is a FADE signal in this venue, not upward pressure. Kept wired
+# at weight 0 pending an OFFLINE validation of the fade sign before any re-enable.
+SIGNAL_WEIGHT_OBI = 0.0
 SIGNAL_WEIGHT_CVD = 0.25
 
 # --- BTC drift-from-strike ("price to beat") signal (signals/strike.py) ---
@@ -124,7 +126,13 @@ SIGNAL_WEIGHT_CVD = 0.25
 # scaled (more decisive near expiry). Fed into fair value at SIGNAL_WEIGHT_DRIFT.
 MARKET_WINDOW_SEC = 300           # 5-min window length
 DRIFT_VOL_SCALE = 0.0015          # typical BTC move (fraction) over a full window
-SIGNAL_WEIGHT_DRIFT = 0.25        # weight of the (bounded [-1,1]) drift signal in fair value
+# DISABLED (2026-07-15): shipped at 0.25 on theory and it was ANTI-PREDICTIVE in
+# a mean-reverting regime — when drift said UP, YES won only 23% (vs 53% when it
+# said DOWN). Root cause: over a 5-min window BTC is short-horizon mean-reverting,
+# and the Polymarket price already prices that reversion, so raw "BTC is above
+# the strike NOW" naively extrapolates the wrong way. Kept wired at weight 0 for
+# a properly-validated redesign (near-expiry-only, or fade sign). See BUG #23.
+SIGNAL_WEIGHT_DRIFT = 0.0
 
 # --- Two-sided (YES/NO) net-edge side selection ---
 # Favorite-following tilt scale. Replaces the old hard-coded price_edge * 0.50

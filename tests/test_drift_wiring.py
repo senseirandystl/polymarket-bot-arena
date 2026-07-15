@@ -1,4 +1,11 @@
-"""Drift signal + OBI restoration wired into make_decision, and per-side eval."""
+"""Drift + OBI are WIRED but DISABLED (weight 0) pending offline validation.
+
+Both were shipped weighted and both measured anti-predictive (drift especially:
+33% WR blow-up in a mean-reverting regime — when drift said UP, YES won 23%).
+They stay wired so a validated version can be re-enabled by flipping a weight,
+but the live default weight is 0. These tests prove (a) the live defaults are
+off, and (b) the plumbing still works when a weight is applied.
+"""
 
 import config
 from bots.bot_momentum import MomentumBot
@@ -24,32 +31,28 @@ def _sig(**over):
     return base
 
 
-def test_config_drift_and_obi_restored():
-    assert config.SIGNAL_WEIGHT_DRIFT > 0
-    assert config.SIGNAL_WEIGHT_OBI > 0          # restored
-    assert config.MARKET_WINDOW_SEC == 300
+def test_drift_disabled_by_default():
+    # Catastrophic when weighted; must ship OFF until validated.
+    assert config.SIGNAL_WEIGHT_DRIFT == 0.0
 
 
-def test_positive_drift_pushes_toward_yes():
-    # At a coin-flip market, strong positive drift (BTC above strike) should make
-    # the model favor YES, not default into NO.
+def test_obi_disabled_by_default():
+    assert config.SIGNAL_WEIGHT_OBI == 0.0
+
+
+def test_drift_does_not_move_decision_while_disabled():
     bot = _bot()
     m = _market(yes=0.50, no=0.50)
-    d = bot.make_decision(m, _sig(btc_drift=1.0))
-    if d["action"] == "buy":
-        assert d["side"] == "yes"
+    up = bot.make_decision(m, _sig(btc_drift=1.0))
+    dn = bot.make_decision(m, _sig(btc_drift=-1.0))
+    # weight 0 -> drift has no effect on the decision
+    assert up == dn
 
 
-def test_negative_drift_pushes_toward_no():
-    bot = _bot()
-    m = _market(yes=0.50, no=0.50)
-    d = bot.make_decision(m, _sig(btc_drift=-1.0))
-    if d["action"] == "buy":
-        assert d["side"] == "no"
-
-
-def test_drift_is_regime_symmetric():
-    # Equal-magnitude opposite drift yields opposite sides — no baked-in bias.
+def test_drift_mechanism_works_when_weighted(monkeypatch):
+    # Prove the wiring is intact: with a positive weight, drift moves fair value
+    # the correct (symmetric) way. This does NOT enable it in production.
+    monkeypatch.setattr(config, "SIGNAL_WEIGHT_DRIFT", 0.25)
     bot = _bot()
     m = _market(yes=0.50, no=0.50)
     up = bot.make_decision(m, _sig(btc_drift=1.0))
@@ -58,18 +61,24 @@ def test_drift_is_regime_symmetric():
         assert up["side"] == "yes" and dn["side"] == "no"
 
 
-def test_no_drift_coinflip_no_spurious_bet():
-    # Zero drift + zero flow at 50/50 -> no real edge -> skip (no reflexive NO).
-    bot = _bot()
-    m = _market(yes=0.50, no=0.50)
-    d = bot.make_decision(m, _sig())
-    assert d["action"] == "skip"
-
-
-def test_obi_moves_decision_again():
+def test_obi_mechanism_works_when_weighted(monkeypatch):
+    monkeypatch.setattr(config, "SIGNAL_WEIGHT_OBI", 0.10)
     bot = _bot()
     m = _market(yes=0.52, no=0.48)
     d_pos = bot.make_decision(m, _sig(obi=1.0))
     d_neg = bot.make_decision(m, _sig(obi=-1.0))
-    # OBI restored (weight>0): flipping its sign must change the decision.
     assert d_pos != d_neg
+
+
+def test_btc_drift_present_in_combined_signals():
+    # Wiring: build_combined_signals must expose btc_drift so a future re-enable
+    # is a one-line weight change.
+    from arena.signals import build_combined_signals
+
+    class PF:
+        def get_signals(self, _):
+            return {"prices": [100.0], "volumes": [], "latest": 100.0}
+
+    sig = build_combined_signals(PF(), None, None,
+                                 market=_market(), warm={"obi": 0, "cvd": 0, "pm_momentum": 0})
+    assert "btc_drift" in sig and "btc_strike" in sig

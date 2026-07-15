@@ -32,11 +32,11 @@ def _sig(**over):
 
 # --- R1: config weights reflect measured predictiveness ---
 
-def test_obi_restored():
-    # OBI was zeroed in Phase 1 (measured anti-predictive on a stale snapshot),
-    # then RESTORED once confirmed the warmer computes it fresh every 1s from the
-    # best-first book — a true order-book imbalance signal with its natural sign.
-    assert config.SIGNAL_WEIGHT_OBI > 0.0
+def test_obi_disabled():
+    # OBI zeroed (Phase 1), briefly restored, then re-disabled: it measured
+    # anti-predictive with its natural sign in TWO independent runs. Off until a
+    # fade-sign version is validated offline. See config comment / BUG #23.
+    assert config.SIGNAL_WEIGHT_OBI == 0.0
 
 
 def test_cvd_weight_boosted():
