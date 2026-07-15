@@ -3,6 +3,7 @@
 import random
 import copy
 import logging
+import time
 from abc import ABC, abstractmethod
 from datetime import datetime
 from pathlib import Path
@@ -12,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 import config
 import db
 import learning
+import polymarket_fills
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +71,18 @@ class BaseBot(ABC):
         "sentiment": 0.03,
         "hybrid": 0.03,
     }
+    # Minimum cost-adjusted edge (probability units) to place a trade. Two-sided
+    # selection buys the side with the larger positive edge above this floor.
+    MIN_EDGE = {
+        "momentum": 0.015,
+        "mean_reversion": 0.02,
+        "mean_reversion_sl": 0.02,
+        "mean_reversion_tp": 0.02,
+        "sniper": 0.02,
+        "phantom": 0.015,
+        "sentiment": 0.02,
+        "hybrid": 0.02,
+    }
 
     def __init__(self, name, strategy_type, params, generation=0, lineage=None):
         self.name = name
@@ -78,6 +92,10 @@ class BaseBot(ABC):
         self.lineage = lineage or name
         self._paused = False
         self.trading_mode = "paper"
+        # (ts, total_resolved) cache for the learning-weight ramp — refreshed
+        # off the 1s hot path (see make_decision). Resolved count changes only
+        # when a trade settles (~60s), so a short TTL is plenty.
+        self._perf_cache = None
 
     @abstractmethod
     def analyze(self, market: dict, signals: dict) -> dict:
@@ -94,6 +112,27 @@ class BaseBot(ABC):
         """
         pass
 
+    def _compute_fair_yes(self, yes_mid: float, aggression: float,
+                          alpha: float) -> float:
+        """Fair YES probability from the signal stack.
+
+        fair = yes_mid + price_tilt + alpha, where price_tilt is the
+        favorite-following lane ((yes_mid-0.5) * aggression * K_TILT) and alpha
+        is the summed secondary lanes. Clamped to [0.02, 0.98].
+        """
+        price_tilt = (yes_mid - 0.5) * aggression * config.K_TILT
+        return max(0.02, min(0.98, yes_mid + price_tilt + alpha))
+
+    def _side_net_edges(self, fair_yes: float, yes_price: float,
+                        no_price: float) -> tuple:
+        """Cost-adjusted edge on each side: prob - price - per-share fee.
+
+        Fee is the canonical taker fee for one share at that side's price.
+        """
+        edge_yes = fair_yes - yes_price - polymarket_fills.taker_fee(1.0, yes_price)
+        edge_no = (1.0 - fair_yes) - no_price - polymarket_fills.taker_fee(1.0, no_price)
+        return edge_yes, edge_no
+
     def make_decision(self, market: dict, signals: dict) -> dict:
         """Make a trading decision using market price edge + strategy + learning.
 
@@ -105,7 +144,10 @@ class BaseBot(ABC):
 
         Skips trades when confidence is too low (no edge = no bet).
         """
-        market_price = market.get("current_price", 0.5)
+        # `or 0.5`, not a .get default: _normalize sets current_price=None
+        # explicitly (key present), so a default arg wouldn't fire. A book that
+        # is momentarily unavailable leaves it None — coalesce to neutral 0.5.
+        market_price = market.get("current_price") or 0.5
 
         # --- Signal 1: Market price edge ---
         # When YES is priced high, YES usually wins. The further from 50c, the stronger.
@@ -152,8 +194,17 @@ class BaseBot(ABC):
 
         # Dynamic learning weight: ramps up as bot accumulates data
         # Capped at 0.30 (was 0.60) — stale inherited data was making all bots identical
-        perf = db.get_bot_performance(self.name, hours=168)
-        total_resolved = perf.get("total_trades", 0)
+        # Cached off the hot path: the resolved-trade count changes only when a
+        # trade settles, so re-querying it every 1s tick was pure waste.
+        now_ts = time.time()
+        ttl = getattr(config, "HOTPATH_CACHE_TTL_SEC", 30)
+        if self._perf_cache is not None and (now_ts - self._perf_cache[0]) < ttl:
+            total_resolved = self._perf_cache[1]
+        else:
+            total_resolved = db.get_bot_performance(
+                self.name, hours=168
+            ).get("total_trades", 0)
+            self._perf_cache = (now_ts, total_resolved)
         learning_weight = min(0.30, 0.05 + total_resolved * 0.005)
 
         # --- Signal 4b: Polymarket in-market price momentum ---
@@ -163,6 +214,14 @@ class BaseBot(ABC):
         pm_momentum_raw = signals.get("pm_momentum", 0.0)
         pm_momentum_signal = max(-0.15, min(0.15, float(pm_momentum_raw)))
 
+        # --- Signal 5: Order flow (OBI + CVD) ---
+        # The two order-flow reads the research favors over price-history
+        # indicators: OBI (resting bid vs ask depth) and CVD (market buys minus
+        # sells). Both arrive in [-1, 1] (positive = upward/YES pressure) and are
+        # clamped into the same [-0.15, 0.15] band as the other secondary lanes.
+        obi_signal = max(-0.15, min(0.15, float(signals.get("obi", 0.0) or 0.0) * 0.15))
+        cvd_signal = max(-0.15, min(0.15, float(signals.get("cvd", 0.0) or 0.0) * 0.15))
+
         # --- Combine all signals ---
         # Rebalanced: PM momentum takes 10% from BTC momentum (most similar signal)
         combined = (
@@ -170,6 +229,8 @@ class BaseBot(ABC):
             momentum_signal * 0.15 +       # BTC spot momentum (Binance candles)
             pm_momentum_signal * 0.10 +    # Polymarket YES price momentum (in-market)
             strategy_signal * 0.15 +       # Strategy adds differentiation
+            obi_signal * config.SIGNAL_WEIGHT_OBI +   # Order-book imbalance
+            cvd_signal * config.SIGNAL_WEIGHT_CVD +   # Cumulative volume delta
             learning_signal * learning_weight  # Learning grows over time
         )
         # combined > 0 → YES, < 0 → NO
@@ -235,31 +296,40 @@ class BaseBot(ABC):
         if time_rem is not None and time_rem < 60:
             confidence = min(0.95, confidence * 1.25)
 
-        # --- Bet sizing: proportional to edge strength ---
-        # Data shows: conf 0.30-0.50 is the sweet spot (67.9% WR, +$48).
-        # conf >0.50 drops to 48.6% WR but bets are bigger → big losses.
-        # Cap bet-sizing confidence at 0.45 to stay in the profitable zone.
+        # --- Bet sizing: SHARES-FIRST, proportional to edge strength ---
+        # Decide the exact SHARE count from edge, THEN derive USD (USD = shares ×
+        # price). Sizing in USD first and dividing by price silently destroys PnL
+        # at low prices via rounding — the research credits the shares-first flip
+        # with turning a bot from negative to profitable. Confidence for sizing
+        # is capped at 0.45 (conf 0.30-0.50 is the 67.9% WR sweet spot; >0.50
+        # sizes bigger but wins less).
         bet_conf = min(confidence, 0.45)
         max_pos = config.get_max_position()
+        price = max(market_price, 0.01)
+        max_shares = max_pos / price  # most shares max_pos can buy at this price
         if bet_conf > 0.2:
             # Moderate-to-strong edge
-            amount = max_pos * (0.05 + bet_conf * 0.10)
+            target_shares = max_shares * (0.05 + bet_conf * 0.10)
         else:
             # Weak edge — small bet (still generates learning data)
-            amount = max_pos * 0.03
+            target_shares = max_shares * 0.03
 
-        # Floor the spend so the fill clears Polymarket's 5-share minimum. A
-        # $1.50 bet buys <5 shares above ~30c and gets rejected 'below_min_size';
-        # size up to 5 shares' worth (× buffer for slippage), capped at max_pos.
-        min_notional = config.POLYMARKET_MIN_SHARES * market_price * 1.15
-        amount = min(max(amount, min_notional), max_pos)
+        # Floor to clear Polymarket's 5-share minimum (× buffer for slippage),
+        # cap at what max_pos can buy, then round to a clean share count and
+        # derive the USD spend from it. Never USD → shares.
+        target_shares = min(
+            max(target_shares, config.POLYMARKET_MIN_SHARES * 1.15), max_shares
+        )
+        target_shares = round(target_shares, 4)
+        amount = min(target_shares * price, max_pos)
 
         reasoning = (
             f"price={market_price:.2f} edge={price_edge:+.3f} "
             f"mom={momentum_signal:+.3f} pm={pm_momentum_signal:+.3f} "
+            f"of(obi={obi_signal:+.3f} cvd={cvd_signal:+.3f}) "
             f"strat={strategy_signal:+.3f} "
             f"learn={learning_signal:+.3f}(w={learning_weight:.0%}) "
-            f"=> {side} conf={confidence:.2f}"
+            f"=> {side} {target_shares:.2f}sh conf={confidence:.2f}"
         )
 
         return {
@@ -268,6 +338,11 @@ class BaseBot(ABC):
             "confidence": confidence,
             "reasoning": reasoning,
             "suggested_amount": amount,
+            "target_shares": target_shares,
+            # Price the decision expects to pay. execute() turns this into a
+            # slippage limit so an adverse book move between decision and fill
+            # rejects the trade instead of filling worse (config.MAX_FILL_SLIPPAGE).
+            "entry_price": round(price, 4),
             "features": features,
         }
 
@@ -314,6 +389,14 @@ class BaseBot(ABC):
         """
         from venues import get_engine
 
+        # Slippage limit: reject a fill that drifts more than MAX_FILL_SLIPPAGE
+        # above the price the decision expected. Only applied when the signal
+        # carries an expected ``entry_price`` (all buy signals now do).
+        expected = signal.get("entry_price")
+        limit_price = (
+            expected + config.MAX_FILL_SLIPPAGE if expected is not None else None
+        )
+
         res = get_engine(mode).place(
             bot_name=self.name,
             side=signal["side"],
@@ -323,6 +406,7 @@ class BaseBot(ABC):
             confidence=signal.get("confidence"),
             reasoning=signal.get("reasoning"),
             features=signal.get("features"),
+            limit_price=limit_price,
         )
         return {
             "success": res.success,

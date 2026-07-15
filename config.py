@@ -83,6 +83,74 @@ MIN_WIN_RATE = 0.65            # 65% WR threshold to survive evolution
 BINANCE_WS_URL = "wss://stream.binance.com:9443/ws"
 PRICE_UPDATE_INTERVAL_SEC = 1  # Real-time price updates
 
+# --- Arbitrage bot (bots/bot_arbitrage.py) ---
+# Classic Polymarket cross-book arb: buy YES and NO on the SAME market whenever
+# YES_ask + NO_ask (+ taker fees on both legs) < $1.00 with enough margin. At
+# resolution exactly one side pays $1/share, so a matched pair locks in
+# 1 - (yes_ask + no_ask + fees) per share regardless of outcome — market-neutral.
+# ARBITRAGE_MIN_MARGIN is the required net profit per matched share pair AFTER
+# fees; below it the (usually fleeting) edge doesn't clear execution risk.
+ARBITRAGE_MIN_MARGIN = 0.02     # min net USDC profit per matched share pair
+ARBITRAGE_TARGET_SHARES = 20    # shares per leg to take when an opportunity appears
+ARBITRAGE_BOOK_CACHE_SEC = 1.0  # micro-cache on the per-leg book reads (hot path)
+
+# --- Fill slippage guard (all venues) ---
+# A bot decides on one order-book snapshot but the fill is simulated/placed a
+# moment later against a possibly-moved book. MAX_FILL_SLIPPAGE is how far (in
+# ¢) a BUY's realized avg fill price may exceed the price the decision expected
+# before the fill is REJECTED (reason "slippage_exceeded"). This kills the class
+# of loss where a razor-thin edge (esp. the arbitrage bot's ~1-2¢/pair) is wiped
+# out by adverse drift between decision and fill. The arbitrage bot additionally
+# re-validates the *combined* edge and fills both legs against the exact snapshot
+# it validated (passed to the engine), so its two legs stay atomic.
+MAX_FILL_SLIPPAGE = 0.03
+
+# --- Order-flow signal weights (base_bot.make_decision) ---
+# OBI (order-book imbalance) and CVD (cumulative volume delta) are the two
+# order-flow reads the research favors over price-history indicators. Each is
+# clamped into the same [-0.15, 0.15] band as the other secondary lanes before
+# being weighted, so these are conservative additive nudges, not overrides.
+SIGNAL_WEIGHT_OBI = 0.10
+SIGNAL_WEIGHT_CVD = 0.10
+
+# --- Two-sided (YES/NO) net-edge side selection ---
+# Favorite-following tilt scale. Replaces the old hard-coded price_edge * 0.50
+# lane weight; 0.5 keeps it numerically identical at aggression == 1.0.
+K_TILT = 0.5
+# Fallback minimum cost-adjusted edge (probability units) to place a trade.
+MIN_EDGE_DEFAULT = 0.02
+# Maps the chosen side's edge -> sizing confidence (~0.10 edge -> 0.45 cap).
+EDGE_TO_CONFIDENCE = 4.5
+# A bot never buys a side priced above HIGH_PRICE_GUARD (bad risk/reward) or
+# below CONSENSUS_GUARD (fighting strong market consensus). Symmetric per side.
+HIGH_PRICE_GUARD = 0.72
+CONSENSUS_GUARD = 0.35
+
+# --- Session-timing skip filter (arena/session_filter.py) ---
+# 'Build the skip': sit flat during high-flip session handovers. Defaults are
+# the research's known-bad windows (NYSE open/close, in ET). Weekends off by
+# default (crypto trades weekends; no v2 weekend data yet). Tighten to the
+# arena's own flip-heavy slots once logs accumulate.
+SESSION_SKIP_ENABLED = True
+SESSION_SKIP_WEEKENDS = False
+SESSION_SKIP_WINDOWS_ET = [
+    "09:30-10:15",   # NYSE open — highest direction-flip count per window
+    "15:45-16:15",   # NYSE close — second flip spike
+]
+
+# --- Clean-tick guard (signals/clean_tick.py) ---
+# Reject implausible single-tick price jumps and drop the first (possibly stale)
+# tick from a fresh token. A real Polymarket YES mid does not move >15¢ between
+# two reads a second apart — that is bad data, not a reprice.
+CLEAN_TICK_MAX_JUMP = 0.15   # reject a jump larger than this (in probability)
+CLEAN_TICK_STALE_SEC = 10.0  # ...unless last good is older than this (real reprice)
+# Drop-first-tick is a *WebSocket* hygiene rule (a freshly-opened socket replays
+# a stale cached snapshot). We poll fresh REST /midpoint reads, where the first
+# read is already current — dropping it would just blank a new market's price
+# for a whole cycle (makers then hit `None - price`). Off by default here; the
+# jump-rejection above is the part that matters for REST polling.
+CLEAN_TICK_DROP_FIRST = False # drop the first tick from a newly-seen token
+
 # Copy Trading Settings
 COPYTRADING_ENABLED = True
 COPYTRADING_MAX_WALLETS_TO_TRACK = 10
@@ -103,17 +171,41 @@ DASHBOARD_HOST = "0.0.0.0"
 # this split, all four concerns ran in one 15s main_loop which (a) re-scanned
 # the same markets every cycle and (b) meant bots only re-evaluated every 15s.
 # After the split:
-#   - discovery : up to 2 HTTPS calls every 60s
-#   - trader    : zero network calls per tick (1s) except on bot.execute
-#   - resolver  : 1 HTTPS call every 60s
-#   - pos monitor: 0.5s SL/TP exit loop (hard-realtime; see arena/position_monitor.py)
-DISCOVERY_INTERVAL_SEC = 20       # Gamma discovery + CLOB price refresh. 5-min
+#   - discovery   : ~1-2 HTTPS calls every 20s (window selection only)
+#   - market data : all per-market reads (YES+NO books, OBI, CVD, PM momentum)
+#                   every 1s in one warmer thread -> shared warm cache
+#   - trader      : zero network calls per tick (1s) except on bot.execute
+#   - resolver    : 1 HTTPS call every 60s
+#   - pos monitor : 0.5s SL/TP exit loop (hard-realtime; see arena/position_monitor.py)
+DISCOVERY_INTERVAL_SEC = 20       # Gamma discovery + window selection. 5-min
                                   # windows roll every 300s; 20s keeps the
                                   # current/next selection fresh and turnover
                                   # snappy without hammering the API.
 TRADE_LOOP_INTERVAL_SEC = 1.0     # bot eval / trade-execution loop
 RESOLVE_INTERVAL_SEC = 60         # trade resolution (Polymarket closed events)
 ORDERFLOW_CACHE_SECONDS = 30      # (unused since Simmer removal; kept for compat)
+
+# --- Market-data warmer (arena/market_data.py) ---
+# One background thread owns EVERY per-market network read so the trader hot
+# path and the arbitrage bot both read warm, in-memory data (zero network on
+# the 1s tick). Refreshed for the live market every MARKET_DATA_INTERVAL_SEC so
+# all trading-decision inputs — YES+NO prices, both books, OBI, CVD, PM
+# momentum — stay <=1s fresh. Lower = fresher but more HTTPS/sec to the CLOB.
+MARKET_DATA_INTERVAL_SEC = 1.0
+
+# --- Hot-path DB caches ---
+# make_decision runs every 1s per bot and used to issue two SQLite queries each
+# time (resolved-trade count for the learning weight, and the bot_learning
+# feature table for the learned bias) — data that only changes when a trade
+# RESOLVES (~60s cadence). Cache both per bot for this TTL to take the per-tick
+# DB load from 2*N_bots queries/sec down to a trickle. get_bot_mode is cached
+# separately (shorter TTL) so dashboard live/paper toggles still apply promptly.
+HOTPATH_CACHE_TTL_SEC = 30
+BOT_MODE_CACHE_TTL_SEC = 3
+# The per-signal feed caches (CVD trade tape, PM price history) are coalescing
+# guards only now — the warmer is effectively their sole caller and refreshes
+# every cycle, so their TTL is kept just under the warm interval.
+SIGNAL_CACHE_TTL_SEC = 0.8
 
 # Polymarket enforces a per-order minimum of 5 shares. Bet sizing floors the
 # spend so a trade always clears this (5 shares × price × buffer) — otherwise
