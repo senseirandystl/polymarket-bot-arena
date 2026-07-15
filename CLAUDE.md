@@ -43,16 +43,23 @@ Stored at `~/.config/simmer/bot_keys.json` — keys mapped to slot_0 through slo
 
 ### Signal Hierarchy (make_decision in base_bot.py)
 ```
-combined = (
-    market_price_edge * 0.50    # Strongest: follow the market price (edge = fair − mkt)
-    + btc_momentum * 0.15       # BTC spot momentum (Binance candles)
-    + pm_momentum * 0.10        # Polymarket in-market YES price momentum
-    + strategy_signal * 0.15    # Per-bot strategy differentiation
-    + obi_signal * 0.10         # Order-book imbalance (resting bid vs ask depth)
-    + cvd_signal * 0.10         # Cumulative volume delta (market buys − sells)
-    + learning_bias * variable  # Grows from 5% to 30% weight with data
-)
+fair_yes = yes_mid + price_tilt + alpha
+  price_tilt = (yes_mid−0.5) · aggression · K_TILT   # favorite-following, CAPPED at ±FAVORITE_EDGE_CAP
+  alpha = (
+      btc_momentum   * 0.15                 # BTC spot momentum (Binance candles)
+    + pm_momentum    * 0.10                 # Polymarket in-market YES price momentum
+    + strategy_signal * STRATEGY_SIGNAL_WEIGHT (0.30)   # per-bot thesis (now fires often)
+    + obi_signal     * SIGNAL_WEIGHT_OBI (0.0)          # DISABLED — measured anti-predictive
+    + cvd_signal     * SIGNAL_WEIGHT_CVD (0.25)         # executed flow — the real edge
+    + learning_bias  * (0 while LEARNING_ENABLED=False) # DISABLED — anti-predictive, being redesigned
+  )
 ```
+**Weights are empirical (2026-07-15 overnight run, spec `docs/superpowers/specs/2026-07-15-...`).**
+Per-signal predictiveness (confirms-side WR vs contradicts): CVD 66.9/52.4 (real edge, weighted up);
+OBI 58.1/66.7 (inverted → zeroed); learning bias 53.5/77.6 (inverted → disabled live). The
+`price_tilt` is capped because the favorite underpricing is flat ~+5¢ across 55–85¢, not proportional —
+an uncapped tilt manufactured fake edge at efficient extremes. Coin-flip (45–55¢) trades are suppressed
+by the `MIN_EDGE` gate on a now-real edge, **not** a price-bucket ban.
 OBI + CVD (`signals/orderflow_signals.py`) are the two order-flow reads the
 profitable-bot research favors over price-history indicators — they describe
 pressure that hasn't hit the price yet. OBI is computed once per discovery cycle
