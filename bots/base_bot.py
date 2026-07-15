@@ -149,11 +149,10 @@ class BaseBot(ABC):
         # is momentarily unavailable leaves it None — coalesce to neutral 0.5.
         market_price = market.get("current_price") or 0.5
 
-        # --- Signal 1: Market price edge ---
-        # When YES is priced high, YES usually wins. The further from 50c, the stronger.
+        # --- Signal 1: Market price edge (favorite-following) ---
+        # When YES is priced high, YES usually wins. The further from 50c, the
+        # stronger. Applied as the price_tilt lane inside _compute_fair_yes.
         aggression = self.MARKET_PRICE_AGGRESSION.get(self.strategy_type, 1.0)
-        price_edge = (market_price - 0.5) * aggression
-        # price_edge > 0 means lean YES, < 0 means lean NO
 
         # --- Signal 2: BTC momentum ---
         prices = signals.get("prices", [])
@@ -222,69 +221,70 @@ class BaseBot(ABC):
         obi_signal = max(-0.15, min(0.15, float(signals.get("obi", 0.0) or 0.0) * 0.15))
         cvd_signal = max(-0.15, min(0.15, float(signals.get("cvd", 0.0) or 0.0) * 0.15))
 
-        # --- Combine all signals ---
-        # Rebalanced: PM momentum takes 10% from BTC momentum (most similar signal)
-        combined = (
-            price_edge * 0.50 +           # Market price is primary signal
-            momentum_signal * 0.15 +       # BTC spot momentum (Binance candles)
-            pm_momentum_signal * 0.10 +    # Polymarket YES price momentum (in-market)
-            strategy_signal * 0.15 +       # Strategy adds differentiation
-            obi_signal * config.SIGNAL_WEIGHT_OBI +   # Order-book imbalance
-            cvd_signal * config.SIGNAL_WEIGHT_CVD +   # Cumulative volume delta
-            learning_signal * learning_weight  # Learning grows over time
+        # --- Fair value: reinterpret the signal stack as a YES probability ---
+        # alpha keeps each secondary lane at its existing effective weight; the
+        # price lane moves into _compute_fair_yes via K_TILT. Identity preserved:
+        # price_tilt + alpha == the old `combined`.
+        alpha = (
+            momentum_signal * 0.15 +
+            pm_momentum_signal * 0.10 +
+            strategy_signal * 0.15 +
+            obi_signal * config.SIGNAL_WEIGHT_OBI +
+            cvd_signal * config.SIGNAL_WEIGHT_CVD +
+            learning_signal * learning_weight
         )
-        # combined > 0 → YES, < 0 → NO
+        fair_yes = self._compute_fair_yes(market_price, aggression, alpha)
 
-        side = "yes" if combined > 0 else "no"
-        confidence = min(0.95, abs(combined) * 2)
+        # --- Two-sided net edge: buy the side with the larger positive edge ---
+        yes_price = market_price
+        no_price = market.get("no_price")
+        if no_price is None:
+            no_price = round(1.0 - yes_price, 4)
+        edge_yes, edge_no = self._side_net_edges(fair_yes, yes_price, no_price)
+        if edge_yes >= edge_no:
+            side, side_price, chosen_edge = "yes", yes_price, edge_yes
+        else:
+            side, side_price, chosen_edge = "no", no_price, edge_no
 
-        # --- NO bet ban ---
-        # Data: NO bets lose at EVERY confidence level (44% WR, -$132 all-time).
-        # YES-only strategy is strictly better.
-        if side == "no":
+        confidence = min(0.95, max(0.0, chosen_edge) * config.EDGE_TO_CONFIDENCE)
+
+        # --- Minimum-edge gate (no edge = no bet) ---
+        min_edge = self.MIN_EDGE.get(self.strategy_type, config.MIN_EDGE_DEFAULT)
+        if chosen_edge < min_edge:
             return {
                 "action": "skip",
                 "side": side,
                 "confidence": confidence,
-                "reasoning": f"NO ban: NO bets 44% WR all-time | price={market_price:.2f}",
+                "reasoning": (
+                    f"No edge: {side} edge={chosen_edge:+.3f} < {min_edge:.3f} "
+                    f"| fair={fair_yes:.2f} yes={yes_price:.2f} no={no_price:.2f}"
+                ),
                 "suggested_amount": 0,
                 "features": features,
             }
 
-        # --- High-price YES guard ---
-        # Data: YES at >72c has bad risk/reward (pay 75c, profit 25c on win,
-        # lose 75c on loss). conf 0.50+ is 59% WR but net -$23 from this.
-        if market_price > 0.72:
+        # --- Symmetric guards (keyed on the chosen side's price) ---
+        if side_price > config.HIGH_PRICE_GUARD:
             return {
                 "action": "skip",
                 "side": side,
                 "confidence": confidence,
-                "reasoning": f"High-price guard: price={market_price:.2f} >72c, bad risk/reward for YES",
+                "reasoning": (
+                    f"High-price guard: {side} price={side_price:.2f} "
+                    f">{config.HIGH_PRICE_GUARD:.2f}, bad risk/reward"
+                ),
                 "suggested_amount": 0,
                 "features": features,
             }
-
-        # --- Market consensus guard ---
-        # Data shows: betting against strong market consensus is 0-10% WR.
-        if market_price < 0.35 and side == "yes":
+        if side_price < config.CONSENSUS_GUARD:
             return {
                 "action": "skip",
                 "side": side,
                 "confidence": confidence,
-                "reasoning": f"Market consensus guard: price={market_price:.2f} too low to bet YES",
-                "suggested_amount": 0,
-                "features": features,
-            }
-
-        min_conf = self.MIN_TRADE_CONFIDENCE.get(self.strategy_type, 0.03)
-
-        # --- Skip low-confidence trades (no edge = no bet) ---
-        if confidence < min_conf:
-            return {
-                "action": "skip",
-                "side": side,
-                "confidence": confidence,
-                "reasoning": f"No edge: conf={confidence:.3f} < {min_conf:.3f} | price={market_price:.2f}",
+                "reasoning": (
+                    f"Consensus guard: {side} price={side_price:.2f} "
+                    f"<{config.CONSENSUS_GUARD:.2f}, fighting consensus"
+                ),
                 "suggested_amount": 0,
                 "features": features,
             }
@@ -305,7 +305,7 @@ class BaseBot(ABC):
         # sizes bigger but wins less).
         bet_conf = min(confidence, 0.45)
         max_pos = config.get_max_position()
-        price = max(market_price, 0.01)
+        price = max(side_price, 0.01)
         max_shares = max_pos / price  # most shares max_pos can buy at this price
         if bet_conf > 0.2:
             # Moderate-to-strong edge
@@ -324,12 +324,12 @@ class BaseBot(ABC):
         amount = min(target_shares * price, max_pos)
 
         reasoning = (
-            f"price={market_price:.2f} edge={price_edge:+.3f} "
+            f"fair={fair_yes:.2f} yes={yes_price:.2f} no={no_price:.2f} "
+            f"=> {side} edge={chosen_edge:+.3f} "
             f"mom={momentum_signal:+.3f} pm={pm_momentum_signal:+.3f} "
             f"of(obi={obi_signal:+.3f} cvd={cvd_signal:+.3f}) "
-            f"strat={strategy_signal:+.3f} "
-            f"learn={learning_signal:+.3f}(w={learning_weight:.0%}) "
-            f"=> {side} {target_shares:.2f}sh conf={confidence:.2f}"
+            f"strat={strategy_signal:+.3f} learn={learning_signal:+.3f} "
+            f"{target_shares:.2f}sh conf={confidence:.2f}"
         )
 
         return {

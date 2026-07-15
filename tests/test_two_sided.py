@@ -68,8 +68,9 @@ def _signals(**over):
 
 
 def test_no_ban_is_gone_strong_no_lean_buys_no():
+    # Market leans NO (yes 0.45 / no 0.55, sum 1.0) with bearish alpha → buy NO.
     bot = _bot()
-    m = _market(yes=0.55, no=0.44)
+    m = _market(yes=0.45, no=0.55)
     s = _signals(pm_momentum=-0.15, obi=-1.0, cvd=-1.0)
     d = bot.make_decision(m, s)
     assert d["action"] == "buy"
@@ -78,11 +79,11 @@ def test_no_ban_is_gone_strong_no_lean_buys_no():
 
 def test_no_trade_sizes_against_no_price():
     bot = _bot()
-    m = _market(yes=0.55, no=0.44)
+    m = _market(yes=0.45, no=0.55)
     s = _signals(pm_momentum=-0.15, obi=-1.0, cvd=-1.0)
     d = bot.make_decision(m, s)
     assert d["side"] == "no"
-    assert abs(d["entry_price"] - 0.44) < 1e-6
+    assert abs(d["entry_price"] - 0.55) < 1e-6
 
 
 def test_high_price_guard_fires_on_no_price():
@@ -94,11 +95,14 @@ def test_high_price_guard_fires_on_no_price():
 
 
 def test_consensus_guard_fires_on_low_side_price():
+    # Synthetic underpriced NO book (no=0.30 < CONSENSUS_GUARD) chosen via strong
+    # NO edge → consensus guard skips it (backstop against fighting consensus).
     bot = _bot()
-    m = _market(yes=0.80, no=0.20)
+    m = _market(yes=0.55, no=0.30)
     s = _signals(pm_momentum=-0.15, obi=-1.0, cvd=-1.0)
     d = bot.make_decision(m, s)
     assert d["action"] == "skip"
+    assert "onsensus" in d["reasoning"]
 
 
 def test_no_edge_skips():
