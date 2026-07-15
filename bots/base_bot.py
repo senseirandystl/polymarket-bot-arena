@@ -234,34 +234,49 @@ class BaseBot(ABC):
         obi_signal = max(-0.15, min(0.15, float(signals.get("obi", 0.0) or 0.0) * 0.15))
         cvd_signal = max(-0.15, min(0.15, float(signals.get("cvd", 0.0) or 0.0) * 0.15))
 
+        # --- Signal 6: BTC drift from the window's "price to beat" (strike) ---
+        # The dominant fundamental: where BTC sits vs the window open price.
+        # Already bounded [-1, 1] and time-scaled (signals/strike.py). Regime-
+        # agnostic: >0 favors YES, <0 favors NO — it self-corrects with the
+        # market instead of baking in a directional bias. Weighted as a PRIMARY
+        # signal (not clamped into the secondary band) because it is the actual
+        # moneyness; its edge only fires when the Polymarket price lags BTC.
+        drift_signal_val = max(-1.0, min(1.0, float(signals.get("btc_drift", 0.0) or 0.0)))
+
         # --- Fair value: reinterpret the signal stack as a YES probability ---
-        # alpha keeps each secondary lane at its existing effective weight; the
-        # price lane moves into _compute_fair_yes via K_TILT. Identity preserved:
-        # price_tilt + alpha == the old `combined`.
+        # Secondary lanes nudge; the drift lane anchors to BTC's real position.
         alpha = (
             momentum_signal * 0.15 +
             pm_momentum_signal * 0.10 +
             strategy_signal * config.STRATEGY_SIGNAL_WEIGHT +
             obi_signal * config.SIGNAL_WEIGHT_OBI +
             cvd_signal * config.SIGNAL_WEIGHT_CVD +
+            drift_signal_val * config.SIGNAL_WEIGHT_DRIFT +
             learning_signal * learning_weight
         )
         fair_yes = self._compute_fair_yes(market_price, aggression, alpha)
 
-        # --- Two-sided net edge: buy the side with the larger positive edge ---
+        # --- Per-side evaluation: each side scored on its OWN price + fee ---
+        # Binary outcomes must sum to 1, so both sides share the one fair
+        # probability (fair_yes / 1-fair_yes) — but each side is evaluated
+        # INDEPENDENTLY: its own book price, its own taker fee, and therefore its
+        # own net edge and its own confidence. The bot takes whichever side wins
+        # its own evaluation. Fully symmetric / regime-agnostic — no side is
+        # favored by a constant, only by the signals (the drift lane above being
+        # the one that actually reads which way BTC is going).
         yes_price = market_price
         no_price = market.get("no_price")
         if no_price is None:
             no_price = round(1.0 - yes_price, 4)
         edge_yes, edge_no = self._side_net_edges(fair_yes, yes_price, no_price)
+        conf_yes = min(0.95, max(0.0, edge_yes) * config.EDGE_TO_CONFIDENCE)
+        conf_no = min(0.95, max(0.0, edge_no) * config.EDGE_TO_CONFIDENCE)
         if edge_yes >= edge_no:
-            side, side_price, chosen_edge = "yes", yes_price, edge_yes
+            side, side_price, chosen_edge, confidence = "yes", yes_price, edge_yes, conf_yes
         else:
-            side, side_price, chosen_edge = "no", no_price, edge_no
+            side, side_price, chosen_edge, confidence = "no", no_price, edge_no, conf_no
 
-        confidence = min(0.95, max(0.0, chosen_edge) * config.EDGE_TO_CONFIDENCE)
-
-        # --- Minimum-edge gate (no edge = no bet) ---
+        # --- Minimum-edge gate (no edge = no bet) — SAME bar on both sides ---
         min_edge = self.MIN_EDGE.get(self.strategy_type, config.MIN_EDGE_DEFAULT)
         if chosen_edge < min_edge:
             return {
@@ -338,10 +353,10 @@ class BaseBot(ABC):
 
         reasoning = (
             f"fair={fair_yes:.2f} yes={yes_price:.2f} no={no_price:.2f} "
-            f"=> {side} edge={chosen_edge:+.3f} "
-            f"mom={momentum_signal:+.3f} pm={pm_momentum_signal:+.3f} "
+            f"=> {side} edge={chosen_edge:+.3f} (eY={edge_yes:+.3f} eN={edge_no:+.3f}) "
+            f"drift={drift_signal_val:+.3f} mom={momentum_signal:+.3f} pm={pm_momentum_signal:+.3f} "
             f"of(obi={obi_signal:+.3f} cvd={cvd_signal:+.3f}) "
-            f"strat={strategy_signal:+.3f} learn={learning_signal:+.3f} "
+            f"strat={strategy_signal:+.3f} "
             f"{target_shares:.2f}sh conf={confidence:.2f}"
         )
 

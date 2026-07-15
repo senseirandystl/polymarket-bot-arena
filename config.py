@@ -112,8 +112,19 @@ MAX_FILL_SLIPPAGE = 0.03
 #   OBI  58.1% vs 66.7%  -> INVERTED (resting-depth fade) -> zeroed out
 # CVD = executed aggression (predicts); OBI = resting depth (fades). See
 # docs/superpowers/specs/2026-07-15-strategy-rootcause-improvements-design.md.
-SIGNAL_WEIGHT_OBI = 0.0
+# OBI restored (2026-07-15): the warmer computes it fresh from the 1s YES book
+# (best-first normalized), so it is a true, non-stale order-book imbalance read
+# (bid-heavy = upward/YES pressure). Modest weight; natural sign, no bias.
+SIGNAL_WEIGHT_OBI = 0.10
 SIGNAL_WEIGHT_CVD = 0.25
+
+# --- BTC drift-from-strike ("price to beat") signal (signals/strike.py) ---
+# The dominant fundamental for these markets: where BTC sits vs the window's open
+# price. Regime-agnostic (favors whichever side BTC is actually on) and time-
+# scaled (more decisive near expiry). Fed into fair value at SIGNAL_WEIGHT_DRIFT.
+MARKET_WINDOW_SEC = 300           # 5-min window length
+DRIFT_VOL_SCALE = 0.0015          # typical BTC move (fraction) over a full window
+SIGNAL_WEIGHT_DRIFT = 0.25        # weight of the (bounded [-1,1]) drift signal in fair value
 
 # --- Two-sided (YES/NO) net-edge side selection ---
 # Favorite-following tilt scale. Replaces the old hard-coded price_edge * 0.50

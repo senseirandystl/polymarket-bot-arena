@@ -32,8 +32,11 @@ def _sig(**over):
 
 # --- R1: config weights reflect measured predictiveness ---
 
-def test_obi_weight_zeroed():
-    assert config.SIGNAL_WEIGHT_OBI == 0.0
+def test_obi_restored():
+    # OBI was zeroed in Phase 1 (measured anti-predictive on a stale snapshot),
+    # then RESTORED once confirmed the warmer computes it fresh every 1s from the
+    # best-first book — a true order-book imbalance signal with its natural sign.
+    assert config.SIGNAL_WEIGHT_OBI > 0.0
 
 
 def test_cvd_weight_boosted():
@@ -71,16 +74,6 @@ def test_tilt_uncapped_in_band():
 
 
 # --- R1: OBI no longer moves the decision; CVD still does ---
-
-def test_obi_does_not_move_decision():
-    bot = _bot()
-    m = _market(yes=0.52, no=0.48)
-    d_pos = bot.make_decision(m, _sig(obi=1.0))
-    d_neg = bot.make_decision(m, _sig(obi=-1.0))
-    assert d_pos["side"] == d_neg["side"]
-    # confidence identical because OBI weight is 0
-    assert abs(d_pos.get("confidence", 0) - d_neg.get("confidence", 0)) < 1e-9
-
 
 def test_cvd_still_moves_decision():
     bot = _bot()
