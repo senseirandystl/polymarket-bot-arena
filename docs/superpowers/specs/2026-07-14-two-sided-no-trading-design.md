@@ -182,11 +182,35 @@ New/updated tests in `tests/` (pytest):
 8. **YES-behavior parity** — a representative YES scenario yields the same side
    (and comparable sizing) as before the change, guarding the §7 reconciliation.
 
+## Phase 2 — sniper + maker bots (added after directional phase approved)
+
+The user elected to extend NO trading to **all** remaining bots in the same
+effort. Sniper and both makers carried their own independent NO bans outside the
+base `make_decision` path, each with bespoke logic, so they use a **symmetric
+mirror** of their own strategy rather than the net-edge model:
+
+- **`bot_sniper`** — a side-agnostic `_zone_signal(price)` applies the sniper's
+  cheap/strong zones to *either* token's price. `make_decision` evaluates it on
+  the YES price (up-momentum confirms) and the NO price (down-momentum confirms)
+  and snipes the higher-confidence qualifying side. Old NO-zone `skip` removed.
+- **`bot_late_window_maker`** — up-momentum → quote YES on the YES price;
+  down-momentum → quote NO on the NO price; same price band confirms each side.
+  Old `if momentum < 0: hold` NO ban removed.
+- **`bot_fee_zone_maker`** — quotes whichever side's price sits in the fee zone
+  (fee is symmetric `fee(p)==fee(1−p)`), momentum contradiction check mirrored
+  per side.
+- **mean-rev SL/TP** — call `super().make_decision`, so they inherit the
+  two-sided base behavior automatically (docstrings updated only).
+
+Since `yes+no ≈ 1`, at most one side's price lands in any band, so no bot
+double-quotes; arbitrage stays the only two-legged bot. The sniper/maker NO
+branches are symmetric mirrors **not yet validated by live NO data** — flagged
+for recheck once NO trades accumulate. Tests: `tests/test_no_side_bots.py`.
+
 ## Out of scope
 
 - Arbitrage bot (two-legged; untouched).
-- Maker bots (override `make_decision`; untouched).
 - Evolution, dashboard, discovery, venues, learning internals (already
   NO-capable).
 - Retuning of the numeric defaults beyond sane starting values (a follow-up once
-  live NO data accumulates).
+  live NO data accumulates) — including the sniper/maker NO-zone assumptions.
