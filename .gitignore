@@ -32,3 +32,6 @@ setup_log.md
 # DB backups
 *.db.bak.*
 bot_arena.db.bak.*
+
+# Offline signal-validation harness cache (real market data; keep out of git + bounded)
+tools/.signal_cache/
