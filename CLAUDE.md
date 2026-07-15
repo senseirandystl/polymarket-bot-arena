@@ -49,11 +49,22 @@ fair_yes = yes_mid + price_tilt + alpha
       btc_momentum   * 0.15                 # BTC spot momentum (Binance candles)
     + pm_momentum    * 0.10                 # Polymarket in-market YES price momentum
     + strategy_signal * STRATEGY_SIGNAL_WEIGHT (0.30)   # per-bot thesis (now fires often)
-    + obi_signal     * SIGNAL_WEIGHT_OBI (0.0)          # DISABLED — measured anti-predictive
-    + cvd_signal     * SIGNAL_WEIGHT_CVD (0.25)         # executed flow — the real edge
+    + obi_signal     * SIGNAL_WEIGHT_OBI (0.10)         # order-book imbalance (warm 1s book, natural sign)
+    + cvd_signal     * SIGNAL_WEIGHT_CVD (0.25)         # executed flow — a real edge
+    + btc_drift      * SIGNAL_WEIGHT_DRIFT (0.25)       # BTC vs the window's "price to beat" — the FUNDAMENTAL
     + learning_bias  * (0 while LEARNING_ENABLED=False) # DISABLED — anti-predictive, being redesigned
   )
 ```
+**`btc_drift` (`signals/strike.py`) is the dominant fundamental.** These markets
+resolve UP iff BTC closes above its price at the window OPEN (the "price to
+beat"/strike). The strike is snapshotted at first live sighting of each window;
+`drift = tanh(z)` where `z = (btc_now − strike) / (DRIFT_VOL_SCALE·√(frac window
+remaining))` — bounded [−1,1], **regime-agnostic** (favors YES above the strike,
+NO below — self-correcting, no baked-in directional bias) and **time-scaled**
+(the same drift reads more decisive near expiry). Its edge only fires when the
+Polymarket price *lags* BTC. Each side is then evaluated **independently** on its
+own book price + fee (own net edge, own confidence); binary outcomes share one
+`fair_yes`, but neither side is favored by a constant — only by the signals.
 **Weights are empirical (2026-07-15 overnight run, spec `docs/superpowers/specs/2026-07-15-...`).**
 Per-signal predictiveness (confirms-side WR vs contradicts): CVD 66.9/52.4 (real edge, weighted up);
 OBI 58.1/66.7 (inverted → zeroed); learning bias 53.5/77.6 (inverted → disabled live). The
