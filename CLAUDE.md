@@ -49,22 +49,24 @@ fair_yes = yes_mid + price_tilt + alpha
       btc_momentum   * 0.15                 # BTC spot momentum (Binance candles)
     + pm_momentum    * 0.10                 # Polymarket in-market YES price momentum
     + strategy_signal * STRATEGY_SIGNAL_WEIGHT (0.30)   # per-bot thesis (now fires often)
-    + obi_signal     * SIGNAL_WEIGHT_OBI (0.10)         # order-book imbalance (warm 1s book, natural sign)
+    + obi_signal     * SIGNAL_WEIGHT_OBI (0.0)          # DISABLED — anti-predictive twice (fade signal); see BUG #23
     + cvd_signal     * SIGNAL_WEIGHT_CVD (0.25)         # executed flow — a real edge
-    + btc_drift      * SIGNAL_WEIGHT_DRIFT (0.25)       # BTC vs the window's "price to beat" — the FUNDAMENTAL
+    + btc_drift      * SIGNAL_WEIGHT_DRIFT (0.0)        # DISABLED — anti-predictive (mean-reversion); see BUG #23
     + learning_bias  * (0 while LEARNING_ENABLED=False) # DISABLED — anti-predictive, being redesigned
   )
 ```
-**`btc_drift` (`signals/strike.py`) is the dominant fundamental.** These markets
-resolve UP iff BTC closes above its price at the window OPEN (the "price to
-beat"/strike). The strike is snapshotted at first live sighting of each window;
-`drift = tanh(z)` where `z = (btc_now − strike) / (DRIFT_VOL_SCALE·√(frac window
-remaining))` — bounded [−1,1], **regime-agnostic** (favors YES above the strike,
-NO below — self-correcting, no baked-in directional bias) and **time-scaled**
-(the same drift reads more decisive near expiry). Its edge only fires when the
-Polymarket price *lags* BTC. Each side is then evaluated **independently** on its
-own book price + fee (own net edge, own confidence); binary outcomes share one
-`fair_yes`, but neither side is favored by a constant — only by the signals.
+**`btc_drift` (`signals/strike.py`) is WIRED but DISABLED (weight 0).** It
+snapshots each window's "price to beat" (BTC at window open) and emits
+`drift = tanh(z)`, `z = (btc_now − strike) / (DRIFT_VOL_SCALE·√frac-remaining)`.
+It was shipped weighted at 0.25 and proved **anti-predictive** — over a 5-min
+window BTC is short-horizon mean-reverting and the Polymarket price already
+prices the reversion, so "BTC is above the strike NOW" extrapolated the wrong
+way (33% WR blow-up; when drift said UP, YES won 23%). Left wired at weight 0 for
+a validated redesign (near-expiry-only, and/or fade sign). **Any new signal must
+be validated offline against resolved-market data BEFORE it gets a live weight
+(BUG #23).** Side selection is an explicit **per-side** evaluation — each side
+scored on its own book price + fee (own edge, own confidence), same `MIN_EDGE`
+bar both sides, no hardcoded directional bias.
 **Weights are empirical (2026-07-15 overnight run, spec `docs/superpowers/specs/2026-07-15-...`).**
 Per-signal predictiveness (confirms-side WR vs contradicts): CVD 66.9/52.4 (real edge, weighted up);
 OBI 58.1/66.7 (inverted → zeroed); learning bias 53.5/77.6 (inverted → disabled live). The
