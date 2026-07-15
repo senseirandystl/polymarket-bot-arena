@@ -9,7 +9,11 @@ DEFAULT_PARAMS = {
     "momentum_weight": 0.35,
     "mean_rev_weight": 0.35,
     "sentiment_weight": 0.30,
-    "confidence_threshold": 0.55,
+    # 0.55->0.15: momentum and mean-reversion are opposite theses that partly
+    # cancel in the weighted score, so a 0.55 gate meant the ensemble almost
+    # never fired. 0.15 lets a net lean through (still capped at +/-0.043 of
+    # fair value by the strategy lane weight).
+    "confidence_threshold": 0.15,
     "agreement_bonus": 0.15,   # bonus when multiple strategies agree
     "position_size_pct": 0.06,
     "min_confidence": 0.5,

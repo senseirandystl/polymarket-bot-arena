@@ -4,12 +4,16 @@ import math
 from bots.base_bot import BaseBot
 
 DEFAULT_PARAMS = {
-    "lookback_candles": 20,
+    # lookback 20->10 (20 rarely had enough 1-min candles in a 5-min window, so
+    # the bot never fired); z-score threshold 0.6->0.4 and RSI is now a
+    # confidence modifier, not a hard AND-gate — so mean-reversion emits a
+    # frequent, distinct (contrarian) lean instead of holding ~always.
+    "lookback_candles": 10,
     "bb_std_dev": 2.0,         # Bollinger Band width
     "rsi_period": 14,
-    "rsi_oversold": 30,
-    "rsi_overbought": 70,
-    "reversion_threshold": 0.6, # z-score threshold
+    "rsi_oversold": 40,
+    "rsi_overbought": 60,
+    "reversion_threshold": 0.4, # z-score threshold to fade
     "position_size_pct": 0.05,
     "min_confidence": 0.55,
 }
@@ -68,30 +72,31 @@ class MeanRevBot(BaseBot):
         rsi = self._calc_rsi(prices, self.strategy_params["rsi_period"])
 
         threshold = self.strategy_params["reversion_threshold"]
+        import config
+        amount = config.get_max_position() * self.strategy_params["position_size_pct"]
 
-        # Overextended UP → bet NO (expect reversion down)
-        if zscore > threshold and rsi > self.strategy_params["rsi_overbought"]:
-            confidence = min(0.95, 0.5 + abs(zscore) * 0.15 + (rsi - 70) * 0.005)
-            import config
-            amount = config.get_max_position() * self.strategy_params["position_size_pct"]
+        # Overextended UP → fade → bet NO (expect reversion down). RSI is a
+        # confidence booster (stronger when also overbought), not a hard gate.
+        if zscore > threshold:
+            rsi_boost = max(0.0, rsi - self.strategy_params["rsi_overbought"]) * 0.005
+            confidence = min(0.95, 0.35 + abs(zscore) * 0.15 + rsi_boost)
             return {
                 "action": "buy",
                 "side": "no",
                 "confidence": confidence,
-                "reasoning": f"Mean reversion SHORT: z={zscore:.2f}, RSI={rsi:.1f} (overbought)",
+                "reasoning": f"Mean reversion SHORT: z={zscore:.2f}, RSI={rsi:.1f} (fade up)",
                 "suggested_amount": amount,
             }
 
-        # Overextended DOWN → bet YES (expect reversion up)
-        if zscore < -threshold and rsi < self.strategy_params["rsi_oversold"]:
-            confidence = min(0.95, 0.5 + abs(zscore) * 0.15 + (30 - rsi) * 0.005)
-            import config
-            amount = config.get_max_position() * self.strategy_params["position_size_pct"]
+        # Overextended DOWN → fade → bet YES (expect reversion up)
+        if zscore < -threshold:
+            rsi_boost = max(0.0, self.strategy_params["rsi_oversold"] - rsi) * 0.005
+            confidence = min(0.95, 0.35 + abs(zscore) * 0.15 + rsi_boost)
             return {
                 "action": "buy",
                 "side": "yes",
                 "confidence": confidence,
-                "reasoning": f"Mean reversion LONG: z={zscore:.2f}, RSI={rsi:.1f} (oversold)",
+                "reasoning": f"Mean reversion LONG: z={zscore:.2f}, RSI={rsi:.1f} (fade down)",
                 "suggested_amount": amount,
             }
 

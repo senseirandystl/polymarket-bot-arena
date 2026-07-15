@@ -3,15 +3,13 @@
 from bots.base_bot import BaseBot
 
 DEFAULT_PARAMS = {
-    "sentiment_window_min": 5,
-    "bullish_threshold": 0.6,
-    "bearish_threshold": 0.4,
-    "influencer_weight": 2.0,
-    "noise_filter_min_posts": 5,
+    # Polymarket in-market sentiment weights (see analyze()). score = PM
+    # YES-price momentum * pm_weight + executed flow (CVD) * cvd_weight.
+    "pm_weight": 3.0,
+    "cvd_weight": 0.5,
+    "deadband": 0.05,        # |score| below this = neutral (hold)
     "position_size_pct": 0.04,
     "min_confidence": 0.55,
-    "sentiment_momentum_weight": 0.6,
-    "raw_sentiment_weight": 0.4,
 }
 
 
@@ -26,73 +24,35 @@ class SentimentBot(BaseBot):
         )
 
     def analyze(self, market: dict, signals: dict) -> dict:
-        """Trade based on X/social sentiment for BTC/SOL."""
-        sentiment_data = signals.get("sentiment", {})
+        """Polymarket in-market sentiment: how *this market's* traders are
+        positioning, from PM YES-price momentum + executed flow (CVD).
 
-        if not sentiment_data:
-            return {"action": "hold", "side": "yes", "confidence": 0, "reasoning": "no sentiment data"}
+        Repurposed 2026-07-15: the original X/social feed never existed
+        post-Simmer, so this bot always held and was a base-signal clone. Its
+        distinct thesis is now book sentiment (in-market repricing + aggressor
+        flow), which leads/lags BTC spot and differs from the momentum bot's
+        BTC-spot trend read.
+        """
+        pm = float(signals.get("pm_momentum", 0.0) or 0.0)   # PM YES price momentum
+        cvd = float(signals.get("cvd", 0.0) or 0.0)          # executed buy-sell flow, [-1,1]
 
-        # Sentiment data expected format:
-        # {
-        #   "score": 0.0-1.0 (0=bearish, 0.5=neutral, 1=bullish),
-        #   "post_count": int,
-        #   "influencer_score": 0.0-1.0,
-        #   "momentum": float (change in sentiment over window),
-        # }
+        pm_w = self.strategy_params.get("pm_weight", 3.0)
+        cvd_w = self.strategy_params.get("cvd_weight", 0.5)
+        score = pm * pm_w + cvd * cvd_w                       # >0 bullish YES, <0 bearish
 
-        score = sentiment_data.get("score", 0.5)
-        post_count = sentiment_data.get("post_count", 0)
-        influencer_score = sentiment_data.get("influencer_score", 0.5)
-        momentum = sentiment_data.get("momentum", 0)
-
-        # Filter noise: need minimum posts to trust the signal
-        if post_count < self.strategy_params["noise_filter_min_posts"]:
+        deadband = self.strategy_params.get("deadband", 0.05)
+        if abs(score) <= deadband:
             return {"action": "hold", "side": "yes", "confidence": 0,
-                    "reasoning": f"too few posts ({post_count}) for reliable signal"}
+                    "reasoning": f"Neutral market sentiment: score={score:+.3f}"}
 
-        # Weight influencer sentiment higher
-        weighted_score = (
-            score + (influencer_score - 0.5) * self.strategy_params["influencer_weight"]
-        ) / (1 + self.strategy_params["influencer_weight"] * 0.5)
-        weighted_score = max(0, min(1, weighted_score))
-
-        # Combine raw sentiment with momentum
-        sw = self.strategy_params["raw_sentiment_weight"]
-        mw = self.strategy_params["sentiment_momentum_weight"]
-        # Momentum > 0 means sentiment is improving
-        momentum_signal = 0.5 + momentum * 5  # scale momentum
-        momentum_signal = max(0, min(1, momentum_signal))
-
-        combined = weighted_score * sw + momentum_signal * mw
-
-        bullish_thresh = self.strategy_params["bullish_threshold"]
-        bearish_thresh = self.strategy_params["bearish_threshold"]
-
-        if combined > bullish_thresh:
-            confidence = min(0.95, 0.5 + (combined - bullish_thresh) * 2)
-            import config
-            amount = config.get_max_position() * self.strategy_params["position_size_pct"]
-            return {
-                "action": "buy",
-                "side": "yes",
-                "confidence": confidence,
-                "reasoning": f"Bullish sentiment: score={score:.2f}, influencer={influencer_score:.2f}, momentum={momentum:.3f}, posts={post_count}",
-                "suggested_amount": amount,
-            }
-
-        if combined < bearish_thresh:
-            confidence = min(0.95, 0.5 + (bearish_thresh - combined) * 2)
-            import config
-            amount = config.get_max_position() * self.strategy_params["position_size_pct"]
-            return {
-                "action": "buy",
-                "side": "no",
-                "confidence": confidence,
-                "reasoning": f"Bearish sentiment: score={score:.2f}, influencer={influencer_score:.2f}, momentum={momentum:.3f}, posts={post_count}",
-                "suggested_amount": amount,
-            }
-
+        import config
+        amount = config.get_max_position() * self.strategy_params["position_size_pct"]
+        side = "yes" if score > 0 else "no"
+        confidence = min(0.95, 0.35 + abs(score))
         return {
-            "action": "hold", "side": "yes", "confidence": 0,
-            "reasoning": f"Neutral sentiment: combined={combined:.2f}"
+            "action": "buy",
+            "side": side,
+            "confidence": confidence,
+            "reasoning": f"Market sentiment {side}: pm={pm:+.3f} cvd={cvd:+.3f} score={score:+.3f}",
+            "suggested_amount": amount,
         }
