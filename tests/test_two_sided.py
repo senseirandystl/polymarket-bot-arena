@@ -10,17 +10,17 @@ def _bot():
 
 # --- Task 1: pure fair-value + edge helpers ---
 
-def test_compute_fair_yes_identity_with_combined():
-    # price_tilt = (0.60-0.5)*1*0.5 = 0.05; alpha=0.02 -> fair = 0.67
+def test_compute_fair_yes_blend():
+    # fair = mid + trust * (P_model - mid): 0.60 + 0.5*(0.70-0.60) = 0.65
     bot = _bot()
-    fair = bot._compute_fair_yes(0.60, 1.0, 0.02)
-    assert abs(fair - 0.67) < 1e-9
+    fair = bot._compute_fair_yes(0.60, 0.70, 0.5)
+    assert abs(fair - 0.65) < 1e-9
 
 
 def test_compute_fair_yes_clamped():
     bot = _bot()
-    assert bot._compute_fair_yes(0.98, 2.0, 0.5) <= 0.98
-    assert bot._compute_fair_yes(0.02, 2.0, -0.5) >= 0.02
+    assert bot._compute_fair_yes(0.97, 0.98, 2.0) <= 0.98
+    assert bot._compute_fair_yes(0.03, 0.02, 2.0) >= 0.02
 
 
 def test_side_net_edges_complementary_is_mirror():
@@ -115,14 +115,17 @@ def test_no_edge_skips():
 
 # --- Task 3: YES-parity regression ---
 
-def test_favorite_upswing_still_buys_yes():
+def test_yes_bought_when_market_lags_bullish_model():
+    # Bullish drift + flow with the market still near 50c: the model-vs-price
+    # gap is real edge -> buy YES. (A 62c favorite with the same signals is
+    # priced-in and correctly skipped under the model-blend fair value.)
     bot = _bot()
-    m = _market(yes=0.62, no=0.38)
-    s = _signals(pm_momentum=0.15, obi=1.0, cvd=1.0)
+    m = _market(yes=0.53, no=0.47)
+    s = _signals(pm_momentum=0.15, cvd=1.0, btc_drift=0.4)
     d = bot.make_decision(m, s)
     assert d["action"] == "buy"
     assert d["side"] == "yes"
-    assert abs(d["entry_price"] - 0.62) < 1e-6
+    assert abs(d["entry_price"] - 0.53) < 1e-6
 
 
 def test_complementary_mids_reduce_to_sign():

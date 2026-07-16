@@ -117,8 +117,12 @@ MAX_FILL_SLIPPAGE = 0.03
 # same inversion as the pre-#21 clean run. So OBI as computed here (top-of-book
 # resting depth) is a FADE signal in this venue, not upward pressure. Kept wired
 # at weight 0 pending an OFFLINE validation of the fade sign before any re-enable.
+# NOTE (2026-07-16): per-lane weights moved into the per-strategy model
+# profiles (bots/base_bot.py STRATEGY_SIGNAL_PROFILE) so strategies genuinely
+# differ. SIGNAL_WEIGHT_OBI remains as a GLOBAL kill-switch multiplied onto the
+# OBI lane for every strategy — keep 0.0 until a fade-sign OBI is validated
+# offline.
 SIGNAL_WEIGHT_OBI = 0.0
-SIGNAL_WEIGHT_CVD = 0.25
 
 # --- BTC drift-from-strike ("price to beat") signal (signals/strike.py) ---
 # The dominant fundamental for these markets: where BTC sits vs the window's open
@@ -130,24 +134,26 @@ DRIFT_VOL_SCALE = 0.0015          # typical BTC move (fraction) over a full wind
 # strike (mid-window "first sighting"), not a bad signal. With the accurate
 # strike (Binance open @ eventStartTime) the offline harness
 # (tools/validate_signals.py, 300 resolved markets, 50% UP base rate) measures
-# drift ~76% predictive — symmetric and 86% near expiry. Now VALIDATED, so it
-# earns a live weight. Start moderate; tunable in one place.
-SIGNAL_WEIGHT_DRIFT = 0.20
+# drift ~76% predictive — symmetric and 86% near expiry. Drift is now weighted
+# per-strategy inside STRATEGY_SIGNAL_PROFILE (bots/base_bot.py); it is the
+# anchor lane of every strategy's model.
 
-# --- Two-sided (YES/NO) net-edge side selection ---
-# Favorite-following tilt scale. Replaces the old hard-coded price_edge * 0.50
-# lane weight; 0.5 keeps it numerically identical at aggression == 1.0.
-K_TILT = 0.5
-# Cap on the price_tilt contribution to fair value (probability units). The
-# empirical favorite underpricing is ~flat +4-6c across 55-85c, NOT proportional
-# to distance from 0.5 — an uncapped tilt manufactured fake edge at the extremes
-# (>=75c was break-even yet drew big confident bets). Cap models the real,
-# bounded favorite edge and stops overbetting efficient extremes.
-FAVORITE_EDGE_CAP = 0.06
-# Weight of each strategy's analyze() lean in fair value. Raised 0.15 -> 0.30 so
-# momentum/mean_reversion/sentiment/hybrid express genuinely distinct theses
-# (they fired in only 6.6% of trades at the old weight — all bots were clones).
-STRATEGY_SIGNAL_WEIGHT = 0.30
+# --- Two-sided (YES/NO) net-edge side selection: MODEL-BLEND fair value ---
+# fair_yes = yes_mid + trust * (P_model - yes_mid). Edge exists ONLY when the
+# bot's model probability diverges from the market price (market lags BTC) —
+# never by construction. This replaced the additive tilt/alpha stack after the
+# 2026-07-16 live run (136 resolved trades): the flat +6c favorite tilt cleared
+# the MIN_EDGE gate at window open on its own, so every bot bought the 58-65c
+# favorite in the first minute (107 early trades, 49% WR, -$79.53; the 60-70c
+# bucket alone was -$64.55 at 47% WR — no favorite premium exists at taker
+# prices). The net-edge harness (tools/validate_signals.py, PM price history)
+# confirms: "buy the favorite" EV is negative above ~0.67 and marginal
+# elsewhere, while "follow drift only when the market lags" is the top rule.
+# Weight of each strategy's analyze() lean inside P_model (all strategies).
+STRATEGY_SIGNAL_WEIGHT = 0.15
+# Sanity clamp on P_model.
+MODEL_PROB_MIN = 0.02
+MODEL_PROB_MAX = 0.98
 # Live learning bias: the raw-YES-WR learner was anti-predictive (-24pp) and
 # double-counted price. Disabled in live decisions (outcomes still recorded)
 # pending the edge-calibrated redesign. See spec R5.

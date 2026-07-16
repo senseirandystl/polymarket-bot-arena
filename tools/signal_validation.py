@@ -26,10 +26,12 @@ class Sample:
     strike: float
     yes_won: bool              # ground truth: did Up (YES) win?
     signals: dict              # signal_name -> value (YES-frame: >0 leans Up)
+    pm_yes: Optional[float] = None   # Polymarket YES mid at this decision point
 
 
 def build_samples(market_id: str, strike: float, trajectory: list,
-                  yes_won: bool, window_sec: int = 300) -> list:
+                  yes_won: bool, window_sec: int = 300,
+                  pm_prices: Optional[list] = None) -> list:
     """Build decision-time samples from a BTC price trajectory.
 
     ``trajectory`` is a list of ``(seconds_from_open, btc_price)`` points (e.g.
@@ -39,6 +41,11 @@ def build_samples(market_id: str, strike: float, trajectory: list,
       * ``drift_raw``   — signed fractional distance from strike
       * ``drift_prod``  — the production ``drift_signal`` (tanh, time-scaled)
       * ``mom2``        — BTC change over the last two trajectory points
+
+    ``pm_prices`` (optional) is a list of ``(seconds_from_open, yes_mid)``
+    points from Polymarket's price history; each sample gets the most recent
+    PM YES mid at-or-before its decision time (``pm_yes``), enabling net-edge
+    (vs-the-price) metrics, not just raw predictiveness.
     """
     samples = []
     prev = None
@@ -49,6 +56,11 @@ def build_samples(market_id: str, strike: float, trajectory: list,
             continue
         drift_raw = (btc - strike) / strike
         mom2 = 0.0 if prev is None or prev <= 0 else (btc - prev) / prev
+        pm_yes = None
+        if pm_prices:
+            past = [p for t, p in pm_prices if t <= elapsed]
+            if past:
+                pm_yes = float(past[-1])
         samples.append(Sample(
             market_id=market_id, time_remaining=float(tr), btc_now=float(btc),
             strike=float(strike), yes_won=bool(yes_won),
@@ -57,6 +69,7 @@ def build_samples(market_id: str, strike: float, trajectory: list,
                 "drift_prod": drift_signal(strike, btc, tr),
                 "mom2": mom2,
             },
+            pm_yes=pm_yes,
         ))
         prev = btc
     return samples
@@ -101,6 +114,55 @@ def predictiveness(samples: list, signal_key: str,
         "up_n": up_n, "up_winrate": up_wr,
         "down_n": dn_n, "down_winrate": dn_wr,
     }
+
+
+def net_edge(samples: list, side_of: Callable, fee: Callable,
+             filt: Optional[Callable] = None) -> dict:
+    """Realised per-share net EV of a decision rule against the ACTUAL PM price.
+
+    ``side_of(sample) -> "yes" | "no" | None`` picks the side to buy (None =
+    skip). The buy price is the PM mid for that side at decision time and
+    ``fee(shares, price)`` is the canonical taker fee. This is the metric that
+    matters: a signal can be predictive yet have NO edge once the market has
+    already priced it in (BUG: raw follow-WR ≠ profit).
+    """
+    n = wins = 0
+    ev_sum = price_sum = 0.0
+    for s in samples:
+        if s.pm_yes is None or (filt is not None and not filt(s)):
+            continue
+        side = side_of(s)
+        if side is None:
+            continue
+        price = s.pm_yes if side == "yes" else (1.0 - s.pm_yes)
+        if price <= 0.01 or price >= 0.99:
+            continue
+        won = s.yes_won if side == "yes" else (not s.yes_won)
+        ev = (1.0 - price if won else -price) - fee(1.0, price)
+        n += 1
+        wins += 1 if won else 0
+        ev_sum += ev
+        price_sum += price
+    return {
+        "n": n,
+        "winrate": (wins / n) if n else None,
+        "avg_price": (price_sum / n) if n else None,
+        "ev_per_share": (ev_sum / n) if n else None,
+    }
+
+
+def net_edge_time_buckets(samples: list, side_of: Callable, fee: Callable,
+                          edges=(60, 120, 180, 300)) -> list:
+    """``net_edge`` split by time-remaining bucket."""
+    out = []
+    lo = 0
+    for hi in edges:
+        res = net_edge(samples, side_of, fee,
+                       filt=lambda s, lo=lo, hi=hi: lo < s.time_remaining <= hi)
+        res["bucket"] = f"{lo}-{hi}s"
+        out.append(res)
+        lo = hi
+    return out
 
 
 def time_buckets(samples: list, signal_key: str, edges=(60, 120, 180, 300)) -> list:

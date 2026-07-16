@@ -1,11 +1,15 @@
-"""Phase 1 root-cause fixes: signal re-weighting, tilt cap, stop-loss removal.
+"""Model-blend fair value: signal weighting + no manufactured edge.
 
-Backed by the overnight run analysis (docs/superpowers/specs/2026-07-15-...):
-OBI + learning bias were anti-predictive; CVD is the real edge; price_tilt
-manufactured fake edge at extremes; stop-loss is net-harmful in 5-min markets.
+History: the additive stack (fair = mid + tilt + alpha) counted its bonus
+lanes as edge BY CONSTRUCTION — the flat +6c favorite tilt alone cleared the
+MIN_EDGE gate at window open, so every bot bought the 58-65c favorite in the
+first minute (2026-07-16 live run: 107 early trades, 49% WR, -$79.53). Fair is
+now a market-vs-model blend: fair = mid + trust * (P_model - mid), so edge
+exists only when the bot's model actively disagrees with the price.
 """
 
 import config
+from bots.base_bot import BaseBot
 from bots.bot_momentum import MomentumBot
 from bots.bot_meanrev_sl import MeanRevSLBot
 
@@ -14,74 +18,97 @@ def _bot():
     return MomentumBot(name="momentum-test", generation=0)
 
 
-def _market(yes=0.52, no=None):
+def _market(yes=0.52, no=None, tr=180):
     return {
         "id": "m", "current_price": yes,
         "no_price": (round(1 - yes, 4)) if no is None else no,
         "polymarket_token_id": "y", "polymarket_no_token_id": "n",
-        "time_remaining_seconds": 180,
+        "time_remaining_seconds": tr,
     }
 
 
 def _sig(**over):
     base = {"prices": [100.0, 100.0], "latest": 100.0, "orderflow": {},
-            "pm_momentum": 0.0, "obi": 0.0, "cvd": 0.0}
+            "pm_momentum": 0.0, "obi": 0.0, "cvd": 0.0, "btc_drift": 0.0}
     base.update(over)
     return base
 
 
-# --- R1: config weights reflect measured predictiveness ---
+# --- Weights reflect measured predictiveness ---
 
 def test_obi_disabled():
-    # OBI zeroed (Phase 1), briefly restored, then re-disabled: it measured
-    # anti-predictive with its natural sign in TWO independent runs. Off until a
-    # fade-sign version is validated offline. See config comment / BUG #23.
+    # OBI kill-switch stays 0.0 until a fade-sign OBI is validated offline.
     assert config.SIGNAL_WEIGHT_OBI == 0.0
 
 
-def test_cvd_weight_boosted():
-    assert config.SIGNAL_WEIGHT_CVD >= 0.20
+def test_cvd_weighted_in_every_profile():
+    # CVD (executed aggression) is the one validated flow edge — every
+    # strategy's model weights it > 0; sentiment weights it heaviest.
+    profs = BaseBot.STRATEGY_SIGNAL_PROFILE
+    for strat, prof in profs.items():
+        assert prof["cvd"] > 0.0, strat
+    assert profs["sentiment"]["cvd"] == max(p["cvd"] for p in profs.values())
 
 
 def test_learning_disabled_live():
     assert config.LEARNING_ENABLED is False
 
 
-def test_strategy_weight_raised():
-    assert config.STRATEGY_SIGNAL_WEIGHT >= 0.30
+# --- No manufactured edge: the favorite tilt is gone ---
+
+def test_no_edge_from_price_alone():
+    # A 63c favorite with ZERO signal must be a skip for every strategy — the
+    # old tilt made this an automatic buy (the -$64.55 bucket).
+    for cls_name, bot in [("mom", _bot()), ("sl", MeanRevSLBot())]:
+        d = bot.make_decision(_market(yes=0.63, tr=290), _sig())
+        assert d["action"] == "skip", cls_name
 
 
-# --- R2: price_tilt is capped so it can't manufacture edge at extremes ---
+def test_ignorance_never_fades_the_favorite():
+    # With no information the model sits at 0.5; blending toward it made the
+    # non-favorite look cheap. The model-lean eligibility rule forbids buying
+    # a side the model doesn't actively lean toward.
+    d = _bot().make_decision(_market(yes=0.63), _sig())
+    assert d["action"] == "skip"
+    d = _bot().make_decision(_market(yes=0.37), _sig())
+    assert d["action"] == "skip"
 
-def test_tilt_capped_high():
+
+def test_priced_in_signal_earns_nothing():
+    # Strong drift already reflected in the price -> no edge, skip.
+    d = _bot().make_decision(_market(yes=0.70, tr=150), _sig(btc_drift=0.5))
+    assert d["action"] == "skip"
+
+
+def test_market_lagging_model_is_the_trade():
+    # Same drift, market still near 50c -> the model-vs-price gap IS the edge.
+    d = _bot().make_decision(_market(yes=0.52, tr=150), _sig(btc_drift=0.5))
+    assert d["action"] == "buy"
+    assert d["side"] == "yes"
+
+
+def test_fair_blend_math():
     bot = _bot()
-    # raw tilt = (0.90-0.5)*1.2*K_TILT = 0.24; capped to FAVORITE_EDGE_CAP.
-    fair = bot._compute_fair_yes(0.90, 1.2, 0.0)
-    assert abs(fair - (0.90 + config.FAVORITE_EDGE_CAP)) < 1e-9
+    # fair = mid + trust * (P_model - mid)
+    assert abs(bot._compute_fair_yes(0.50, 0.70, 0.5) - 0.60) < 1e-9
+    assert abs(bot._compute_fair_yes(0.60, 0.60, 0.5) - 0.60) < 1e-9  # priced in
 
 
-def test_tilt_capped_low():
-    bot = _bot()
-    fair = bot._compute_fair_yes(0.10, 1.2, 0.0)
-    assert abs(fair - (0.10 - config.FAVORITE_EDGE_CAP)) < 1e-9
+# --- Strategy differentiation is real (emphasis, never direction) ---
+
+def test_profiles_have_no_negative_weights():
+    for strat, prof in BaseBot.STRATEGY_SIGNAL_PROFILE.items():
+        for lane, w in prof.items():
+            assert w >= 0.0, (strat, lane)
 
 
-def test_tilt_uncapped_in_band():
-    bot = _bot()
-    # small tilt below the cap passes through unchanged: (0.55-0.5)*1.0*0.5=0.025
-    fair = bot._compute_fair_yes(0.55, 1.0, 0.0)
-    assert abs(fair - 0.575) < 1e-9
-
-
-# --- R1: OBI no longer moves the decision; CVD still does ---
-
-def test_cvd_still_moves_decision():
-    bot = _bot()
-    m = _market(yes=0.52, no=0.48)
-    d_pos = bot.make_decision(m, _sig(cvd=1.0))
-    d_neg = bot.make_decision(m, _sig(cvd=-1.0))
-    # CVD is the real edge: flipping its sign must change the fair value / side lean
-    assert d_pos != d_neg
+def test_strategies_diverge_on_momentum_only_input():
+    # A pure BTC-momentum burst (no drift backing) trades the momentum bot but
+    # not the fundamentals-only mean-reversion bot.
+    m = _market(yes=0.55, tr=150)
+    s = _sig(btc_drift=0.2, prices=[100.0, 100.06], latest=100.06)
+    assert _bot().make_decision(m, s)["action"] == "buy"
+    assert MeanRevSLBot().make_decision(m, s)["action"] == "skip"
 
 
 # --- R3: stop-loss removed — SL bots hold to resolution ---

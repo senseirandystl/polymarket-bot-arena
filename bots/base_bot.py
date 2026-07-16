@@ -44,16 +44,42 @@ class BaseBot(ABC):
         "sentiment": 0.50,      # neutral
         "hybrid": 0.50,         # neutral
     }
-    # How aggressively each strategy trusts the market price signal
-    MARKET_PRICE_AGGRESSION = {
-        "momentum": 1.2,        # follows market price strongly
-        "mean_reversion": 0.95, # nearly follows market (contrarian was -$16 loser)
-        "mean_reversion_sl": 0.95,
-        "mean_reversion_tp": 0.95,
-        "sniper": 1.0,          # sniper overrides make_decision entirely
-        "phantom": 1.1,         # trend-following
-        "sentiment": 1.0,       # neutral
-        "hybrid": 1.0,          # neutral (was 0.9, contrarian loses)
+    # Per-strategy MODEL weight profile. Each lane arrives normalized to
+    # [-1, 1] in YES-frame and the weighted sum maps to a model probability:
+    #   P_model = 0.5 + 0.5 * sum(w_lane * lane)
+    # Differentiation is by EMPHASIS, never by a hardcoded direction — every
+    # weight is >= 0 and every lane is regime-agnostic, so no strategy carries
+    # a baked-in YES/NO bias (see memory: regime-agnostic-signals).
+    #   momentum / phantom  — trend followers: drift anchor + heavy flow/momentum
+    #   mean_reversion*     — fundamentals-only: near-pure drift; by ignoring
+    #                         momentum/flow it naturally fades price moves that
+    #                         BTC's actual position doesn't back
+    #   sentiment           — order-flow reader: CVD (executed aggression) heavy
+    #   hybrid              — balanced blend of everything
+    STRATEGY_SIGNAL_PROFILE = {
+        "momentum":          {"drift": 0.45, "mom": 0.25, "pm": 0.15, "cvd": 0.15, "obi": 0.10},
+        "phantom":           {"drift": 0.40, "mom": 0.30, "pm": 0.20, "cvd": 0.10, "obi": 0.10},
+        "mean_reversion":    {"drift": 0.65, "mom": 0.00, "pm": 0.00, "cvd": 0.05, "obi": 0.00},
+        "mean_reversion_sl": {"drift": 0.65, "mom": 0.00, "pm": 0.00, "cvd": 0.05, "obi": 0.00},
+        "mean_reversion_tp": {"drift": 0.65, "mom": 0.00, "pm": 0.00, "cvd": 0.05, "obi": 0.00},
+        "sentiment":         {"drift": 0.35, "mom": 0.00, "pm": 0.10, "cvd": 0.35, "obi": 0.15},
+        "hybrid":            {"drift": 0.50, "mom": 0.10, "pm": 0.10, "cvd": 0.15, "obi": 0.05},
+        "sniper":            {"drift": 0.50, "mom": 0.10, "pm": 0.10, "cvd": 0.15, "obi": 0.05},
+    }
+    DEFAULT_SIGNAL_PROFILE = {"drift": 0.50, "mom": 0.10, "pm": 0.10, "cvd": 0.15, "obi": 0.05}
+    # How far fair value moves from the market mid toward the bot's own model.
+    # fair = mid + trust * (P_model - mid): the bot only sees edge when its
+    # model DISAGREES with the price — the honest replacement for the additive
+    # tilt/alpha stack that manufactured edge by construction.
+    STRATEGY_MODEL_TRUST = {
+        "momentum": 0.50,
+        "mean_reversion": 0.60,
+        "mean_reversion_sl": 0.60,
+        "mean_reversion_tp": 0.60,
+        "sniper": 0.50,
+        "phantom": 0.50,
+        "sentiment": 0.50,
+        "hybrid": 0.50,
     }
     # Minimum confidence to place a trade
     # v6.3: Simmer BTC markets price near 47-55¢ most of the time. At 52¢ the
@@ -112,22 +138,32 @@ class BaseBot(ABC):
         """
         pass
 
-    def _compute_fair_yes(self, yes_mid: float, aggression: float,
-                          alpha: float) -> float:
-        """Fair YES probability from the signal stack.
+    def _model_prob_yes(self, lanes: dict) -> float:
+        """Model probability of YES from normalized signal lanes.
 
-        fair = yes_mid + price_tilt + alpha, where price_tilt is the
-        favorite-following lane ((yes_mid-0.5) * aggression * K_TILT) and alpha
-        is the summed secondary lanes. Clamped to [0.02, 0.98].
-
-        price_tilt is capped at +/-FAVORITE_EDGE_CAP: the favorite underpricing
-        is empirically flat (~+5c) across the favorite band, so an uncapped tilt
-        manufactured fake edge at the extremes (see spec R2).
+        ``lanes`` maps lane name -> value in [-1, 1] (YES-frame). Weighted by
+        this strategy's profile and mapped to a probability. Lanes not in the
+        profile (e.g. ``strat``/``learn``) carry their weight in the value.
         """
-        cap = config.FAVORITE_EDGE_CAP
-        price_tilt = (yes_mid - 0.5) * aggression * config.K_TILT
-        price_tilt = max(-cap, min(cap, price_tilt))
-        return max(0.02, min(0.98, yes_mid + price_tilt + alpha))
+        prof = self.STRATEGY_SIGNAL_PROFILE.get(
+            self.strategy_type, self.DEFAULT_SIGNAL_PROFILE)
+        s = 0.0
+        for k, v in lanes.items():
+            s += prof.get(k, 1.0) * v
+        return max(config.MODEL_PROB_MIN,
+                   min(config.MODEL_PROB_MAX, 0.5 + 0.5 * s))
+
+    def _compute_fair_yes(self, yes_mid: float, model_prob: float,
+                          trust: float) -> float:
+        """Fair YES probability: market mid pulled toward the bot's model.
+
+        fair = mid + trust * (P_model - mid). If the market already prices the
+        model's view, fair == mid and there is NO edge — a signal the market
+        has absorbed earns nothing (the flaw in the old additive stack, where
+        edge equalled the bonus terms by construction).
+        """
+        fair = yes_mid + trust * (model_prob - yes_mid)
+        return max(0.02, min(0.98, fair))
 
     def _side_net_edges(self, fair_yes: float, yes_price: float,
                         no_price: float) -> tuple:
@@ -155,12 +191,7 @@ class BaseBot(ABC):
         # is momentarily unavailable leaves it None — coalesce to neutral 0.5.
         market_price = market.get("current_price") or 0.5
 
-        # --- Signal 1: Market price edge (favorite-following) ---
-        # When YES is priced high, YES usually wins. The further from 50c, the
-        # stronger. Applied as the price_tilt lane inside _compute_fair_yes.
-        aggression = self.MARKET_PRICE_AGGRESSION.get(self.strategy_type, 1.0)
-
-        # --- Signal 2: BTC momentum ---
+        # --- Lane: BTC momentum (normalized to [-1, 1]) ---
         prices = signals.get("prices", [])
         btc_latest = signals.get("latest", 0)
         price_momentum = 0.0
@@ -169,19 +200,17 @@ class BaseBot(ABC):
         elif btc_latest > 0 and len(prices) >= 1 and prices[-1] > 0:
             # Use live price vs last closed candle
             price_momentum = (btc_latest - prices[-1]) / prices[-1]
-        elif btc_latest > 0 and len(prices) == 0:
-            # No candles yet — use market price direction as weak proxy
-            # Market price > 0.5 suggests BTC trending up in this window
-            price_momentum = (market_price - 0.5) * 0.005
-        # Momentum signal: BTC going up → lean YES
-        momentum_signal = max(-0.15, min(0.15, price_momentum * 30))
+        # No candles at all -> 0. (The old fallback leaked the market price in
+        # as "momentum", i.e. favorite-following in disguise.)
+        # 0.05% 1-candle move saturates the lane.
+        momentum_signal = max(-1.0, min(1.0, price_momentum * 2000))
 
-        # --- Signal 3: Strategy analysis ---
+        # --- Lane: strategy thesis from analyze() ---
         raw_signal = self.analyze(market, signals)
         strategy_signal = 0.0
         if raw_signal["action"] != "hold":
             strategy_yes = 1.0 if raw_signal["side"] == "yes" else -1.0
-            strategy_signal = strategy_yes * raw_signal["confidence"] * 0.15
+            strategy_signal = strategy_yes * raw_signal["confidence"]
 
         # --- Signal 4: Learning bias ---
         of_data = signals.get("orderflow", {})
@@ -219,42 +248,47 @@ class BaseBot(ABC):
         else:
             learning_weight = 0.0
 
-        # --- Signal 4b: Polymarket in-market price momentum ---
+        # --- Lane: Polymarket in-market price momentum (normalized) ---
         # Rate of change of the YES price on Polymarket itself (from price history API).
         # Distinct from BTC spot momentum — this captures how *traders in this market*
         # are actually positioning, which can lead or lag BTC spot price.
-        pm_momentum_raw = signals.get("pm_momentum", 0.0)
-        pm_momentum_signal = max(-0.15, min(0.15, float(pm_momentum_raw)))
+        # A 0.15 YES-price move saturates the lane.
+        pm_momentum_raw = float(signals.get("pm_momentum", 0.0) or 0.0)
+        pm_momentum_signal = max(-1.0, min(1.0, pm_momentum_raw / 0.15))
 
-        # --- Signal 5: Order flow (OBI + CVD) ---
-        # The two order-flow reads the research favors over price-history
-        # indicators: OBI (resting bid vs ask depth) and CVD (market buys minus
-        # sells). Both arrive in [-1, 1] (positive = upward/YES pressure) and are
-        # clamped into the same [-0.15, 0.15] band as the other secondary lanes.
-        obi_signal = max(-0.15, min(0.15, float(signals.get("obi", 0.0) or 0.0) * 0.15))
-        cvd_signal = max(-0.15, min(0.15, float(signals.get("cvd", 0.0) or 0.0) * 0.15))
+        # --- Lane: Order flow (OBI + CVD), already in [-1, 1] ---
+        # CVD = executed aggression (validated edge); OBI = resting depth,
+        # globally killed via config.SIGNAL_WEIGHT_OBI until validated offline.
+        obi_signal = max(-1.0, min(1.0, float(signals.get("obi", 0.0) or 0.0)))
+        obi_signal *= config.SIGNAL_WEIGHT_OBI
+        cvd_signal = max(-1.0, min(1.0, float(signals.get("cvd", 0.0) or 0.0)))
 
-        # --- Signal 6: BTC drift from the window's "price to beat" (strike) ---
-        # The dominant fundamental: where BTC sits vs the window open price.
+        # --- Lane: BTC drift from the window's "price to beat" (strike) ---
+        # The fundamental anchor: where BTC sits vs the window open price.
         # Already bounded [-1, 1] and time-scaled (signals/strike.py). Regime-
-        # agnostic: >0 favors YES, <0 favors NO — it self-corrects with the
-        # market instead of baking in a directional bias. Weighted as a PRIMARY
-        # signal (not clamped into the secondary band) because it is the actual
-        # moneyness; its edge only fires when the Polymarket price lags BTC.
+        # agnostic: >0 favors YES, <0 favors NO. Because it is time-damped, the
+        # model has little conviction early in the window — so with the honest
+        # blend below, bots naturally sit out the noisy first minute instead of
+        # spending their one trade per market there (the -$79 early-window leak).
         drift_signal_val = max(-1.0, min(1.0, float(signals.get("btc_drift", 0.0) or 0.0)))
 
-        # --- Fair value: reinterpret the signal stack as a YES probability ---
-        # Secondary lanes nudge; the drift lane anchors to BTC's real position.
-        alpha = (
-            momentum_signal * 0.15 +
-            pm_momentum_signal * 0.10 +
-            strategy_signal * config.STRATEGY_SIGNAL_WEIGHT +
-            obi_signal * config.SIGNAL_WEIGHT_OBI +
-            cvd_signal * config.SIGNAL_WEIGHT_CVD +
-            drift_signal_val * config.SIGNAL_WEIGHT_DRIFT +
-            learning_signal * learning_weight
-        )
-        fair_yes = self._compute_fair_yes(market_price, aggression, alpha)
+        # --- Model probability, then fair value as market-vs-model blend ---
+        # Edge appears ONLY where the model disagrees with the market price
+        # ("follow drift only when the market lags" was the top rule in the
+        # offline net-edge harness). Weighted per-strategy for real
+        # differentiation; strat/learn lanes carry their weight in the value.
+        lanes = {
+            "drift": drift_signal_val,
+            "mom": momentum_signal,
+            "pm": pm_momentum_signal,
+            "cvd": cvd_signal,
+            "obi": obi_signal,
+            "strat": strategy_signal * config.STRATEGY_SIGNAL_WEIGHT,
+            "learn": learning_signal * 2.0 * learning_weight,
+        }
+        model_prob = self._model_prob_yes(lanes)
+        trust = self.STRATEGY_MODEL_TRUST.get(self.strategy_type, 0.5)
+        fair_yes = self._compute_fair_yes(market_price, model_prob, trust)
 
         # --- Per-side evaluation: each side scored on its OWN price + fee ---
         # Binary outcomes must sum to 1, so both sides share the one fair
@@ -269,6 +303,19 @@ class BaseBot(ABC):
         if no_price is None:
             no_price = round(1.0 - yes_price, 4)
         edge_yes, edge_no = self._side_net_edges(fair_yes, yes_price, no_price)
+
+        # --- Model-lean eligibility: never fade the market on IGNORANCE ---
+        # With no information the model sits at 0.5 and the blend would pull
+        # fair toward 0.5, making the non-favorite side look "cheap" on every
+        # market — a pure contrarian leak. A side is only tradable when the
+        # model ACTIVELY leans toward it (its lanes point that way), so the
+        # trade thesis is "market lags my information", never "market is more
+        # confident than my nothing".
+        if model_prob <= 0.5:
+            edge_yes = float("-inf")
+        if model_prob >= 0.5:
+            edge_no = float("-inf")
+
         conf_yes = min(0.95, max(0.0, edge_yes) * config.EDGE_TO_CONFIDENCE)
         conf_no = min(0.95, max(0.0, edge_no) * config.EDGE_TO_CONFIDENCE)
         if edge_yes >= edge_no:
@@ -352,7 +399,8 @@ class BaseBot(ABC):
         amount = min(target_shares * price, max_pos)
 
         reasoning = (
-            f"fair={fair_yes:.2f} yes={yes_price:.2f} no={no_price:.2f} "
+            f"fair={fair_yes:.2f} model={model_prob:.2f} trust={trust:.2f} "
+            f"yes={yes_price:.2f} no={no_price:.2f} "
             f"=> {side} edge={chosen_edge:+.3f} (eY={edge_yes:+.3f} eN={edge_no:+.3f}) "
             f"drift={drift_signal_val:+.3f} mom={momentum_signal:+.3f} pm={pm_momentum_signal:+.3f} "
             f"of(obi={obi_signal:+.3f} cvd={cvd_signal:+.3f}) "

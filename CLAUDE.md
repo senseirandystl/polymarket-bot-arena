@@ -41,20 +41,32 @@ Stored at `~/.config/simmer/bot_keys.json` — keys mapped to slot_0 through slo
 
 ## Architecture
 
-### Signal Hierarchy (make_decision in base_bot.py)
+### Signal Hierarchy (make_decision in base_bot.py) — MODEL-BLEND fair value (BUG #24)
 ```
-fair_yes = yes_mid + price_tilt + alpha
-  price_tilt = (yes_mid−0.5) · aggression · K_TILT   # favorite-following, CAPPED at ±FAVORITE_EDGE_CAP
-  alpha = (
-      btc_momentum   * 0.15                 # BTC spot momentum (Binance candles)
-    + pm_momentum    * 0.10                 # Polymarket in-market YES price momentum
-    + strategy_signal * STRATEGY_SIGNAL_WEIGHT (0.30)   # per-bot thesis (now fires often)
-    + obi_signal     * SIGNAL_WEIGHT_OBI (0.0)          # DISABLED — unvalidated (no book history in harness); BUG #23
-    + cvd_signal     * SIGNAL_WEIGHT_CVD (0.25)         # executed flow — a real edge
-    + btc_drift      * SIGNAL_WEIGHT_DRIFT (0.20)       # BTC vs the "price to beat" — validated ~76% (BUG #23)
-    + learning_bias  * (0 while LEARNING_ENABLED=False) # DISABLED — anti-predictive, being redesigned
-  )
+P_model  = 0.5 + 0.5 · Σ w_lane · lane          # lanes normalized to [-1,1], YES-frame
+fair_yes = yes_mid + trust · (P_model − yes_mid) # edge ONLY where model disagrees with price
+  lanes: drift (anchor), mom (BTC 1-candle), pm (in-market momentum),
+         cvd (executed flow), obi (× SIGNAL_WEIGHT_OBI=0 kill-switch),
+         strat (analyze() thesis × STRATEGY_SIGNAL_WEIGHT=0.15),
+         learn (× 0 while LEARNING_ENABLED=False)
+  w_lane: per-strategy — BaseBot.STRATEGY_SIGNAL_PROFILE (differentiation by
+          EMPHASIS, all weights ≥0, no baked-in direction)
+  trust:  BaseBot.STRATEGY_MODEL_TRUST (0.5–0.6)
 ```
+**Model-lean eligibility:** a bot may only buy a side its model *actively leans
+toward* (`P_model > 0.5` for YES, `< 0.5` for NO) — model ignorance (P=0.5) is
+not disagreement with the market, so it never fades the favorite on nothing.
+**Why the old additive form died (BUG #24, 2026-07-16):** `fair = mid + tilt +
+alpha` counted its own bonus lanes as edge *by construction* — the flat +6¢
+favorite tilt alone cleared MIN_EDGE at window open, so all four directional
+bots bought the 58–65¢ favorite in the first minute of every window (107
+early-window trades, 49% WR, −$79.53; the 60–70¢ bucket alone −$64.55 at 47%
+WR — no favorite premium exists at taker prices). The net-edge harness
+(PM-price-aware, see below) confirmed: "buy the favorite" is the worst rule
+(negative EV above ~0.67); "follow drift only when the market lags" is the
+best. The tilt (`K_TILT`/`FAVORITE_EDGE_CAP`) and `MARKET_PRICE_AGGRESSION`
+are gone; drift's time-damping now naturally keeps bots flat in the noisy
+first minute instead of a hard time ban.
 **`btc_drift` (`signals/strike.py`) is the validated fundamental.** Each window
 resolves UP iff BTC closes ≥ its price at the window OPEN. The **strike** ("price
 to beat") is fetched accurately as the **Binance BTCUSDT 1m open at the market's
@@ -70,38 +82,40 @@ on its own book price + fee (own edge, own confidence), same `MIN_EDGE` bar, no
 hardcoded bias.
 
 **Signal-validation harness (`tools/validate_signals.py`).** Offline check of any
-candidate signal's predictiveness on REAL data (resolved Gamma markets + Binance
-1m klines), writing nothing to `bot_arena.db` (gitignored, size-capped kline
-cache). **No signal earns a live weight until validated here** (confirms-side WR
-≫ contradicts-side WR on a real sample) — the rule that #23 was born from.
-Run: `.venv/bin/python3 tools/validate_signals.py --markets 300`.
-**Weights are empirical (2026-07-15 overnight run, spec `docs/superpowers/specs/2026-07-15-...`).**
-Per-signal predictiveness (confirms-side WR vs contradicts): CVD 66.9/52.4 (real edge, weighted up);
-OBI 58.1/66.7 (inverted → zeroed); learning bias 53.5/77.6 (inverted → disabled live). The
-`price_tilt` is capped because the favorite underpricing is flat ~+5¢ across 55–85¢, not proportional —
-an uncapped tilt manufactured fake edge at efficient extremes. Coin-flip (45–55¢) trades are suppressed
-by the `MIN_EDGE` gate on a now-real edge, **not** a price-bucket ban.
+candidate signal on REAL data (resolved Gamma markets + Binance 1m klines + the
+market's own **Polymarket price history** via CLOB `prices-history`), writing
+nothing to `bot_arena.db` (gitignored, size-capped kline+PM cache). It reports
+two things: raw predictiveness (follow-the-signal WR) **and NET EDGE** — the
+per-share EV of a decision rule *after paying the actual PM price + taker fee*.
+**A signal can be predictive yet worthless once the market has priced it in**
+(that gap is exactly BUG #24), so a live weight requires positive NET edge, not
+just follow-WR ≫ 50%. Caveat: PM history mids are somewhat stale, so net-EV
+numbers are optimistic upper bounds — use them for *ordering/sign*, and the live
+DB for ground truth. Run: `.venv/bin/python3 tools/validate_signals.py --markets 300`.
+Empirical (2026-07-16, 300 markets, 50% UP base): drift 74.5% follow-WR (83%
+near expiry, 64% early); "follow drift only when the side ≤58¢ (market lags)"
+is the top net-EV rule; "buy the favorite" is the worst (negative above ~0.67).
+Prior run (2026-07-15): CVD 66.9/52.4 (real edge); OBI inverted (→ kill-switch
+0); learning bias inverted (→ disabled live). Coin-flip (45–55¢) trades are
+suppressed by the `MIN_EDGE` gate on a now-real edge, **not** a price-bucket ban.
 OBI + CVD (`signals/orderflow_signals.py`) are the two order-flow reads the
 profitable-bot research favors over price-history indicators — they describe
 pressure that hasn't hit the price yet. OBI is computed once per discovery cycle
 from the Up-token CLOB book; CVD is fetched per market from the data-api trade
 tape (`data-api.polymarket.com/trades`), cached ~20s. Both are in `[-1, 1]`
-(positive = upward/YES) and clamped into the secondary-lane band before weighting.
-Weights are tunable via `config.SIGNAL_WEIGHT_OBI` / `SIGNAL_WEIGHT_CVD`.
+(positive = upward/YES). Per-strategy lane weights live in
+`BaseBot.STRATEGY_SIGNAL_PROFILE`; `config.SIGNAL_WEIGHT_OBI` is a global OBI
+kill-switch.
 
-**Two-sided (YES/NO) net-edge selection.** The `combined` sum above is
-reinterpreted as a **fair YES probability**: `fair_yes = yes_mid + price_tilt +
-alpha`, where `price_tilt = (yes_mid−0.5)·aggression·config.K_TILT` is the
-favorite-following lane (the old `market_price_edge*0.50`, with `K_TILT=0.5`
-keeping it numerically identical at aggression 1.0) and `alpha` is the summed
-secondary lanes. The bot then computes a **cost-adjusted net edge on BOTH sides**
+**Two-sided (YES/NO) net-edge selection.** From the blended `fair_yes` above,
+the bot computes a **cost-adjusted net edge on BOTH sides**
 — `edge = prob − side_price − taker_fee(1, side_price)` for YES and NO, each
 using that side's own book mid (`market["no_price"]` for NO) and the canonical
 `polymarket_fills.taker_fee` — and **buys whichever side has the larger positive
 edge** above a per-strategy `BaseBot.MIN_EDGE` floor (skips if neither clears it).
 YES and NO are evaluated on their own prices/fees, so NO is a first-class
-decision, not a mirror of YES; when the two mids are exactly complementary the
-comparison reduces to the old sign decision. A directional bot takes at most one
+decision, not a mirror of YES — subject to the **model-lean eligibility** rule
+above (only the side the model actively leans toward is tradable). A directional bot takes at most one
 side per market (argmax) — arbitrage is the only two-legged bot. Sizing,
 `entry_price`, and the slippage limit all key off the chosen side's price. The
 old blanket **NO ban is gone** (see BUG_HISTORY #20).
@@ -152,13 +166,22 @@ Order placement is split by venue so the two never intermix — `base_bot.execut
 - **Fees:** `polymarket_fills.taker_fee()` is the **single source of truth** for fee math — makers free, takers pay `feeRate × shares × p × (1−p)` per the [official Polymarket docs](https://docs.polymarket.com/trading/fees) (symmetric around 50¢; crypto tier `config.POLYMARKET_TAKER_FEE_RATE = 0.07`, peaking at $1.75/100 shares at 50¢). Any bot needing a fee estimate must call this, never re-derive it (see BUG_HISTORY #17). Factored into resolved P&L (`payout − amount − fee`). Trade columns `fill_source`/`entry_price`/`fee` record each fill.
 
 ### Per-Strategy Differentiation
-| Strategy | Aggression | Prior | Min Confidence |
-|----------|-----------|-------|----------------|
-| momentum | 1.2 (follows price strongly) | 0.52 (slight YES) | 0.01 (trades almost everything) |
-| mean_reversion | 0.95 (nearly follows, was 0.6) | 0.48 (slight NO) | 0.06 |
-| sentiment | 1.0 (neutral) | 0.50 | 0.03 |
-| hybrid | 1.0 (neutral, was 0.9) | 0.50 | 0.05 |
+Differentiation is by **model emphasis** (`BaseBot.STRATEGY_SIGNAL_PROFILE` lane
+weights + `STRATEGY_MODEL_TRUST`), never by a hardcoded direction — all weights
+are ≥0 and all lanes regime-agnostic. Under the old shared additive stack the
+four directional bots placed the *identical* trade in the same second (4× the
+same mistake); now different inputs trade different bots:
+
+| Strategy | Model profile (drift/mom/pm/cvd/obi) | Trust | Character |
+|----------|--------------------------------------|-------|-----------|
+| momentum | .45/.25/.15/.15/.10 | 0.50 | trend follower — drift anchor + heavy momentum/flow |
+| phantom  | .40/.30/.20/.10/.10 | 0.50 | faster trend follower |
+| mean_reversion (+sl/tp) | .65/0/0/.05/0 | 0.60 | fundamentals-only — near-pure drift; by ignoring momentum it naturally fades price moves BTC doesn't back |
+| sentiment | .35/0/.10/.35/.15 | 0.50 | order-flow reader — CVD heavy |
+| hybrid | .50/.10/.10/.15/.05 | 0.50 | balanced blend |
 | arbitrage | n/a — **overrides** `make_decision`/`execute` (market-neutral, two-legged) | n/a | n/a |
+
+(OBI lane weights are inert while the `config.SIGNAL_WEIGHT_OBI` kill-switch is 0.)
 
 **Every bot trades both sides now (BUG_HISTORY #20).** The four directional bots (+SL/TP variants) pick YES or NO via the two-sided net-edge comparison above. The **sniper** overrides `make_decision` but applies its cheap/strong price zones symmetrically to the NO token (down-momentum confirmed). Both **makers** quote whichever side's price is in their band — late-window on down-momentum, fee-zone on the symmetric fee zone. A directional/sniper/maker bot takes **at most one side per market**; only arbitrage is two-legged. The sniper/maker NO branches are symmetric mirrors not yet validated by live NO data (recheck once NO trades accumulate).
 

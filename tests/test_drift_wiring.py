@@ -33,7 +33,11 @@ def _sig(**over):
 
 def test_drift_enabled_after_validation():
     # Re-enabled once the accurate strike made it ~76% predictive offline.
-    assert config.SIGNAL_WEIGHT_DRIFT > 0.0
+    # Drift now lives in the per-strategy model profiles as the anchor lane —
+    # every strategy must weight it > 0.
+    from bots.base_bot import BaseBot
+    for strat, prof in BaseBot.STRATEGY_SIGNAL_PROFILE.items():
+        assert prof["drift"] > 0.0, strat
 
 
 def test_obi_disabled_by_default():

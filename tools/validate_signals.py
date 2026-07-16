@@ -29,10 +29,14 @@ from pathlib import Path
 import requests
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from tools.signal_validation import build_samples, predictiveness, time_buckets
+from tools.signal_validation import (
+    build_samples, net_edge, net_edge_time_buckets, predictiveness, time_buckets,
+)
+from polymarket_fills import taker_fee
 
 GAMMA = "https://gamma-api.polymarket.com/events"
 BINANCE = "https://api.binance.com/api/v3/klines"
+CLOB_HISTORY = "https://clob.polymarket.com/prices-history"
 SERIES_ID = "10684"
 WINDOW_SEC = 300
 CACHE_DIR = Path(__file__).resolve().parent / ".signal_cache"
@@ -67,8 +71,16 @@ def fetch_resolved_markets(n: int) -> list:
                 # ["1","0"] => Up won; ["0","1"] => Down won.
                 if prices[0] not in ("0", "1"):
                     continue
+                tokens = m.get("clobTokenIds")
+                if isinstance(tokens, str):
+                    try:
+                        tokens = json.loads(tokens)
+                    except Exception:
+                        tokens = None
+                up_token = tokens[0] if tokens else None
                 out.append({"id": m.get("conditionId"), "start": start,
-                            "end": end, "yes_won": prices[0] == "1"})
+                            "end": end, "yes_won": prices[0] == "1",
+                            "up_token": up_token})
         offset += 100
     return out[:n]
 
@@ -112,6 +124,31 @@ def fetch_trajectory(mkt: dict, cache: dict, use_cache: bool) -> list:
     return [((row[0] - open_ms) / 1000.0, float(row[1])) for row in rows]
 
 
+def fetch_pm_prices(mkt: dict, cache: dict, use_cache: bool) -> list:
+    """Polymarket YES(Up) mid over the window as ``(seconds_from_open, p)``.
+
+    Cached under ``pm:<condition_id>`` in the same size-capped kline cache so
+    storage stays bounded.
+    """
+    if not mkt.get("up_token"):
+        return []
+    key = f"pm:{mkt['id']}"
+    if use_cache and key in cache:
+        rows = cache[key]
+    else:
+        st, en = _ms(mkt["start"]) // 1000, _ms(mkt["end"]) // 1000
+        r = requests.get(CLOB_HISTORY, params={
+            "market": mkt["up_token"], "startTs": st, "endTs": en, "fidelity": 1,
+        }, timeout=20)
+        r.raise_for_status()
+        hist = r.json().get("history") or []
+        rows = [[h["t"], h["p"]] for h in hist]
+        if use_cache:
+            cache[key] = rows
+    open_s = _ms(mkt["start"]) / 1000.0
+    return [(float(t) - open_s, float(p)) for t, p in rows]
+
+
 def _fmt(res: dict) -> str:
     wr = res["follow_winrate"]
     wr_s = f"{wr*100:5.1f}%" if wr is not None else "  n/a"
@@ -144,6 +181,7 @@ def main() -> int:
     for i, mkt in enumerate(markets):
         try:
             traj = fetch_trajectory(mkt, cache, use_cache)
+            pm = fetch_pm_prices(mkt, cache, use_cache)
         except Exception as e:
             print(f"  skip {str(mkt['id'])[:10]}: {e}")
             continue
@@ -152,7 +190,8 @@ def main() -> int:
         strike = traj[0][1]                         # open @ eventStartTime = true strike
         up_count += 1 if mkt["yes_won"] else 0
         all_samples.extend(build_samples(mkt["id"], strike, traj,
-                                          mkt["yes_won"], WINDOW_SEC))
+                                          mkt["yes_won"], WINDOW_SEC,
+                                          pm_prices=pm))
         if use_cache and i % 25 == 0:
             _save_cache(cache)
         if not use_cache:
@@ -173,6 +212,47 @@ def main() -> int:
     print("\n=== drift_prod by time-remaining bucket (is it salvageable near expiry?) ===")
     for b in time_buckets(all_samples, "drift_prod"):
         print(f"  {b['bucket']:>10}: {_fmt(b).strip()}")
+
+    # --- NET-EDGE metrics: what a bot actually earns AFTER paying the PM price
+    # + taker fee. A signal can be predictive yet worthless once priced in.
+    def _ne_fmt(res):
+        if not res["n"]:
+            return "    n=   0"
+        return (f"    n={res['n']:4d}  wr={res['winrate']*100:5.1f}%  "
+                f"avg_price={res['avg_price']:.3f}  "
+                f"EV/share={res['ev_per_share']*100:+.2f}c")
+
+    def fav_side(s):
+        if abs(s.pm_yes - 0.5) < 0.02:
+            return None
+        return "yes" if s.pm_yes > 0.5 else "no"
+
+    def drift_side(s):
+        d = s.signals["drift_prod"]
+        return None if abs(d) < 1e-6 else ("yes" if d > 0 else "no")
+
+    def mom_side(s):
+        m = s.signals["mom2"]
+        return None if abs(m) < 1e-9 else ("yes" if m > 0 else "no")
+
+    def drift_lag_side(s):
+        """Drift side only when the PM price has NOT priced it in yet."""
+        side = drift_side(s)
+        if side is None:
+            return None
+        price = s.pm_yes if side == "yes" else 1.0 - s.pm_yes
+        return side if price <= 0.58 else None
+
+    rules = [("buy the favorite (tilt lane)", fav_side),
+             ("follow drift", drift_side),
+             ("follow drift ONLY when side <=58c (market lags)", drift_lag_side),
+             ("follow 1-candle BTC momentum", mom_side)]
+    print("\n=== NET EDGE vs the actual PM price (per-share EV after taker fee) ===")
+    for label, rule in rules:
+        print(f"  [{label}]")
+        print(_ne_fmt(net_edge(all_samples, rule, taker_fee)))
+        for b in net_edge_time_buckets(all_samples, rule, taker_fee):
+            print(f"      {b['bucket']:>10}: {_ne_fmt(b).strip()}")
 
     print("\nNote: nothing was written to bot_arena.db. "
           f"Kline cache: {'on' if use_cache else 'off'} ({CACHE_FILE}).")
