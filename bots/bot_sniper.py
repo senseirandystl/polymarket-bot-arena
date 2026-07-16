@@ -28,6 +28,12 @@ DEFAULT_PARAMS = {
     "skip_zone_high": 0.64,    # End of coin-flip dead zone (was 0.58 — 58-65c was 20% WR)
     "require_momentum": True,  # Only trade when BTC momentum confirms
     "momentum_threshold": 0.0003,  # Tighter threshold (was 0.0005 hardcoded)
+    # Drift confirmation (2026-07-16, harness net-edge, ~300 markets): the cheap
+    # zone WITHOUT confirmation is toxic — 37.5% WR, -8.8c/share (the original
+    # "100% WR" came from 13 Simmer-era trades). With signed drift ≥ 0.15 toward
+    # the sniped side it flips to 62.9% WR / +16.3c per share. Zones say WHERE
+    # to look; drift says WHETHER the pattern is backed by BTC's actual position.
+    "min_drift": 0.15,
     "position_size_pct": 0.08, # Larger positions since we're more selective
     "min_confidence": 0.10,    # Only trade with real edge
 }
@@ -110,6 +116,14 @@ class SniperBot(BaseBot):
             yes_ok = yes_ok and btc_momentum >= -mom_thresh
             no_ok = no_ok and btc_momentum <= mom_thresh
 
+        # Drift confirmation: the sniped side must be backed by BTC's actual
+        # position vs the strike (signed drift ≥ min_drift). Without it the
+        # cheap zone measured 37.5% WR / -8.8c per share offline.
+        drift = float(signals.get("btc_drift", 0.0) or 0.0)
+        min_drift = p.get("min_drift", 0.15)
+        yes_ok = yes_ok and drift >= min_drift
+        no_ok = no_ok and -drift >= min_drift
+
         side = None
         confidence = 0
         reasoning_parts = [f"yes={market_price:.2f} no={no_price:.2f}"]
@@ -149,12 +163,9 @@ class SniperBot(BaseBot):
                 "suggested_amount": 0, "features": features,
             }
 
-        # --- Early-window boost ---
-        window_age = market.get("window_age_seconds")
-        if window_age is not None and 0 <= window_age < 90:
-            confidence *= 1.25
-            confidence = min(0.95, confidence)
-            reasoning_parts.append(f"early-window-boost(age={window_age:.0f}s)")
+        # (Early-window boost REMOVED 2026-07-16: live data showed early-window
+        # entries were the arena's entire loss — 107 trades, 49% WR, -$79.53 —
+        # boosting confidence AND size exactly there was backwards. See BUG #24.)
 
         # --- Late-window boost ---
         # Mirror of early-window: BTC direction increasingly certain in final 60s.
@@ -166,10 +177,8 @@ class SniperBot(BaseBot):
         # --- Position sizing ---
         max_pos = config.get_max_position()
         size_pct = p.get("position_size_pct", 0.08)
-        if window_age is not None and 0 <= window_age < 90:
-            size_pct *= 1.2  # Larger positions in early window
         if time_rem is not None and 0 < time_rem < 60:
-            size_pct *= 1.2  # Larger positions in late window too
+            size_pct *= 1.2  # Larger positions in late window (direction ~locked)
         amount = max_pos * size_pct * (0.5 + confidence)
         amount = min(amount, max_pos)
 

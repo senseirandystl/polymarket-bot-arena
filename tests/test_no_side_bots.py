@@ -22,18 +22,19 @@ def _market(yes, no=None, time_rem=180):
     }
 
 
-def _sig(prices):
+def _sig(prices, drift=0.0):
     return {"prices": prices, "latest": prices[-1] if prices else 0.0,
-            "orderflow": {}}
+            "orderflow": {}, "btc_drift": drift}
 
 
 # --- Sniper ---
 
 def test_sniper_buys_no_on_cheap_no_zone_with_down_momentum():
-    # yes=0.55 (coin-flip for YES) -> no=0.45 (cheap-NO zone) + BTC dropping -> NO
+    # yes=0.55 (coin-flip for YES) -> no=0.45 (cheap-NO zone) + BTC dropping
+    # + down-drift backing -> NO
     bot = SniperBot()
     m = _market(yes=0.55, no=0.45)
-    s = _sig([100.5, 100.0])            # negative momentum
+    s = _sig([100.5, 100.0], drift=-0.3)   # negative momentum + down drift
     d = bot.make_decision(m, s)
     assert d["action"] == "buy"
     assert d["side"] == "no"
@@ -42,7 +43,7 @@ def test_sniper_buys_no_on_cheap_no_zone_with_down_momentum():
 def test_sniper_still_buys_yes_on_cheap_yes_zone_with_up_momentum():
     bot = SniperBot()
     m = _market(yes=0.45, no=0.55)
-    s = _sig([100.0, 100.5])            # positive momentum
+    s = _sig([100.0, 100.5], drift=0.3)    # positive momentum + up drift
     d = bot.make_decision(m, s)
     assert d["action"] == "buy"
     assert d["side"] == "yes"
@@ -52,7 +53,17 @@ def test_sniper_skips_no_when_momentum_contradicts():
     # NO would be in-zone, but BTC rising contradicts a NO bet -> skip
     bot = SniperBot()
     m = _market(yes=0.55, no=0.45)
-    s = _sig([100.0, 100.5])            # positive momentum blocks NO
+    s = _sig([100.0, 100.5], drift=-0.3)   # positive momentum blocks NO
+    d = bot.make_decision(m, s)
+    assert d["action"] == "skip"
+
+
+def test_sniper_skips_zone_without_drift_backing():
+    # In-zone + momentum OK but drift flat: the cheap zone measured 37.5% WR
+    # unbacked -> must skip.
+    bot = SniperBot()
+    m = _market(yes=0.45, no=0.55)
+    s = _sig([100.0, 100.5], drift=0.0)
     d = bot.make_decision(m, s)
     assert d["action"] == "skip"
 
@@ -62,7 +73,7 @@ def test_sniper_skips_no_when_momentum_contradicts():
 def test_late_window_maker_quotes_no_with_down_momentum():
     bot = LateWindowMakerBot()
     m = _market(yes=0.40, no=0.60, time_rem=100)   # no in [0.56,0.90] band
-    s = _sig([101.0, 100.5, 100.0])                # downward momentum
+    s = _sig([101.0, 100.5, 100.0], drift=-0.5)    # down drift + down momentum
     d = bot.analyze(m, s)
     assert d["action"] == "buy"
     assert d["side"] == "no"
@@ -72,7 +83,7 @@ def test_late_window_maker_quotes_no_with_down_momentum():
 def test_late_window_maker_still_quotes_yes_with_up_momentum():
     bot = LateWindowMakerBot()
     m = _market(yes=0.60, no=0.40, time_rem=100)
-    s = _sig([100.0, 100.5, 101.0])                # upward momentum
+    s = _sig([100.0, 100.5, 101.0], drift=0.5)     # up drift + up momentum
     d = bot.analyze(m, s)
     assert d["action"] == "buy"
     assert d["side"] == "yes"
@@ -83,7 +94,7 @@ def test_late_window_maker_still_quotes_yes_with_up_momentum():
 def test_fee_zone_maker_quotes_no_when_no_price_in_zone():
     bot = FeeZoneMakerBot()
     m = _market(yes=0.40, no=0.60)                 # no in [0.56,0.86] zone
-    s = _sig([100.0, 100.0, 100.0, 100.0, 100.0])  # flat momentum (no contradiction)
+    s = _sig([100.0]*5, drift=-0.3)                # down drift backs NO
     d = bot.analyze(m, s)
     assert d["action"] == "buy"
     assert d["side"] == "no"
@@ -93,7 +104,16 @@ def test_fee_zone_maker_quotes_no_when_no_price_in_zone():
 def test_fee_zone_maker_still_quotes_yes_when_yes_price_in_zone():
     bot = FeeZoneMakerBot()
     m = _market(yes=0.60, no=0.40)
-    s = _sig([100.0, 100.0, 100.0, 100.0, 100.0])
+    s = _sig([100.0]*5, drift=0.3)                 # up drift backs YES
     d = bot.analyze(m, s)
     assert d["action"] == "buy"
     assert d["side"] == "yes"
+
+
+def test_fee_zone_maker_holds_without_drift_backing():
+    # In-zone favorite with flat drift measured barely break-even (+0.8c/sh)
+    # offline -> hold until the fundamental backs the side.
+    bot = FeeZoneMakerBot()
+    m = _market(yes=0.60, no=0.40)
+    d = bot.analyze(m, _sig([100.0]*5, drift=0.0))
+    assert d["action"] == "hold"

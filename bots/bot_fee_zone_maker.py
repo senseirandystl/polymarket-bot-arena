@@ -23,6 +23,13 @@ We run throughout the full market window (not time-gated), quoting
 whenever the price is in the fee-advantage zone. Smaller positions,
 higher frequency than LateWindowMaker.
 
+REALITY CHECK (2026-07-16): in the current venues, "maker" quotes execute as
+TAKER fills (paper walks the real asks and pays the taker fee; live uses
+market orders) — the zero-fee maker advantage is aspirational until real
+limit-order posting exists. So an in-zone favorite must be backed by the
+drift fundamental (``min_drift`` gate) to carry real edge; the zone alone
+measured barely break-even net of price+fee in the offline harness.
+
 Competing hypothesis:
   Always-on fee-zone quoting beats late-window time-gating because
   price signal alone (no momentum requirement) is sufficient in the
@@ -53,6 +60,12 @@ DEFAULT_PARAMS = {
     "min_price_zone": 0.56,    # Only quote at YES price ≥ 56¢
     "max_price_zone": 0.86,    # Only quote at YES price ≤ 86¢ (fee still ≥80 bps here)
     "min_fee_bps": 80,         # Require taker fee ≥ 80 bps at this price to justify quoting
+    # Drift confirmation (2026-07-16, harness net-edge, ~300 markets): quoting
+    # the in-zone favorite WITHOUT drift backing is barely break-even (+0.8c/sh,
+    # 72.2% WR at avg 0.70 — the price already demands that WR). Requiring the
+    # signed drift ≥ 0.15 toward the quoted side lifts it to +9.4c/sh at 82.6%.
+    # The zone picks WHERE to quote; drift decides WHETHER the favorite is real.
+    "min_drift": 0.15,         # Signed btc_drift toward the quoted side must be ≥ this
     "spread_ticks": 2,         # Half-spread: 2 ticks (±2¢ around market price)
     "momentum_weight": 0.30,   # Weight of momentum signal in confidence (vs price signal)
     "position_size_pct": 0.06, # 6% of max — smaller per-trade, higher frequency
@@ -132,6 +145,18 @@ class FeeZoneMakerBot(BaseBot):
         if fee_bps < min_fee:
             return _hold(f"fzm: fee {fee_bps:.0f}bps < {min_fee}bps at price={side_price:.2f}")
 
+        # ── Drift confirmation: the in-zone favorite must be BACKED by BTC ───
+        # Paper/live fills cross the book as takers (we pay the very fee that
+        # defines the zone), so the quoted side needs real fundamental backing,
+        # not just a favorable price. Signed drift toward the side ≥ min_drift.
+        drift = float(signals.get("btc_drift", 0.0) or 0.0)
+        signed_drift = drift if side == "yes" else -drift
+        min_drift = p.get("min_drift", 0.15)
+        if signed_drift < min_drift:
+            return _hold(
+                f"fzm: drift does not back {side} "
+                f"(drift={drift:+.3f}, need signed ≥ {min_drift})")
+
         # ── BTC momentum context ──────────────────────────────────────────────
         prices = signals.get("prices", [])
         lb = p["lookback_candles"]
@@ -153,7 +178,9 @@ class FeeZoneMakerBot(BaseBot):
         # Momentum signal: momentum confirming the side boosts confidence
         mw = p["momentum_weight"]
         mom_boost = min(0.30, max(0.0, signed_mom * 50))  # up to +0.30 from momentum
-        confidence = min(0.88, 0.30 + price_signal * (1.0 - mw) * 0.50 + mom_boost * mw)
+        drift_boost = min(0.20, signed_drift * 0.20)      # drift conviction adds up to +0.20
+        confidence = min(0.88, 0.30 + price_signal * (1.0 - mw) * 0.50
+                         + mom_boost * mw + drift_boost)
 
         min_conf = p["min_confidence"]
         if confidence < min_conf:
@@ -179,10 +206,11 @@ class FeeZoneMakerBot(BaseBot):
                 f"bid={maker_bid:.2f} ask={maker_ask:.2f}"
             ),
             "suggested_amount": amount,
-            # Expected taker price = the ask we'd cross; feeds the execute()
-            # slippage guard (config.MAX_FILL_SLIPPAGE) so an adverse book move
-            # between decision and fill rejects rather than fills worse.
-            "entry_price": maker_ask,
+            # Expected taker price: the fill walks the real book from the best
+            # ask, so expect ~the side's current price (not our quoted ask, a
+            # logged maker metric — using it widened the slippage guard by the
+            # half-spread). Feeds the execute() guard (config.MAX_FILL_SLIPPAGE).
+            "entry_price": round(side_price, 4),
             "features": features,
             "maker_bid": maker_bid,
             "maker_ask": maker_ask,

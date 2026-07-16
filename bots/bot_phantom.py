@@ -7,12 +7,22 @@ import math
 import config
 from bots.base_bot import BaseBot
 
+# Retune (2026-07-16): the old EMA 20/50 + 20-candle breakout needed 70 one-min
+# candles (~70 minutes) before analyze() could fire at all — the price feed
+# fills at 1 candle/min from a cold start, so phantom was a silent base-stack
+# clone for the first hour of EVERY restart. EMA 9/26 + 10-candle breakout
+# (36-candle warmup) keeps the identity (trend filter + breakout + vol sanity)
+# on horizons that fit 5-min markets and halves the warmup.
 DEFAULT_PARAMS = {
-    "ema_fast": 20,
-    "ema_slow": 50,
-    "atr_period": 14,
-    "breakout_lookback": 20,
-    "min_atr_pct": 0.0005,    # 0.05%
+    "ema_fast": 9,
+    "ema_slow": 26,
+    "atr_period": 10,
+    "breakout_lookback": 10,
+    # Real BTC 1-min |move| distribution (2,740 samples from the harness kline
+    # cache): p50 0.022%, p75 0.042%, avg 0.032%. The old 0.05% floor sat at
+    # ~p75+ — phantom idled through most normal tape. 0.02% skips only truly
+    # dead tape; the 1% ceiling still rejects chaos.
+    "min_atr_pct": 0.0002,    # 0.02% (~median 1-min move)
     "max_atr_pct": 0.01,      # 1.0%
     "position_size_pct": 0.06,
     "min_confidence": 0.20,

@@ -29,12 +29,21 @@ from bots.base_bot import BaseBot
 # Widening the window to 150s lets it catch the market earlier, while it is
 # still in the profitable mid-high band; the max cap stays ≤0.90 to respect the
 # break-even rule (buying YES as a taker above ~0.90 needs an implausible WR).
+#
+# Retune 2 (2026-07-16, harness net-edge data, ~300 resolved markets): side
+# selection is now DRIFT-first — the validated fundamental (83% WR in the final
+# minute) picks the side, momentum only confirms. Late-window band entries
+# gated on |drift| ≥ 0.25 measured 85.8% WR / +7.7c per share net of price+fee;
+# requiring momentum agreement on top raised WR to 88.4%. Momentum-only side
+# selection is the weaker signal and is demoted to a non-contradiction check +
+# confidence booster.
 DEFAULT_PARAMS = {
     "entry_window_sec": 150,   # Activate in the last 150s (more shots, less extreme prices)
-    "min_momentum": 0.0005,    # Require |BTC momentum| ≥ 0.05% (avg over lookback)
-    "min_price_yes": 0.56,     # Market price must be ≥ 56¢ to confirm YES direction
+    "min_drift": 0.25,         # |btc_drift| needed for conviction (drift picks the side)
+    "min_momentum": 0.0005,    # Momentum must not CONTRADICT the drift side by more than this
+    "min_price_yes": 0.56,     # Chosen side's price must be ≥ 56¢ (direction confirmed by book)
     "max_price_yes": 0.90,     # Cap: above 90¢ taker margin is too thin to profit
-    "maker_offset_pct": 0.06,  # Simulated limit = market_price + 6¢ (captures spread)
+    "maker_offset_pct": 0.06,  # Simulated limit = market_price + 6¢ (logged maker metric only)
     "position_size_pct": 0.10, # 10% of max — large because entries are highly selective
     "lookback_candles": 3,     # BTC candles used for momentum calculation
 }
@@ -78,25 +87,38 @@ class LateWindowMakerBot(BaseBot):
         if time_rem is None or time_rem > entry_window:
             return _hold(f"lwm: waiting (rem={time_rem}s, window={entry_window}s)")
 
-        # ── BTC momentum ─────────────────────────────────────────────────────
+        # ── Drift conviction gate (primary) ──────────────────────────────────
+        # btc_drift is the validated "price to beat" fundamental (signals/
+        # strike.py) — time-scaled, so late in the window a strong value means
+        # the direction is close to locked in. It PICKS the side.
+        drift = float(signals.get("btc_drift", 0.0) or 0.0)
+        min_drift = p.get("min_drift", 0.25)
+        if abs(drift) < min_drift:
+            return _hold(f"lwm: weak drift ({drift:+.3f} < {min_drift})")
+
+        # ── BTC momentum (confirmation only) ─────────────────────────────────
         prices = signals.get("prices", [])
         lb = p["lookback_candles"]
         momentum = 0.0
         if len(prices) >= lb and prices[-lb] > 0:
             momentum = (prices[-1] - prices[-lb]) / prices[-lb]
 
+        # Momentum must not contradict the drift side (agreement measured
+        # +2.6pp WR in the harness; contradiction is a warning sign).
+        signed_mom = momentum if drift > 0 else -momentum
         min_mom = p["min_momentum"]
-        if abs(momentum) < min_mom:
-            return _hold(f"lwm: weak momentum ({momentum:+.5f} < {min_mom})")
+        if signed_mom < -min_mom:
+            return _hold(
+                f"lwm: momentum contradicts drift side "
+                f"(drift={drift:+.3f} mom={momentum:+.5f})")
 
-        # ── Side selection: quote whichever side momentum + price confirm ─────
-        # UP momentum → quote YES on the YES price; DOWN momentum → quote NO on
-        # the NO price. The SAME price band confirms each side's own token price
-        # (yes+no ~= 1, so only one side's price sits in the band). NO is a
-        # first-class mirror of the YES entry, not a banned side.
+        # ── Side selection: quote the DRIFT side on its own token price ──────
+        # The band check confirms the book agrees with the direction (yes+no
+        # ~= 1, so only one side's price sits in the band). NO is a first-class
+        # mirror of the YES entry, not a banned side.
         min_price = p["min_price_yes"]
         max_price = p["max_price_yes"]
-        if momentum > 0:
+        if drift > 0:
             side, side_price = "yes", market_price
         else:
             no_price = market.get("no_price")
@@ -118,10 +140,12 @@ class LateWindowMakerBot(BaseBot):
         maker_mid = round((maker_bid + maker_ask) / 2, 3)
         edge_bps = p["maker_offset_pct"] * 10000  # spread captured if filled
 
-        # ── Confidence: urgency × momentum strength ───────────────────────────
+        # ── Confidence: drift conviction × urgency × momentum agreement ──────
         time_weight = 1.0 - (time_rem / entry_window)  # 0 at window-open, 1 at close
-        mom_strength = min(1.0, abs(momentum) / (min_mom * 5))
-        confidence = min(0.92, 0.45 + time_weight * 0.30 + mom_strength * 0.20)
+        drift_strength = min(1.0, abs(drift))
+        mom_strength = min(1.0, max(0.0, signed_mom) / (min_mom * 5))
+        confidence = min(0.92, 0.35 + drift_strength * 0.30
+                         + time_weight * 0.20 + mom_strength * 0.10)
 
         # ── Features ─────────────────────────────────────────────────────────
         of_data = signals.get("orderflow", {})
@@ -143,9 +167,12 @@ class LateWindowMakerBot(BaseBot):
                 f"edge={edge_bps:.0f}bps tw={time_weight:.2f}"
             ),
             "suggested_amount": amount,
-            # Expected taker price = the ask we'd cross; feeds the execute()
-            # slippage guard (config.MAX_FILL_SLIPPAGE).
-            "entry_price": maker_ask,
+            # Expected taker price: the fill walks the real book from the best
+            # ask, so expect ~the side's current price. Feeds the execute()
+            # slippage guard (config.MAX_FILL_SLIPPAGE). Using maker_ask here
+            # (side_price + 6c) silently widened the guard to ~9c over mid —
+            # the maker_* fields below are logged metrics, not fill targets.
+            "entry_price": round(side_price, 4),
             "features": features,
             "maker_bid": maker_bid,
             "maker_ask": maker_ask,
