@@ -19,6 +19,7 @@ from datetime import datetime, timezone
 import requests
 
 import config
+from signals import clean_tick
 
 logger = logging.getLogger("polymarket.markets")
 
@@ -107,6 +108,7 @@ def _normalize(m: dict):
         "polymarket_no_token_id": toks[1],    # "Down" / NO
         "polymarket_neg_risk": bool(m.get("negRisk")),
         "resolves_at": m.get("endDate"),
+        "event_start_time": m.get("eventStartTime"),  # window OPEN (ISO) — the strike anchor
         "time_remaining_seconds": time_rem,
         "current_price": None,                # set by refresh_price()
         "outcome_prices": _as_list(m.get("outcomePrices")),
@@ -214,20 +216,99 @@ def midpoint_price(token_id: str):
         return None
 
 
-def current_prices(condition_id: str):
-    """Fresh ``{"yes": up_mid, "no": down_mid}`` for a market, or ``None``.
+def midpoints_batch(token_ids: list) -> dict:
+    """Live CLOB midpoints for many tokens in ONE call: ``{token_id: float}``.
 
-    Uses the live ``/midpoint`` for each token; ``no`` falls back to ``1 - yes``
-    if the Down book is momentarily empty.
+    Uses the batch ``POST /midpoints`` endpoint so an entire discovery snapshot
+    (current + upcoming markets, both tokens each) is priced with a single round
+    trip instead of one ``/midpoint`` GET per token — far fewer failure points
+    under the dashboard's 1-3s poll cadence, and an atomic snapshot so YES/NO
+    for a market are consistent with each other. Tokens the book has no mid for
+    are simply absent. Returns ``{}`` on failure so callers fall back cleanly.
     """
-    up, down = _token_ids(condition_id)
-    yes = midpoint_price(up)
+    ids = [str(t) for t in token_ids if t]
+    if not ids:
+        return {}
+    try:
+        resp = requests.post(
+            f"{CLOB}/midpoints",
+            json=[{"token_id": t} for t in ids],
+            timeout=10,
+        )
+        if resp.status_code != 200:
+            return {}
+        raw = resp.json() or {}
+    except Exception as e:
+        logger.debug(f"midpoints_batch failed ({len(ids)} tokens): {e}")
+        return {}
+    out = {}
+    for tok, mid in raw.items():
+        try:
+            out[tok] = float(mid)
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _yes_no_from_mids(up, down, mids: dict):
+    """Resolve a ``{"yes","no"}`` dict from a batch-mids map, with fallbacks.
+
+    Layered for reliability: batch mid → single ``/midpoint`` → order-book mid.
+    ``no`` derives from ``1 - yes`` whenever the Down book has no independent mid.
+    Returns ``None`` only when every source is exhausted.
+    """
+    yes = mids.get(str(up)) if up else None
+    if yes is None:
+        yes = midpoint_price(up)
+    if yes is None:
+        book = get_order_book(up)
+        yes = midpoint(book) if book.get("valid") else None
     if yes is None:
         return None
-    no = midpoint_price(down) if down else None
+    no = mids.get(str(down)) if down else None
     if no is None:
         no = round(1.0 - yes, 4)
     return {"yes": yes, "no": no}
+
+
+def price_markets(markets: list) -> list:
+    """Set ``current_price`` (YES/Up mid) and ``no_price`` (Down mid) on every
+    market in ONE batch call. Markets whose tokens the batch didn't price keep
+    their previous values. Returns the same list for chaining.
+
+    This is the efficient path for the dashboard: instead of calling
+    ``refresh_price`` (one /midpoint each) per visible market, price the whole
+    snapshot at once.
+    """
+    real = [m for m in markets if m]
+    tokens = []
+    for m in real:
+        tokens.append(m.get("polymarket_token_id"))
+        tokens.append(m.get("polymarket_no_token_id"))
+    mids = midpoints_batch(tokens)
+    for m in real:
+        up = m.get("polymarket_token_id")
+        down = m.get("polymarket_no_token_id")
+        yes = mids.get(str(up)) if up else None
+        if yes is not None:
+            m["current_price"] = yes
+            no = mids.get(str(down)) if down else None
+            m["no_price"] = no if no is not None else round(1.0 - yes, 4)
+    return markets
+
+
+def current_prices(condition_id: str):
+    """Fresh ``{"yes": up_mid, "no": down_mid}`` for a market, or ``None``.
+
+    Prices both tokens in a single batch ``/midpoints`` call, then falls back to
+    per-token ``/midpoint`` and finally the order-book mid so a transient empty
+    book on one side never blanks the card.
+    """
+    up, down = _token_ids(condition_id)
+    if not up:
+        return None
+    mids = midpoints_batch([up, down] if down else [up])
+    return _yes_no_from_mids(up, down, mids)
 
 
 def current_up_price(condition_id: str):
@@ -251,6 +332,10 @@ def refresh_price(market: dict) -> dict:
     if yes is None:
         book = get_order_book(tok)
         yes = midpoint(book) if book.get("valid") else None
+    # Clean-tick guard: reject an implausible single-tick jump (bad/stale data)
+    # and drop the first tick from a freshly-seen token before it can move a bot.
+    if tok:
+        yes = clean_tick.clean_price(tok, yes)
     if yes is not None:
         market["current_price"] = yes
     return market

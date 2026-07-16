@@ -126,13 +126,13 @@ SIGNAL_WEIGHT_CVD = 0.25
 # scaled (more decisive near expiry). Fed into fair value at SIGNAL_WEIGHT_DRIFT.
 MARKET_WINDOW_SEC = 300           # 5-min window length
 DRIFT_VOL_SCALE = 0.0015          # typical BTC move (fraction) over a full window
-# DISABLED (2026-07-15): shipped at 0.25 on theory and it was ANTI-PREDICTIVE in
-# a mean-reverting regime — when drift said UP, YES won only 23% (vs 53% when it
-# said DOWN). Root cause: over a 5-min window BTC is short-horizon mean-reverting,
-# and the Polymarket price already prices that reversion, so raw "BTC is above
-# the strike NOW" naively extrapolates the wrong way. Kept wired at weight 0 for
-# a properly-validated redesign (near-expiry-only, or fade sign). See BUG #23.
-SIGNAL_WEIGHT_DRIFT = 0.0
+# RE-ENABLED (2026-07-16) after the #23 blow-up was traced to a MISCALCULATED
+# strike (mid-window "first sighting"), not a bad signal. With the accurate
+# strike (Binance open @ eventStartTime) the offline harness
+# (tools/validate_signals.py, 300 resolved markets, 50% UP base rate) measures
+# drift ~76% predictive — symmetric and 86% near expiry. Now VALIDATED, so it
+# earns a live weight. Start moderate; tunable in one place.
+SIGNAL_WEIGHT_DRIFT = 0.20
 
 # --- Two-sided (YES/NO) net-edge side selection ---
 # Favorite-following tilt scale. Replaces the old hard-coded price_edge * 0.50

@@ -31,28 +31,18 @@ def _sig(**over):
     return base
 
 
-def test_drift_disabled_by_default():
-    # Catastrophic when weighted; must ship OFF until validated.
-    assert config.SIGNAL_WEIGHT_DRIFT == 0.0
+def test_drift_enabled_after_validation():
+    # Re-enabled once the accurate strike made it ~76% predictive offline.
+    assert config.SIGNAL_WEIGHT_DRIFT > 0.0
 
 
 def test_obi_disabled_by_default():
+    # OBI stays off — not yet validated (no order-book history in the harness).
     assert config.SIGNAL_WEIGHT_OBI == 0.0
 
 
-def test_drift_does_not_move_decision_while_disabled():
-    bot = _bot()
-    m = _market(yes=0.50, no=0.50)
-    up = bot.make_decision(m, _sig(btc_drift=1.0))
-    dn = bot.make_decision(m, _sig(btc_drift=-1.0))
-    # weight 0 -> drift has no effect on the decision
-    assert up == dn
-
-
-def test_drift_mechanism_works_when_weighted(monkeypatch):
-    # Prove the wiring is intact: with a positive weight, drift moves fair value
-    # the correct (symmetric) way. This does NOT enable it in production.
-    monkeypatch.setattr(config, "SIGNAL_WEIGHT_DRIFT", 0.25)
+def test_drift_moves_decision_symmetrically():
+    # Live weight is on: equal-magnitude opposite drift -> opposite sides.
     bot = _bot()
     m = _market(yes=0.50, no=0.50)
     up = bot.make_decision(m, _sig(btc_drift=1.0))

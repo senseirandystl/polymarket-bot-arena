@@ -75,18 +75,21 @@ def build_combined_signals(
             if cond:
                 cvd = get_cvd_feed().get_cvd(cond)
 
-    # BTC drift from the window's "price to beat" (strike). Snapshot the strike
-    # at first LIVE sighting, then measure how far BTC has drifted. Regime-
-    # agnostic directional fundamental; 0.0 until a strike is captured.
+    # BTC drift from the window's "price to beat" (accurate strike = Binance open
+    # at eventStartTime). Warm path reads the strike the warmer already fetched;
+    # cold path (maker) fetches via the registry (cached). Regime-agnostic
+    # fundamental; 0.0 until a strike is available.
     btc_latest = float(price_signals.get("latest", 0.0) or 0.0)
     btc_drift = 0.0
     btc_strike = None
     if market is not None and btc_latest > 0:
         mkt_id = market.get("id") or market.get("market_id")
         tr = market.get("time_remaining_seconds")
-        reg = get_strike_registry()
-        reg.observe(mkt_id, btc_latest, tr)
-        btc_strike = reg.strike(mkt_id)
+        if warm is not None and warm.get("strike"):
+            btc_strike = warm.get("strike")
+        else:
+            btc_strike = get_strike_registry().get_strike(
+                mkt_id, market.get("event_start_time"))
         btc_drift = drift_signal(btc_strike, btc_latest, tr)
 
     return {
