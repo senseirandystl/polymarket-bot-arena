@@ -57,7 +57,10 @@ TARGET_MARKET_KEYWORDS = ["5 min", "5-min", "5min", "up or down", "up/down"]
 BTC_5MIN_MARKET_ID = None  # Will be populated by setup.py
 
 # Risk Limits - Paper Mode (default) — no caps, let bots compete freely
-PAPER_MAX_POSITION = 50.0  # $SIM per trade
+# NOTE (2026-07-17): directional bets are PURE-KELLY sized and no longer capped
+# by PAPER_MAX_POSITION — it now only scales the maker/arb position_size_pct
+# knobs (via get_max_position()).
+PAPER_MAX_POSITION = 50.0  # $SIM sizing base for maker/arb bots
 PAPER_MAX_DAILY_LOSS_PER_BOT = 999999.0  # Uncapped for paper
 PAPER_MAX_DAILY_LOSS_TOTAL = 999999.0  # Uncapped for paper
 PAPER_STARTING_BALANCE = 10000.0  # $SIM
@@ -68,7 +71,9 @@ LIVE_MAX_DAILY_LOSS_PER_BOT = 50.0  # USDC
 LIVE_MAX_DAILY_LOSS_TOTAL = 100.0  # USDC
 
 # General Risk Rules (both modes)
-MAX_POSITION_PCT_OF_BALANCE = 0.10  # Never bet more than 10% of balance
+# No longer caps directional bets (pure Kelly, 2026-07-17). Still used to
+# derive the live-mode notional bankroll for sizing (LIVE_MAX_POSITION / pct).
+MAX_POSITION_PCT_OF_BALANCE = 0.10
 MAX_TRADES_PER_HOUR_PER_BOT = 60  # Bots trade every 5-min market they find
 
 # Evolution Settings
@@ -172,6 +177,11 @@ FLOW_ONLY_EDGE_MULT = 2.0
 # fraction of it. Size therefore scales with edge, odds, AND the live
 # bankroll (compounding) — replacing the old flat 5-9.5%-of-max-position
 # formula that ignored all three (win avg $3.83 vs loss avg $3.76 overnight).
+# This constant is only the DEFAULT: the live value is stored in the DB
+# (db.get_kelly_fraction) and editable in the dashboard Settings tab —
+# changes take effect within SIZING_BANKROLL_CACHE_SEC, no restart. Bets are
+# PURE Kelly (2026-07-17): no per-trade or %-of-balance caps in paper mode
+# (the shared-pool gate is the only spend limit); live keeps LIVE_MAX_POSITION.
 KELLY_FRACTION = 0.25
 # How long make_decision may reuse the last bankroll read (it runs per-bot
 # per-second; the pool changes only on fills/resolutions).

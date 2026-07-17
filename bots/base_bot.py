@@ -20,6 +20,23 @@ logger = logging.getLogger(__name__)
 # Bankroll read for Kelly sizing, cached off the 1s hot path (the pool only
 # changes on fills/resolutions). Shared across bots — the pool is shared too.
 _bankroll_cache: tuple = (0.0, 0.0)  # (ts, value)
+_kelly_cache: tuple = (0.0, 0.0)     # (ts, value)
+
+
+def _kelly_fraction() -> float:
+    """Kelly fraction for sizing, live-editable in dashboard Settings.
+
+    Read from the DB (the dashboard runs in a separate process, so a module
+    constant would never see edits) with the same short hot-path cache as the
+    bankroll.
+    """
+    global _kelly_cache
+    now = time.time()
+    if (now - _kelly_cache[0]) < getattr(config, "SIZING_BANKROLL_CACHE_SEC", 5.0):
+        return _kelly_cache[1]
+    value = db.get_kelly_fraction()
+    _kelly_cache = (now, value)
+    return value
 
 
 def _sizing_bankroll(mode: str) -> float:
@@ -406,35 +423,27 @@ class BaseBot(ABC):
         if time_rem is not None and time_rem < 60:
             confidence = min(0.95, confidence * 1.25)
 
-        # --- Bet sizing: fractional Kelly, SHARES-FIRST ---
+        # --- Bet sizing: pure fractional Kelly, SHARES-FIRST ---
         # Binary-market Kelly: buying a side at price c with true probability p
         # grows fastest at bankroll fraction f* = (p - c)/(1 - c); with the
         # fee-adjusted edge already computed, f* = edge/(1 - price). We bet
-        # config.KELLY_FRACTION of that (model p is an estimate; full Kelly
-        # over-bets estimation error), capped by MAX_POSITION_PCT_OF_BALANCE
-        # and the per-trade max. Size now scales with edge, odds, AND the live
-        # bankroll — the old formula (flat % of max_pos by confidence) sized
-        # wins and losses almost identically ($3.83 vs $3.76).
-        max_pos = config.get_max_position()
+        # the Kelly fraction (live-editable in dashboard Settings; full Kelly
+        # over-bets estimation error) of the LIVE bankroll — no per-trade or
+        # %-of-balance caps (removed 2026-07-17 to run pure Kelly sizing; the
+        # venue's shared-pool gate still prevents spending cash the pool
+        # lacks). Size scales with edge, odds, AND bankroll — the old formula
+        # (flat % of max_pos by confidence) sized wins and losses almost
+        # identically ($3.83 vs $3.76).
         price = max(side_price, 0.01)
-        max_shares = max_pos / price  # most shares max_pos can buy at this price
         bankroll = _sizing_bankroll(self.trading_mode)
         kelly_f = max(0.0, chosen_edge) / max(1.0 - price, 0.05)
-        f = kelly_f * config.KELLY_FRACTION
-        f = min(f, config.MAX_POSITION_PCT_OF_BALANCE)
-        kelly_usd = min(f * bankroll, max_pos)
+        kelly_usd = kelly_f * _kelly_fraction() * bankroll
         # SHARES-FIRST: derive the exact share count, then the USD from it.
         # Sizing USD-first and dividing by price rounds away PnL at low prices.
-        target_shares = kelly_usd / price
-
-        # Floor to clear Polymarket's 5-share minimum (× buffer for slippage),
-        # cap at what max_pos can buy, then round to a clean share count and
-        # derive the USD spend from it. Never USD → shares.
-        target_shares = min(
-            max(target_shares, config.POLYMARKET_MIN_SHARES * 1.15), max_shares
-        )
+        # Floor to clear Polymarket's 5-share minimum (× buffer for slippage).
+        target_shares = max(kelly_usd / price, config.POLYMARKET_MIN_SHARES * 1.15)
         target_shares = round(target_shares, 4)
-        amount = min(target_shares * price, max_pos)
+        amount = target_shares * price
 
         reasoning = (
             f"fair={fair_yes:.2f} model={model_prob:.2f} trust={trust:.2f} "
@@ -469,8 +478,6 @@ class BaseBot(ABC):
         # Per-bot mode: fresh read from DB so dashboard toggles take effect immediately
         self.trading_mode = db.get_bot_mode(self.name)
         mode = self.trading_mode
-        # Use per-bot mode for position limits (global config.TRADING_MODE is always "paper")
-        max_pos = config.LIVE_MAX_POSITION if mode == "live" else config.PAPER_MAX_POSITION
 
         # Check risk limits
         daily_loss = db.get_bot_daily_loss(self.name, mode)
@@ -486,7 +493,12 @@ class BaseBot(ABC):
             logger.warning(f"[{self.name}] Total arena daily loss limit hit (${total_daily:.2f})")
             return {"success": False, "reason": "arena_loss_limit"}
 
-        amount = min(signal.get("suggested_amount", max_pos * 0.5), max_pos)
+        # Pure Kelly sizing: paper amounts are uncapped (the shared-pool gate
+        # in venues/paper.py still refuses to overspend the pool). LIVE keeps
+        # the hard per-trade safety cap — real money.
+        amount = signal.get("suggested_amount", 0.0)
+        if mode == "live":
+            amount = min(amount, config.LIVE_MAX_POSITION)
 
         try:
             return self._place_via_engine(signal, market, amount, mode)

@@ -36,8 +36,8 @@ Absolute numbers from the Feb 2026 v4 baseline (276 resolved trades, total P&L `
 
 > **Deployment note:** The two plists in `~/Library/LaunchAgents/` are symlinks back to the project tree (see [launchd Services](#launchd-services) below), so the repo is the single source of truth — `git pull` automatically propagates plist edits. Logs live in `~/Library/Logs/`, not in the repo.
 
-### Simmer API Keys (4 accounts, slot-based)
-Stored at `~/.config/simmer/bot_keys.json` — keys mapped to slot_0 through slot_3. When evolution kills a bot, the replacement inherits the dead bot's slot (and API key). Default key at `~/.config/simmer/simmer_api_key.json`.
+### Credentials
+Paper mode needs **no keys** — all market data (discovery, books, resolutions) is public. Live mode needs Polymarket credentials, added via the dashboard Settings tab (encrypted store, `credentials_store.py`). The old Simmer key files (`~/.config/simmer/*`) are obsolete — Simmer is fully removed (BUG #10).
 
 ## Architecture
 
@@ -143,11 +143,15 @@ old blanket **NO ban is gone** (see BUG_HISTORY #20).
   prices in the market-data warmer (and the fallback `refresh_price`).
   Drop-first-tick is OFF (`CLEAN_TICK_DROP_FIRST=False`) — REST/warmer reads are
   already current, so dropping the first would blank a new market for a cycle.
-- **Fractional-Kelly sizing (2026-07-17):** binary-market Kelly `f* =
-  edge/(1−price)` (edge already fee-adjusted), bet at `config.KELLY_FRACTION`
-  (0.25) of it against the **live bankroll** (paper pool via cached
-  `db.get_paper_available`, `SIZING_BANKROLL_CACHE_SEC`), capped by
-  `MAX_POSITION_PCT_OF_BALANCE` and the per-trade max. Replaces the flat
+- **Pure fractional-Kelly sizing (2026-07-17):** binary-market Kelly `f* =
+  edge/(1−price)` (edge already fee-adjusted), bet at the **Kelly fraction ×
+  f* × live bankroll** (paper pool via cached `db.get_paper_available`,
+  `SIZING_BANKROLL_CACHE_SEC`). The Kelly fraction lives in the DB
+  (`db.get_kelly_fraction`, default `config.KELLY_FRACTION` = 0.25) and is
+  **editable in the dashboard Settings tab** — the arena picks up changes
+  within seconds. Paper bets are **uncapped** (no per-trade / %-of-balance
+  limits; the venue's shared-pool gate is the only spend limit); live mode
+  keeps the hard `LIVE_MAX_POSITION` cap. Replaces the flat
   confidence-scaled %-of-max-position formula (win avg $3.83 vs loss avg
   $3.76 over 453 trades — size ignored edge, odds, and bankroll). Still
   **shares-first**: exact share count derived before USD (`amount =
@@ -165,7 +169,7 @@ old blanket **NO ban is gone** (see BUG_HISTORY #20).
   entry) per bucket — a high WR bought at high prices still loses; the gap must
   be ≥5¢ to break even, ≥10¢ to profit.
 - **Bet sizing cap:** Confidence capped at 0.45 for sizing (prevents overconfident large bets)
-- **No stale expiry:** Pending trades stay pending until the market actually resolves (Simmer can take up to a day). The old 1h auto-expire was removed — it threw away real outcomes. See BUG_HISTORY #10.
+- **No stale expiry:** Pending trades stay pending until the market actually resolves. The old 1h auto-expire was removed — it threw away real outcomes. See BUG_HISTORY #10.
 - **Daily loss limits:** Uncapped for paper trading (was $10/bot, $25 total)
 - **Dedup:** Loads recent (bot, market) pairs from DB to prevent duplicates across restarts
 
@@ -182,7 +186,7 @@ One background thread (`MarketDataWarmer`, `config.MARKET_DATA_INTERVAL_SEC`, de
 
 ### Execution venues (paper vs live)
 Order placement is split by venue so the two never intermix — `base_bot.execute()` picks an engine via `venues.get_engine(mode)`. Both use identical pricing/fill/fee math (`polymarket_fills.py`):
-- **Paper** (`venues/paper.py`, `fill_source='paper_sim'`): **simulates against the real CLOB order book** — walks the asks for depth/slippage, applies the Polymarket taker fee, and never submits. All paper bots share ONE virtual USDC pool. `available = bankroll + realized_paper_pnl − reserved_open_cost` (`db.get_paper_available`); a bot can't spend cash the pool lacks. The dashboard Settings "Balance" field **tops the pool up to the entered figure** via `db.topup_paper_bankroll` — it back-solves the underlying `bankroll` so `available` equals what you type, *preserving* trade history and open positions (entering $200 when the pool is at $45 sets available to exactly $200). Resolves against the real market outcome.
+- **Paper** (`venues/paper.py`, `fill_source='paper_sim'`): **simulates against the real CLOB order book** — walks the asks for depth/slippage, applies the Polymarket taker fee, and never submits. All paper bots share ONE virtual USDC pool. `available = bankroll + realized_paper_pnl − reserved_open_cost` (`db.get_paper_available`); a bot can't spend cash the pool lacks. The dashboard Settings "Balance" field **tops the pool up to the entered figure** via `db.topup_paper_bankroll` — it back-solves the underlying `bankroll` so `available` equals what you type, *preserving* trade history and open positions (entering $200 when the pool is at $45 sets available to exactly $200). The Settings "Kelly Fraction" field edits the live sizing multiplier the same way (`db.get_kelly_fraction`, picked up within seconds). Resolves against the real market outcome.
 - **Live** (`venues/live.py` → `polymarket_client.py`): real CLOB `create_market_order`/`MarketOrderArgs` (auto tick-size / neg-risk / fee). Uses the real wallet USDC balance. Fully wired but only used when a bot's `trading_mode` is `live` (arena starts in paper).
 - **Fees:** `polymarket_fills.taker_fee()` is the **single source of truth** for fee math — makers free, takers pay `feeRate × shares × p × (1−p)` per the [official Polymarket docs](https://docs.polymarket.com/trading/fees) (symmetric around 50¢; crypto tier `config.POLYMARKET_TAKER_FEE_RATE = 0.07`, peaking at $1.75/100 shares at 50¢). Any bot needing a fee estimate must call this, never re-derive it (see BUG_HISTORY #17). Factored into resolved P&L (`payout − amount − fee`). Trade columns `fill_source`/`entry_price`/`fee` record each fill.
 
@@ -322,7 +326,7 @@ The HTTP-Basic credentials used by the probe (`admin` / `Thor`) are hardcoded to
 
 ### Fresh-clone Setup
 
-> ⚠️ This starts the bot trading on completion. Make sure the Simmer keys exist at `~/.config/simmer/simmer_api_key.json` and at `~/.config/simmer/bot_keys.json` (all four `slot_0…slot_3` entries populated) first. Otherwise the loaded program will fail to start and `KeepAlive` will keep relaunching it — the throttle is 30s for the arena and 10s for the dashboard, so the stderr logs (`~/Library/Logs/com.polymarket.botarena.err.log`, `~/Library/Logs/com.polymarket.dashboard.err.log`) fill quickly with `FileNotFoundError` lines.
+> ⚠️ This starts the bot trading (paper mode) on completion. No API keys are required for paper trading. If a service fails to start, `KeepAlive` relaunches it on a throttle (30s arena / 10s dashboard), so the stderr logs (`~/Library/Logs/com.polymarket.botarena.err.log`, `~/Library/Logs/com.polymarket.dashboard.err.log`) fill quickly with the traceback — check there first.
 
 `WorkingDirectory` is intentionally unset in both plists — `config.py` (`DB_PATH`, `LOG_DIR`) and `dashboard/server.py` (`Path(__file__).parent / "index.html"`) anchor every path on `__file__`, so launchd's default cwd of `/` is harmless. If you specifically want the courtesy-chdir before exec, add `<key>WorkingDirectory</key><string>/your/absolute/repo/path</string>` to both plists manually before `launchctl load -w`.
 

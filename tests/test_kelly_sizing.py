@@ -29,8 +29,9 @@ def _sig(**over):
     return base
 
 
-def _decide(bankroll, yes, drift):
-    with mock.patch.object(base_bot, "_sizing_bankroll", lambda mode: bankroll):
+def _decide(bankroll, yes, drift, fraction=0.25):
+    with mock.patch.object(base_bot, "_sizing_bankroll", lambda mode: bankroll), \
+         mock.patch.object(base_bot, "_kelly_fraction", lambda: fraction):
         return _bot().make_decision(_market(yes), _sig(btc_drift=drift))
 
 
@@ -49,24 +50,46 @@ def test_size_scales_with_edge():
 
 
 def test_kelly_fraction_math():
-    # f = KELLY_FRACTION * edge/(1-price), amount = f * bankroll (shares-first
-    # rounding aside), capped by MAX_POSITION_PCT_OF_BALANCE and max_pos.
+    # PURE Kelly: amount = fraction * edge/(1-price) * bankroll — no per-trade
+    # or %-of-balance caps (shares-first rounding aside).
     bankroll = 200.0
-    d = _decide(bankroll, 0.52, 0.9)
+    fraction = 0.25
+    d = _decide(bankroll, 0.52, 0.9, fraction=fraction)
     assert d["action"] == "buy"
     price = d["entry_price"]
     edge = float(d["reasoning"].split("edge=")[1].split(" ")[0])
-    f = min(config.KELLY_FRACTION * edge / (1 - price),
-            config.MAX_POSITION_PCT_OF_BALANCE)
-    expected = min(f * bankroll, config.get_max_position())
-    # shares-first rounding + 5-share floor can nudge the USD slightly
+    expected = fraction * edge / (1 - price) * bankroll
     assert abs(d["suggested_amount"] - expected) <= max(0.05, price * 0.01) \
         or d["suggested_amount"] >= config.POLYMARKET_MIN_SHARES * price
 
 
-def test_size_capped_at_max_position_pct():
-    d = _decide(10000.0, 0.52, 0.95)   # huge bankroll + huge edge
-    assert d["suggested_amount"] <= config.get_max_position() + 1e-9
+def test_size_uncapped_scales_past_old_per_trade_limit():
+    # Caps removed 2026-07-17: with a big pool and strong edge the bet may
+    # exceed the old $50 per-trade / 10%-of-balance limits (the paper venue's
+    # shared-pool gate remains the only spend limit).
+    d = _decide(10000.0, 0.52, 0.95)
+    assert d["action"] == "buy"
+    assert d["suggested_amount"] > config.PAPER_MAX_POSITION
+
+
+def test_kelly_fraction_scales_size_linearly():
+    quarter = _decide(200.0, 0.52, 0.9, fraction=0.25)
+    full = _decide(200.0, 0.52, 0.9, fraction=1.0)
+    assert full["suggested_amount"] > 3.5 * quarter["suggested_amount"]
+
+
+def test_kelly_fraction_db_roundtrip(tmp_path, monkeypatch):
+    import db as db_module
+    monkeypatch.setattr(db_module, "DB_PATH", tmp_path / "kelly.db")
+    db_module.init_db()
+    assert db_module.get_kelly_fraction() == config.KELLY_FRACTION  # default
+    db_module.set_kelly_fraction(0.5)
+    assert db_module.get_kelly_fraction() == 0.5
+    import pytest
+    with pytest.raises(ValueError):
+        db_module.set_kelly_fraction(1.5)
+    with pytest.raises(ValueError):
+        db_module.set_kelly_fraction(0.0)
 
 
 def test_tiny_edge_still_floors_at_min_shares():

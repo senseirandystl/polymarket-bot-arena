@@ -2,12 +2,21 @@
 
 import sqlite3
 import json
+import threading
+import time
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from contextlib import contextmanager
 import config
 
 DB_PATH = config.DB_PATH
+
+# Short-TTL cache for per-bot trading mode. get_bot_mode is read on every trade
+# (base_bot.execute + the arb bot's execute); this keeps live/paper toggles from
+# the dashboard applying within BOT_MODE_CACHE_TTL_SEC while removing a per-trade
+# SQLite round-trip. Invalidated on set_bot_mode / retire.
+_bot_mode_cache: dict = {}   # bot_name -> (ts, mode)
+_bot_mode_lock = threading.Lock()
 
 
 # ---------------------------------------------------------------------------
@@ -273,6 +282,76 @@ def get_bot_performance(bot_name, hours=12, mode=None):
         return result
 
 
+def get_entry_price_buckets(mode=None, hours=None):
+    """ROI by entry-price bucket for resolved trades — the core profitability lens.
+
+    A high win rate bought at high prices still loses money: WR must exceed the
+    average entry price by ≥5¢ to break even, ≥10¢ to profit (0xSurferX/0x_Punisher).
+    This groups resolved trades into entry-price buckets and, per bucket, returns
+    count / wins / win_rate / avg_entry / pnl / roi plus ``breakeven_gap`` =
+    win_rate − avg_entry (the cents of edge over the break-even line: <0 losing,
+    ≥0.05 healthy). ``roi`` is total pnl / total staked.
+
+    Buckets (YES-price cents): 0-20, 20-40, 40-55, 55-65, 65-70, 70-75, 75-85,
+    85-95, 95+. Only rows with a non-null ``entry_price`` and a win/loss outcome
+    are counted.
+    """
+    edges = [0.0, 0.20, 0.40, 0.55, 0.65, 0.70, 0.75, 0.85, 0.95, 1.0001]
+    labels = ["0-20", "20-40", "40-55", "55-65", "65-70",
+              "70-75", "75-85", "85-95", "95+"]
+    with get_conn() as conn:
+        conditions = ["entry_price IS NOT NULL",
+                      "outcome IN ('win', 'loss', 'exit_tp', 'exit_sl')"]
+        params = []
+        if mode is not None:
+            conditions.append("mode=?")
+            params.append(mode)
+        if hours is not None:
+            cutoff = (datetime.utcnow() - timedelta(hours=hours)).strftime("%Y-%m-%d %H:%M:%S")
+            conditions.append("created_at>=?")
+            params.append(cutoff)
+        where = " AND ".join(conditions)
+        rows = conn.execute(
+            f"SELECT entry_price, amount, pnl, outcome FROM trades WHERE {where}",
+            params,
+        ).fetchall()
+
+    buckets = [{"bucket": lbl, "count": 0, "wins": 0, "staked": 0.0,
+                "pnl": 0.0, "entry_sum": 0.0} for lbl in labels]
+    for r in rows:
+        price = r["entry_price"]
+        if price is None:
+            continue
+        idx = next((i for i in range(len(labels)) if edges[i] <= price < edges[i + 1]), None)
+        if idx is None:
+            continue
+        b = buckets[idx]
+        b["count"] += 1
+        b["wins"] += 1 if r["outcome"] in ("win", "exit_tp") else 0
+        b["staked"] += r["amount"] or 0.0
+        b["pnl"] += r["pnl"] or 0.0
+        b["entry_sum"] += price
+
+    out = []
+    for b in buckets:
+        n = b["count"]
+        if n == 0:
+            continue
+        wr = b["wins"] / n
+        avg_entry = b["entry_sum"] / n
+        out.append({
+            "bucket": b["bucket"],
+            "count": n,
+            "wins": b["wins"],
+            "win_rate": round(wr, 4),
+            "avg_entry": round(avg_entry, 4),
+            "pnl": round(b["pnl"], 2),
+            "roi": round(b["pnl"] / b["staked"], 4) if b["staked"] else 0.0,
+            "breakeven_gap": round(wr - avg_entry, 4),
+        })
+    return out
+
+
 def get_all_bots_performance(hours=12):
     with get_conn() as conn:
         cutoff = (datetime.utcnow() - timedelta(hours=hours)).strftime("%Y-%m-%d %H:%M:%S")
@@ -313,6 +392,30 @@ def retire_bot(bot_name):
             "UPDATE bot_configs SET active=0, retired_at=datetime('now') WHERE bot_name=? AND active=1",
             (bot_name,)
         )
+    with _bot_mode_lock:
+        _bot_mode_cache.pop(bot_name, None)
+
+
+def wipe_all():
+    """Delete every row from all arena tables (schema is preserved).
+
+    Backs the 'start fresh' startup option — the caller wipes the DB so a new
+    bot slate isn't polluted by a previous run's trades, learning, evolution
+    history or bankroll. Uses per-table DELETE (not file unlink) so it is safe
+    while another process (the dashboard) holds an open connection.
+    """
+    with get_conn() as conn:
+        tables = [
+            r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+            ).fetchall()
+        ]
+        for t in tables:
+            conn.execute(f"DELETE FROM {t}")
+    with _bot_mode_lock:
+        _bot_mode_cache.clear()
+    return len(tables)
 
 
 def add_copy_wallet(address: str, label: str = None, mode: str = "paper"):
@@ -472,13 +575,29 @@ def set_paper_bankroll(amount):
     set_arena_state("paper_bankroll", amount)
 
 
-def get_paper_available():
-    """Available shared paper cash right now.
+def get_kelly_fraction():
+    """The Kelly fraction used for bet sizing (editable in dashboard Settings).
 
-    cash = bankroll + realized paper P&L (resolved) - open paper cost (pending).
-    All paper bots draw from this one pool.
+    Falls back to ``config.KELLY_FRACTION`` until a value is saved.
     """
-    bankroll = get_paper_bankroll()
+    v = get_arena_state("kelly_fraction")
+    try:
+        f = float(v) if v is not None else config.KELLY_FRACTION
+    except (TypeError, ValueError):
+        return config.KELLY_FRACTION
+    return f if 0.0 < f <= 1.0 else config.KELLY_FRACTION
+
+
+def set_kelly_fraction(fraction):
+    """Set the Kelly fraction (0 < f <= 1). Raises ValueError on bad input."""
+    fraction = float(fraction)
+    if not (0.0 < fraction <= 1.0):
+        raise ValueError("Kelly fraction must be in (0, 1]")
+    set_arena_state("kelly_fraction", fraction)
+
+
+def _paper_pnl_and_reserved():
+    """(realized paper P&L on resolved trades, reserved cost of open trades)."""
     with get_conn() as conn:
         realized = conn.execute(
             "SELECT COALESCE(SUM(pnl), 0) FROM trades "
@@ -488,19 +607,58 @@ def get_paper_available():
             "SELECT COALESCE(SUM(amount + COALESCE(fee, 0)), 0) FROM trades "
             "WHERE mode='paper' AND outcome IS NULL"
         ).fetchone()[0]
-    return bankroll + (realized or 0) - (open_cost or 0)
+    return (realized or 0.0), (open_cost or 0.0)
+
+
+def get_paper_available():
+    """Available shared paper cash right now.
+
+    cash = bankroll + realized paper P&L (resolved) - open paper cost (pending).
+    All paper bots draw from this one pool.
+    """
+    realized, open_cost = _paper_pnl_and_reserved()
+    return get_paper_bankroll() + realized - open_cost
+
+
+def topup_paper_bankroll(target_available):
+    """Top the shared paper pool up so *available cash* equals ``target_available``.
+
+    The user enters the balance they want to see. Because
+    ``available = bankroll + realized_pnl - reserved_open``, we solve for the
+    underlying bankroll that yields the requested available cash *without*
+    discarding trade history or un-reserving live positions::
+
+        bankroll = target_available - realized_pnl + reserved_open
+
+    So entering $200 when the pool is at $45 (after losses + open bets) sets
+    available to exactly $200, and future resolutions still move it correctly.
+    Returns the new available cash.
+    """
+    target = float(target_available)
+    if target < 0:
+        raise ValueError("Balance must be non-negative")
+    realized, open_cost = _paper_pnl_and_reserved()
+    set_arena_state("paper_bankroll", target - realized + open_cost)
+    return get_paper_available()
 
 
 def get_bot_mode(bot_name):
-    """Get per-bot trading mode ('paper' or 'live')."""
+    """Get per-bot trading mode ('paper' or 'live'), cached briefly."""
+    now = time.time()
+    ttl = getattr(config, "BOT_MODE_CACHE_TTL_SEC", 3)
+    with _bot_mode_lock:
+        hit = _bot_mode_cache.get(bot_name)
+        if hit and (now - hit[0]) < ttl:
+            return hit[1]
     with get_conn() as conn:
         row = conn.execute(
             "SELECT trading_mode FROM bot_configs WHERE bot_name=? AND active=1",
             (bot_name,)
         ).fetchone()
-        if row:
-            return row["trading_mode"] or "paper"
-        return "paper"
+    mode = (row["trading_mode"] or "paper") if row else "paper"
+    with _bot_mode_lock:
+        _bot_mode_cache[bot_name] = (now, mode)
+    return mode
 
 
 def set_bot_mode(bot_name, mode):
@@ -512,6 +670,8 @@ def set_bot_mode(bot_name, mode):
             "UPDATE bot_configs SET trading_mode=? WHERE bot_name=? AND active=1",
             (mode, bot_name)
         )
+    with _bot_mode_lock:  # invalidate so the new mode is read immediately
+        _bot_mode_cache.pop(bot_name, None)
 
 
 init_db()

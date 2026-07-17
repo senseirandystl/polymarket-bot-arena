@@ -267,6 +267,22 @@ td { padding: 6px 4px; border-bottom: 1px solid #21262d; }
             </table>
         </div>
 
+        <div class="section-title">Entry-Price Buckets <span style="color:#8b949e;font-size:11px;text-transform:none;letter-spacing:0;">&mdash; WR must beat avg entry by &ge;5&cent; to break even</span></div>
+        <div class="card">
+            <table id="entry-buckets-table">
+                <thead><tr><th>Entry ¢</th><th>Trades</th><th>Win%</th><th>Avg Entry</th><th>B/E Gap</th><th>P&L</th><th>ROI</th></tr></thead>
+                <tbody></tbody>
+            </table>
+        </div>
+
+        <div class="section-title">Skips <span style="color:#8b949e;font-size:11px;text-transform:none;letter-spacing:0;">&mdash; why the arena sat flat</span></div>
+        <div class="card">
+            <table id="skips-table">
+                <thead><tr><th>Reason</th><th>Count</th></tr></thead>
+                <tbody></tbody>
+            </table>
+        </div>
+
         <div class="section-title">Evolution History</div>
         <div class="card" id="evolution-card">
             <table id="evolution-table">
@@ -290,15 +306,27 @@ td { padding: 6px 4px; border-bottom: 1px solid #21262d; }
         <div class="storage-info" id="storage-info">Loading credential store info...</div>
 
         <div class="settings-section">
-            <h3>Paper Bankroll</h3>
-            <div class="settings-blurb">Shared virtual USDC bankroll for paper mode. All bots trade from this one pool against real Polymarket order books. Set it, e.g., to 100 and click Save.</div>
+            <h3>Paper Balance</h3>
+            <div class="settings-blurb">Shared virtual USDC pool for paper mode. All bots trade from this one balance against real Polymarket order books. Enter the balance you want and click Save — it <b>tops the pool up to that amount</b> (past P&amp;L and open positions are preserved), so entering 200 makes the available balance $200.</div>
 
             <div class="cred-row">
-                <label>Bankroll (USDC)<small>Available now: <span id="bankroll-available">&mdash;</span></small></label>
-                <input type="number" id="paper-bankroll-input" min="0" step="1" placeholder="100">
+                <label>Balance (USDC)<small>Available now: <span id="bankroll-available">&mdash;</span></small></label>
+                <input type="number" id="paper-bankroll-input" min="0" step="1" placeholder="200">
                 <button class="btn" onclick="saveBankroll()">Save</button>
             </div>
             <div class="test-result" id="bankroll-result"></div>
+        </div>
+
+        <div class="settings-section">
+            <h3>Kelly Fraction</h3>
+            <div class="settings-blurb">Fraction of the full Kelly-optimal bet size used for every trade (bet = fraction &times; edge/(1&minus;price) &times; bankroll). <b>0.25</b> = quarter-Kelly (conservative), <b>1.0</b> = full Kelly (growth-optimal only if the model's probabilities are exact — aggressive otherwise). The arena picks up changes within seconds; no restart needed.</div>
+
+            <div class="cred-row">
+                <label>Fraction (0&ndash;1]<small>Current: <span id="kelly-current">&mdash;</span></small></label>
+                <input type="number" id="kelly-fraction-input" min="0.01" max="1" step="0.05" placeholder="0.25">
+                <button class="btn" onclick="saveKelly()">Save</button>
+            </div>
+            <div class="test-result" id="kelly-result"></div>
         </div>
 
         <div class="settings-section">
@@ -497,13 +525,50 @@ async function refreshSettings() {
         console.error('refreshSettings error:', e);
     }
     loadBankroll();
+    loadKelly();
+}
+
+async function loadKelly() {
+    try {
+        const k = await fetchJSON('/api/settings/kelly');
+        const input = document.getElementById('kelly-fraction-input');
+        if (input && document.activeElement !== input) input.value = Number(k.kelly_fraction).toFixed(2);
+        const cur = document.getElementById('kelly-current');
+        if (cur) cur.textContent = Number(k.kelly_fraction).toFixed(2);
+    } catch (e) { console.error('loadKelly error:', e); }
+}
+
+async function saveKelly() {
+    const input = document.getElementById('kelly-fraction-input');
+    const resultEl = document.getElementById('kelly-result');
+    const fraction = parseFloat(input.value);
+    if (isNaN(fraction) || fraction <= 0 || fraction > 1) {
+        resultEl.textContent = 'Enter a number in (0, 1].';
+        resultEl.style.color = '#f85149';
+        return;
+    }
+    try {
+        const resp = await postJSON('/api/settings/kelly', { fraction });
+        if (resp && resp.error) {
+            resultEl.textContent = 'Save failed: ' + resp.error;
+            resultEl.style.color = '#f85149';
+            return;
+        }
+        resultEl.textContent = `Kelly fraction set to ${Number(resp.kelly_fraction).toFixed(2)} — live within a few seconds.`;
+        resultEl.style.color = '#3fb950';
+        const cur = document.getElementById('kelly-current');
+        if (cur) cur.textContent = Number(resp.kelly_fraction).toFixed(2);
+    } catch (e) {
+        resultEl.textContent = 'Save failed: ' + e;
+        resultEl.style.color = '#f85149';
+    }
 }
 
 async function loadBankroll() {
     try {
         const b = await fetchJSON('/api/settings/bankroll');
         const input = document.getElementById('paper-bankroll-input');
-        if (input && document.activeElement !== input) input.value = b.bankroll;
+        if (input && document.activeElement !== input) input.value = Number(b.available).toFixed(2);
         const avail = document.getElementById('bankroll-available');
         if (avail) avail.textContent = '$' + Number(b.available).toFixed(2);
     } catch (e) { console.error('loadBankroll error:', e); }
@@ -525,7 +590,7 @@ async function saveBankroll() {
             resultEl.style.color = '#f85149';
             return;
         }
-        resultEl.textContent = `Bankroll set to $${Number(resp.bankroll).toFixed(2)} (available $${Number(resp.available).toFixed(2)}).`;
+        resultEl.textContent = `Balance topped up — available now $${Number(resp.available).toFixed(2)}.`;
         resultEl.style.color = '#3fb950';
     } catch (e) {
         resultEl.textContent = 'Save failed: ' + e;
@@ -707,6 +772,38 @@ function updateTrades(trades) {
     `).join('');
 }
 
+function updateEntryBuckets(buckets) {
+    const tbody = document.querySelector('#entry-buckets-table tbody');
+    if (!tbody) return;
+    if (!buckets || buckets.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="7" style="color:#8b949e">No resolved trades with entry prices yet</td></tr>';
+        return;
+    }
+    tbody.innerHTML = buckets.map(b => {
+        // Break-even gap: WR − avg entry. <0 losing (red), ≥0.05 healthy (green).
+        const gapCls = b.breakeven_gap < 0 ? 'negative' : (b.breakeven_gap >= 0.05 ? 'positive' : 'neutral');
+        return `
+        <tr>
+            <td>${b.bucket}</td>
+            <td>${b.count}</td>
+            <td>${(b.win_rate * 100).toFixed(0)}%</td>
+            <td>${(b.avg_entry * 100).toFixed(0)}¢</td>
+            <td class="${gapCls}">${b.breakeven_gap >= 0 ? '+' : ''}${(b.breakeven_gap * 100).toFixed(1)}¢</td>
+            <td class="${pnlClass(b.pnl)}">${fmtPnl(b.pnl)}</td>
+            <td class="${pnlClass(b.roi)}">${(b.roi * 100).toFixed(1)}%</td>
+        </tr>`;
+    }).join('');
+}
+
+function updateSkips(skips) {
+    const tbody = document.querySelector('#skips-table tbody');
+    if (!tbody) return;
+    const entries = Object.entries(skips || {}).sort((a, b) => b[1] - a[1]);
+    tbody.innerHTML = entries.length
+        ? entries.map(([r, c]) => `<tr><td>${r}</td><td>${c}</td></tr>`).join('')
+        : '<tr><td colspan="2" style="color:#8b949e">No skips recorded yet</td></tr>';
+}
+
 function updateEarnings(data) {
     const daily = data.daily || [];
     const sparkline = document.getElementById('earnings-sparkline');
@@ -780,11 +877,24 @@ function renderMarketCard(market, bodyId, kind) {
         : '-';
     const trades = market.trades || [];
     const tradeRows = trades.length
-        ? trades.map(t => `
+        ? trades.map(t => {
+            const side = (t.side || '').toUpperCase();
+            // Prefer "<shares> @ <entryPrice¢>" (e.g. "5 @ 56.0"); fall back to
+            // the USD spend for older rows that predate entry_price/shares.
+            let detail;
+            if (t.shares_bought != null && t.entry_price != null) {
+                const sh = (+t.shares_bought).toFixed(1).replace(/\.0$/, '');
+                const px = (t.entry_price * 100).toFixed(1);
+                detail = `${sh} @ ${px}`;
+            } else {
+                detail = `$${(t.amount || 0).toFixed(2)}`;
+            }
+            return `
             <div class="mkt-trade">
-                <span class="who">${t.bot_name} &middot; ${(t.side || '').toUpperCase()} $${(t.amount || 0).toFixed(2)}</span>
+                <span class="who">${t.bot_name} &middot; ${side} ${detail}</span>
                 ${renderTradePnl(t)}
-            </div>`).join('')
+            </div>`;
+        }).join('')
         : '<div class="mkt-empty">No trades placed yet</div>';
 
     body.innerHTML = `
@@ -805,20 +915,28 @@ function updateMarketCards() {
 }
 
 async function fetchMarkets() {
+    // NON-DESTRUCTIVE: /api/markets is a heavy endpoint (Gamma discovery + two
+    // refresh_price calls). Polled every 3s, an occasional slow/failed response
+    // is normal. We must NOT blank activeMarkets on a transient failure — the
+    // 1s tickCurrent() would immediately render "No current market", producing a
+    // 3-6s flicker. Keep the last-known-good markets until a valid response
+    // replaces them; only a successful payload updates state.
+    let data;
     try {
-        const data = await fetchJSON('/api/markets');
-        activeMarkets = (data && !data.error)
-            ? { current: data.current, next: data.next }
-            : { current: null, next: null };
-        // Seed livePrices from the (already-fresh) market payload, and drop
-        // entries for windows that are no longer current/next.
-        const keep = {};
-        for (const m of [activeMarkets.current, activeMarkets.next]) {
-            if (m && m.id) keep[m.id] = livePrices[m.id]
-                || { yes: m.current_price, no: m.no_price };
-        }
-        livePrices = keep;
-    } catch(e) { activeMarkets = { current: null, next: null }; }
+        data = await fetchJSON('/api/markets');
+    } catch(e) {
+        return;  // network blip — keep last-known-good, don't flash empty
+    }
+    if (!data || data.error) return;  // server-side error — keep last-known-good
+    activeMarkets = { current: data.current, next: data.next };
+    // Seed livePrices from the (already-fresh) market payload, and drop
+    // entries for windows that are no longer current/next.
+    const keep = {};
+    for (const m of [activeMarkets.current, activeMarkets.next]) {
+        if (m && m.id) keep[m.id] = livePrices[m.id]
+            || { yes: m.current_price, no: m.no_price };
+    }
+    livePrices = keep;
 }
 
 function updateMode(mode) {
@@ -910,7 +1028,7 @@ function updateCopyBots(wallets) {
 
 async function refresh() {
     try {
-        const [status, overview, bots, evolution, trades, earnings, copyBots] = await Promise.all([
+        const [status, overview, bots, evolution, trades, earnings, copyBots, buckets, skips] = await Promise.all([
             fetchJSON('/api/status'),
             fetchJSON('/api/overview'),
             fetchJSON('/api/bots'),
@@ -918,6 +1036,8 @@ async function refresh() {
             fetchJSON('/api/trades?limit=20'),
             fetchJSON('/api/earnings'),
             fetchJSON('/api/copytrading'),
+            fetchJSON('/api/entry-buckets?mode=paper'),
+            fetchJSON('/api/skips'),
         ]);
         updateMode(status.mode);
         updateBanner(status.warnings || []);
@@ -926,6 +1046,8 @@ async function refresh() {
         updateCopyBots(copyBots);
         updateEvolution(evolution);
         updateTrades(trades);
+        updateEntryBuckets(buckets);
+        updateSkips(skips);
         updateEarnings(earnings);
     } catch (e) {
         console.error('Refresh error:', e);

@@ -104,13 +104,13 @@ def get_bot_balance(trading_mode="paper"):
 
 
 @app.get("/", response_class=HTMLResponse)
-async def index():
+def index():
     html_path = Path(__file__).parent / "index.html"
     return html_path.read_text()
 
 
 @app.get("/api/status")
-async def get_status():
+def get_status():
     warnings: list = []
     # Paper mode needs no credentials \u2014 it simulates against public Polymarket
     # order books. Only live mode requires Polymarket CLOB credentials.
@@ -178,7 +178,7 @@ def _to_et(dt_utc):
 
 
 @app.get("/api/markets")
-async def get_markets():
+def get_markets():
     """Current + upcoming BTC 5-min markets, from Polymarket (Gamma + CLOB).
 
     The dashboard runs as its own process, so it can't read the arena's
@@ -212,21 +212,24 @@ async def get_markets():
         current = soon[0] if soon else None
     upcoming = [m for m in btc_markets if m is not current]
 
-    # Fresh CLOB price for just the two visible markets.
-    for mk in (current, upcoming[0] if upcoming else None):
-        if mk:
-            polymarket_markets.refresh_price(mk)
+    # Fresh CLOB prices for the visible markets in ONE batch call (POST
+    # /midpoints) — atomic snapshot, one round trip instead of a /midpoint GET
+    # per market. Prices current + the next card; both YES and NO are set.
+    polymarket_markets.price_markets([current, upcoming[0] if upcoming else None])
 
     def _shape(m):
         if not m:
             return None
         tr = m.get("time_remaining_seconds")
         yes = m.get("current_price")
+        no = m.get("no_price")
+        if no is None and yes is not None:
+            no = round(1.0 - yes, 4)
         shaped = {
             "id": m.get("id"),
             "question": m.get("question"),
             "current_price": yes,                     # YES/Up (0-1)
-            "no_price": (round(1.0 - yes, 4) if yes is not None else None),
+            "no_price": no,                           # NO/Down (0-1), real mid
             "resolves_at": m.get("resolves_at"),
             "time_remaining_seconds": tr,
             "is_current_window": tr is not None and 0 < tr <= 300,
@@ -234,7 +237,8 @@ async def get_markets():
         }
         with db.get_conn() as conn:
             rows = conn.execute(
-                "SELECT bot_name, side, amount, shares_bought, outcome, pnl, created_at "
+                "SELECT bot_name, side, amount, shares_bought, entry_price, "
+                "outcome, pnl, created_at "
                 "FROM trades WHERE market_id=? ORDER BY created_at ASC",
                 (shaped["id"],),
             ).fetchall()
@@ -252,7 +256,7 @@ async def get_markets():
 
 
 @app.get("/api/price/{condition_id}")
-async def get_price(condition_id: str):
+def get_price(condition_id: str):
     """Fresh YES/NO prices for one market (fast poll for the market cards)."""
     import polymarket_markets
     prices = polymarket_markets.current_prices(condition_id)
@@ -269,7 +273,7 @@ async def get_price(condition_id: str):
 
 
 @app.get("/api/maker-status")
-async def get_maker_status():
+def get_maker_status():
     """Return the latest snapshot the arena's secondary-bot tick published.
 
     Powers the Maker Section card on the Overview tab.  Always returns
@@ -358,7 +362,7 @@ async def get_maker_status():
 
 
 @app.get("/api/overview")
-async def get_overview():
+def get_overview():
     stats = db.get_dashboard_stats()
     active_bots = db.get_active_bots()
     return JSONResponse({
@@ -370,8 +374,27 @@ async def get_overview():
     })
 
 
+@app.get("/api/entry-buckets")
+def get_entry_buckets(mode: str = "paper", hours: int = None):
+    """ROI by entry-price bucket — reveals whether a high WR is bought at bad
+    prices. ``breakeven_gap`` = win_rate − avg_entry (cents of edge over the
+    break-even line; <0 is losing, ≥0.05 is healthy)."""
+    return JSONResponse(db.get_entry_price_buckets(mode=mode, hours=hours))
+
+
+@app.get("/api/skips")
+def get_skips():
+    """Skip-reason tally the arena persists (why it sat flat, not just what it
+    traded). Empty until the arena process has flushed at least once."""
+    raw = db.get_arena_state("skip_counts")
+    try:
+        return JSONResponse(json.loads(raw) if raw else {})
+    except (json.JSONDecodeError, TypeError):
+        return JSONResponse({})
+
+
 @app.get("/api/settings/bankroll")
-async def get_bankroll(_auth: str = Depends(verify_auth)):
+def get_bankroll(_auth: str = Depends(verify_auth)):
     return JSONResponse({
         "bankroll": db.get_paper_bankroll(),
         "available": db.get_paper_available(),
@@ -380,7 +403,13 @@ async def get_bankroll(_auth: str = Depends(verify_auth)):
 
 @app.post("/api/settings/bankroll")
 async def set_bankroll(request: Request, _auth: str = Depends(verify_auth)):
-    """Set the shared virtual USDC bankroll for paper mode."""
+    """Top the shared paper pool up to the entered balance.
+
+    The number the user enters becomes the new *available* shared balance: it
+    tops the pool up to that figure while preserving trade history and open
+    positions (see ``db.topup_paper_bankroll``). Entering $200 when the pool is
+    at $45 sets available to $200.
+    """
     body = await request.json()
     try:
         amount = float(body.get("amount"))
@@ -388,7 +417,7 @@ async def set_bankroll(request: Request, _auth: str = Depends(verify_auth)):
         return JSONResponse({"error": "amount must be a number"}, status_code=400)
     if amount < 0:
         return JSONResponse({"error": "amount must be non-negative"}, status_code=400)
-    db.set_paper_bankroll(amount)
+    db.topup_paper_bankroll(amount)
     return JSONResponse({
         "success": True,
         "bankroll": db.get_paper_bankroll(),
@@ -396,8 +425,33 @@ async def set_bankroll(request: Request, _auth: str = Depends(verify_auth)):
     })
 
 
+@app.get("/api/settings/kelly")
+def get_kelly(_auth: str = Depends(verify_auth)):
+    return JSONResponse({"kelly_fraction": db.get_kelly_fraction()})
+
+
+@app.post("/api/settings/kelly")
+async def set_kelly(request: Request, _auth: str = Depends(verify_auth)):
+    """Set the Kelly fraction used for bet sizing (0 < f <= 1).
+
+    The arena reads it from the DB on a short cache, so edits take effect
+    within seconds without a restart. 0.25 = quarter-Kelly (conservative);
+    1.0 = full Kelly (growth-optimal only if model probabilities are exact).
+    """
+    body = await request.json()
+    try:
+        fraction = float(body.get("fraction"))
+    except (TypeError, ValueError):
+        return JSONResponse({"error": "fraction must be a number"}, status_code=400)
+    try:
+        db.set_kelly_fraction(fraction)
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    return JSONResponse({"success": True, "kelly_fraction": db.get_kelly_fraction()})
+
+
 @app.get("/api/bots")
-async def get_bots():
+def get_bots():
     active = db.get_active_bots()
     result = []
     for bot_cfg in active:
@@ -451,7 +505,7 @@ async def get_bots():
 
 
 @app.get("/api/evolution")
-async def get_evolution():
+def get_evolution():
     history = db.get_evolution_history(limit=20)
     for h in history:
         for key in ("survivors", "replaced", "new_bots", "rankings"):
@@ -461,7 +515,7 @@ async def get_evolution():
 
 
 @app.get("/api/trades")
-async def get_trades(bot: str = None, limit: int = 50):
+def get_trades(bot: str = None, limit: int = 50):
     if bot:
         return JSONResponse(db.get_bot_trades(bot, limit=limit))
     with db.get_conn() as conn:
@@ -485,7 +539,7 @@ async def get_trades(bot: str = None, limit: int = 50):
 
 
 @app.get("/api/copytrading")
-async def get_copytrading():
+def get_copytrading():
     wallets = db.list_copy_wallets()
     result = []
     for w in wallets:
@@ -520,7 +574,7 @@ async def get_copytrading():
 
 
 @app.get("/api/earnings")
-async def get_earnings():
+def get_earnings():
     with db.get_conn() as conn:
         # Bucket by ET calendar date (created_at is stored UTC). Grouping in
         # Python keeps the day boundary DST-correct and consistent with the
@@ -558,7 +612,7 @@ async def get_earnings():
 
 
 @app.get("/api/learning")
-async def get_learning():
+def get_learning():
     active = db.get_active_bots()
     result = {}
     for bot_cfg in active:
@@ -573,7 +627,7 @@ async def get_learning():
 
 
 @app.get("/api/credentials/status")
-async def credentials_status_endpoint():
+def credentials_status_endpoint():
     """Return the list of credential fields and which ones are currently set.
 
     Powers both the Settings tab form and the dashboard warning banner.
