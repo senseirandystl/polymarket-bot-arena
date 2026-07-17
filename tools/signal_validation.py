@@ -41,6 +41,11 @@ def build_samples(market_id: str, strike: float, trajectory: list,
       * ``drift_raw``   — signed fractional distance from strike
       * ``drift_prod``  — the production ``drift_signal`` (tanh, time-scaled)
       * ``mom2``        — BTC change over the last two trajectory points
+      * ``pm_mom``      — per-minute PM YES-price change from the last two PM
+        points at/before decision time (``None`` without >=2 points). This is
+        the shape of the live ``pm_momentum`` lane, un-clamped — the live lane
+        saturates at a 0.19c/step move (SCALE=80 then /0.15), i.e. it degrades
+        to sign(last tick); validate the RAW quantity here before any weight.
 
     ``pm_prices`` (optional) is a list of ``(seconds_from_open, yes_mid)``
     points from Polymarket's price history; each sample gets the most recent
@@ -57,10 +62,15 @@ def build_samples(market_id: str, strike: float, trajectory: list,
         drift_raw = (btc - strike) / strike
         mom2 = 0.0 if prev is None or prev <= 0 else (btc - prev) / prev
         pm_yes = None
+        pm_mom = None
         if pm_prices:
-            past = [p for t, p in pm_prices if t <= elapsed]
+            past = [(t, p) for t, p in pm_prices if t <= elapsed]
             if past:
-                pm_yes = float(past[-1])
+                pm_yes = float(past[-1][1])
+            if len(past) >= 2:
+                (t0, p0), (t1, p1) = past[-2], past[-1]
+                dt_min = max((float(t1) - float(t0)) / 60.0, 1e-9)
+                pm_mom = (float(p1) - float(p0)) / dt_min   # per-minute delta
         samples.append(Sample(
             market_id=market_id, time_remaining=float(tr), btc_now=float(btc),
             strike=float(strike), yes_won=bool(yes_won),
@@ -68,6 +78,7 @@ def build_samples(market_id: str, strike: float, trajectory: list,
                 "drift_raw": drift_raw,
                 "drift_prod": drift_signal(strike, btc, tr),
                 "mom2": mom2,
+                "pm_mom": pm_mom,
             },
             pm_yes=pm_yes,
         ))
@@ -114,6 +125,26 @@ def predictiveness(samples: list, signal_key: str,
         "up_n": up_n, "up_winrate": up_wr,
         "down_n": dn_n, "down_winrate": dn_wr,
     }
+
+
+def magnitude_distribution(samples: list, signal_key: str,
+                           percentiles=(50, 75, 90, 97)) -> dict:
+    """Percentiles of ``|signal|`` across samples (None values skipped).
+
+    Use to pick an HONEST saturation point for a lane normalization: a lane
+    that saturates below the median of its own input distribution degrades to
+    a sign() detector (the BUG #25 momentum mistake, replayed live by pm).
+    """
+    vals = sorted(abs(s.signals[signal_key]) for s in samples
+                  if s.signals.get(signal_key) is not None)
+    out = {"signal": signal_key, "n": len(vals)}
+    for p in percentiles:
+        if not vals:
+            out[f"p{p}"] = None
+        else:
+            idx = min(len(vals) - 1, max(0, round(p / 100.0 * (len(vals) - 1))))
+            out[f"p{p}"] = vals[idx]
+    return out
 
 
 def net_edge(samples: list, side_of: Callable, fee: Callable,

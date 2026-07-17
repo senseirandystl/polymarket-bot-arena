@@ -48,3 +48,46 @@ def test_time_buckets_partition_samples():
     assert total == 4
     labels = [b["bucket"] for b in buckets]
     assert labels == ["0-60s", "60-120s", "120-180s", "180-300s"]
+
+
+# --- pm_mom lane validation (BUG: live lane saturates at a 0.19c/step move) ---
+
+def _pm_up():
+    # PM YES mid rising 2c/min over the window.
+    return [(0, 0.50), (60, 0.52), (120, 0.54), (180, 0.56), (240, 0.58)]
+
+
+def test_build_samples_pm_mom_sign_follows_pm_trend():
+    s = build_samples("m", 100000.0, _traj_up(), yes_won=True, pm_prices=_pm_up())
+    # Every sample after the first PM point should carry a positive pm_mom
+    vals = [x.signals.get("pm_mom") for x in s]
+    assert all(v is not None for v in vals)
+    assert all(v > 0 for v in vals if v is not None)
+
+
+def test_build_samples_pm_mom_none_without_history():
+    s = build_samples("m", 100000.0, _traj_up(), yes_won=True)
+    assert all(x.signals.get("pm_mom") is None for x in s)
+
+
+def test_build_samples_pm_mom_needs_two_points():
+    # Only one PM point at/before decision time -> no momentum measurable.
+    s = build_samples("m", 100000.0, _traj_up(), yes_won=True,
+                      pm_prices=[(0, 0.50)])
+    assert all(x.signals.get("pm_mom") is None for x in s)
+
+
+def test_predictiveness_skips_none_signals():
+    s = build_samples("m", 100000.0, _traj_up(), yes_won=True)
+    r = predictiveness(s, "pm_mom")
+    assert r["n"] == 0
+
+
+def test_magnitude_distribution_percentiles():
+    from tools.signal_validation import magnitude_distribution
+    s = build_samples("m", 100000.0, _traj_up(), yes_won=True, pm_prices=_pm_up())
+    dist = magnitude_distribution(s, "pm_mom", percentiles=(50, 97))
+    assert dist["n"] == len(s)
+    # steady 2c/min PM trend -> per-minute |delta| = 0.02 at every sample
+    assert abs(dist["p50"] - 0.02) < 1e-9
+    assert abs(dist["p97"] - 0.02) < 1e-9

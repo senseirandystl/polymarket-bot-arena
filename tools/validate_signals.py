@@ -30,7 +30,8 @@ import requests
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from tools.signal_validation import (
-    build_samples, net_edge, net_edge_time_buckets, predictiveness, time_buckets,
+    build_samples, magnitude_distribution, net_edge, net_edge_time_buckets,
+    predictiveness, time_buckets,
 )
 from polymarket_fills import taker_fee
 
@@ -203,11 +204,18 @@ def main() -> int:
     print(f"\nBuilt {len(all_samples)} decision-samples from {len(markets)} markets "
           f"(UP base rate {100*up_count/max(len(markets),1):.0f}%).\n")
 
-    signals = ["drift_raw", "drift_prod", "mom2"]
+    signals = ["drift_raw", "drift_prod", "mom2", "pm_mom"]
     print("=== Overall predictiveness (follow-the-signal win rate; >55% good, <45% inverted) ===")
     for sig in signals:
         print(f"  [{sig}]")
         print(_fmt(predictiveness(all_samples, sig)))
+
+    print("\n=== pm_mom |magnitude| distribution (per-minute PM price move) ===")
+    dist = magnitude_distribution(all_samples, "pm_mom")
+    print(f"    n={dist['n']}  " + "  ".join(
+        f"p{p}={dist[f'p{p}']:.4f}" if dist[f'p{p}'] is not None else f"p{p}=n/a"
+        for p in (50, 75, 90, 97)))
+    print("    (live lane saturates at 0.0019/step — compare to p50/p97 above)")
 
     print("\n=== drift_prod by time-remaining bucket (is it salvageable near expiry?) ===")
     for b in time_buckets(all_samples, "drift_prod"):
@@ -243,10 +251,29 @@ def main() -> int:
         price = s.pm_yes if side == "yes" else 1.0 - s.pm_yes
         return side if price <= 0.58 else None
 
+    def pm_side(s):
+        v = s.signals.get("pm_mom")
+        if v is None or abs(v) < 1e-9:
+            return None
+        return "yes" if v > 0 else "no"
+
+    def ignorance_fade_side(s):
+        """Reproduce the live leak: with drift weak (model near-ignorant),
+        buy the market UNDERDOG — the trade the fair-blend manufactures when
+        P_model~0.5 and the mid has moved away. Expect strongly negative EV."""
+        if abs(s.signals["drift_prod"]) >= 0.15:
+            return None
+        if abs(s.pm_yes - 0.5) < 0.05:
+            return None
+        return "no" if s.pm_yes > 0.5 else "yes"
+
     rules = [("buy the favorite (tilt lane)", fav_side),
              ("follow drift", drift_side),
              ("follow drift ONLY when side <=58c (market lags)", drift_lag_side),
-             ("follow 1-candle BTC momentum", mom_side)]
+             ("follow 1-candle BTC momentum", mom_side),
+             ("follow PM in-market momentum (pm lane)", pm_side),
+             ("IGNORANCE-FADE: buy underdog when |drift|<0.15 (live leak)",
+              ignorance_fade_side)]
     print("\n=== NET EDGE vs the actual PM price (per-share EV after taker fee) ===")
     for label, rule in rules:
         print(f"  [{label}]")

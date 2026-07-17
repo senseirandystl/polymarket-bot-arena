@@ -129,6 +129,19 @@ MAX_FILL_SLIPPAGE = 0.03
 # offline.
 SIGNAL_WEIGHT_OBI = 0.0
 
+# PM in-market momentum kill-switch (2026-07-17). The live lane degraded to
+# sign(last tick): SCALE=80 in signals/polymarket_prices.py saturates its
+# clamp at a 0.19c/step move, ~66x below the median per-minute PM move
+# (harness p50 0.126, p97 0.40) — it was pegged at +/-1.000 on 79% of the
+# 44%-WR chop-run trades and manufactured model leans of 0.55-0.66 from
+# noise. The harness verdict on the RAW quantity: predictive (69.7%
+# follow-WR) but NET edge NEGATIVE (-0.80c/share at avg entry 0.688) — the
+# market has already priced its own momentum by the time it is measurable.
+# House rule: no positive net edge, no live weight. Same treatment as OBI —
+# global kill-switch multiplied onto the pm lane for every strategy; keep
+# 0.0 unless a reworked pm signal shows positive net edge offline.
+SIGNAL_WEIGHT_PM = 0.0
+
 # --- BTC drift-from-strike ("price to beat") signal (signals/strike.py) ---
 # The dominant fundamental for these markets: where BTC sits vs the window's open
 # price. Regime-agnostic (favors whichever side BTC is actually on) and time-
@@ -168,6 +181,17 @@ DRIFT_VETO_MIN = 0.05
 # multiplied by this — a claim resting purely on the noisy flow/momentum lanes
 # must be proportionally stronger (flow-only cheap-side trades ran 29% WR).
 FLOW_ONLY_EDGE_MULT = 2.0
+# Conviction-scaled trust (2026-07-17 chop-regime leak): trust_eff =
+# trust * min(1, |P_model - 0.5| / MODEL_CONVICTION_SCALE). The edge formula
+# trust*(P_model - mid) derives its MAGNITUDE from the market's displacement,
+# so a near-ignorant model (lean 0.01-0.03) used to book a 3-7c "edge"
+# whenever the mid moved away from 0.5 — a structural underdog-fade that ran
+# 38.5% WR / -$22 in the 2026-07-17 chop run (YES side 10% WR). Scaling
+# trust by the model's own information content kills that trade class while
+# leaving the validated market-lags-drift rule (+19.5c/share offline, model
+# lean >= 0.10) at full trust. 0.10 = the lean where trust saturates; a
+# drift-0.5 reading (lean 0.1125 on the momentum profile) keeps full trust.
+MODEL_CONVICTION_SCALE = 0.10
 
 # --- Fractional-Kelly bet sizing (base_bot.make_decision) ---
 # For a binary market, buying a side at price c with true probability p, the

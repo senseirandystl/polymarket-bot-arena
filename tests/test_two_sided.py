@@ -68,10 +68,13 @@ def _signals(**over):
 
 
 def test_no_ban_is_gone_strong_no_lean_buys_no():
-    # Market leans NO (yes 0.45 / no 0.55, sum 1.0) with bearish alpha → buy NO.
+    # Market leans NO (yes 0.45 / no 0.55, sum 1.0) with a genuinely strong
+    # bearish model: decisive down-drift + bearish flow. (pm/obi are killed
+    # lanes; conviction-scaled trust means flow alone is a WEAK model — a
+    # strong lean now requires the drift fundamental to agree.)
     bot = _bot()
     m = _market(yes=0.45, no=0.55)
-    s = _signals(pm_momentum=-0.15, obi=-1.0, cvd=-1.0)
+    s = _signals(btc_drift=-0.5, cvd=-1.0)
     d = bot.make_decision(m, s)
     assert d["action"] == "buy"
     assert d["side"] == "no"
@@ -80,7 +83,7 @@ def test_no_ban_is_gone_strong_no_lean_buys_no():
 def test_no_trade_sizes_against_no_price():
     bot = _bot()
     m = _market(yes=0.45, no=0.55)
-    s = _signals(pm_momentum=-0.15, obi=-1.0, cvd=-1.0)
+    s = _signals(btc_drift=-0.5, cvd=-1.0)
     d = bot.make_decision(m, s)
     assert d["side"] == "no"
     assert abs(d["entry_price"] - 0.55) < 1e-6

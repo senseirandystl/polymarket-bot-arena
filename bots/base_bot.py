@@ -287,6 +287,10 @@ class BaseBot(ABC):
         # A 0.15 YES-price move saturates the lane.
         pm_momentum_raw = float(signals.get("pm_momentum", 0.0) or 0.0)
         pm_momentum_signal = max(-1.0, min(1.0, pm_momentum_raw / 0.15))
+        # Global kill-switch (see config comment): the live lane saturates at
+        # a 0.19c/step move -> sign(last tick), and the raw quantity measured
+        # NET-NEGATIVE after the price in the offline harness (-0.80c/share).
+        pm_momentum_signal *= config.SIGNAL_WEIGHT_PM
 
         # --- Lane: Order flow (OBI + CVD), already in [-1, 1] ---
         # CVD = executed aggression (validated edge); OBI = resting depth,
@@ -320,7 +324,17 @@ class BaseBot(ABC):
         }
         model_prob = self._model_prob_yes(lanes)
         trust = self.STRATEGY_MODEL_TRUST.get(self.strategy_type, 0.5)
-        fair_yes = self._compute_fair_yes(market_price, model_prob, trust)
+        # --- Conviction-scaled trust: the model's say is proportional to how
+        # much it actually knows. edge = trust*(P_model - mid) takes its
+        # magnitude from the MARKET's displacement, so a near-ignorant model
+        # (P_model ~ 0.5) could book a phantom edge on any market move away
+        # from 0.5 and systematically fade it (2026-07-17 chop run: underdog
+        # buys 38.5% WR, YES side 10% WR). A decisive model (lean >= the
+        # scale) keeps full trust — the validated market-lags-drift trade is
+        # untouched.
+        conviction = min(1.0, abs(model_prob - 0.5) / config.MODEL_CONVICTION_SCALE)
+        trust_eff = trust * conviction
+        fair_yes = self._compute_fair_yes(market_price, model_prob, trust_eff)
 
         # --- Per-side evaluation: each side scored on its OWN price + fee ---
         # Binary outcomes must sum to 1, so both sides share the one fair
@@ -446,7 +460,8 @@ class BaseBot(ABC):
         amount = target_shares * price
 
         reasoning = (
-            f"fair={fair_yes:.2f} model={model_prob:.2f} trust={trust:.2f} "
+            f"fair={fair_yes:.2f} model={model_prob:.2f} "
+            f"trust={trust:.2f}x{conviction:.2f}={trust_eff:.2f} "
             f"yes={yes_price:.2f} no={no_price:.2f} "
             f"=> {side} edge={chosen_edge:+.3f} (eY={edge_yes:+.3f} eN={edge_no:+.3f}) "
             f"drift={drift_signal_val:+.3f} mom={momentum_signal:+.3f} pm={pm_momentum_signal:+.3f} "

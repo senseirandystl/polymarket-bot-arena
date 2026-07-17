@@ -43,9 +43,13 @@ Paper mode needs **no keys** — all market data (discovery, books, resolutions)
 
 ### Signal Hierarchy (make_decision in base_bot.py) — MODEL-BLEND fair value (BUG #24)
 ```
-P_model  = 0.5 + 0.5 · Σ w_lane · lane          # lanes normalized to [-1,1], YES-frame
-fair_yes = yes_mid + trust · (P_model − yes_mid) # edge ONLY where model disagrees with price
-  lanes: drift (anchor), mom (BTC 1-candle), pm (in-market momentum),
+P_model   = 0.5 + 0.5 · Σ w_lane · lane          # lanes normalized to [-1,1], YES-frame
+trust_eff = trust · min(1, |P_model − 0.5| / MODEL_CONVICTION_SCALE)   # BUG #26
+fair_yes  = yes_mid + trust_eff · (P_model − yes_mid) # edge ONLY where model disagrees with price
+  lanes: drift (anchor), mom (BTC 1-candle),
+         pm (in-market momentum × SIGNAL_WEIGHT_PM=0 kill-switch — BUG #26:
+         net edge NEGATIVE after the price, and the live lane saturated at a
+         0.19¢ move → sign(last tick)),
          cvd (executed flow), obi (× SIGNAL_WEIGHT_OBI=0 kill-switch),
          strat (analyze() thesis × STRATEGY_SIGNAL_WEIGHT=0.15),
          learn (× 0 while LEARNING_ENABLED=False)
@@ -56,6 +60,15 @@ fair_yes = yes_mid + trust · (P_model − yes_mid) # edge ONLY where model disa
 **Model-lean eligibility:** a bot may only buy a side its model *actively leans
 toward* (`P_model > 0.5` for YES, `< 0.5` for NO) — model ignorance (P=0.5) is
 not disagreement with the market, so it never fades the favorite on nothing.
+**Conviction-scaled trust (BUG #26):** eligibility alone was too weak — `edge =
+trust·(P_model − mid)` takes its magnitude from the *market's* displacement, so
+a model at 0.52 could book a 3–7¢ "edge" against any real market move and
+systematically fade it (chop run: underdog buys 38.5% WR, YES side 10% WR).
+`trust_eff` scales the model's say by its own information content
+(`config.MODEL_CONVICTION_SCALE` = 0.10 — full trust at lean ≥ 0.10, e.g. the
+validated market-lags-drift trade; near-zero at lean ≈ 0.01–0.03). Replay of the
+126-trade day under the new math: keeps 31 (65% WR, +$48.65), suppresses 95
+(54% WR, −$27.97 net).
 **Drift veto (BUG #25):** a directional bot never buys the side that
 *contradicts* a drift reading ≥ `config.DRIFT_VETO_MIN` (0.05) — live,
 drift-contradicting trades ran 26% WR vs 52% agreeing. Flow-only trades at
@@ -103,7 +116,13 @@ Empirical (2026-07-16, 300 markets, 50% UP base): drift 74.5% follow-WR (83%
 near expiry, 64% early); "follow drift only when the side ≤58¢ (market lags)"
 is the top net-EV rule; "buy the favorite" is the worst (negative above ~0.67).
 Prior run (2026-07-15): CVD 66.9/52.4 (real edge); OBI inverted (→ kill-switch
-0); learning bias inverted (→ disabled live). Coin-flip (45–55¢) trades are
+0); learning bias inverted (→ disabled live). 2026-07-17 run (300 markets):
+`pm_mom` (PM in-market momentum) 69.7% follow-WR but **net edge −0.80¢/share**
+— predictive yet priced in (→ `SIGNAL_WEIGHT_PM = 0` kill-switch, BUG #26);
+the harness now also reports `magnitude_distribution` percentiles for honest
+lane-saturation calibration (pm p50 0.126/min vs the live 0.0019 clamp) and an
+ignorance-fade probe rule (its +9.7¢ reading is stale-mid inflation — the live
+DB ground truth for the same trade class was 41.7% WR / −2.8¢ gap). Coin-flip (45–55¢) trades are
 suppressed by the `MIN_EDGE` gate on a now-real edge, **not** a price-bucket ban.
 OBI + CVD (`signals/orderflow_signals.py`) are the two order-flow reads the
 profitable-bot research favors over price-history indicators — they describe
