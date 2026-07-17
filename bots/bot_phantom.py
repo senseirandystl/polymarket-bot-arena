@@ -32,7 +32,7 @@ DEFAULT_PARAMS = {
 class PhantomBot(BaseBot):
     def __init__(self, name="phantom-v1", params=None, generation=0, lineage=None):
         # "phantom" is a first-class strategy_type in base_bot's signal tables
-        # (STRATEGY_PRIORS / STRATEGY_SIGNAL_PROFILE / MIN_TRADE_CONFIDENCE), so
+        # (STRATEGY_PRIORS / STRATEGY_SIGNAL_PROFILE / MIN_EDGE), so
         # pass it straight through. The old code passed "hybrid" then reassigned
         # to "phantom" afterwards — fragile, and wrong if the base ever reads
         # strategy_type during __init__.

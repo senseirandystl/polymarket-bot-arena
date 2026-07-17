@@ -17,6 +17,29 @@ import polymarket_fills
 
 logger = logging.getLogger(__name__)
 
+# Bankroll read for Kelly sizing, cached off the 1s hot path (the pool only
+# changes on fills/resolutions). Shared across bots — the pool is shared too.
+_bankroll_cache: tuple = (0.0, 0.0)  # (ts, value)
+
+
+def _sizing_bankroll(mode: str) -> float:
+    """Current bankroll for bet sizing (cached, config.SIZING_BANKROLL_CACHE_SEC).
+
+    Paper: the shared virtual pool's available cash. Live: a notional bankroll
+    consistent with the per-trade cap (wallet reads are too slow for the 1s
+    tick; LIVE_MAX_POSITION already hard-caps exposure).
+    """
+    if mode == "live":
+        pct = max(config.MAX_POSITION_PCT_OF_BALANCE, 0.01)
+        return config.LIVE_MAX_POSITION / pct
+    global _bankroll_cache
+    now = time.time()
+    if (now - _bankroll_cache[0]) < getattr(config, "SIZING_BANKROLL_CACHE_SEC", 5.0):
+        return _bankroll_cache[1]
+    value = max(0.0, db.get_paper_available())
+    _bankroll_cache = (now, value)
+    return value
+
 
 class BaseBot(ABC):
     name: str
@@ -82,21 +105,9 @@ class BaseBot(ABC):
         "hybrid": 0.50,
     }
     # Minimum confidence to place a trade
-    # v6.3: Simmer BTC markets price near 47-55¢ most of the time. At 52¢ the
-    # combined signal peaks at ~0.08 even with strong BTC momentum — so any
-    # threshold above 0.08 means the bot NEVER trades. Lowered aggressively to
-    # let all bots trade and accumulate learning data. "If we never trade we
-    # never get rich." — higher WR thresholds are moot if we place zero trades.
-    MIN_TRADE_CONFIDENCE = {
-        "momentum": 0.05,       # was 0.30 — old data was from more extreme prices
-        "mean_reversion": 0.03,
-        "mean_reversion_sl": 0.03,
-        "mean_reversion_tp": 0.03,
-        "sniper": 0.10,         # sniper has its own decision logic
-        "phantom": 0.04,
-        "sentiment": 0.03,
-        "hybrid": 0.03,
-    }
+    # (MIN_TRADE_CONFIDENCE removed 2026-07-17 — it was dead code: defined but
+    # never read since the two-sided rewrite; the MIN_EDGE gate below is the
+    # real trade filter.)
     # Minimum cost-adjusted edge (probability units) to place a trade. Two-sided
     # selection buys the side with the larger positive edge above this floor.
     MIN_EDGE = {
@@ -341,7 +352,14 @@ class BaseBot(ABC):
             side, side_price, chosen_edge, confidence = "no", no_price, edge_no, conf_no
 
         # --- Minimum-edge gate (no edge = no bet) — SAME bar on both sides ---
+        # Information-scaled: with drift flat the model's disagreement with the
+        # market rests entirely on the noisy flow/momentum lanes, so a
+        # flow-only claim must clear a HIGHER bar (overnight run: flow-only
+        # cheap-side trades by the trend bots ran 29% WR in the 0.30-0.42
+        # bucket; drift-backed trades in the same bucket were profitable).
         min_edge = self.MIN_EDGE.get(self.strategy_type, config.MIN_EDGE_DEFAULT)
+        if abs(drift_signal_val) < getattr(config, "DRIFT_VETO_MIN", 0.05):
+            min_edge *= getattr(config, "FLOW_ONLY_EDGE_MULT", 2.0)
         if chosen_edge < min_edge:
             return {
                 "action": "skip",
@@ -388,23 +406,26 @@ class BaseBot(ABC):
         if time_rem is not None and time_rem < 60:
             confidence = min(0.95, confidence * 1.25)
 
-        # --- Bet sizing: SHARES-FIRST, proportional to edge strength ---
-        # Decide the exact SHARE count from edge, THEN derive USD (USD = shares ×
-        # price). Sizing in USD first and dividing by price silently destroys PnL
-        # at low prices via rounding — the research credits the shares-first flip
-        # with turning a bot from negative to profitable. Confidence for sizing
-        # is capped at 0.45 (conf 0.30-0.50 is the 67.9% WR sweet spot; >0.50
-        # sizes bigger but wins less).
-        bet_conf = min(confidence, 0.45)
+        # --- Bet sizing: fractional Kelly, SHARES-FIRST ---
+        # Binary-market Kelly: buying a side at price c with true probability p
+        # grows fastest at bankroll fraction f* = (p - c)/(1 - c); with the
+        # fee-adjusted edge already computed, f* = edge/(1 - price). We bet
+        # config.KELLY_FRACTION of that (model p is an estimate; full Kelly
+        # over-bets estimation error), capped by MAX_POSITION_PCT_OF_BALANCE
+        # and the per-trade max. Size now scales with edge, odds, AND the live
+        # bankroll — the old formula (flat % of max_pos by confidence) sized
+        # wins and losses almost identically ($3.83 vs $3.76).
         max_pos = config.get_max_position()
         price = max(side_price, 0.01)
         max_shares = max_pos / price  # most shares max_pos can buy at this price
-        if bet_conf > 0.2:
-            # Moderate-to-strong edge
-            target_shares = max_shares * (0.05 + bet_conf * 0.10)
-        else:
-            # Weak edge — small bet (still generates learning data)
-            target_shares = max_shares * 0.03
+        bankroll = _sizing_bankroll(self.trading_mode)
+        kelly_f = max(0.0, chosen_edge) / max(1.0 - price, 0.05)
+        f = kelly_f * config.KELLY_FRACTION
+        f = min(f, config.MAX_POSITION_PCT_OF_BALANCE)
+        kelly_usd = min(f * bankroll, max_pos)
+        # SHARES-FIRST: derive the exact share count, then the USD from it.
+        # Sizing USD-first and dividing by price rounds away PnL at low prices.
+        target_shares = kelly_usd / price
 
         # Floor to clear Polymarket's 5-share minimum (× buffer for slippage),
         # cap at what max_pos can buy, then round to a clean share count and

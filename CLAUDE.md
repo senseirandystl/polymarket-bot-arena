@@ -143,9 +143,23 @@ old blanket **NO ban is gone** (see BUG_HISTORY #20).
   prices in the market-data warmer (and the fallback `refresh_price`).
   Drop-first-tick is OFF (`CLEAN_TICK_DROP_FIRST=False`) — REST/warmer reads are
   already current, so dropping the first would blank a new market for a cycle.
-- **Shares-first sizing:** `make_decision` sizes in exact shares first, then
-  derives USD (`amount = target_shares × price`) — never USD → shares, which
-  rounds away PnL at low prices. `target_shares` is returned on the signal.
+- **Fractional-Kelly sizing (2026-07-17):** binary-market Kelly `f* =
+  edge/(1−price)` (edge already fee-adjusted), bet at `config.KELLY_FRACTION`
+  (0.25) of it against the **live bankroll** (paper pool via cached
+  `db.get_paper_available`, `SIZING_BANKROLL_CACHE_SEC`), capped by
+  `MAX_POSITION_PCT_OF_BALANCE` and the per-trade max. Replaces the flat
+  confidence-scaled %-of-max-position formula (win avg $3.83 vs loss avg
+  $3.76 over 453 trades — size ignored edge, odds, and bankroll). Still
+  **shares-first**: exact share count derived before USD (`amount =
+  target_shares × price`) — never USD → shares, which rounds away PnL at low
+  prices. Flow-only trades (|drift| < `DRIFT_VETO_MIN`) must clear
+  `MIN_EDGE × FLOW_ONLY_EDGE_MULT` (2×) — a claim resting purely on noisy
+  flow lanes needs proportionally more edge (they ran 29% WR on cheap sides).
+- **Price-justified-by-drift gate (zone bots):** the late-window maker,
+  fee-zone maker, and sniper require `0.5 + 0.5·|drift|` (the calibrated
+  drift-implied probability) `≥ side_price + taker_fee + min_edge` — a 71%-WR
+  maker still lost −$41.66 buying 79¢ entries whose price already contained
+  the conviction (overnight 2026-07-17, 69 trades).
 - **Entry-price-bucket ROI:** `db.get_entry_price_buckets()` + dashboard
   `/api/entry-buckets` report count/WR/ROI and the **break-even gap** (WR − avg
   entry) per bucket — a high WR bought at high prices still loses; the gap must

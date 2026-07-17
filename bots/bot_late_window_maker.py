@@ -20,6 +20,7 @@ Competing hypothesis:
 
 import config
 import learning
+import polymarket_fills
 from bots.base_bot import BaseBot
 
 # Retune (was: window=90s, min_mom=0.0008, price [0.58,0.92]): the bot had ZERO
@@ -43,6 +44,13 @@ DEFAULT_PARAMS = {
     "min_momentum": 0.0005,    # Momentum must not CONTRADICT the drift side by more than this
     "min_price_yes": 0.56,     # Chosen side's price must be ≥ 56¢ (direction confirmed by book)
     "max_price_yes": 0.90,     # Cap: above 90¢ taker margin is too thin to profit
+    # Price must be JUSTIFIED by drift's calibrated probability (2026-07-17
+    # overnight run: 69 trades, 71% WR but -$41.66 at avg entry 0.788 — WR ran
+    # ~5-10pp BELOW the price paid at every level; the price already contained
+    # the conviction). Drift's implied P = 0.5 + 0.5*|drift| is empirically
+    # well-calibrated (see BUG #23 calibration table), so require
+    # implied_P >= side_price + taker_fee + min_edge.
+    "min_edge": 0.03,
     "maker_offset_pct": 0.06,  # Simulated limit = market_price + 6¢ (logged maker metric only)
     "position_size_pct": 0.10, # 10% of max — large because entries are highly selective
     "lookback_candles": 3,     # BTC candles used for momentum calculation
@@ -132,6 +140,19 @@ class LateWindowMakerBot(BaseBot):
         if side_price > max_price:
             return _hold(
                 f"lwm: {side} price {side_price:.2f} > {max_price} (margin too thin)")
+
+        # ── Edge gate: the price must be justified by drift's implied P ──────
+        # implied_P = 0.5 + 0.5*|drift| is calibrated against resolved markets.
+        # Buying above it is paying for conviction the fundamental doesn't
+        # have — exactly how a 71%-WR bot lost money at 79c entries.
+        implied_p = 0.5 + 0.5 * abs(drift)
+        fee = polymarket_fills.taker_fee(1.0, side_price)
+        min_edge = p.get("min_edge", 0.03)
+        lwm_edge = implied_p - side_price - fee
+        if lwm_edge < min_edge:
+            return _hold(
+                f"lwm: price {side_price:.2f} not justified by drift "
+                f"(implied_P={implied_p:.2f}, edge={lwm_edge:+.3f} < {min_edge})")
 
         # ── Maker quote computation (on the chosen side's price) ──────────────
         # What we'd post as a limit order: slightly ahead of market to capture spread

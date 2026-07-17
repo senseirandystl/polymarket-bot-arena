@@ -159,6 +159,23 @@ MODEL_PROB_MAX = 0.98
 # drift-contradicting trades 26% WR / -$55 vs 52% agreeing. Below the floor
 # (drift ~ 0) flow-only trades are allowed — they measured break-even.
 DRIFT_VETO_MIN = 0.05
+# When drift is below the veto floor (flow-only trade), the MIN_EDGE bar is
+# multiplied by this — a claim resting purely on the noisy flow/momentum lanes
+# must be proportionally stronger (flow-only cheap-side trades ran 29% WR).
+FLOW_ONLY_EDGE_MULT = 2.0
+
+# --- Fractional-Kelly bet sizing (base_bot.make_decision) ---
+# For a binary market, buying a side at price c with true probability p, the
+# growth-optimal bankroll fraction is f* = (p - c)/(1 - c); with our
+# fee-adjusted edge (= p - c - fee) that is f* = edge/(1 - price). Full Kelly
+# over-bets on estimation error (our p is a model output), so we bet a
+# fraction of it. Size therefore scales with edge, odds, AND the live
+# bankroll (compounding) — replacing the old flat 5-9.5%-of-max-position
+# formula that ignored all three (win avg $3.83 vs loss avg $3.76 overnight).
+KELLY_FRACTION = 0.25
+# How long make_decision may reuse the last bankroll read (it runs per-bot
+# per-second; the pool changes only on fills/resolutions).
+SIZING_BANKROLL_CACHE_SEC = 5.0
 # Live learning bias: the raw-YES-WR learner was anti-predictive (-24pp) and
 # double-counted price. Disabled in live decisions (outcomes still recorded)
 # pending the edge-calibrated redesign. See spec R5.

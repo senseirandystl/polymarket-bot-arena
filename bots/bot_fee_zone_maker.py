@@ -66,6 +66,7 @@ DEFAULT_PARAMS = {
     # signed drift ≥ 0.15 toward the quoted side lifts it to +9.4c/sh at 82.6%.
     # The zone picks WHERE to quote; drift decides WHETHER the favorite is real.
     "min_drift": 0.15,         # Signed btc_drift toward the quoted side must be ≥ this
+    "min_edge": 0.02,          # implied_P(drift) − price − fee must clear this
     "spread_ticks": 2,         # Half-spread: 2 ticks (±2¢ around market price)
     "momentum_weight": 0.30,   # Weight of momentum signal in confidence (vs price signal)
     "position_size_pct": 0.06, # 6% of max — smaller per-trade, higher frequency
@@ -156,6 +157,18 @@ class FeeZoneMakerBot(BaseBot):
             return _hold(
                 f"fzm: drift does not back {side} "
                 f"(drift={drift:+.3f}, need signed ≥ {min_drift})")
+
+        # The price must also be JUSTIFIED by drift's calibrated implied
+        # probability (0.5 + 0.5*signed_drift) — being in-zone and drift-backed
+        # is not enough if the book already charges more than the fundamental
+        # supports (the late-window maker lost -$41.66 exactly this way).
+        implied_p = 0.5 + 0.5 * signed_drift
+        fzm_edge = implied_p - side_price - taker_fee(side_price)
+        min_edge = p.get("min_edge", 0.02)
+        if fzm_edge < min_edge:
+            return _hold(
+                f"fzm: price {side_price:.2f} not justified by drift "
+                f"(implied_P={implied_p:.2f}, edge={fzm_edge:+.3f} < {min_edge})")
 
         # ── BTC momentum context ──────────────────────────────────────────────
         prices = signals.get("prices", [])

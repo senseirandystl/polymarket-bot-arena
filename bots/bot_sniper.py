@@ -118,11 +118,22 @@ class SniperBot(BaseBot):
 
         # Drift confirmation: the sniped side must be backed by BTC's actual
         # position vs the strike (signed drift ≥ min_drift). Without it the
-        # cheap zone measured 37.5% WR / -8.8c per share offline.
+        # cheap zone measured 37.5% WR / -8.8c per share offline. The price
+        # must also be justified by drift's calibrated implied probability
+        # (0.5 + 0.5*signed_drift ≥ price + fee + min_edge) — same gate that
+        # fixed the late-window maker's buy-conviction-already-in-the-price leak.
+        import polymarket_fills
         drift = float(signals.get("btc_drift", 0.0) or 0.0)
         min_drift = p.get("min_drift", 0.15)
-        yes_ok = yes_ok and drift >= min_drift
-        no_ok = no_ok and -drift >= min_drift
+        min_edge = p.get("min_edge", 0.02)
+
+        def _justified(side_price, signed_drift):
+            implied_p = 0.5 + 0.5 * signed_drift
+            return (implied_p - side_price
+                    - polymarket_fills.taker_fee(1.0, side_price)) >= min_edge
+
+        yes_ok = yes_ok and drift >= min_drift and _justified(market_price, drift)
+        no_ok = no_ok and -drift >= min_drift and _justified(no_price, -drift)
 
         side = None
         confidence = 0
