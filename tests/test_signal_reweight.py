@@ -103,10 +103,11 @@ def test_profiles_have_no_negative_weights():
 
 
 def test_strategies_diverge_on_momentum_only_input():
-    # A pure BTC-momentum burst (no drift backing) trades the momentum bot but
-    # not the fundamentals-only mean-reversion bot.
+    # A REAL BTC-momentum burst (0.2% candle ~ p97; median moves no longer
+    # saturate the lane) trades the momentum bot but not the fundamentals-only
+    # mean-reversion bot.
     m = _market(yes=0.55, tr=150)
-    s = _sig(btc_drift=0.2, prices=[100.0, 100.06], latest=100.06)
+    s = _sig(btc_drift=0.2, prices=[100.0, 100.2], latest=100.2)
     assert _bot().make_decision(m, s)["action"] == "buy"
     assert MeanRevSLBot().make_decision(m, s)["action"] == "skip"
 
@@ -116,3 +117,43 @@ def test_strategies_diverge_on_momentum_only_input():
 def test_sl_bot_holds_to_resolution():
     bot = MeanRevSLBot()
     assert getattr(bot, "exit_strategy", None) is None
+
+
+# --- Drift veto + honest momentum normalization (2026-07-16 overnight run) ---
+
+def test_drift_veto_blocks_contradicting_side():
+    # Strong flow/momentum pushing YES while drift reads DOWN: live, trades
+    # contradicting a non-trivial drift ran 26% WR (-$55). The veto forbids the
+    # contradicting side, symmetric in both directions.
+    m = _market(yes=0.45, tr=200)
+    s = _sig(btc_drift=-0.10, cvd=1.0, pm_momentum=0.15,
+             prices=[100.0, 100.1], latest=100.1)
+    d = _bot().make_decision(m, s)
+    assert not (d["action"] == "buy" and d["side"] == "yes")
+    # mirror: up drift forbids NO
+    m2 = _market(yes=0.55, tr=200)
+    s2 = _sig(btc_drift=0.10, cvd=-1.0, pm_momentum=-0.15,
+              prices=[100.1, 100.0], latest=100.0)
+    d2 = _bot().make_decision(m2, s2)
+    assert not (d2["action"] == "buy" and d2["side"] == "no")
+
+
+def test_drift_veto_allows_flow_trades_when_drift_flat():
+    # Below the veto floor (drift ~ 0) flow-only trades stay allowed — they
+    # measured break-even live and are the sentiment bot's identity.
+    from bots.bot_sentiment import SentimentBot
+    d = SentimentBot(name="s").make_decision(
+        _market(yes=0.50, tr=150), _sig(cvd=0.8))
+    assert d["action"] == "buy"
+
+
+def test_momentum_lane_not_saturated_by_median_move():
+    # A median-size BTC 1-min move (~0.022%) must NOT saturate the momentum
+    # lane (the first normalization saturated at 0.05% — below the median —
+    # letting one candle of noise outvote the time-damped drift).
+    m = _market(yes=0.50, tr=280)
+    s = _sig(prices=[100000.0, 100022.0], latest=100022.0)  # +0.022%
+    d = _bot().make_decision(m, s)
+    # 0.022% * 500 = 0.11 of saturation; momentum bot weight 0.25 ->
+    # ~0.014 prob shift -> nowhere near the min-edge gate on its own.
+    assert d["action"] == "skip"

@@ -154,6 +154,11 @@ STRATEGY_SIGNAL_WEIGHT = 0.15
 # Sanity clamp on P_model.
 MODEL_PROB_MIN = 0.02
 MODEL_PROB_MAX = 0.98
+# Drift veto: a directional bot never buys the side that CONTRADICTS a drift
+# reading of at least this magnitude. Live evidence (2026-07-16 overnight run):
+# drift-contradicting trades 26% WR / -$55 vs 52% agreeing. Below the floor
+# (drift ~ 0) flow-only trades are allowed — they measured break-even.
+DRIFT_VETO_MIN = 0.05
 # Live learning bias: the raw-YES-WR learner was anti-predictive (-24pp) and
 # double-counted price. Disabled in live decisions (outcomes still recorded)
 # pending the edge-calibrated redesign. See spec R5.

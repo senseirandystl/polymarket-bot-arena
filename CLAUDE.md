@@ -56,6 +56,13 @@ fair_yes = yes_mid + trust · (P_model − yes_mid) # edge ONLY where model disa
 **Model-lean eligibility:** a bot may only buy a side its model *actively leans
 toward* (`P_model > 0.5` for YES, `< 0.5` for NO) — model ignorance (P=0.5) is
 not disagreement with the market, so it never fades the favorite on nothing.
+**Drift veto (BUG #25):** a directional bot never buys the side that
+*contradicts* a drift reading ≥ `config.DRIFT_VETO_MIN` (0.05) — live,
+drift-contradicting trades ran 26% WR vs 52% agreeing. Flow-only trades at
+drift≈0 stay allowed. Lane normalizations are calibrated to the real input
+distribution (momentum saturates at a 0.2% one-candle move ≈ p97; the first
+cut saturated below the *median* move and let one candle of noise outvote the
+time-damped drift — the #25 loss).
 **Why the old additive form died (BUG #24, 2026-07-16):** `fair = mid + tilt +
 alpha` counted its own bonus lanes as edge *by construction* — the flat +6¢
 favorite tilt alone cleared MIN_EDGE at window open, so all four directional

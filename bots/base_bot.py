@@ -202,8 +202,12 @@ class BaseBot(ABC):
             price_momentum = (btc_latest - prices[-1]) / prices[-1]
         # No candles at all -> 0. (The old fallback leaked the market price in
         # as "momentum", i.e. favorite-following in disguise.)
-        # 0.05% 1-candle move saturates the lane.
-        momentum_signal = max(-1.0, min(1.0, price_momentum * 2000))
+        # Saturation at a 0.2% one-candle move (~p97 of real BTC 1-min moves;
+        # median is 0.022%). The first normalization saturated at 0.05% — BELOW
+        # the median — so the lane sat at +/-0.5..1.0 of pure noise and outvoted
+        # the time-damped drift early in the window (26% WR on the 34 trades
+        # that contradicted drift, -$55 — the whole loss of that run).
+        momentum_signal = max(-1.0, min(1.0, price_momentum * 500))
 
         # --- Lane: strategy thesis from analyze() ---
         raw_signal = self.analyze(market, signals)
@@ -315,6 +319,19 @@ class BaseBot(ABC):
             edge_yes = float("-inf")
         if model_prob >= 0.5:
             edge_no = float("-inf")
+
+        # --- Drift veto: never trade AGAINST a non-trivial drift reading ---
+        # Drift is the validated fundamental (where BTC actually sits vs the
+        # strike). Momentum/flow lanes may modulate conviction but must not
+        # outvote it: live, trades contradicting a non-zero drift ran 26% WR
+        # (vs 52% agreeing). Symmetric and regime-agnostic — the veto follows
+        # whichever side BTC is on. Flow-only trades (|drift| below the floor)
+        # remain allowed.
+        veto = getattr(config, "DRIFT_VETO_MIN", 0.05)
+        if drift_signal_val >= veto:
+            edge_no = float("-inf")
+        elif drift_signal_val <= -veto:
+            edge_yes = float("-inf")
 
         conf_yes = min(0.95, max(0.0, edge_yes) * config.EDGE_TO_CONFIDENCE)
         conf_no = min(0.95, max(0.0, edge_no) * config.EDGE_TO_CONFIDENCE)
