@@ -169,6 +169,25 @@ def init_db():
                 pnl REAL,
                 created_at TEXT DEFAULT (datetime('now'))
             );
+
+            CREATE TABLE IF NOT EXISTS lane_validation_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                markets INTEGER NOT NULL,
+                samples INTEGER NOT NULL,
+                results TEXT NOT NULL,           -- JSON: lane -> metrics
+                created_at TEXT DEFAULT (datetime('now'))
+            );
+
+            CREATE TABLE IF NOT EXISTS lane_proposals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                lane TEXT NOT NULL,              -- 'fut' | 'tech' | 'xasset'
+                status TEXT NOT NULL DEFAULT 'pending',  -- pending|approved|denied
+                run_id INTEGER,                  -- lane_validation_runs.id
+                metrics TEXT NOT NULL,           -- JSON: evidence behind it
+                proposal TEXT NOT NULL,          -- JSON: {profile: {strategy: w}}
+                created_at TEXT DEFAULT (datetime('now')),
+                decided_at TEXT
+            );
         """)
 
         # Migrations
@@ -605,6 +624,151 @@ def set_kelly_fraction(fraction):
     if not (0.0 < fraction <= 1.0):
         raise ValueError("Kelly fraction must be in (0, 1]")
     set_arena_state("kelly_fraction", fraction)
+
+
+# ---------------------------------------------------------------------------
+# Candidate-lane validation runs, proposals + approved overrides
+#
+# The offline harness (tools/validate_signals.py --candidates --propose)
+# records each validation run and, when a kill-switched lane clears the
+# promotion thresholds, files a PENDING proposal. The dashboard lists pending
+# proposals with approve/deny; APPROVING writes the lane into the
+# 'lane_overrides' arena_state JSON, which bots/base_bot.py consults (cached)
+# to weight the lane live — no config edit, no restart. Denying just closes
+# the proposal (the harness may re-file after a later run with fresh data).
+# ---------------------------------------------------------------------------
+
+def record_lane_validation_run(markets, samples, results: dict) -> int:
+    """Store one harness run's per-lane metrics. Returns the run id."""
+    with get_conn() as conn:
+        cur = conn.execute(
+            "INSERT INTO lane_validation_runs (markets, samples, results) "
+            "VALUES (?, ?, ?)",
+            (int(markets), int(samples), json.dumps(results)))
+        return cur.lastrowid
+
+
+def get_latest_lane_run():
+    """Most recent validation run (results parsed), or None."""
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM lane_validation_runs ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+    if not row:
+        return None
+    d = dict(row)
+    try:
+        d["results"] = json.loads(d["results"])
+    except (TypeError, ValueError):
+        d["results"] = {}
+    return d
+
+
+def create_lane_proposal(lane, metrics: dict, proposal: dict, run_id=None):
+    """File a pending proposal for ``lane`` unless one is already open or the
+    lane is already approved (override active). Returns the proposal id, or
+    None when skipped."""
+    overrides = get_lane_overrides()
+    if overrides.get(lane, {}).get("enabled"):
+        return None
+    with get_conn() as conn:
+        exists = conn.execute(
+            "SELECT id FROM lane_proposals WHERE lane=? AND status='pending'",
+            (lane,)).fetchone()
+        if exists:
+            # Refresh the evidence on the open proposal instead of stacking
+            # duplicates — the dashboard should always show the latest run.
+            conn.execute(
+                "UPDATE lane_proposals SET metrics=?, proposal=?, run_id=? "
+                "WHERE id=?",
+                (json.dumps(metrics), json.dumps(proposal), run_id,
+                 exists["id"]))
+            return exists["id"]
+        cur = conn.execute(
+            "INSERT INTO lane_proposals (lane, status, run_id, metrics, proposal) "
+            "VALUES (?, 'pending', ?, ?, ?)",
+            (lane, run_id, json.dumps(metrics), json.dumps(proposal)))
+        return cur.lastrowid
+
+
+def get_lane_proposals(status=None):
+    """Proposals (newest first), optionally filtered by status; JSON parsed."""
+    with get_conn() as conn:
+        if status:
+            rows = conn.execute(
+                "SELECT * FROM lane_proposals WHERE status=? ORDER BY id DESC",
+                (status,)).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM lane_proposals ORDER BY id DESC").fetchall()
+    out = []
+    for r in rows:
+        d = dict(r)
+        for k in ("metrics", "proposal"):
+            try:
+                d[k] = json.loads(d[k])
+            except (TypeError, ValueError):
+                d[k] = {}
+        out.append(d)
+    return out
+
+
+def decide_lane_proposal(proposal_id, action):
+    """Approve or deny a pending proposal.
+
+    Approve → mark approved AND activate the lane override (arena_state
+    'lane_overrides'); the arena picks it up within the hot-path cache TTL.
+    Deny → just close it. Raises ValueError on bad input / already decided.
+    """
+    if action not in ("approve", "deny"):
+        raise ValueError("action must be 'approve' or 'deny'")
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM lane_proposals WHERE id=?", (proposal_id,)
+        ).fetchone()
+        if not row:
+            raise ValueError(f"proposal {proposal_id} not found")
+        if row["status"] != "pending":
+            raise ValueError(f"proposal {proposal_id} already {row['status']}")
+        status = "approved" if action == "approve" else "denied"
+        conn.execute(
+            "UPDATE lane_proposals SET status=?, decided_at=datetime('now') "
+            "WHERE id=?", (status, proposal_id))
+    if action == "approve":
+        try:
+            prop = json.loads(row["proposal"])
+        except (TypeError, ValueError):
+            prop = {}
+        overrides = get_lane_overrides()
+        overrides[row["lane"]] = {
+            "enabled": True,
+            "profile": prop.get("profile", {}),
+            "approved_at": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        set_arena_state("lane_overrides", json.dumps(overrides))
+    return status
+
+
+def get_lane_overrides() -> dict:
+    """Approved lane overrides: lane -> {enabled, profile: {strategy: w}}."""
+    raw = get_arena_state("lane_overrides")
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+        return parsed if isinstance(parsed, dict) else {}
+    except (TypeError, ValueError):
+        return {}
+
+
+def disable_lane_override(lane):
+    """Kill an approved lane override (dashboard 'disable' safety hatch)."""
+    overrides = get_lane_overrides()
+    if lane in overrides:
+        overrides[lane]["enabled"] = False
+        set_arena_state("lane_overrides", json.dumps(overrides))
+        return True
+    return False
 
 
 def _paper_pnl_and_reserved():

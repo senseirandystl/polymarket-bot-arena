@@ -22,6 +22,26 @@ logger = logging.getLogger(__name__)
 # changes on fills/resolutions). Shared across bots — the pool is shared too.
 _bankroll_cache: tuple = (0.0, 0.0)  # (ts, value)
 _kelly_cache: tuple = (0.0, 0.0)     # (ts, value)
+_lane_override_cache: tuple = (0.0, {})  # (ts, overrides dict)
+
+
+def _lane_overrides() -> dict:
+    """Approved candidate-lane overrides (dashboard Signal Lab).
+
+    lane -> {enabled, profile: {strategy: weight}}. A lane the harness
+    validated and a human APPROVED trades live through this DB override —
+    no config edit, no restart. Cached off the 1s hot path.
+    """
+    global _lane_override_cache
+    now = time.time()
+    if (now - _lane_override_cache[0]) < getattr(config, "HOTPATH_CACHE_TTL_SEC", 30):
+        return _lane_override_cache[1]
+    try:
+        value = db.get_lane_overrides()
+    except Exception:
+        value = _lane_override_cache[1]  # DB hiccup: keep last known
+    _lane_override_cache = (now, value)
+    return value
 
 
 def _kelly_fraction() -> float:
@@ -205,9 +225,17 @@ class BaseBot(ABC):
         """
         prof = self.STRATEGY_SIGNAL_PROFILE.get(
             self.strategy_type, self.DEFAULT_SIGNAL_PROFILE)
+        overrides = _lane_overrides()
         s = 0.0
         for k, v in lanes.items():
-            s += prof.get(k, 1.0) * v
+            ov = overrides.get(k)
+            if ov and ov.get("enabled"):
+                # Approved lane: weight comes from the approved proposal's
+                # per-strategy profile; strategies it doesn't name stay 0.
+                w = float(ov.get("profile", {}).get(self.strategy_type, 0.0))
+            else:
+                w = prof.get(k, 1.0)
+            s += w * v
         return max(config.MODEL_PROB_MIN,
                    min(config.MODEL_PROB_MAX, 0.5 + 0.5 * s))
 
@@ -360,16 +388,26 @@ class BaseBot(ABC):
         # --- Candidate lanes (2026-07-18): derivatives context, technicals,
         # cross-asset. Computed + logged every tick but globally kill-switched
         # at 0 (config.SIGNAL_WEIGHT_FUT/TECH/XASSET) until the offline
-        # harness validates positive NET edge for each. Re-enabling a
-        # validated lane = one config edit + a profile weight.
+        # harness validates positive NET edge. A harness-validated,
+        # HUMAN-APPROVED lane (dashboard Signal Lab -> db lane_overrides)
+        # trades live through the override: the kill-switch multiplier
+        # becomes 1.0 and the lane's per-strategy profile weight comes from
+        # the approved proposal (applied in _model_prob_yes).
+        overrides = _lane_overrides()
+
+        def _lane_mult(lane: str, config_switch: float) -> float:
+            if overrides.get(lane, {}).get("enabled"):
+                return 1.0
+            return config_switch
+
         fut = signals.get("futures", {}) or {}
         fut_signal = max(-1.0, min(1.0, float(fut.get("taker_delta", 0.0) or 0.0)))
-        fut_signal *= getattr(config, "SIGNAL_WEIGHT_FUT", 0.0)
+        fut_signal *= _lane_mult("fut", getattr(config, "SIGNAL_WEIGHT_FUT", 0.0))
         tech = signals.get("technicals", {}) or {}
         tech_signal = max(-1.0, min(1.0, float(tech.get("mtf_score", 0.0) or 0.0)))
-        tech_signal *= getattr(config, "SIGNAL_WEIGHT_TECH", 0.0)
+        tech_signal *= _lane_mult("tech", getattr(config, "SIGNAL_WEIGHT_TECH", 0.0))
         xasset_signal = max(-1.0, min(1.0, float(signals.get("xasset", 0.0) or 0.0)))
-        xasset_signal *= getattr(config, "SIGNAL_WEIGHT_XASSET", 0.0)
+        xasset_signal *= _lane_mult("xasset", getattr(config, "SIGNAL_WEIGHT_XASSET", 0.0))
 
         lanes = {
             "drift": drift_signal_val,

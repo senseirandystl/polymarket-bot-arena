@@ -213,6 +213,7 @@ td { padding: 6px 4px; border-bottom: 1px solid #21262d; }
         <button class="tab-button active" onclick="switchTab('overview')">Overview</button>
         <button class="tab-button" onclick="switchTab('bots')">Bots</button>
         <button class="tab-button" onclick="switchTab('trades')">Trades</button>
+        <button class="tab-button" onclick="switchTab('signal-lab')">Signal Lab</button>
         <button class="tab-button" onclick="switchTab('settings')">Settings</button>
     </div>
     <div>
@@ -298,6 +299,25 @@ td { padding: 6px 4px; border-bottom: 1px solid #21262d; }
                 <thead><tr><th>Date</th><th>Trades</th><th>Wins</th><th>P&L</th></tr></thead>
                 <tbody></tbody>
             </table>
+        </div>
+    </div>
+
+    <!-- ===== SIGNAL LAB TAB ===== -->
+    <div class="tab-content hidden" id="tab-signal-lab">
+        <div class="section-title">Pending Lane Proposals <span style="color:#8b949e;font-size:11px;text-transform:none;letter-spacing:0;">&mdash; filed by the offline harness when a kill-switched signal lane clears the promotion bar (n&ge;200, follow-WR&ge;55%, net edge &ge;+0.5&cent;/share after price+fee). Approving activates the lane live within seconds.</span></div>
+        <div class="card" id="lane-proposals-card">
+            <div style="color:#8b949e">Loading&hellip;</div>
+        </div>
+
+        <div class="section-title">Active Lane Overrides</div>
+        <div class="card" id="lane-overrides-card">
+            <div style="color:#8b949e">Loading&hellip;</div>
+        </div>
+
+        <div class="section-title">Last Validation Run</div>
+        <div class="card" id="lane-run-card">
+            <div style="color:#8b949e">No validation run recorded yet. Run:<br>
+            <code style="color:#c9d1d9">.venv/bin/python3 tools/validate_signals.py --markets 300 --propose</code></div>
         </div>
     </div>
 
@@ -469,12 +489,13 @@ function switchTab(name) {
     document.querySelectorAll('.tab-content').forEach(el => el.classList.add('hidden'));
     document.querySelectorAll('.tab-button').forEach(b => b.classList.remove('active'));
     document.getElementById('tab-' + name).classList.remove('hidden');
-    // Re-find buttons in case DOM order changed
+    // Re-find buttons in case DOM order changed ("Signal Lab" -> 'signal-lab')
     const btns = document.querySelectorAll('.tab-button');
     btns.forEach(b => {
-        if (b.textContent.trim().toLowerCase() === name) b.classList.add('active');
+        if (b.textContent.trim().toLowerCase().replace(/\s+/g, '-') === name) b.classList.add('active');
     });
     if (name === 'settings') refreshSettings();
+    if (name === 'signal-lab') loadSignalLab();
 }
 
 // ---------- Warning banner ----------
@@ -1089,8 +1110,119 @@ async function tickNext() {
     }
 }
 
+// ---------- Signal Lab (candidate-lane proposals) ----------
+const LANE_LABELS = {
+    fut: 'Futures taker delta (perp aggression)',
+    tech: 'Technicals multi-TF (MACD/BB context)',
+    xasset: 'Cross-asset (ETH+SOL confirmation)',
+};
+
+function fmtMetric(m) {
+    const wr = m.follow_wr != null ? (m.follow_wr * 100).toFixed(1) + '%' : 'n/a';
+    const ev = m.ev_per_share != null ? ((m.ev_per_share * 100).toFixed(2)) + '¢/sh' : 'n/a';
+    const price = m.avg_price != null ? m.avg_price.toFixed(3) : 'n/a';
+    return `n=${m.net_n ?? m.n ?? 0} &middot; follow-WR ${wr} &middot; net EV ${ev} &middot; avg entry ${price}`;
+}
+
+async function loadSignalLab() {
+    let data;
+    try { data = await fetchJSON('/api/lane-proposals'); }
+    catch (e) {
+        document.getElementById('lane-proposals-card').innerHTML =
+            '<div style="color:#f85149">Failed to load proposals</div>';
+        return;
+    }
+
+    // Pending proposals with approve/deny
+    const pending = (data.proposals || []).filter(p => p.status === 'pending');
+    const decided = (data.proposals || []).filter(p => p.status !== 'pending').slice(0, 5);
+    let html = '';
+    if (pending.length === 0) {
+        html += '<div style="color:#8b949e">No pending proposals. The harness files one automatically when a candidate lane clears the promotion bar.</div>';
+    }
+    for (const p of pending) {
+        const profile = Object.entries(p.proposal.profile || {})
+            .map(([s, w]) => `${s}:${w}`).join(', ');
+        html += `
+        <div style="border:1px solid #30363d;border-radius:6px;padding:12px;margin-bottom:10px">
+            <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap">
+                <div>
+                    <b style="color:#f0f6fc">${LANE_LABELS[p.lane] || p.lane}</b>
+                    <span style="color:#8b949e;font-size:11px"> (lane: ${p.lane}, proposal #${p.id}, ${p.created_at} UTC)</span>
+                    <div style="color:#c9d1d9;font-size:12px;margin-top:4px">${fmtMetric(p.metrics)}</div>
+                    <div style="color:#8b949e;font-size:12px;margin-top:2px">Proposed profile weights &rarr; ${profile || '(none)'}</div>
+                </div>
+                <div style="display:flex;gap:8px">
+                    <button class="btn btn-primary" onclick="decideLane(${p.id}, 'approve')">Approve</button>
+                    <button class="btn btn-danger" onclick="decideLane(${p.id}, 'deny')">Deny</button>
+                </div>
+            </div>
+        </div>`;
+    }
+    if (decided.length) {
+        html += '<div style="color:#8b949e;font-size:11px;margin-top:6px">Recent decisions: '
+            + decided.map(p => `${p.lane} &rarr; ${p.status} (${(p.decided_at || '').slice(0, 16)})`).join(' &middot; ')
+            + '</div>';
+    }
+    document.getElementById('lane-proposals-card').innerHTML = html;
+
+    // Active overrides
+    const ov = data.overrides || {};
+    const active = Object.entries(ov).filter(([, v]) => v.enabled);
+    let ovHtml = '';
+    if (active.length === 0) {
+        ovHtml = '<div style="color:#8b949e">None — all candidate lanes are kill-switched at weight 0.</div>';
+    }
+    for (const [lane, v] of active) {
+        const profile = Object.entries(v.profile || {}).map(([s, w]) => `${s}:${w}`).join(', ');
+        ovHtml += `
+        <div style="display:flex;justify-content:space-between;align-items:center;padding:8px 0;border-bottom:1px solid #21262d">
+            <div>
+                <b style="color:#3fb950">${LANE_LABELS[lane] || lane}</b>
+                <span style="color:#8b949e;font-size:11px"> approved ${v.approved_at || ''} UTC</span>
+                <div style="color:#8b949e;font-size:12px">profile: ${profile || '(none)'}</div>
+            </div>
+            <button class="btn btn-danger" onclick="disableLane('${lane}')">Disable</button>
+        </div>`;
+    }
+    document.getElementById('lane-overrides-card').innerHTML = ovHtml;
+
+    // Last run summary
+    if (data.last_run) {
+        const r = data.last_run;
+        let rows = '';
+        for (const [key, m] of Object.entries(r.results || {})) {
+            rows += `<tr><td>${key}</td><td>${m.n ?? 0}</td>
+                <td>${m.follow_wr != null ? (m.follow_wr * 100).toFixed(1) + '%' : 'n/a'}</td>
+                <td>${m.ev_per_share != null ? (m.ev_per_share * 100).toFixed(2) + '¢' : 'n/a'}</td></tr>`;
+        }
+        document.getElementById('lane-run-card').innerHTML = `
+            <div style="color:#8b949e;font-size:12px;margin-bottom:8px">Run #${r.id} &middot; ${r.created_at} UTC &middot; ${r.markets} markets &middot; ${r.samples} samples</div>
+            <table><tr><th>Candidate</th><th>n</th><th>Follow-WR</th><th>Net EV/share</th></tr>${rows}</table>`;
+    }
+}
+
+async function decideLane(id, action) {
+    if (action === 'approve' &&
+        !confirm('Approve this lane? It will start carrying live decision weight within seconds.')) return;
+    const res = await postJSON(`/api/lane-proposals/${id}/decide`, { action });
+    if (res.error) alert(res.error);
+    loadSignalLab();
+}
+
+async function disableLane(lane) {
+    if (!confirm(`Disable the '${lane}' lane override? It reverts to kill-switched (weight 0).`)) return;
+    const res = await postJSON(`/api/lane-overrides/${lane}/disable`, {});
+    if (res.error) alert(res.error);
+    loadSignalLab();
+}
+
 refresh();
 setInterval(refresh, 10000);
+// Keep the Signal Lab fresh while it's the visible tab.
+setInterval(() => {
+    if (!document.getElementById('tab-signal-lab').classList.contains('hidden')) loadSignalLab();
+}, 15000);
 // Market list re-pull every 3s keeps current/next turnover snappy.
 setInterval(fetchMarkets, 3000);
 // 1s: countdown + fresh current-market price. 10s: next-market price.

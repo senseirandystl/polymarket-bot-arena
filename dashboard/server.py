@@ -450,6 +450,46 @@ async def set_kelly(request: Request, _auth: str = Depends(verify_auth)):
     return JSONResponse({"success": True, "kelly_fraction": db.get_kelly_fraction()})
 
 
+@app.get("/api/lane-proposals")
+def get_lane_proposals(_auth: str = Depends(verify_auth)):
+    """Signal Lab: candidate-lane proposals + approved overrides + last run.
+
+    Proposals are filed by the offline harness (validate_signals --propose)
+    when a kill-switched lane clears the promotion thresholds; approving one
+    here activates the lane live via the DB override (no restart).
+    """
+    return JSONResponse({
+        "proposals": db.get_lane_proposals(),
+        "overrides": db.get_lane_overrides(),
+        "last_run": db.get_latest_lane_run(),
+    })
+
+
+@app.post("/api/lane-proposals/{proposal_id}/decide")
+async def decide_lane_proposal(proposal_id: int, request: Request,
+                               _auth: str = Depends(verify_auth)):
+    """Approve or deny a pending lane proposal (body: {"action": "approve"})."""
+    body = await request.json()
+    action = (body.get("action") or "").strip().lower()
+    try:
+        status_out = db.decide_lane_proposal(proposal_id, action)
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    return JSONResponse({
+        "success": True,
+        "status": status_out,
+        "overrides": db.get_lane_overrides(),
+    })
+
+
+@app.post("/api/lane-overrides/{lane}/disable")
+async def disable_lane(lane: str, _auth: str = Depends(verify_auth)):
+    """Safety hatch: switch an approved lane back off without a restart."""
+    if db.disable_lane_override(lane):
+        return JSONResponse({"success": True, "overrides": db.get_lane_overrides()})
+    return JSONResponse({"error": f"no override for lane '{lane}'"}, status_code=404)
+
+
 @app.get("/api/bots")
 def get_bots():
     active = db.get_active_bots()

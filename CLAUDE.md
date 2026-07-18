@@ -88,6 +88,35 @@ hosted-LLM (Claude/Grok) hookup. The momentum lane and the late-window boosts
 (base + sniper) are smooth curves now (same calibration points, no cliffs).
 Default paper bankroll is **$200** (`PAPER_BANKROLL_DEFAULT`).
 
+**Lane-promotion pipeline (2026-07-18).** Candidate lanes graduate from
+kill-switched to live through a measured, human-approved path:
+1. **Backfill + measure** — `tools/validate_signals.py --candidates`
+   reconstructs fut/tech/xasset readings for every harness decision point
+   (`tools/lane_candidates.py`: batch Binance klines + funding/OI/taker
+   series; production `technicals.compute`/`soft_saturate` code paths, so the
+   harness validates exactly what ships; the `/futures/data/*` endpoints
+   retain only ~30 days) and reports follow-WR + **net edge** per lane.
+2. **Auto-proposal** — `--propose` records the run (`lane_validation_runs`)
+   and files a PENDING `lane_proposals` row for any lane clearing the
+   conjunctive bar (`lane_candidates.MIN_SAMPLES/MIN_FOLLOW_WR/MIN_NET_EDGE`
+   = n≥200, WR≥55%, net ≥ +0.5¢/share on the lane's LIVE key — the WR-only
+   bar is exactly what pm_mom would have passed while losing money). This is
+   the only harness mode that writes to bot_arena.db (never trade tables).
+3. **Human approve/deny** — dashboard **Signal Lab** tab
+   (`/api/lane-proposals`, `/api/lane-proposals/{id}/decide`). Approving
+   writes the lane into the `lane_overrides` arena_state JSON
+   (`db.decide_lane_proposal`) with the proposal's per-strategy profile
+   weights (conservative 0.10 starters, `lane_candidates.PROFILE_SUGGESTIONS`).
+4. **Live effect, no restart** — `base_bot._lane_overrides()` (hot-path
+   cached, `HOTPATH_CACHE_TTL_SEC`) flips the lane's kill-switch multiplier
+   to 1.0 and `_model_prob_yes` takes the lane's weight from the approved
+   profile (strategies not named stay 0). The Signal Lab **Disable** button
+   (`/api/lane-overrides/{lane}/disable`) reverts a lane to weight 0 within
+   seconds — the safety hatch if live performance diverges from the harness.
+Schedule the measurement (e.g. nightly cron/launchd:
+`.venv/bin/python3 tools/validate_signals.py --markets 300 --propose`);
+promotion itself stays a dashboard decision.
+
 **Hard model-lean floor (BUG #27):** conviction scaling damped weak models but
 their residual edge still scaled with MARKET displacement, so trust_eff=0.03
 trades still cleared MIN_EDGE. Now lean < `config.MODEL_LEAN_MIN` skips

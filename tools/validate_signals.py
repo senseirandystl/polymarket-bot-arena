@@ -12,6 +12,17 @@ which is the bug that made the live drift signal read inverted (BUG #23).
 Run:
     .venv/bin/python3 tools/validate_signals.py --markets 200
     .venv/bin/python3 tools/validate_signals.py --markets 300 --no-cache
+    .venv/bin/python3 tools/validate_signals.py --markets 300 --candidates
+    .venv/bin/python3 tools/validate_signals.py --markets 300 --propose
+
+``--candidates`` backfills the kill-switched candidate lanes (fut/tech/xasset
+— tools/lane_candidates.py) and reports their follow-WR + net edge.
+``--propose`` additionally records the run in bot_arena.db
+(lane_validation_runs) and files a PENDING lane proposal for any candidate
+clearing the promotion thresholds — reviewed and approved/denied by a human
+in the dashboard Signal Lab (approval activates the lane live via the
+DB override; see db.decide_lane_proposal). This is the ONLY mode that writes
+to bot_arena.db, and it never touches trade tables.
 
 Storage: klines are cached in a gitignored, size-capped JSON
 (``tools/.signal_cache/klines.json``, <=CACHE_MAX markets) so re-runs are fast
@@ -169,12 +180,45 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--markets", type=int, default=200, help="resolved markets to sample")
     ap.add_argument("--no-cache", action="store_true", help="ignore + skip the kline cache")
+    ap.add_argument("--candidates", action="store_true",
+                    help="backfill + evaluate the kill-switched candidate lanes "
+                         "(fut/tech/xasset) — extra Binance series fetches")
+    ap.add_argument("--propose", action="store_true",
+                    help="record the run in bot_arena.db and file lane "
+                         "proposals for candidates clearing the promotion "
+                         "thresholds (implies --candidates)")
     args = ap.parse_args()
+    if args.propose:
+        args.candidates = True
 
     use_cache = not args.no_cache
     print(f"Fetching {args.markets} resolved BTC 5-min markets from Gamma...")
     markets = fetch_resolved_markets(args.markets)
     print(f"  got {len(markets)} resolved markets")
+
+    # Candidate-lane backfill: fetch each auxiliary series ONCE for the whole
+    # span (paginated), then look values up per decision point — instead of
+    # per-market requests.
+    series = {}
+    if args.candidates and markets:
+        from tools import lane_candidates as lc
+        span_start = min(_ms(m["start"]) for m in markets)
+        span_end = max(_ms(m["end"]) for m in markets)
+        hist_start = span_start - 65 * 60 * 1000    # 60 candles of BTC history
+        print("Fetching candidate-lane series (BTC/ETH/SOL klines + "
+              "funding/OI/taker)...")
+        try:
+            series["btc_close"] = lc.fetch_klines_series("BTCUSDT", hist_start, span_end)
+            series["eth_close"] = lc.fetch_klines_series("ETHUSDT", span_start - 5*60*1000, span_end)
+            series["sol_close"] = lc.fetch_klines_series("SOLUSDT", span_start - 5*60*1000, span_end)
+            # Funding prints only every 8h — reach back 9h so every sample has
+            # a last-at-or-before funding reading; OI/taker are 5m series.
+            series.update(lc.fetch_futures_series(span_start - 9*3600*1000, span_end))
+            for k, v in series.items():
+                print(f"  {k}: {len(v)} points")
+        except Exception as e:
+            print(f"  candidate series fetch failed ({e}) — candidate lanes "
+                  f"will be partial/empty")
 
     cache = _load_cache() if use_cache else {}
     all_samples = []
@@ -190,9 +234,13 @@ def main() -> int:
             continue
         strike = traj[0][1]                         # open @ eventStartTime = true strike
         up_count += 1 if mkt["yes_won"] else 0
-        all_samples.extend(build_samples(mkt["id"], strike, traj,
-                                          mkt["yes_won"], WINDOW_SEC,
-                                          pm_prices=pm))
+        mkt_samples = build_samples(mkt["id"], strike, traj,
+                                    mkt["yes_won"], WINDOW_SEC,
+                                    pm_prices=pm)
+        if args.candidates and series:
+            from tools import lane_candidates as lc
+            lc.attach_candidates(mkt_samples, _ms(mkt["start"]) / 1000.0, series)
+        all_samples.extend(mkt_samples)
         if use_cache and i % 25 == 0:
             _save_cache(cache)
         if not use_cache:
@@ -281,8 +329,52 @@ def main() -> int:
         for b in net_edge_time_buckets(all_samples, rule, taker_fee):
             print(f"      {b['bucket']:>10}: {_ne_fmt(b).strip()}")
 
-    print("\nNote: nothing was written to bot_arena.db. "
-          f"Kline cache: {'on' if use_cache else 'off'} ({CACHE_FILE}).")
+    # --- Candidate lanes (kill-switched): follow-WR + NET edge per lane ---
+    wrote_db = False
+    if args.candidates:
+        from tools import lane_candidates as lc
+        results = lc.evaluate_candidates(all_samples, taker_fee)
+        print("\n=== CANDIDATE lanes (kill-switched; promotion bar: "
+              f"n>={lc.MIN_SAMPLES}, follow-WR>={lc.MIN_FOLLOW_WR:.0%}, "
+              f"net>={lc.MIN_NET_EDGE*100:.1f}c/share on the LIVE key) ===")
+        for key in lc.CANDIDATE_KEYS:
+            m = results[key]
+            wr = f"{m['follow_wr']*100:5.1f}%" if m["follow_wr"] is not None else "  n/a"
+            ev = (f"{m['ev_per_share']*100:+.2f}c"
+                  if m["ev_per_share"] is not None else "n/a")
+            live = "  (LIVE key)" if key in lc.LIVE_LANE_KEYS.values() else ""
+            print(f"  [{key:<11}] n={m['n']:5d}  follow-WR={wr}  "
+                  f"net n={m['net_n']:5d}  EV/share={ev}{live}")
+
+        proposals = lc.build_proposals(results)
+        if args.propose:
+            import db
+            db.init_db()
+            run_id = db.record_lane_validation_run(
+                len(markets), len(all_samples), results)
+            wrote_db = True
+            if proposals:
+                for p in proposals:
+                    pid = db.create_lane_proposal(
+                        p["lane"], p["metrics"], p["proposal"], run_id=run_id)
+                    state = f"proposal #{pid}" if pid else "already approved — skipped"
+                    print(f"  >> {p['lane']}: cleared promotion bar -> {state}")
+            else:
+                print("  >> no lane cleared the promotion bar this run")
+            print(f"  (run #{run_id} recorded; review pending proposals in the "
+                  f"dashboard Signal Lab)")
+        elif proposals:
+            print("  >> would propose: "
+                  + ", ".join(p["lane"] for p in proposals)
+                  + "  (re-run with --propose to file)")
+
+    if wrote_db:
+        print("\nNote: wrote lane_validation_runs/lane_proposals only — trade "
+              "tables untouched. "
+              f"Kline cache: {'on' if use_cache else 'off'} ({CACHE_FILE}).")
+    else:
+        print("\nNote: nothing was written to bot_arena.db. "
+              f"Kline cache: {'on' if use_cache else 'off'} ({CACHE_FILE}).")
     return 0
 
 
