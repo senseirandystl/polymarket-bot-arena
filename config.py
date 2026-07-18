@@ -213,10 +213,18 @@ FLOW_ONLY_EDGE_MULT = 2.0
 MODEL_CONVICTION_SCALE = 0.10
 # Hard model-lean floor (BUG #27, 2026-07-17 evening run). Conviction-scaled
 # trust DAMPED weak models but still let them trade into large market
-# displacement (a trust_eff=0.03 trade is in the log). Live ground truth over
-# 87 model-blend trades: lean < 0.10 -> 28.6% WR / -$78.74; lean >= 0.10 ->
-# 73% WR / +$96.12. Below the floor the bot has no tradable opinion: skip.
-MODEL_LEAN_MIN = 0.10
+# displacement (a trust_eff=0.03 trade is in the log). Below the floor the
+# bot has no tradable opinion: skip. RECALIBRATED 0.10 -> 0.05 (2026-07-18):
+# 0.10 was measured against the OLD model distribution, where the saturated
+# cvd/pm lanes inflated leans; with those lanes killed the same floor
+# demanded |drift| >= 0.286 from the drift-pure meanrev profile — while the
+# harness validates follow-drift with no magnitude bar (+7.6c/share) and
+# puts the ignorance boundary at |drift| ~ 0.15 (its underdog probe, -4.44c/
+# share). 0.05 maps the drift-pure profile onto exactly that boundary
+# (0.70 * 0.15 * 0.5 = 0.052). The 0.05-0.10 band still trades under DAMPED
+# trust (conviction scaling re-engages there) and flow-only trades keep the
+# 2x MIN_EDGE bar, so the ignorance-fade class stays suppressed.
+MODEL_LEAN_MIN = 0.05
 # Book-consistency gate (BUG #27): when the YES and NO book prices disagree
 # with each other (|yes + no - 1| beyond this), the data is suspect (stale or
 # gapped book) — a directional bot stands down. A REAL cross-book gap is the

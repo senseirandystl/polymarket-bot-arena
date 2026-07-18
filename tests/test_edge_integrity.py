@@ -132,3 +132,56 @@ def test_consistent_books_unaffected():
     d = bot.make_decision(_market(yes=0.52, no=0.49),
                           _trending_sig(drift=0.6, up=True))
     assert d["action"] == "buy"
+
+
+# --- Ask-priced decisions (follow-up: mid-vs-ask fill mismatch) ---
+# Decisions used to price edge + entry off the MID while the paper engine
+# fills by walking the ASKS — on wide books (3-8c spreads live) the fill
+# landed > MAX_FILL_SLIPPAGE above the decision price and the slippage guard
+# rejected 5 of 7 attempted trades in an hour. Edge must be measured against
+# the price you can actually execute at; the guard then only catches book
+# MOVEMENT between decision and fill.
+
+def test_entry_price_uses_executable_ask():
+    bot = _bot()
+    m = _market(yes=0.52, no=0.49)
+    m["yes_ask"] = 0.55
+    d = bot.make_decision(m, _trending_sig(drift=0.6, up=True))
+    assert d["action"] == "buy" and d["side"] == "yes"
+    assert abs(d["entry_price"] - 0.55) < 1e-9
+
+
+def test_wide_spread_kills_marginal_edge_at_decision_time():
+    # A trade whose edge only exists at the mid must not fire once the
+    # executable ask eats it (this used to fire, then die at the fill).
+    # Marginal case: drift-pure meanrev, model ~0.62 — edge at the 0.52 mid,
+    # none at a 0.60 ask.
+    bot = MeanRevBot(name="mr-test", generation=0)
+    sig = _sig(btc_drift=0.35)
+    m_tight = _market(yes=0.52, no=0.48)
+    d_tight = bot.make_decision(m_tight, sig)
+    assert d_tight["action"] == "buy"
+    m_wide = _market(yes=0.52, no=0.48)
+    m_wide["yes_ask"] = 0.60  # 8c above mid — spread eats the edge
+    d_wide = bot.make_decision(m_wide, sig)
+    assert d_wide["action"] == "skip"
+
+
+def test_ask_fallback_to_mid_when_absent():
+    # Until the warmer primes a market there is no book — mid fallback keeps
+    # the bot functional (same behavior as before).
+    bot = _bot()
+    d = bot.make_decision(_market(yes=0.52, no=0.49),
+                          _trending_sig(drift=0.6, up=True))
+    assert d["action"] == "buy"
+    assert abs(d["entry_price"] - 0.52) < 1e-9
+
+
+def test_book_sum_gate_still_uses_mids():
+    # Ask prices sum > 1 on any normal spread — the consistency gate must
+    # keep judging the MIDS, not the asks.
+    bot = _bot()
+    m = _market(yes=0.52, no=0.49)
+    m["yes_ask"], m["no_ask"] = 0.55, 0.52   # asks sum 1.07: fine
+    d = bot.make_decision(m, _trending_sig(drift=0.6, up=True))
+    assert d["action"] == "buy"

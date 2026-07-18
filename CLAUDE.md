@@ -64,9 +64,22 @@ edge_side = trust_eff · (P_model_side − side_price) − taker_fee        # BU
 ```
 **Hard model-lean floor (BUG #27):** conviction scaling damped weak models but
 their residual edge still scaled with MARKET displacement, so trust_eff=0.03
-trades still cleared MIN_EDGE. Now lean < `config.MODEL_LEAN_MIN` (0.10) skips
+trades still cleared MIN_EDGE. Now lean < `config.MODEL_LEAN_MIN` skips
 outright — no opinion, no trade. Harness ignorance-fade probe (underdog when
-|drift|<0.15): 31.6% WR, −4.44¢/share over 247 samples.
+|drift|<0.15): 31.6% WR, −4.44¢/share over 247 samples. **Recalibrated 0.10 →
+0.05 (2026-07-18):** 0.10 was measured against the old cvd/pm-inflated lean
+distribution; on the fidelity profiles it demanded |drift| ≥ 0.286 from the
+drift-pure meanrev. 0.05 maps drift-pure onto exactly the harness's |drift| ≈
+0.15 ignorance boundary; the 0.05–0.10 band trades under damped trust.
+**Ask-priced decisions (2026-07-18):** edge, guards, `entry_price` and Kelly
+sizing all use the side's **executable best ask** (laid onto the market dict
+from the warm books by the trader; mid fallback until the warmer primes).
+Decisions used to price the mid while the fill engines walk the asks — on
+wide books (3–8¢ spreads) the fill landed > `MAX_FILL_SLIPPAGE` above the
+decision price and the slippage guard rejected 5 of 7 attempted trades in an
+hour. The slippage guard now only catches book *movement* between decision
+and fill. (The book-sum gate still judges the MIDS — asks sum > 1 on any
+normal spread.)
 **Book-consistency gate (BUG #27):** |yes + no − 1| > `config.BOOK_SUM_TOLERANCE`
 (0.04) → directional skip. The old `edge_no = (1 − fair_yes) − no_price` mixed
 the two books, so stale/gapped books (sums 0.84–0.94 live) minted phantom

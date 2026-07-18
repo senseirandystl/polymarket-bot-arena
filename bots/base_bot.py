@@ -416,8 +416,20 @@ class BaseBot(ABC):
                 "features": features,
             }
 
+        # --- Executable prices: edge is measured against what a taker PAYS ---
+        # Decisions used to price edge + entry off the MID while the fill
+        # engines walk the ASKS: on wide books (3-8c spreads live) the fill
+        # landed > MAX_FILL_SLIPPAGE above the decision price and the
+        # slippage guard rejected most attempted trades (5 of 7 in an hour).
+        # The trader lays the warm books' best asks onto the market dict;
+        # until the warmer primes a market, fall back to the mid. The
+        # book-sum gate above intentionally keeps judging the MIDS (asks sum
+        # > 1 on any normal spread).
+        yes_exec = market.get("yes_ask") or yes_price
+        no_exec = market.get("no_ask") or no_price
+
         edge_yes, edge_no = self._side_net_edges(model_prob, trust_eff,
-                                                 yes_price, no_price)
+                                                 yes_exec, no_exec)
 
         # --- Model-lean eligibility: never fade the market on IGNORANCE ---
         # With no information the model sits at 0.5 and the blend would pull
@@ -447,9 +459,9 @@ class BaseBot(ABC):
         conf_yes = min(0.95, max(0.0, edge_yes) * config.EDGE_TO_CONFIDENCE)
         conf_no = min(0.95, max(0.0, edge_no) * config.EDGE_TO_CONFIDENCE)
         if edge_yes >= edge_no:
-            side, side_price, chosen_edge, confidence = "yes", yes_price, edge_yes, conf_yes
+            side, side_price, chosen_edge, confidence = "yes", yes_exec, edge_yes, conf_yes
         else:
-            side, side_price, chosen_edge, confidence = "no", no_price, edge_no, conf_no
+            side, side_price, chosen_edge, confidence = "no", no_exec, edge_no, conf_no
 
         # --- Minimum-edge gate (no edge = no bet) — SAME bar on both sides ---
         # Information-scaled: with drift flat the model's disagreement with the
@@ -532,6 +544,7 @@ class BaseBot(ABC):
             f"fair={fair_yes:.2f} model={model_prob:.2f} "
             f"trust={trust:.2f}x{conviction:.2f}={trust_eff:.2f} "
             f"yes={yes_price:.2f} no={no_price:.2f} "
+            f"ask={yes_exec:.2f}/{no_exec:.2f} "
             f"=> {side} edge={chosen_edge:+.3f} (eY={edge_yes:+.3f} eN={edge_no:+.3f}) "
             f"drift={drift_signal_val:+.3f} mom={momentum_signal:+.3f} pm={pm_momentum_signal:+.3f} "
             f"of(obi={obi_signal:+.3f} cvd={cvd_signal:+.3f}) "

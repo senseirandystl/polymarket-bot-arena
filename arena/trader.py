@@ -24,15 +24,19 @@ list copy.  Bots that appear in the list at the start of a tick remain
 in scope for the whole tick — we don't churn mid-iteration.
 """
 
+import json
 import logging
 import threading
+import time
 from datetime import datetime, timezone
 
 import db
 import polymarket_markets
 from bots.base_bot import BaseBot
 from config import TRADE_LOOP_INTERVAL_SEC
+from arena import market_data
 from arena.market_utils import compute_time_remaining_seconds
+from arena.session_filter import session_skip
 from arena.signals import build_combined_signals
 from arena.state import SharedArenaState
 
@@ -64,6 +68,9 @@ class Trader(threading.Thread):
         # the list under this lock at the top of every tick.
         self._bots_lock = threading.Lock()
         self._bots: list = []
+        # Skip tally is flushed to arena_state at most every 30s so the
+        # dashboard (a separate process) can surface why the arena sat flat.
+        self._last_skip_flush = 0.0
 
     def set_bots(self, bots) -> None:
         """Called by the coordinator after evolution. Atomic swap."""
@@ -86,10 +93,11 @@ class Trader(threading.Thread):
     # ------------------------------------------------------------------
 
     def _tick(self) -> None:
+        now = datetime.now(timezone.utc)
         market = self._discovery.current_market_snapshot()
         if market is not None:
             market["time_remaining_seconds"] = compute_time_remaining_seconds(
-                market, datetime.now(timezone.utc)
+                market, now
             )
         # Stop trading the moment the current market's residual drops below 1s.
         if market is None or market.get("time_remaining_seconds", 0) < 1:
@@ -99,11 +107,41 @@ class Trader(threading.Thread):
         if not market_id:
             return
 
-        # FRESH price every tick: the discovery snapshot's price is up to
-        # DISCOVERY_INTERVAL_SEC old, but bots re-evaluate every second, so pull
-        # the live CLOB midpoint now. Best-effort — keep the snapshot price if
-        # the fetch fails so a transient blip doesn't stall evaluation.
-        polymarket_markets.refresh_price(market)
+        # Session-timing gate — 'build the skip, default state is flat'. Sit out
+        # high-flip session handovers (NYSE open/close) entirely, one check for
+        # all taker bots. Cheap and off the per-bot path.
+        skip_reason = session_skip(now)
+        if skip_reason is not None:
+            self._state.note_skip("session")
+            logger.debug(f"Session skip ({skip_reason}) — no taker trades this tick")
+            return
+
+        # FRESH data every tick with ZERO network on the hot path: the
+        # market-data warmer refreshes YES+NO prices, both books, OBI, CVD and
+        # PM momentum every ~1s into a shared warm cache. Read it here and lay
+        # the warm values onto the market snapshot + signals. Fall back to a
+        # direct price fetch only until the warmer has primed this market.
+        warm = market_data.store().get(market_id)
+        if warm is not None:
+            if warm.get("yes_price") is not None:
+                market["current_price"] = warm["yes_price"]
+            if warm.get("no_price") is not None:
+                market["no_price"] = warm["no_price"]
+            # Executable (taker) prices: make_decision measures edge against
+            # the best ASK, not the mid — the fill engines walk the asks, so
+            # a mid-priced edge on a wide book just dies at the slippage
+            # guard (5 of 7 attempted trades in the first post-restart hour).
+            for ask_key, book_key in (("yes_ask", "yes_book"),
+                                      ("no_ask", "no_book")):
+                book = warm.get(book_key) or {}
+                if book.get("valid") and book.get("best_ask"):
+                    market[ask_key] = book["best_ask"]
+            market["orderflow"] = {
+                **(market.get("orderflow") or {}),
+                "obi": warm.get("obi", 0.0),
+            }
+        else:
+            polymarket_markets.refresh_price(market)
 
         with self._bots_lock:
             bots = list(self._bots)
@@ -113,6 +151,7 @@ class Trader(threading.Thread):
             self._sentiment_feed,
             self._pm_price_feed,
             market,
+            warm=warm,
         )
 
         new_trades = 0
@@ -126,7 +165,9 @@ class Trader(threading.Thread):
             try:
                 signal = bot.make_decision(market, combined_signals)
                 if signal.get("action") == "skip":
-                    # Do NOT mark traded — re-evaluate next tick.
+                    # Do NOT mark traded — re-evaluate next tick. Skip is a
+                    # first-class outcome; tally it so runs are explainable.
+                    self._state.note_skip("no_edge")
                     logger.debug(
                         f"[{bot.name}] skip | {signal.get('reasoning', '')}"
                     )
@@ -156,3 +197,12 @@ class Trader(threading.Thread):
             logger.debug(
                 f"Trader tick: {new_trades} new trades on {market_id[:12]}..."
             )
+
+        # Periodically persist the skip tally (cross-process observability).
+        now_ts = time.time()
+        if now_ts - self._last_skip_flush >= 30:
+            self._last_skip_flush = now_ts
+            try:
+                db.set_arena_state("skip_counts", json.dumps(self._state.skip_snapshot()))
+            except Exception as e:
+                logger.debug(f"skip_counts flush failed: {e}")
