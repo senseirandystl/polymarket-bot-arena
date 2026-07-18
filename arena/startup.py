@@ -12,7 +12,7 @@ Flow (terminal only):
                        existing DB slate).
          • Fresh     → wipe DB + logs, then fall through to step 2.
     2. Ask **Default** bots (Enter) or **Manual** selection.
-         • Default   → the 5 canonical bots (incl. the arbitrage bot).
+         • Default   → the 8 canonical bots (incl. arbitrage, sniper + makers).
          • Manual    → show every strategy, accept a list/range like
                        ``1,3,5`` or ``1-6`` (or a mix) → launch exactly those.
 
@@ -63,13 +63,14 @@ STRATEGY_MENU = [
 # meanrev-v1 / mean_reversion.)
 _ = MeanRevSLBot  # retained for legacy strategy_type resolution
 
-# The 7 default bots (1-based indices into STRATEGY_MENU): the four directional
-# defaults, the arbitrage bot, and the two maker bots.
-DEFAULT_INDICES = [1, 5, 2, 7, 8, 9, 10]
+# The 8 default bots (1-based indices into STRATEGY_MENU): momentum, phantom,
+# arbitrage, meanrev, hybrid, sniper, and the two maker bots (2026-07-18
+# roster update — sniper promoted into the default slate).
+DEFAULT_INDICES = [1, 5, 8, 2, 7, 4, 9, 10]
 
 
 def build_default_bots() -> list:
-    """The canonical default slate (7 bots incl. arbitrage + both makers)."""
+    """The canonical default slate (8 bots incl. arbitrage, sniper + both makers)."""
     return _build_from_indices(DEFAULT_INDICES)
 
 

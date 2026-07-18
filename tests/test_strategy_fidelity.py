@@ -85,7 +85,7 @@ def test_default_slate_uses_meanrev_v1():
     names = [b.name for b in build_default_bots()]
     assert "meanrev-v1" in names
     assert not any("sl25" in n for n in names)
-    assert len(names) == 7
+    assert len(names) == 8
 
 
 def test_db_migration_renames_meanrev(tmp_path, monkeypatch):

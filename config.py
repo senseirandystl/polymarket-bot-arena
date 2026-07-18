@@ -46,7 +46,7 @@ POLYMARKET_TAKER_FEE_RATE = 0.07
 # is submitted). All paper bots share ONE virtual USDC bankroll, set by the user
 # in the dashboard Settings tab (arena_state key 'paper_bankroll'); this default
 # is used until they set one. Live mode uses the real wallet USDC balance.
-PAPER_BANKROLL_DEFAULT = 100.0
+PAPER_BANKROLL_DEFAULT = 200.0
 
 # Database
 DB_PATH = Path(__file__).parent / "bot_arena.db"
@@ -156,6 +156,20 @@ SIGNAL_WEIGHT_CVD = 0.0
 # a 1500-share one-sided tape still reads ~1.0. Calibrate offline before
 # re-weighting the lane.
 CVD_VOLUME_FLOOR = 200.0
+
+# --- Candidate signal lanes (2026-07-18) — ALL kill-switched at 0 ---
+# New lanes computed every tick and logged in trade reasoning, but carrying
+# ZERO live weight until tools/validate_signals.py measures POSITIVE NET edge
+# for each (house rule: validate-before-weighting — see BUG #23/#26/#27 for
+# what shipping an unvalidated lane costs). Each is a global multiplier onto
+# its lane for every strategy, same pattern as OBI/PM/CVD above.
+SIGNAL_WEIGHT_FUT = 0.0      # Binance perp funding/OI/taker delta (signals/futures_meta.py)
+SIGNAL_WEIGHT_TECH = 0.0     # MACD/Bollinger/multi-TF composite (signals/technicals.py)
+SIGNAL_WEIGHT_XASSET = 0.0   # ETH/SOL cross-asset confirmation (signals/cross_asset.py)
+# Macro-release caution (signals/macro_calendar.py) is NON-directional context:
+# above this smooth 0..1 caution score, directional takers stand down (same
+# philosophy as the session filter — "build the skip, default flat").
+MACRO_CAUTION_SKIP = 0.75
 
 # --- BTC drift-from-strike ("price to beat") signal (signals/strike.py) ---
 # The dominant fundamental for these markets: where BTC sits vs the window's open

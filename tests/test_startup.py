@@ -44,14 +44,14 @@ def test_parse_non_numeric_raises():
 
 # --- default slate ----------------------------------------------------------
 
-def test_default_slate_is_seven_bots_with_arbitrage_and_makers():
+def test_default_slate_is_eight_bots_with_arbitrage_sniper_and_makers():
     bots = startup.build_default_bots()
-    assert len(bots) == 7
+    assert len(bots) == 8
     types = {b.strategy_type for b in bots}
     assert "arbitrage" in types
-    # The four directional defaults (meanrev is the plain mean_reversion bot
-    # since the sl25 rename — the stop-loss variant menu entry is gone).
-    assert {"momentum", "phantom", "mean_reversion", "hybrid"} <= types
+    # The directional defaults (meanrev is the plain mean_reversion bot
+    # since the sl25 rename) + the sniper (promoted 2026-07-18).
+    assert {"momentum", "phantom", "mean_reversion", "hybrid", "sniper"} <= types
     # Both maker bots are now first-class members of the default lineup.
     assert {"late_window_maker", "fee_zone_maker"} <= types
 

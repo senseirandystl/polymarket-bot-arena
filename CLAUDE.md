@@ -2,10 +2,10 @@
 
 ## What This Is
 
-An automated trading bot arena that runs competing bots on **Polymarket's** BTC 5-minute up/down markets. The **default slate is 7 bots** (four directional defaults + the market-neutral **arbitrage** bot + two **maker** bots — late-window and fee-zone); a terminal launch can instead select any subset of strategies (see **Startup flow** below). The maker bots are first-class members of the slate but run on the discovery-cycle (maker) cadence, not the 1s trader tick. Directional bots evolve every 4 hours — the bottom performers are replaced by mutated copies of the top ones; the arbitrage bot is **evolution-exempt** (`arena.EVOLUTION_EXEMPT_TYPES`) and the maker bots are excluded from evolution too (they are partitioned out of the trader/evolution list in `main_loop`). **Paper mode simulates against real Polymarket order books** (discovery, prices, depth-based fills, fees, resolution — everything except order submission); **live mode** submits real CLOB orders. Simmer has been fully removed (its 5-min market feed was inconsistent and its free tier capped at 50 buys/day). See [BUG_HISTORY.md](./BUG_HISTORY.md) #10.
+An automated trading bot arena that runs competing bots on **Polymarket's** BTC 5-minute up/down markets. The **default slate is 8 bots** (five directional defaults incl. the sniper + the market-neutral **arbitrage** bot + two **maker** bots — late-window and fee-zone; roster updated 2026-07-18); a terminal launch can instead select any subset of strategies (see **Startup flow** below). The maker bots are first-class members of the slate but run on the discovery-cycle (maker) cadence, not the 1s trader tick. Directional bots evolve every 4 hours — the bottom performers are replaced by mutated copies of the top ones; the arbitrage bot is **evolution-exempt** (`arena.EVOLUTION_EXEMPT_TYPES`) and the maker bots are excluded from evolution too (they are partitioned out of the trader/evolution list in `main_loop`). **Paper mode simulates against real Polymarket order books** (discovery, prices, depth-based fills, fees, resolution — everything except order submission); **live mode** submits real CLOB orders. Simmer has been fully removed (its 5-min market feed was inconsistent and its free tier capped at 50 buys/day). See [BUG_HISTORY.md](./BUG_HISTORY.md) #10.
 
 ### Startup flow (terminal launches only — `arena.py` / `bin/arena`)
-On an interactive tty, `arena/startup.py` runs before the threads boot. If the DB holds a previous run it asks **Continue** (resume the exact prior slate) or **Start fresh** (wipe DB rows via `db.wipe_all()` + truncate `logs/*.log`, then choose bots). Bot choice is **Default** (Enter → the 7-bot slate incl. both makers) or **Manual** (numbered strategy menu — now includes the two maker bots as selectable entries; accepts `1,3,5`, `1-6`, or a mix → launches exactly those). Under launchd / any non-tty parent there is no prompt — it silently resumes the existing DB config, so the service never blocks.
+On an interactive tty, `arena/startup.py` runs before the threads boot. If the DB holds a previous run it asks **Continue** (resume the exact prior slate) or **Start fresh** (wipe DB rows via `db.wipe_all()` + truncate `logs/*.log`, then choose bots). Bot choice is **Default** (Enter → the 8-bot slate incl. sniper + both makers) or **Manual** (numbered strategy menu — now includes the two maker bots as selectable entries; accepts `1,3,5`, `1-6`, or a mix → launches exactly those). Under launchd / any non-tty parent there is no prompt — it silently resumes the existing DB config, so the service never blocks.
 
 ## Current State (v4 — Feb 15, 2026)
 
@@ -56,12 +56,36 @@ edge_side = trust_eff · (P_model_side − side_price) − taker_fee        # BU
          saturation → sign(tape), live flat; feed now volume-floored at
          CVD_VOLUME_FLOOR=200sh pending offline re-validation),
          obi (× SIGNAL_WEIGHT_OBI=0 kill-switch),
+         fut/tech/xasset (2026-07-18 CANDIDATE lanes — Binance perp
+         funding/OI/taker delta, MACD/Bollinger/multi-TF composite, ETH+SOL
+         cross-asset confirmation; × SIGNAL_WEIGHT_FUT/TECH/XASSET=0
+         kill-switches, raw reads logged in trade reasoning for offline
+         validation — never weight before the harness shows positive NET edge),
          strat (analyze() thesis — PER-STRATEGY profile weight since BUG #27),
          learn (× 0 while LEARNING_ENABLED=False)
   w_lane: per-strategy — BaseBot.STRATEGY_SIGNAL_PROFILE (differentiation by
           EMPHASIS, all weights ≥0, no baked-in direction)
   trust:  BaseBot.STRATEGY_MODEL_TRUST (0.5–0.6)
 ```
+**Signal-stack expansion (2026-07-18).** New modules in `signals/`: `curves.py`
+(smooth scoring: tanh soft-saturation, logistic, Gaussian zones, smoothstep —
+used for lane values/confidence; validated hard SAFETY gates stay hard),
+`futures_meta.py` (background-thread Binance perp funding/OI/taker-delta feed,
+auto-started idempotently by `arena/signals.build_combined_signals`), `volatility_regime.py` + `technicals.py` +
+`cross_asset.py` (pure local compute off the candle stream — the price feed now
+also carries ETH and exposes momentum/acceleration/multi-TF), and
+`macro_calendar.py` (time-based 08:30/14:00-ET release caution; ≥
+`config.MACRO_CAUTION_SKIP` (0.75) directional takers stand down in
+`make_decision` — non-directional context, like the session filter). All
+DIRECTIONAL candidate lanes are kill-switched at 0 pending harness validation;
+`vol_regime` context drives **HybridBot's regime-switching meta-learner**
+(dynamic sub-strategy weights: smooth trend-regime tilt × recent-live-WR
+logistic tilt, sub-analyzers now incl. phantom). Sentiment scoring upgrades to
+a local **Ollama** LLM when reachable (`OLLAMA_URL`, keyword fallback,
+background thread only). The momentum lane and the late-window boosts
+(base + sniper) are smooth curves now (same calibration points, no cliffs).
+Default paper bankroll is **$200** (`PAPER_BANKROLL_DEFAULT`).
+
 **Hard model-lean floor (BUG #27):** conviction scaling damped weak models but
 their residual edge still scaled with MARKET displacement, so trust_eff=0.03
 trades still cleared MIN_EDGE. Now lean < `config.MODEL_LEAN_MIN` skips

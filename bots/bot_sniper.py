@@ -19,6 +19,7 @@ strategy, not a banned side. The NO zones are unvalidated by live data yet
 import config
 import learning
 from bots.base_bot import BaseBot
+from signals.curves import gaussian_zone, smooth_ramp
 
 DEFAULT_PARAMS = {
     "min_price_yes": 0.40,     # Min YES price for YES bets
@@ -65,12 +66,18 @@ class SniperBot(BaseBot):
         skip_hi = p.get("skip_zone_high", 0.64)
         max_price = p.get("max_price_yes", 0.78)
         min_price = p.get("min_price_yes", 0.40)
+        # Zone MEMBERSHIP stays a hard gate (the brackets are measured live-WR
+        # boundaries); confidence WITHIN a zone is a smooth Gaussian bump
+        # peaking mid-zone — an entry at the zone edge earns proportionally
+        # less conviction instead of the old linear cliff at the boundary.
         if min_price <= price < skip_lo:
-            # cheap zone: token priced just under 50c, historically wins
-            return True, 0.20 + (0.50 - price) * 2.0, "cheap"
+            center = (min_price + skip_lo) / 2.0
+            width = max((skip_lo - min_price) / 2.0, 0.01)
+            return True, 0.15 + 0.25 * gaussian_zone(price, center, width), "cheap"
         if skip_hi < price <= max_price:
-            # strong zone: clear market signal
-            return True, 0.15 + (price - 0.50) * 1.5, "strong"
+            center = (skip_hi + max_price) / 2.0
+            width = max((max_price - skip_hi) / 2.0, 0.01)
+            return True, 0.12 + 0.22 * gaussian_zone(price, center, width), "strong"
         return False, 0.0, "skip"
 
     def make_decision(self, market, signals):
@@ -178,18 +185,20 @@ class SniperBot(BaseBot):
         # entries were the arena's entire loss — 107 trades, 49% WR, -$79.53 —
         # boosting confidence AND size exactly there was backwards. See BUG #24.)
 
-        # --- Late-window boost ---
-        # Mirror of early-window: BTC direction increasingly certain in final 60s.
+        # --- Late-window boost (smooth) ---
+        # BTC direction increasingly certain toward close: ramp from x1.0 at
+        # 90s remaining to full boost inside 30s (no hard step at 60s).
         time_rem = market.get("time_remaining_seconds")
-        if time_rem is not None and 0 < time_rem < 60:
-            confidence = min(0.95, confidence * 1.30)
-            reasoning_parts.append(f"late-window-boost(rem={time_rem:.0f}s)")
+        late = 0.0
+        if time_rem is not None and time_rem > 0:
+            late = smooth_ramp(-float(time_rem), -90.0, -30.0)
+            if late > 0.05:
+                confidence = min(0.95, confidence * (1.0 + 0.30 * late))
+                reasoning_parts.append(f"late-window-boost(rem={time_rem:.0f}s)")
 
         # --- Position sizing ---
         max_pos = config.get_max_position()
-        size_pct = p.get("position_size_pct", 0.08)
-        if time_rem is not None and 0 < time_rem < 60:
-            size_pct *= 1.2  # Larger positions in late window (direction ~locked)
+        size_pct = p.get("position_size_pct", 0.08) * (1.0 + 0.2 * late)
         amount = max_pos * size_pct * (0.5 + confidence)
         amount = min(amount, max_pos)
 
@@ -197,11 +206,19 @@ class SniperBot(BaseBot):
         reasoning_parts.append(mom_str)
         reasoning_parts.append(f"=> {side} conf={confidence:.2f}")
 
+        # Expected executable price for the venue slippage band (BUG #28):
+        # the chosen side's warm best ask when available, else its mid.
+        if side == "yes":
+            entry = market.get("yes_ask") or market_price
+        else:
+            entry = market.get("no_ask") or no_price
+
         return {
             "action": "buy",
             "side": side,
             "confidence": confidence,
             "reasoning": "sniper: " + " ".join(reasoning_parts),
             "suggested_amount": amount,
+            "entry_price": round(float(entry), 4),
             "features": features,
         }

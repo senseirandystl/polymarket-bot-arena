@@ -14,6 +14,7 @@ import config
 import db
 import learning
 import polymarket_fills
+from signals.curves import soft_saturate, smooth_ramp
 
 logger = logging.getLogger(__name__)
 
@@ -111,17 +112,22 @@ class BaseBot(ABC):
     #   sentiment— in-market flow reader (raw pm/cvd via analyze; its lanes
     #              stay killed until validated)
     #   hybrid   — balanced ensemble of the sub-strategies
+    # (fut/tech/xasset are the 2026-07-18 candidate lanes — explicit 0.00 in
+    # every profile so re-enabling a validated lane requires a DELIBERATE
+    # per-strategy weight, never an accidental default-1.0 fallthrough.)
+    _DEAD_LANES = {"pm": 0.00, "cvd": 0.00, "obi": 0.00,
+                   "fut": 0.00, "tech": 0.00, "xasset": 0.00}
     STRATEGY_SIGNAL_PROFILE = {
-        "momentum":          {"drift": 0.25, "mom": 0.45, "pm": 0.00, "cvd": 0.00, "obi": 0.00, "strat": 0.30},
-        "phantom":           {"drift": 0.20, "mom": 0.30, "pm": 0.00, "cvd": 0.00, "obi": 0.00, "strat": 0.50},
-        "mean_reversion":    {"drift": 0.70, "mom": 0.00, "pm": 0.00, "cvd": 0.00, "obi": 0.00, "strat": 0.30},
-        "mean_reversion_sl": {"drift": 0.70, "mom": 0.00, "pm": 0.00, "cvd": 0.00, "obi": 0.00, "strat": 0.30},
-        "mean_reversion_tp": {"drift": 0.70, "mom": 0.00, "pm": 0.00, "cvd": 0.00, "obi": 0.00, "strat": 0.30},
-        "sentiment":         {"drift": 0.30, "mom": 0.00, "pm": 0.00, "cvd": 0.00, "obi": 0.00, "strat": 0.70},
-        "hybrid":            {"drift": 0.40, "mom": 0.20, "pm": 0.00, "cvd": 0.00, "obi": 0.00, "strat": 0.40},
-        "sniper":            {"drift": 0.50, "mom": 0.10, "pm": 0.00, "cvd": 0.00, "obi": 0.00, "strat": 0.15},
+        "momentum":          {"drift": 0.25, "mom": 0.45, "strat": 0.30, **_DEAD_LANES},
+        "phantom":           {"drift": 0.20, "mom": 0.30, "strat": 0.50, **_DEAD_LANES},
+        "mean_reversion":    {"drift": 0.70, "mom": 0.00, "strat": 0.30, **_DEAD_LANES},
+        "mean_reversion_sl": {"drift": 0.70, "mom": 0.00, "strat": 0.30, **_DEAD_LANES},
+        "mean_reversion_tp": {"drift": 0.70, "mom": 0.00, "strat": 0.30, **_DEAD_LANES},
+        "sentiment":         {"drift": 0.30, "mom": 0.00, "strat": 0.70, **_DEAD_LANES},
+        "hybrid":            {"drift": 0.40, "mom": 0.20, "strat": 0.40, **_DEAD_LANES},
+        "sniper":            {"drift": 0.50, "mom": 0.10, "strat": 0.15, **_DEAD_LANES},
     }
-    DEFAULT_SIGNAL_PROFILE = {"drift": 0.50, "mom": 0.10, "pm": 0.00, "cvd": 0.00, "obi": 0.00, "strat": 0.15}
+    DEFAULT_SIGNAL_PROFILE = {"drift": 0.50, "mom": 0.10, "strat": 0.15, **_DEAD_LANES}
     # How far fair value moves from the market mid toward the bot's own model.
     # fair = mid + trust * (P_model - mid): the bot only sees edge when its
     # model DISAGREES with the price — the honest replacement for the additive
@@ -267,7 +273,9 @@ class BaseBot(ABC):
         # the median — so the lane sat at +/-0.5..1.0 of pure noise and outvoted
         # the time-damped drift early in the window (26% WR on the 34 trades
         # that contradicted drift, -$55 — the whole loss of that run).
-        momentum_signal = max(-1.0, min(1.0, price_momentum * 500))
+        # tanh keeps the same slope near zero as the old hard clamp but rolls
+        # off smoothly instead of pinning every >p97 move at exactly 1.0.
+        momentum_signal = soft_saturate(price_momentum, 0.002)
 
         # --- Lane: strategy thesis from analyze() ---
         raw_signal = self.analyze(market, signals)
@@ -349,16 +357,49 @@ class BaseBot(ABC):
         # ("follow drift only when the market lags" was the top rule in the
         # offline net-edge harness). Weighted per-strategy for real
         # differentiation; strat/learn lanes carry their weight in the value.
+        # --- Candidate lanes (2026-07-18): derivatives context, technicals,
+        # cross-asset. Computed + logged every tick but globally kill-switched
+        # at 0 (config.SIGNAL_WEIGHT_FUT/TECH/XASSET) until the offline
+        # harness validates positive NET edge for each. Re-enabling a
+        # validated lane = one config edit + a profile weight.
+        fut = signals.get("futures", {}) or {}
+        fut_signal = max(-1.0, min(1.0, float(fut.get("taker_delta", 0.0) or 0.0)))
+        fut_signal *= getattr(config, "SIGNAL_WEIGHT_FUT", 0.0)
+        tech = signals.get("technicals", {}) or {}
+        tech_signal = max(-1.0, min(1.0, float(tech.get("mtf_score", 0.0) or 0.0)))
+        tech_signal *= getattr(config, "SIGNAL_WEIGHT_TECH", 0.0)
+        xasset_signal = max(-1.0, min(1.0, float(signals.get("xasset", 0.0) or 0.0)))
+        xasset_signal *= getattr(config, "SIGNAL_WEIGHT_XASSET", 0.0)
+
         lanes = {
             "drift": drift_signal_val,
             "mom": momentum_signal,
             "pm": pm_momentum_signal,
             "cvd": cvd_signal,
             "obi": obi_signal,
+            "fut": fut_signal,
+            "tech": tech_signal,
+            "xasset": xasset_signal,
             "strat": strategy_signal,
             "learn": learning_signal * 2.0 * learning_weight,
         }
         model_prob = self._model_prob_yes(lanes)
+
+        # --- Macro-release caution: stand down around high-impact prints ---
+        # Non-directional context (signals/macro_calendar.py): the smooth 0..1
+        # caution peaks in the minutes around 08:30/14:00 ET weekday release
+        # slots, where the window can gap violently against any model. Same
+        # philosophy as the session filter — build the skip, default flat.
+        macro = float(signals.get("macro_caution", 0.0) or 0.0)
+        if macro >= getattr(config, "MACRO_CAUTION_SKIP", 0.75):
+            return {
+                "action": "skip",
+                "side": "yes",
+                "confidence": 0.0,
+                "reasoning": f"Macro-release caution {macro:.2f} — high-impact window",
+                "suggested_amount": 0,
+                "features": features,
+            }
 
         # --- Hard model-lean floor: no opinion, no trade (BUG #27) ---
         # Conviction-scaled trust damps a weak model but its residual edge
@@ -527,12 +568,14 @@ class BaseBot(ABC):
                 "features": features,
             }
 
-        # --- Late-window conviction boost ---
-        # BTC direction increasingly locked in during the final 60s of a market.
-        # Boost confidence to better reflect signal certainty at market close.
+        # --- Late-window conviction boost (smooth) ---
+        # BTC direction increasingly locked in toward market close. The boost
+        # ramps smoothly from x1.0 at 90s remaining to x1.25 inside 30s — the
+        # old hard step at exactly 60s made 61s and 59s decisions discontinuous.
         time_rem = market.get("time_remaining_seconds")
-        if time_rem is not None and time_rem < 60:
-            confidence = min(0.95, confidence * 1.25)
+        if time_rem is not None:
+            late = smooth_ramp(-float(time_rem), -90.0, -30.0)
+            confidence = min(0.95, confidence * (1.0 + 0.25 * late))
 
         # --- Bet sizing: pure fractional Kelly, SHARES-FIRST ---
         # Binary-market Kelly: buying a side at price c with true probability p
@@ -564,6 +607,11 @@ class BaseBot(ABC):
             f"=> {side} edge={chosen_edge:+.3f} (eY={edge_yes:+.3f} eN={edge_no:+.3f}) "
             f"drift={drift_signal_val:+.3f} mom={momentum_signal:+.3f} pm={pm_momentum_signal:+.3f} "
             f"of(obi={obi_signal:+.3f} cvd={cvd_signal:+.3f}) "
+            # Raw candidate-lane reads (pre-kill-switch) — logged for the
+            # offline validation dataset, they carry zero decision weight.
+            f"cand(fut={float(fut.get('taker_delta', 0.0) or 0.0):+.2f} "
+            f"tech={float(tech.get('mtf_score', 0.0) or 0.0):+.2f} "
+            f"xa={float(signals.get('xasset', 0.0) or 0.0):+.2f}) "
             f"strat={strategy_signal:+.3f} "
             f"{target_shares:.2f}sh conf={confidence:.2f}"
         )

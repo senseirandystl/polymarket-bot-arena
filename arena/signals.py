@@ -14,6 +14,9 @@ from signals.sentiment import SentimentFeed
 from signals.polymarket_prices import PolymarketPriceFeed
 from signals.orderflow_signals import get_cvd_feed
 from signals.strike import get_strike_registry, drift_signal
+from signals import cross_asset, technicals, volatility_regime
+from signals.futures_meta import get_feed as get_futures_feed
+from signals.macro_calendar import macro_caution
 
 logger = logging.getLogger(__name__)
 
@@ -92,6 +95,27 @@ def build_combined_signals(
                 mkt_id, market.get("event_start_time"))
         btc_drift = drift_signal(btc_strike, btc_latest, tr)
 
+    # --- Context + candidate lanes (all local compute or cached feeds) ---
+    # Volatility regime + technicals + cross-asset ride the candle stream the
+    # feed already holds (zero network); futures meta returns its background
+    # thread's cached snapshot. Candidate DIRECTIONAL lanes (futures,
+    # technicals, cross-asset) are kill-switched at weight 0 in config until
+    # the offline harness validates positive net edge; regime/macro are
+    # non-directional context and are consumed directly (hybrid weighting,
+    # selectivity).
+    btc_prices = price_signals.get("prices", []) or []
+    regime = volatility_regime.compute(btc_prices)
+    tech = technicals.compute(btc_prices)
+    xasset = cross_asset.compute(price_feed)
+    try:
+        fut_feed = get_futures_feed()
+        fut_feed.start()  # idempotent — first call boots the refresh thread
+        futures = fut_feed.get_signals()
+    except Exception as e:  # a broken lane must never stall a trading tick
+        logger.debug(f"futures meta read failed: {e}")
+        futures = {"funding": 0.0, "oi_delta": 0.0, "taker_delta": 0.0,
+                   "stale": True}
+
     return {
         **price_signals,
         **sent_signals,
@@ -100,5 +124,10 @@ def build_combined_signals(
         "cvd": cvd,
         "btc_drift": btc_drift,
         "btc_strike": btc_strike,
+        "vol_regime": regime,
+        "technicals": tech,
+        "xasset": xasset.get("xasset_score", 0.0),
+        "futures": futures,
+        "macro_caution": macro_caution(),
         **pm_signals,
     }
