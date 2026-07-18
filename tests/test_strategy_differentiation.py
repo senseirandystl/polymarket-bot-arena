@@ -34,9 +34,18 @@ def test_momentum_fires_on_trend():
 
 
 def test_mean_rev_fires_and_opposes_momentum():
-    # Overextended up-move -> fade it -> NO (opposite of momentum's YES)
-    d = MeanRevBot(name="mr").analyze(_mkt(), _sig())
+    # Overextended up-move WITH a down-drift backing the fade -> NO
+    # (opposite of momentum's YES). BUG #28: the ungated fade went 0/11 live
+    # (-$55) — the fade now requires signed drift agreement, so the identity
+    # is "fade the move the fundamentals don't back", not "fade everything".
+    d = MeanRevBot(name="mr").analyze(_mkt(), _sig(btc_drift=-0.3))
     assert d["action"] == "buy" and d["side"] == "no"
+
+
+def test_mean_rev_holds_without_drift_backing():
+    # Same overextension, drift flat -> no thesis (the 0/11 death class).
+    d = MeanRevBot(name="mr").analyze(_mkt(), _sig())
+    assert d["action"] == "hold"
 
 
 def test_sentiment_fires_on_pm_flow():
@@ -53,7 +62,9 @@ def test_sentiment_holds_without_pm_or_flow():
 
 
 def test_momentum_and_meanrev_take_opposite_sides():
-    m, s = _mkt(), _sig()
+    # A BTC pop inside a DOWN window (drift negative): momentum follows the
+    # pop (YES), meanrev fades it back toward the fundamentals (NO).
+    m, s = _mkt(), _sig(btc_drift=-0.3)
     sides = {MomentumBot(name="m").analyze(m, s)["side"],
              MeanRevBot(name="mr").analyze(m, s)["side"]}
     assert sides == {"yes", "no"}   # genuinely distinct, not clones

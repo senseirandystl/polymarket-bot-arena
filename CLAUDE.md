@@ -80,6 +80,14 @@ decision price and the slippage guard rejected 5 of 7 attempted trades in an
 hour. The slippage guard now only catches book *movement* between decision
 and fill. (The book-sum gate still judges the MIDS — asks sum > 1 on any
 normal spread.)
+**Mid = information, ask = cost (BUG #28):** the consensus/high-price guards
+are keyed on the chosen side's **MID** (what the crowd believes) while edge,
+`entry_price` and sizing use the ask — judging guards on the ask let a wide
+0.41 ask sneak past the consensus guard when the mid said 0.26. The venue
+slippage guard is a symmetric **band**: |fill − expected| ≤
+`MAX_FILL_SLIPPAGE` in either direction (a fill far *below* expectation
+means the book moved and the decision inputs are stale — that class ran 22%
+WR live).
 **Book-consistency gate (BUG #27):** |yes + no − 1| > `config.BOOK_SUM_TOLERANCE`
 (0.04) → directional skip. The old `edge_no = (1 − fair_yes) − no_price` mixed
 the two books, so stale/gapped books (sums 0.84–0.94 live) minted phantom
@@ -263,7 +271,7 @@ Both live signal lanes are harness-validated for net edge (drift +7.6¢, mom
 |----------|-------------------------------|-------|-----------|
 | momentum | .25/.45/.30 | 0.50 | trades the BTC short-term trend (mom lane + its trend analyze()) |
 | phantom  | .20/.30/.50 | 0.50 | EMA-crossover/breakout swing — analyze()-thesis-dominant |
-| mean_reversion (meanrev-v1, +tp) | .70/0/.30 | 0.60 | drift anchor + z-score fade thesis — "buy the dip in the winning direction" (thesis and drift agree only when price overextends *against* the drift side) |
+| mean_reversion (meanrev-v1, +tp) | .70/0/.30 | 0.60 | drift anchor + z-score fade, **drift-gated** (BUG #28: the fade only fires toward the side signed drift ≥ `min_drift` 0.10 already favors — drift picks the side, the z-score times the pullback; ungated it went 0/11) + max side mid 0.58 (`STRATEGY_MAX_SIDE_PRICE`, the harness's "market lags" rule) |
 | sentiment | .30/0/.70 | 0.50 | in-market flow reader (raw pm+cvd via analyze(); its lanes stay killed until validated) — not in the default slate |
 | hybrid | .40/.20/.40 | 0.50 | balanced ensemble of the sub-strategies |
 | arbitrage | n/a — **overrides** `make_decision`/`execute` (market-neutral, two-legged) | n/a | n/a |

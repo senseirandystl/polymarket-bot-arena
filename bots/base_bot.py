@@ -142,6 +142,15 @@ class BaseBot(ABC):
     # real trade filter.)
     # Minimum cost-adjusted edge (probability units) to place a trade. Two-sided
     # selection buys the side with the larger positive edge above this floor.
+    # Per-strategy max side MID (judged alongside the global HIGH_PRICE_GUARD).
+    # meanrev embodies the harness's top rule — "follow drift only when the
+    # side is <= 58c (market lags)", +11.8c/share over 532 samples — so above
+    # 0.58 the drift is priced-in and it stands down (BUG #28).
+    STRATEGY_MAX_SIDE_PRICE = {
+        "mean_reversion": 0.58,
+        "mean_reversion_sl": 0.58,
+        "mean_reversion_tp": 0.58,
+    }
     MIN_EDGE = {
         "momentum": 0.015,
         "mean_reversion": 0.02,
@@ -485,26 +494,33 @@ class BaseBot(ABC):
                 "features": features,
             }
 
-        # --- Symmetric guards (keyed on the chosen side's price) ---
-        if side_price > config.HIGH_PRICE_GUARD:
+        # --- Symmetric guards — keyed on the chosen side's MID (BUG #28) ---
+        # The mid is the market's INFORMATION (what the crowd believes); the
+        # ask is only the COST. Judging guards on the ask let a bot buy YES
+        # at a wide 0.41 ask while the mid said 0.26 — the deep-consensus
+        # fight the guard exists to block. Edge/sizing stay on the ask.
+        side_mid = yes_price if side == "yes" else no_price
+        max_price = min(config.HIGH_PRICE_GUARD,
+                        self.STRATEGY_MAX_SIDE_PRICE.get(self.strategy_type, 1.0))
+        if side_mid > max_price:
             return {
                 "action": "skip",
                 "side": side,
                 "confidence": confidence,
                 "reasoning": (
-                    f"High-price guard: {side} price={side_price:.2f} "
-                    f">{config.HIGH_PRICE_GUARD:.2f}, bad risk/reward"
+                    f"High-price guard: {side} mid={side_mid:.2f} "
+                    f">{max_price:.2f}, priced-in / bad risk-reward"
                 ),
                 "suggested_amount": 0,
                 "features": features,
             }
-        if side_price < config.CONSENSUS_GUARD:
+        if side_mid < config.CONSENSUS_GUARD:
             return {
                 "action": "skip",
                 "side": side,
                 "confidence": confidence,
                 "reasoning": (
-                    f"Consensus guard: {side} price={side_price:.2f} "
+                    f"Consensus guard: {side} mid={side_mid:.2f} "
                     f"<{config.CONSENSUS_GUARD:.2f}, fighting consensus"
                 ),
                 "suggested_amount": 0,
@@ -643,13 +659,12 @@ class BaseBot(ABC):
         """
         from venues import get_engine
 
-        # Slippage limit: reject a fill that drifts more than MAX_FILL_SLIPPAGE
-        # above the price the decision expected. Only applied when the signal
-        # carries an expected ``entry_price`` (all buy signals now do).
+        # Slippage band: reject a fill that deviates more than
+        # MAX_FILL_SLIPPAGE from the decision's expected price in EITHER
+        # direction (BUG #28: a fill far below expectation is stale data, not
+        # a bargain). Only applied when the signal carries an expected
+        # ``entry_price`` (all buy signals now do).
         expected = signal.get("entry_price")
-        limit_price = (
-            expected + config.MAX_FILL_SLIPPAGE if expected is not None else None
-        )
 
         res = get_engine(mode).place(
             bot_name=self.name,
@@ -660,7 +675,7 @@ class BaseBot(ABC):
             confidence=signal.get("confidence"),
             reasoning=signal.get("reasoning"),
             features=signal.get("features"),
-            limit_price=limit_price,
+            expected_price=expected,
         )
         return {
             "success": res.success,

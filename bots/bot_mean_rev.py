@@ -14,6 +14,14 @@ DEFAULT_PARAMS = {
     "rsi_oversold": 40,
     "rsi_overbought": 60,
     "reversion_threshold": 0.4, # z-score threshold to fade
+    # Drift-agreement gate (BUG #28): the fade may only fire toward the side
+    # a signed btc_drift of at least this magnitude already favors. Ungated,
+    # the z-fade was a pure contrarian knife-catcher — 10 of 11 live trades
+    # fired with drift 0.00-0.08 and ALL lost (-$55.30; the documented
+    # "contrarian loses in 5-min markets" death class). Gated, the identity
+    # becomes "buy the dip in the WINNING direction": drift picks the side,
+    # the z-score times the pullback entry.
+    "min_drift": 0.10,
     "position_size_pct": 0.05,
     "min_confidence": 0.55,
 }
@@ -75,8 +83,22 @@ class MeanRevBot(BaseBot):
         import config
         amount = config.get_max_position() * self.strategy_params["position_size_pct"]
 
+        # Drift-agreement gate: the fade side must be the side BTC's actual
+        # position vs the strike already favors (see DEFAULT_PARAMS comment).
+        drift = float(signals.get("btc_drift", 0.0) or 0.0)
+        min_drift = self.strategy_params.get("min_drift", 0.10)
+        fade_no_ok = drift <= -min_drift    # fade an up-move only in a DOWN window
+        fade_yes_ok = drift >= min_drift    # fade a down-move only in an UP window
+
         # Overextended UP → fade → bet NO (expect reversion down). RSI is a
         # confidence booster (stronger when also overbought), not a hard gate.
+        if zscore > threshold and not fade_no_ok:
+            return {"action": "hold", "side": "yes", "confidence": 0,
+                    "reasoning": f"Fade NO not drift-backed: z={zscore:.2f}, drift={drift:+.3f}"}
+        if zscore < -threshold and not fade_yes_ok:
+            return {"action": "hold", "side": "yes", "confidence": 0,
+                    "reasoning": f"Fade YES not drift-backed: z={zscore:.2f}, drift={drift:+.3f}"}
+
         if zscore > threshold:
             rsi_boost = max(0.0, rsi - self.strategy_params["rsi_overbought"]) * 0.005
             confidence = min(0.95, 0.35 + abs(zscore) * 0.15 + rsi_boost)
