@@ -149,3 +149,15 @@ class TestFuturesMetaFeed:
         s = feed.get_signals()
         assert s["stale"] is True
         assert s["funding"] == 0.0
+
+
+class TestSentimentFeedDisabled:
+    def test_start_is_noop_when_disabled(self, monkeypatch):
+        import config
+        from signals.sentiment import SentimentFeed
+        monkeypatch.setattr(config, "SENTIMENT_FEED_ENABLED", False, raising=False)
+        feed = SentimentFeed()
+        feed.start()
+        assert feed._running is False
+        assert feed._thread is None
+        assert feed.get_signals("btc") == {}

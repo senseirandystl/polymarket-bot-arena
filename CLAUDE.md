@@ -80,9 +80,11 @@ also carries ETH and exposes momentum/acceleration/multi-TF), and
 DIRECTIONAL candidate lanes are kill-switched at 0 pending harness validation;
 `vol_regime` context drives **HybridBot's regime-switching meta-learner**
 (dynamic sub-strategy weights: smooth trend-regime tilt × recent-live-WR
-logistic tilt, sub-analyzers now incl. phantom). Sentiment scoring upgrades to
-a local **Ollama** LLM when reachable (`OLLAMA_URL`, keyword fallback,
-background thread only). The momentum lane and the late-window boosts
+logistic tilt, sub-analyzers now incl. phantom). The sentiment feed is **DISABLED**
+(`config.SENTIMENT_FEED_ENABLED = False` — `SentimentFeed.start()` no-ops, no
+polling thread, `get_signals()` returns `{}`); the LLM scorer scaffolding
+(Ollama-shaped, keyword fallback) stays in `signals/sentiment.py` for a future
+hosted-LLM (Claude/Grok) hookup. The momentum lane and the late-window boosts
 (base + sniper) are smooth curves now (same calibration points, no cliffs).
 Default paper bankroll is **$200** (`PAPER_BANKROLL_DEFAULT`).
 

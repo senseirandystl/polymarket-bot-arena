@@ -171,6 +171,13 @@ SIGNAL_WEIGHT_XASSET = 0.0   # ETH/SOL cross-asset confirmation (signals/cross_a
 # philosophy as the session filter — "build the skip, default flat").
 MACRO_CAUTION_SKIP = 0.75
 
+# Sentiment feed master switch (2026-07-18): OFF — no local LLM will be run
+# and the keyword/CryptoPanic pipeline isn't worth its noise on 5-min BTC
+# markets. When False, SentimentFeed.start() is a no-op: no polling thread,
+# no scoring, get_signals() returns {} (every consumer already handles the
+# empty dict). Revisit when a hosted-LLM scorer (Claude/Grok) is wired in.
+SENTIMENT_FEED_ENABLED = False
+
 # --- BTC drift-from-strike ("price to beat") signal (signals/strike.py) ---
 # The dominant fundamental for these markets: where BTC sits vs the window's open
 # price. Regime-agnostic (favors whichever side BTC is actually on) and time-

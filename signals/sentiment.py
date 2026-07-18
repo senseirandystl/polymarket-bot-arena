@@ -123,6 +123,10 @@ class SentimentFeed:
         self._llm = OllamaScorer()
 
     def start(self):
+        import config
+        if not getattr(config, "SENTIMENT_FEED_ENABLED", True):
+            logger.info("Sentiment feed disabled (config.SENTIMENT_FEED_ENABLED)")
+            return
         if self._running:
             return
         self._running = True
