@@ -24,25 +24,31 @@ def test_compute_fair_yes_clamped():
 
 
 def test_side_net_edges_complementary_is_mirror():
+    # Per-side anchoring (BUG #27): edge_side = trust_eff * (P_side - price)
+    # - fee. On complementary books the pre-fee model terms mirror exactly.
     bot = _bot()
+    model_prob, trust_eff = 0.62, 0.5
     yes_price, no_price = 0.55, 0.45
-    fair_yes = 0.62
-    edge_yes, edge_no = bot._side_net_edges(fair_yes, yes_price, no_price)
+    edge_yes, edge_no = bot._side_net_edges(model_prob, trust_eff,
+                                            yes_price, no_price)
     fee_y = polymarket_fills.taker_fee(1.0, yes_price)
     fee_n = polymarket_fills.taker_fee(1.0, no_price)
-    assert abs(edge_yes - (fair_yes - yes_price - fee_y)) < 1e-9
-    assert abs(edge_no - ((1 - fair_yes) - no_price - fee_n)) < 1e-9
-    # pre-fee mirror
-    assert abs((fair_yes - yes_price) + ((1 - fair_yes) - no_price)) < 1e-9
+    assert abs((edge_yes + fee_y) + (edge_no + fee_n)) < 1e-9
 
 
-def test_side_net_edges_no_book_divergence_favors_no():
+def test_side_net_edges_book_divergence_is_not_edge():
+    # The old cross-anchored form turned a cheap NO book (yes+no < 1) into
+    # phantom NO edge with zero model input: edge_no ~= (1 - yes_mid) -
+    # no_price, independent of trust. Per-side anchoring: the edge is ONLY
+    # the trust-scaled model-vs-own-price term, so an ignorant model
+    # (conviction-scaled trust_eff ~ 0, as make_decision passes it) sees
+    # nothing regardless of the gap.
     bot = _bot()
-    fair_yes = 0.55
-    yes_price = 0.55
-    no_price = 0.38
-    edge_yes, edge_no = bot._side_net_edges(fair_yes, yes_price, no_price)
-    assert edge_no > edge_yes
+    fee_n = polymarket_fills.taker_fee(1.0, 0.38)
+    edge_yes, edge_no = bot._side_net_edges(0.50, 0.5, 0.55, 0.38)
+    assert abs(edge_no - (0.5 * ((1 - 0.50) - 0.38) - fee_n)) < 1e-9
+    edge_yes_ign, edge_no_ign = bot._side_net_edges(0.50, 0.01, 0.55, 0.38)
+    assert edge_no_ign < 0.001 and edge_yes_ign < 0.001
 
 
 # --- Task 2: make_decision side selection, guards, sizing ---
@@ -67,24 +73,26 @@ def _signals(**over):
     return base
 
 
+def _bearish_signals(drift=-0.5):
+    # Falling BTC tape agreeing with the down-drift: the momentum bot needs
+    # actual momentum under the fidelity profiles (cvd/pm are killed lanes).
+    return _signals(btc_drift=drift,
+                    prices=[100.30, 100.20, 100.12, 100.05, 100.0],
+                    latest=100.0)
+
+
 def test_no_ban_is_gone_strong_no_lean_buys_no():
     # Market leans NO (yes 0.45 / no 0.55, sum 1.0) with a genuinely strong
-    # bearish model: decisive down-drift + bearish flow. (pm/obi are killed
-    # lanes; conviction-scaled trust means flow alone is a WEAK model — a
-    # strong lean now requires the drift fundamental to agree.)
+    # bearish model: decisive down-drift + falling BTC tape.
     bot = _bot()
-    m = _market(yes=0.45, no=0.55)
-    s = _signals(btc_drift=-0.5, cvd=-1.0)
-    d = bot.make_decision(m, s)
+    d = bot.make_decision(_market(yes=0.45, no=0.55), _bearish_signals())
     assert d["action"] == "buy"
     assert d["side"] == "no"
 
 
 def test_no_trade_sizes_against_no_price():
     bot = _bot()
-    m = _market(yes=0.45, no=0.55)
-    s = _signals(btc_drift=-0.5, cvd=-1.0)
-    d = bot.make_decision(m, s)
+    d = bot.make_decision(_market(yes=0.45, no=0.55), _bearish_signals())
     assert d["side"] == "no"
     assert abs(d["entry_price"] - 0.55) < 1e-6
 
@@ -98,12 +106,11 @@ def test_high_price_guard_fires_on_no_price():
 
 
 def test_consensus_guard_fires_on_low_side_price():
-    # Synthetic underpriced NO book (no=0.30 < CONSENSUS_GUARD) chosen via strong
-    # NO edge → consensus guard skips it (backstop against fighting consensus).
+    # NO priced below CONSENSUS_GUARD (0.30, books consistent: 0.68+0.30) with
+    # a strong bearish model → the consensus guard skips the cheap side
+    # (backstop against fighting strong consensus).
     bot = _bot()
-    m = _market(yes=0.55, no=0.30)
-    s = _signals(pm_momentum=-0.15, obi=-1.0, cvd=-1.0)
-    d = bot.make_decision(m, s)
+    d = bot.make_decision(_market(yes=0.68, no=0.30), _bearish_signals())
     assert d["action"] == "skip"
     assert "onsensus" in d["reasoning"]
 
@@ -124,7 +131,8 @@ def test_yes_bought_when_market_lags_bullish_model():
     # priced-in and correctly skipped under the model-blend fair value.)
     bot = _bot()
     m = _market(yes=0.53, no=0.47)
-    s = _signals(pm_momentum=0.15, cvd=1.0, btc_drift=0.4)
+    s = _signals(btc_drift=0.4,
+                 prices=[100.0, 100.05, 100.12, 100.20, 100.30], latest=100.30)
     d = bot.make_decision(m, s)
     assert d["action"] == "buy"
     assert d["side"] == "yes"

@@ -41,13 +41,14 @@ def test_obi_disabled():
     assert config.SIGNAL_WEIGHT_OBI == 0.0
 
 
-def test_cvd_weighted_in_every_profile():
-    # CVD (executed aggression) is the one validated flow edge — every
-    # strategy's model weights it > 0; sentiment weights it heaviest.
-    profs = BaseBot.STRATEGY_SIGNAL_PROFILE
-    for strat, prof in profs.items():
-        assert prof["cvd"] > 0.0, strat
-    assert profs["sentiment"]["cvd"] == max(p["cvd"] for p in profs.values())
+def test_cvd_lane_killed():
+    # CVD kill-switch (BUG #27): the live net/total form saturated on thin
+    # tapes and measured statistically flat (53.1% WR). Lane weight 0 in
+    # every profile + global switch 0 until the volume-floored form shows
+    # positive NET edge offline.
+    assert config.SIGNAL_WEIGHT_CVD == 0.0
+    for strat, prof in BaseBot.STRATEGY_SIGNAL_PROFILE.items():
+        assert prof["cvd"] == 0.0, strat
 
 
 def test_learning_disabled_live():
@@ -82,7 +83,10 @@ def test_priced_in_signal_earns_nothing():
 
 def test_market_lagging_model_is_the_trade():
     # Same drift, market still near 50c -> the model-vs-price gap IS the edge.
-    d = _bot().make_decision(_market(yes=0.52, tr=150), _sig(btc_drift=0.5))
+    # Under the fidelity profiles this pure-fundamental trade belongs to the
+    # drift-anchored meanrev bot (the momentum bot needs actual momentum).
+    d = MeanRevSLBot().make_decision(_market(yes=0.52, tr=150),
+                                     _sig(btc_drift=0.5))
     assert d["action"] == "buy"
     assert d["side"] == "yes"
 

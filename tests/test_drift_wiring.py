@@ -56,7 +56,12 @@ def test_drift_moves_decision_symmetrically():
 
 
 def test_obi_mechanism_works_when_weighted(monkeypatch):
-    monkeypatch.setattr(config, "SIGNAL_WEIGHT_OBI", 0.10)
+    # Re-enabling OBI is a kill-switch + profile-weight change; the plumbing
+    # must still react to the lane. (The fidelity profiles carry obi at 0, so
+    # weight one in for the test.)
+    from bots.base_bot import BaseBot
+    monkeypatch.setattr(config, "SIGNAL_WEIGHT_OBI", 1.0)
+    monkeypatch.setitem(BaseBot.STRATEGY_SIGNAL_PROFILE["momentum"], "obi", 0.45)
     bot = _bot()
     m = _market(yes=0.52, no=0.48)
     d_pos = bot.make_decision(m, _sig(obi=1.0))

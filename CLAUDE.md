@@ -44,19 +44,33 @@ Paper mode needs **no keys** — all market data (discovery, books, resolutions)
 ### Signal Hierarchy (make_decision in base_bot.py) — MODEL-BLEND fair value (BUG #24)
 ```
 P_model   = 0.5 + 0.5 · Σ w_lane · lane          # lanes normalized to [-1,1], YES-frame
+|P_model − 0.5| < MODEL_LEAN_MIN (0.10) → SKIP   # hard lean floor, BUG #27
 trust_eff = trust · min(1, |P_model − 0.5| / MODEL_CONVICTION_SCALE)   # BUG #26
-fair_yes  = yes_mid + trust_eff · (P_model − yes_mid) # edge ONLY where model disagrees with price
-  lanes: drift (anchor), mom (BTC 1-candle),
-         pm (in-market momentum × SIGNAL_WEIGHT_PM=0 kill-switch — BUG #26:
-         net edge NEGATIVE after the price, and the live lane saturated at a
-         0.19¢ move → sign(last tick)),
-         cvd (executed flow), obi (× SIGNAL_WEIGHT_OBI=0 kill-switch),
-         strat (analyze() thesis × STRATEGY_SIGNAL_WEIGHT=0.15),
+edge_side = trust_eff · (P_model_side − side_price) − taker_fee        # BUG #27:
+            # each side anchored on its OWN book price — a cross-book gap is
+            # never directional edge (it's the arb bot's two-legged trade)
+  lanes: drift (anchor, harness +7.6¢/share net), mom (BTC 1-candle,
+         harness +10.2¢/share net),
+         pm (× SIGNAL_WEIGHT_PM=0 kill-switch — BUG #26: net edge NEGATIVE),
+         cvd (× SIGNAL_WEIGHT_CVD=0 kill-switch — BUG #27: thin-tape
+         saturation → sign(tape), live flat; feed now volume-floored at
+         CVD_VOLUME_FLOOR=200sh pending offline re-validation),
+         obi (× SIGNAL_WEIGHT_OBI=0 kill-switch),
+         strat (analyze() thesis — PER-STRATEGY profile weight since BUG #27),
          learn (× 0 while LEARNING_ENABLED=False)
   w_lane: per-strategy — BaseBot.STRATEGY_SIGNAL_PROFILE (differentiation by
           EMPHASIS, all weights ≥0, no baked-in direction)
   trust:  BaseBot.STRATEGY_MODEL_TRUST (0.5–0.6)
 ```
+**Hard model-lean floor (BUG #27):** conviction scaling damped weak models but
+their residual edge still scaled with MARKET displacement, so trust_eff=0.03
+trades still cleared MIN_EDGE. Now lean < `config.MODEL_LEAN_MIN` (0.10) skips
+outright — no opinion, no trade. Harness ignorance-fade probe (underdog when
+|drift|<0.15): 31.6% WR, −4.44¢/share over 247 samples.
+**Book-consistency gate (BUG #27):** |yes + no − 1| > `config.BOOK_SUM_TOLERANCE`
+(0.04) → directional skip. The old `edge_no = (1 − fair_yes) − no_price` mixed
+the two books, so stale/gapped books (sums 0.84–0.94 live) minted phantom
+edges that Kelly max-sized (−$29.15 in two trades).
 **Model-lean eligibility:** a bot may only buy a side its model *actively leans
 toward* (`P_model > 0.5` for YES, `< 0.5` for NO) — model ignorance (P=0.5) is
 not disagreement with the market, so it never fades the favorite on nothing.
@@ -147,6 +161,16 @@ side per market (argmax) — arbitrage is the only two-legged bot. Sizing,
 old blanket **NO ban is gone** (see BUG_HISTORY #20).
 
 ### Safeguards
+- **Model-lean floor + book-consistency gate (BUG #27):** see Signal
+  Hierarchy above — lean < `MODEL_LEAN_MIN` (0.10) or books summing outside
+  1±`BOOK_SUM_TOLERANCE` (0.04) skip before any edge is computed.
+- **Shared-pool concentration cap (BUG #27):** total OPEN cost per (market,
+  side) across ALL bots is capped at `config.MARKET_SIDE_EXPOSURE_CAP` (0.10)
+  × the gross paper pool (`db.get_open_exposure` / `db.get_paper_pool_gross`;
+  live: 2×`LIVE_MAX_POSITION`). Directional bots clamp to the remaining
+  headroom or skip (`reason='exposure_cap'`) — per-bot Kelly can't see the
+  correlated positions tandem bots just opened (hour-22 pile-ins were ~4×
+  leverage on one BTC candle). Arbitrage (hedged, own `execute()`) is exempt.
 - **Symmetric side guards:** A bot never buys a *chosen* side priced above
   `config.HIGH_PRICE_GUARD` (0.72 — bad risk/reward) or below
   `config.CONSENSUS_GUARD` (0.35 — fighting strong consensus). Both key off the
@@ -216,16 +240,25 @@ are ≥0 and all lanes regime-agnostic. Under the old shared additive stack the
 four directional bots placed the *identical* trade in the same second (4× the
 same mistake); now different inputs trade different bots:
 
-| Strategy | Model profile (drift/mom/pm/cvd/obi) | Trust | Character |
-|----------|--------------------------------------|-------|-----------|
-| momentum | .45/.25/.15/.15/.10 | 0.50 | trend follower — drift anchor + heavy momentum/flow |
-| phantom  | .40/.30/.20/.10/.10 | 0.50 | faster trend follower |
-| mean_reversion (+sl/tp) | .65/0/0/.05/0 | 0.60 | fundamentals-only — near-pure drift; by ignoring momentum it naturally fades price moves BTC doesn't back |
-| sentiment | .35/0/.10/.35/.15 | 0.50 | order-flow reader — CVD heavy |
-| hybrid | .50/.10/.10/.15/.05 | 0.50 | balanced blend |
+Fidelity redesign (BUG #27): with pm/obi/cvd killed pending validation, the
+LIVE lanes are drift, mom and strat — and the strat lane now carries a
+**per-strategy profile weight** (the flat global 0.15 differentiated nobody).
+Both live signal lanes are harness-validated for net edge (drift +7.6¢, mom
++10.2¢/share):
+
+| Strategy | Live profile (drift/mom/strat) | Trust | Character |
+|----------|-------------------------------|-------|-----------|
+| momentum | .25/.45/.30 | 0.50 | trades the BTC short-term trend (mom lane + its trend analyze()) |
+| phantom  | .20/.30/.50 | 0.50 | EMA-crossover/breakout swing — analyze()-thesis-dominant |
+| mean_reversion (meanrev-v1, +tp) | .70/0/.30 | 0.60 | drift anchor + z-score fade thesis — "buy the dip in the winning direction" (thesis and drift agree only when price overextends *against* the drift side) |
+| sentiment | .30/0/.70 | 0.50 | in-market flow reader (raw pm+cvd via analyze(); its lanes stay killed until validated) — not in the default slate |
+| hybrid | .40/.20/.40 | 0.50 | balanced ensemble of the sub-strategies |
 | arbitrage | n/a — **overrides** `make_decision`/`execute` (market-neutral, two-legged) | n/a | n/a |
 
-(OBI lane weights are inert while the `config.SIGNAL_WEIGHT_OBI` kill-switch is 0.)
+(pm/cvd/obi profile weights are all 0 while their kill-switches are 0. The
+old `meanrev-sl25-v1` is renamed **`meanrev-v1`** / `mean_reversion` — the
+stop-loss was removed long ago (spec R3) and the separate menu entry was a
+byte-identical duplicate; `db.init_db` migrates old rows idempotently.)
 
 **Every bot trades both sides now (BUG_HISTORY #20).** The four directional bots (+SL/TP variants) pick YES or NO via the two-sided net-edge comparison above. The **sniper** overrides `make_decision` but applies its cheap/strong price zones symmetrically to the NO token. Both **makers** quote whichever side's price is in their band. A directional/sniper/maker bot takes **at most one side per market**; only arbitrage is two-legged.
 

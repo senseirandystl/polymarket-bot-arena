@@ -47,8 +47,7 @@ logger = logging.getLogger("arena.startup")
 # roster always matches what was launched.
 STRATEGY_MENU = [
     (MomentumBot,        "momentum-v1",     "Momentum — rides short-term price trend"),
-    (MeanRevBot,         "mean_reversion-v1", "Mean reversion — near-neutral fade"),
-    (MeanRevSLBot,       "meanrev-sl25-v1", "Mean reversion + stop-loss exit"),
+    (MeanRevBot,         "meanrev-v1",      "Mean reversion — drift anchor + buy-the-dip fade"),
     (MeanRevTPBot,       "meanrev-tp-v1",   "Mean reversion + take-profit exit"),
     (SniperBot,          "sniper-v1",       "Sniper — price-zone strike, drift-confirmed"),
     (PhantomBot,         "phantom-v1",      "Phantom — EMA trend + breakout follower"),
@@ -58,10 +57,15 @@ STRATEGY_MENU = [
     (LateWindowMakerBot, "late-window-maker-v1", "Late-window maker — final-150s drift-conviction entry"),
     (FeeZoneMakerBot,    "fee-zone-maker-v1", "Fee-zone maker — 56-86¢ zone, drift-backed quoting"),
 ]
+# (The old separate meanrev-sl25 menu entry is gone: with the stop-loss
+# removed it was byte-identical to the base meanrev bot. MeanRevSLBot stays
+# importable for pre-migration DB rows; db.init_db renames those to
+# meanrev-v1 / mean_reversion.)
+_ = MeanRevSLBot  # retained for legacy strategy_type resolution
 
 # The 7 default bots (1-based indices into STRATEGY_MENU): the four directional
 # defaults, the arbitrage bot, and the two maker bots.
-DEFAULT_INDICES = [1, 6, 3, 8, 9, 10, 11]
+DEFAULT_INDICES = [1, 5, 2, 7, 8, 9, 10]
 
 
 def build_default_bots() -> list:

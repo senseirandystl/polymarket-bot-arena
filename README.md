@@ -8,15 +8,15 @@ An automated trading bot arena that runs competing strategies on Polymarket's BT
 
 | Bot | Strategy | Description |
 |-----|----------|-------------|
-| `momentum-v1` | Trend following | Drift anchor + heavy BTC/PM momentum and flow lanes |
-| `phantom-v1` | Trend following (fast) | EMA 9/26 trend filter + 10-candle breakout |
-| `meanrev-sl25-v1` | Mean reversion | Fundamentals-only model (near-pure drift); fades price moves BTC doesn't back |
+| `momentum-v1` | Trend following | Trades the BTC short-term trend (momentum-dominant model) |
+| `phantom-v1` | Swing / breakout | EMA 9/26 trend filter + 10-candle breakout (thesis-dominant model) |
+| `meanrev-v1` | Mean reversion | Drift anchor + z-score fade — buys dips in the winning direction |
 | `hybrid-v1` | Ensemble | Weighted vote over momentum / mean-rev / sentiment sub-analyzers |
 | `arbitrage-v1` | Market-neutral | Buys YES+NO share-matched when the depth-walked pair cost < $1 − fees |
 | `late-window-maker-v1` | Late-window | Final-150s entries, side picked by drift conviction |
 | `fee-zone-maker-v1` | Fee-zone | Quotes the 56–86¢ zone, only when drift backs the side |
 
-Additional selectable strategies: plain mean-reversion, a 2× take-profit variant, a price-zone **sniper**, and a sentiment (in-market flow) bot.
+Additional selectable strategies: a 2× take-profit mean-reversion variant, a price-zone **sniper**, and a sentiment (in-market flow) bot.
 
 **Signals.** Each bot computes a model probability from normalized lanes — **BTC drift from the window's "price to beat"** (the validated fundamental: Binance open at `eventStartTime`), BTC/Polymarket momentum, CVD executed-flow, and its own strategy thesis — weighted per-strategy. Fair value is a market-vs-model blend: `fair = mid + trust · (P_model − mid)`, so **edge exists only where the model disagrees with the price**. Bots never trade against a non-trivial drift reading, and never fade the market on an ignorant model. Candidate signals must pass the offline validation harness (`tools/validate_signals.py` — real resolved markets, net-edge after price+fee) before earning a live weight.
 

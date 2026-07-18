@@ -142,6 +142,21 @@ SIGNAL_WEIGHT_OBI = 0.0
 # 0.0 unless a reworked pm signal shows positive net edge offline.
 SIGNAL_WEIGHT_PM = 0.0
 
+# CVD kill-switch (BUG #27, 2026-07-17). The live lane (net/total over a ~20s
+# tape, no volume floor) saturates at +/-0.8-1.0 whenever the thin tape is
+# one-sided — sign(recent tape), the same magnitude disease as pm_mom. Live
+# ground truth: cvd-driven trades (|cvd| >= 0.8, |drift| < 0.10) ran 53.1% WR
+# (+$10.47 over 32 trades) — statistically flat, no net edge. The feed now
+# carries a volume floor (CVD_VOLUME_FLOOR below) so thin tapes read weak;
+# keep the lane at 0 until the calibrated form measures POSITIVE NET edge in
+# the offline harness (house rule: validate-before-weighting).
+SIGNAL_WEIGHT_CVD = 0.0
+# Tape volume (shares) below which CVD magnitude is damped: cvd =
+# net / max(total, floor). A 30-share one-sided tape reads 0.15, not 1.0;
+# a 1500-share one-sided tape still reads ~1.0. Calibrate offline before
+# re-weighting the lane.
+CVD_VOLUME_FLOOR = 200.0
+
 # --- BTC drift-from-strike ("price to beat") signal (signals/strike.py) ---
 # The dominant fundamental for these markets: where BTC sits vs the window's open
 # price. Regime-agnostic (favors whichever side BTC is actually on) and time-
@@ -167,7 +182,11 @@ DRIFT_VOL_SCALE = 0.0015          # typical BTC move (fraction) over a full wind
 # prices). The net-edge harness (tools/validate_signals.py, PM price history)
 # confirms: "buy the favorite" EV is negative above ~0.67 and marginal
 # elsewhere, while "follow drift only when the market lags" is the top rule.
-# Weight of each strategy's analyze() lean inside P_model (all strategies).
+# Weight of a strategy's analyze() lean inside P_model is now PER-STRATEGY
+# (the "strat" key in bots/base_bot.py STRATEGY_SIGNAL_PROFILE — BUG #27
+# fidelity redesign; the old flat global 0.15 was too small to differentiate
+# anyone). This constant remains only as the DEFAULT_SIGNAL_PROFILE fallback
+# reference; nothing multiplies it into the lane anymore.
 STRATEGY_SIGNAL_WEIGHT = 0.15
 # Sanity clamp on P_model.
 MODEL_PROB_MIN = 0.02
@@ -192,6 +211,20 @@ FLOW_ONLY_EDGE_MULT = 2.0
 # lean >= 0.10) at full trust. 0.10 = the lean where trust saturates; a
 # drift-0.5 reading (lean 0.1125 on the momentum profile) keeps full trust.
 MODEL_CONVICTION_SCALE = 0.10
+# Hard model-lean floor (BUG #27, 2026-07-17 evening run). Conviction-scaled
+# trust DAMPED weak models but still let them trade into large market
+# displacement (a trust_eff=0.03 trade is in the log). Live ground truth over
+# 87 model-blend trades: lean < 0.10 -> 28.6% WR / -$78.74; lean >= 0.10 ->
+# 73% WR / +$96.12. Below the floor the bot has no tradable opinion: skip.
+MODEL_LEAN_MIN = 0.10
+# Book-consistency gate (BUG #27): when the YES and NO book prices disagree
+# with each other (|yes + no - 1| beyond this), the data is suspect (stale or
+# gapped book) — a directional bot stands down. A REAL cross-book gap is the
+# arbitrage bot's two-legged trade; harvesting it one-legged is a coin flip
+# minus fees, and Kelly max-sized exactly those trades (19:31/19:34, sums
+# 0.84-0.85, 31-34 shares, -$29.15 in two trades). Normal sums cluster
+# 0.98-1.02 live.
+BOOK_SUM_TOLERANCE = 0.04
 
 # --- Fractional-Kelly bet sizing (base_bot.make_decision) ---
 # For a binary market, buying a side at price c with true probability p, the
@@ -222,6 +255,16 @@ EDGE_TO_CONFIDENCE = 4.5
 # below CONSENSUS_GUARD (fighting strong market consensus). Symmetric per side.
 HIGH_PRICE_GUARD = 0.72
 CONSENSUS_GUARD = 0.35
+# Shared-pool concentration cap (BUG #27): max fraction of the GROSS paper
+# pool (bankroll + realized P&L, before open-cost deductions) that may be
+# committed to one (market, side) across ALL bots. The directional bots read
+# identical warm lanes and pile the same side within seconds (20 of 34
+# groups had 3+ bots in the 2026-07-17 run) — per-bot Kelly doesn't know the
+# pool already holds correlated positions, so hour-22's 4-bot clusters were
+# ~4x leverage on single BTC candles. Later bots clamp to the remaining
+# headroom or skip. Arbitrage (hedged, own execute()) is exempt. In live
+# mode the cap base is LIVE_MAX_POSITION * 2 per market-side.
+MARKET_SIDE_EXPOSURE_CAP = 0.10
 
 # --- Session-timing skip filter (arena/session_filter.py) ---
 # 'Build the skip': sit flat during high-flip session handovers. Defaults are

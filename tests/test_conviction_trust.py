@@ -82,9 +82,11 @@ def test_weak_model_fade_blocked_symmetrically():
 
 def test_decisive_model_still_trades_market_lag():
     # The validated top rule (drift decisive, market lagging near 50c) must
-    # SURVIVE conviction scaling: drift 0.5 -> lean 0.1125 >= scale -> full
-    # trust, edge intact.
-    d = _bot().make_decision(_market(yes=0.52, tr=150), _sig(btc_drift=0.5))
+    # SURVIVE conviction scaling AND the model-lean floor. The fidelity
+    # profiles route this pure-fundamental trade through the drift-anchored
+    # meanrev bot (drift 0.5 * 0.70 -> lean 0.175 >= floor, full trust).
+    d = MeanRevSLBot().make_decision(_market(yes=0.52, tr=150),
+                                     _sig(btc_drift=0.5))
     assert d["action"] == "buy"
     assert d["side"] == "yes"
 

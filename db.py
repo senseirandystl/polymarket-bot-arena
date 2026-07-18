@@ -193,6 +193,17 @@ def init_db():
             except sqlite3.OperationalError:
                 pass  # Column already exists
 
+        # Data migration (idempotent): the meanrev slate bot dropped its
+        # stop-loss long ago (spec R3) and is now plain mean_reversion —
+        # rename the historical rows so slate continuity ("Continue" at
+        # startup) and per-bot stats carry over under the new name.
+        conn.execute(
+            "UPDATE bot_configs SET bot_name='meanrev-v1', "
+            "strategy_type='mean_reversion' WHERE bot_name='meanrev-sl25-v1'")
+        conn.execute(
+            "UPDATE trades SET bot_name='meanrev-v1' "
+            "WHERE bot_name='meanrev-sl25-v1'")
+
 
 @contextmanager
 def get_conn():
@@ -608,6 +619,27 @@ def _paper_pnl_and_reserved():
             "WHERE mode='paper' AND outcome IS NULL"
         ).fetchone()[0]
     return (realized or 0.0), (open_cost or 0.0)
+
+
+def get_open_exposure(market_id, side, mode="paper"):
+    """Total OPEN (unresolved) cost committed to one (market, side) across all
+    bots — the shared-pool concentration the per-bot Kelly sizing can't see
+    (BUG #27). Same open-cost definition as ``_paper_pnl_and_reserved``."""
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT COALESCE(SUM(amount + COALESCE(fee, 0)), 0) FROM trades "
+            "WHERE market_id=? AND side=? AND mode=? AND outcome IS NULL",
+            (market_id, side, mode)
+        ).fetchone()
+    return row[0] or 0.0
+
+
+def get_paper_pool_gross():
+    """Gross paper pool (bankroll + realized P&L, BEFORE open-cost
+    deductions) — the stable base for concentration caps; ``available``
+    shrinks as trades open, which would make the cap self-tightening."""
+    realized, _ = _paper_pnl_and_reserved()
+    return get_paper_bankroll() + realized
 
 
 def get_paper_available():

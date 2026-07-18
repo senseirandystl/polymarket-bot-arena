@@ -30,9 +30,13 @@ def _sig(**over):
 
 
 def _decide(bankroll, yes, drift, fraction=0.25):
+    # Trending BTC tape agreeing with the (positive) drift: under the
+    # fidelity profiles the momentum bot needs actual momentum to trade.
+    sig = _sig(btc_drift=drift,
+               prices=[100.0, 100.05, 100.12, 100.20, 100.30], latest=100.30)
     with mock.patch.object(base_bot, "_sizing_bankroll", lambda mode: bankroll), \
          mock.patch.object(base_bot, "_kelly_fraction", lambda: fraction):
-        return _bot().make_decision(_market(yes), _sig(btc_drift=drift))
+        return _bot().make_decision(_market(yes), sig)
 
 
 def test_size_scales_with_bankroll():

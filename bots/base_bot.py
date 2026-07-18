@@ -96,17 +96,32 @@ class BaseBot(ABC):
     #                         BTC's actual position doesn't back
     #   sentiment           — order-flow reader: CVD (executed aggression) heavy
     #   hybrid              — balanced blend of everything
+    # Fidelity redesign (BUG #27): with the pm/obi/cvd lanes killed pending
+    # offline validation, the LIVE inputs are drift, mom (BTC candle trend)
+    # and strat (this strategy's own analyze() thesis — now carrying a
+    # PER-STRATEGY weight here instead of the old flat global 0.15, which was
+    # too small to differentiate anyone). Live weights sum to ~1.0 per
+    # strategy; dead lanes stay listed at their revival weights' position (0)
+    # so re-enabling a validated signal is a one-line profile edit.
+    #   momentum — trades the BTC short-term trend (mom lane + trend analyze)
+    #   phantom  — EMA-crossover/breakout swing: analyze()-dominant
+    #   meanrev  — fundamentals + fade: drift anchor + z-score reversion
+    #              thesis => "buy the dip in the winning direction" (the two
+    #              agree only when price overextends AGAINST the drift side)
+    #   sentiment— in-market flow reader (raw pm/cvd via analyze; its lanes
+    #              stay killed until validated)
+    #   hybrid   — balanced ensemble of the sub-strategies
     STRATEGY_SIGNAL_PROFILE = {
-        "momentum":          {"drift": 0.45, "mom": 0.25, "pm": 0.15, "cvd": 0.15, "obi": 0.10},
-        "phantom":           {"drift": 0.40, "mom": 0.30, "pm": 0.20, "cvd": 0.10, "obi": 0.10},
-        "mean_reversion":    {"drift": 0.65, "mom": 0.00, "pm": 0.00, "cvd": 0.05, "obi": 0.00},
-        "mean_reversion_sl": {"drift": 0.65, "mom": 0.00, "pm": 0.00, "cvd": 0.05, "obi": 0.00},
-        "mean_reversion_tp": {"drift": 0.65, "mom": 0.00, "pm": 0.00, "cvd": 0.05, "obi": 0.00},
-        "sentiment":         {"drift": 0.35, "mom": 0.00, "pm": 0.10, "cvd": 0.35, "obi": 0.15},
-        "hybrid":            {"drift": 0.50, "mom": 0.10, "pm": 0.10, "cvd": 0.15, "obi": 0.05},
-        "sniper":            {"drift": 0.50, "mom": 0.10, "pm": 0.10, "cvd": 0.15, "obi": 0.05},
+        "momentum":          {"drift": 0.25, "mom": 0.45, "pm": 0.00, "cvd": 0.00, "obi": 0.00, "strat": 0.30},
+        "phantom":           {"drift": 0.20, "mom": 0.30, "pm": 0.00, "cvd": 0.00, "obi": 0.00, "strat": 0.50},
+        "mean_reversion":    {"drift": 0.70, "mom": 0.00, "pm": 0.00, "cvd": 0.00, "obi": 0.00, "strat": 0.30},
+        "mean_reversion_sl": {"drift": 0.70, "mom": 0.00, "pm": 0.00, "cvd": 0.00, "obi": 0.00, "strat": 0.30},
+        "mean_reversion_tp": {"drift": 0.70, "mom": 0.00, "pm": 0.00, "cvd": 0.00, "obi": 0.00, "strat": 0.30},
+        "sentiment":         {"drift": 0.30, "mom": 0.00, "pm": 0.00, "cvd": 0.00, "obi": 0.00, "strat": 0.70},
+        "hybrid":            {"drift": 0.40, "mom": 0.20, "pm": 0.00, "cvd": 0.00, "obi": 0.00, "strat": 0.40},
+        "sniper":            {"drift": 0.50, "mom": 0.10, "pm": 0.00, "cvd": 0.00, "obi": 0.00, "strat": 0.15},
     }
-    DEFAULT_SIGNAL_PROFILE = {"drift": 0.50, "mom": 0.10, "pm": 0.10, "cvd": 0.15, "obi": 0.05}
+    DEFAULT_SIGNAL_PROFILE = {"drift": 0.50, "mom": 0.10, "pm": 0.00, "cvd": 0.00, "obi": 0.00, "strat": 0.15}
     # How far fair value moves from the market mid toward the bot's own model.
     # fair = mid + trust * (P_model - mid): the bot only sees edge when its
     # model DISAGREES with the price — the honest replacement for the additive
@@ -193,14 +208,22 @@ class BaseBot(ABC):
         fair = yes_mid + trust * (model_prob - yes_mid)
         return max(0.02, min(0.98, fair))
 
-    def _side_net_edges(self, fair_yes: float, yes_price: float,
-                        no_price: float) -> tuple:
-        """Cost-adjusted edge on each side: prob - price - per-share fee.
+    def _side_net_edges(self, model_prob: float, trust_eff: float,
+                        yes_price: float, no_price: float) -> tuple:
+        """Cost-adjusted edge per side, each anchored on its OWN book price.
 
-        Fee is the canonical taker fee for one share at that side's price.
+        edge_side = trust_eff * (P_model_side - side_price) - taker_fee. The
+        old form anchored fair on the YES mid but paid the NO book, so any
+        cross-book gap (stale/inconsistent books, yes+no != 1) landed in the
+        NO edge as phantom directional signal with zero model input — and
+        Kelly max-sized exactly those trades (BUG #27). Per-side anchoring
+        makes edge purely model-vs-that-side's-price; real cross-book gaps
+        belong to the arbitrage bot's two-legged trade.
         """
-        edge_yes = fair_yes - yes_price - polymarket_fills.taker_fee(1.0, yes_price)
-        edge_no = (1.0 - fair_yes) - no_price - polymarket_fills.taker_fee(1.0, no_price)
+        edge_yes = (trust_eff * (model_prob - yes_price)
+                    - polymarket_fills.taker_fee(1.0, yes_price))
+        edge_no = (trust_eff * ((1.0 - model_prob) - no_price)
+                   - polymarket_fills.taker_fee(1.0, no_price))
         return edge_yes, edge_no
 
     def make_decision(self, market: dict, signals: dict) -> dict:
@@ -298,6 +321,10 @@ class BaseBot(ABC):
         obi_signal = max(-1.0, min(1.0, float(signals.get("obi", 0.0) or 0.0)))
         obi_signal *= config.SIGNAL_WEIGHT_OBI
         cvd_signal = max(-1.0, min(1.0, float(signals.get("cvd", 0.0) or 0.0)))
+        # Global kill-switch (BUG #27): live cvd-driven trades measured
+        # statistically flat (53.1% WR); the feed now has a volume floor but
+        # stays at weight 0 until the calibrated form validates offline.
+        cvd_signal *= config.SIGNAL_WEIGHT_CVD
 
         # --- Lane: BTC drift from the window's "price to beat" (strike) ---
         # The fundamental anchor: where BTC sits vs the window open price.
@@ -319,10 +346,31 @@ class BaseBot(ABC):
             "pm": pm_momentum_signal,
             "cvd": cvd_signal,
             "obi": obi_signal,
-            "strat": strategy_signal * config.STRATEGY_SIGNAL_WEIGHT,
+            "strat": strategy_signal,
             "learn": learning_signal * 2.0 * learning_weight,
         }
         model_prob = self._model_prob_yes(lanes)
+
+        # --- Hard model-lean floor: no opinion, no trade (BUG #27) ---
+        # Conviction-scaled trust damps a weak model but its residual edge
+        # still scales with MARKET displacement, so near-ignorant models kept
+        # clearing MIN_EDGE against displaced prices (lean < 0.10: 28.6% WR /
+        # -$78.74 live; lean >= 0.10: 73% WR / +$96.12). Below the floor the
+        # model has nothing tradable to say — skip outright.
+        model_lean = abs(model_prob - 0.5)
+        if model_lean < config.MODEL_LEAN_MIN:
+            return {
+                "action": "skip",
+                "side": "yes",
+                "confidence": 0.0,
+                "reasoning": (
+                    f"Model lean too weak: |{model_prob:.3f}-0.5|="
+                    f"{model_lean:.3f} < {config.MODEL_LEAN_MIN:.2f}"
+                ),
+                "suggested_amount": 0,
+                "features": features,
+            }
+
         trust = self.STRATEGY_MODEL_TRUST.get(self.strategy_type, 0.5)
         # --- Conviction-scaled trust: the model's say is proportional to how
         # much it actually knows. edge = trust*(P_model - mid) takes its
@@ -348,7 +396,28 @@ class BaseBot(ABC):
         no_price = market.get("no_price")
         if no_price is None:
             no_price = round(1.0 - yes_price, 4)
-        edge_yes, edge_no = self._side_net_edges(fair_yes, yes_price, no_price)
+
+        # --- Book-consistency gate (BUG #27) ---
+        # YES and NO books disagreeing about the same event = suspect data
+        # (stale/gapped book). A real gap is the arb bot's two-legged trade;
+        # one-legged it is a coin flip minus fees — and Kelly max-sized
+        # exactly those (sums 0.84-0.85 -> "13c edges" -> -$29.15 in 2 trades).
+        book_sum = yes_price + no_price
+        if abs(book_sum - 1.0) > config.BOOK_SUM_TOLERANCE:
+            return {
+                "action": "skip",
+                "side": "yes",
+                "confidence": 0.0,
+                "reasoning": (
+                    f"Book inconsistency: yes={yes_price:.2f}+no={no_price:.2f}"
+                    f"={book_sum:.2f} outside 1±{config.BOOK_SUM_TOLERANCE:.2f}"
+                ),
+                "suggested_amount": 0,
+                "features": features,
+            }
+
+        edge_yes, edge_no = self._side_net_edges(model_prob, trust_eff,
+                                                 yes_price, no_price)
 
         # --- Model-lean eligibility: never fade the market on IGNORANCE ---
         # With no information the model sits at 0.5 and the blend would pull
@@ -515,11 +584,42 @@ class BaseBot(ABC):
         if mode == "live":
             amount = min(amount, config.LIVE_MAX_POSITION)
 
+        # Shared-pool concentration cap (BUG #27): per-bot Kelly can't see the
+        # correlated positions the OTHER bots just opened on the same (market,
+        # side) — clamp to the pool's remaining headroom, or stand down.
+        # Arbitrage is exempt (overrides execute(); its legs are hedged).
+        market_id = market.get("condition_id") or market.get("id")
+        headroom = self._exposure_headroom(market_id, signal.get("side"), mode)
+        if headroom is not None and amount > headroom:
+            min_viable = config.POLYMARKET_MIN_SHARES * max(
+                signal.get("entry_price") or 0.5, 0.05)
+            if headroom < min_viable:
+                logger.info(
+                    f"[{self.name}] Exposure cap: (market, {signal.get('side')}) "
+                    f"pool headroom ${headroom:.2f} < min viable ${min_viable:.2f}, skipping")
+                return {"success": False, "reason": "exposure_cap"}
+            logger.info(
+                f"[{self.name}] Exposure cap: clamping ${amount:.2f} -> ${headroom:.2f}")
+            amount = headroom
+
         try:
             return self._place_via_engine(signal, market, amount, mode)
         except Exception as e:
             logger.error(f"[{self.name}] Trade exception: {e}")
             return {"success": False, "reason": str(e)}
+
+    def _exposure_headroom(self, market_id, side, mode) -> float:
+        """Remaining shared-pool budget for this (market, side), or None when
+        it can't be computed (missing ids — fail open, other guards still
+        apply). Cap base: gross paper pool in paper mode; a fixed
+        2x LIVE_MAX_POSITION per market-side in live mode."""
+        if not market_id or side not in ("yes", "no"):
+            return None
+        if mode == "live":
+            cap_usd = 2.0 * config.LIVE_MAX_POSITION
+        else:
+            cap_usd = config.MARKET_SIDE_EXPOSURE_CAP * db.get_paper_pool_gross()
+        return cap_usd - db.get_open_exposure(market_id, side, mode)
 
     def _place_via_engine(self, signal, market, amount, mode) -> dict:
         """Delegate order placement to the paper or live venue engine.
