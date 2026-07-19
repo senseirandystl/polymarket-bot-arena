@@ -208,3 +208,73 @@ class TestBotConsumesOverrides:
         p = bot._model_prob_yes({"fut": 1.0})
         assert abs(p - 0.5) < 1e-9          # profile has fut at 0.00
         self._reset_cache()
+
+
+# ---------------------------------------------------------------------------
+# Dashboard: run-validation endpoints (subprocess mocked)
+# ---------------------------------------------------------------------------
+
+class TestRunValidationEndpoints:
+    @pytest.fixture
+    def client(self):
+        from fastapi.testclient import TestClient
+        import dashboard.server as srv
+        srv._validation_run.update({"proc": None, "started_at": None, "markets": None})
+        yield TestClient(srv.app), srv
+        srv._validation_run.update({"proc": None, "started_at": None, "markets": None})
+
+    AUTH = ("admin", "Thor")
+
+    class _FakeProc:
+        def __init__(self):
+            self._code = None
+
+        def poll(self):
+            return self._code
+
+    def test_status_idle_initially(self, client):
+        cl, _srv = client
+        r = cl.get("/api/lane-validation/status", auth=self.AUTH)
+        assert r.status_code == 200
+        body = r.json()
+        assert body["running"] is False
+        assert body["returncode"] is None
+
+    def test_run_starts_and_guards_concurrency(self, client, monkeypatch):
+        import subprocess
+        cl, srv = client
+        fake = self._FakeProc()
+        captured = {}
+
+        def fake_popen(cmd, **kw):
+            captured["cmd"] = cmd
+            return fake
+
+        monkeypatch.setattr(subprocess, "Popen", fake_popen)
+        r = cl.post("/api/lane-validation/run", auth=self.AUTH,
+                    json={"markets": 150})
+        assert r.status_code == 200
+        assert r.json()["markets"] == 150
+        assert "--propose" in captured["cmd"]
+        assert "150" in captured["cmd"]
+
+        # Second click while running -> 409.
+        r2 = cl.post("/api/lane-validation/run", auth=self.AUTH, json={})
+        assert r2.status_code == 409
+
+        # Process exits -> status reports done, run can start again.
+        fake._code = 0
+        st = cl.get("/api/lane-validation/status", auth=self.AUTH).json()
+        assert st["running"] is False
+        assert st["returncode"] == 0
+        r3 = cl.post("/api/lane-validation/run", auth=self.AUTH, json={})
+        assert r3.status_code == 200
+
+    def test_markets_clamped(self, client, monkeypatch):
+        import subprocess
+        cl, _srv = client
+        monkeypatch.setattr(subprocess, "Popen",
+                            lambda cmd, **kw: self._FakeProc())
+        r = cl.post("/api/lane-validation/run", auth=self.AUTH,
+                    json={"markets": 5})
+        assert r.json()["markets"] == 50   # clamped to the floor

@@ -490,6 +490,74 @@ async def disable_lane(lane: str, _auth: str = Depends(verify_auth)):
     return JSONResponse({"error": f"no override for lane '{lane}'"}, status_code=404)
 
 
+# --- Signal Lab: run the validation harness from the dashboard -------------
+# The harness is network-heavy (minutes for 300 markets), so it runs as a
+# detached subprocess; the UI polls /status until it exits, then reloads the
+# proposals (the run itself lands in the DB via --propose). One run at a
+# time — a second click while running is a 409.
+_validation_run = {"proc": None, "started_at": None, "markets": None}
+_VALIDATION_LOG = config.LOG_DIR / "lane_validation.log"
+
+
+def _validation_running() -> bool:
+    proc = _validation_run["proc"]
+    return proc is not None and proc.poll() is None
+
+
+@app.post("/api/lane-validation/run")
+async def run_lane_validation(request: Request, _auth: str = Depends(verify_auth)):
+    """Launch `validate_signals.py --markets N --propose` in the background."""
+    import subprocess
+    import sys as _sys
+    from datetime import datetime
+
+    if _validation_running():
+        return JSONResponse({"error": "a validation run is already in progress"},
+                            status_code=409)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    try:
+        markets = int(body.get("markets") or 300)
+    except (TypeError, ValueError):
+        return JSONResponse({"error": "markets must be a number"}, status_code=400)
+    markets = max(50, min(1000, markets))
+
+    repo_root = Path(__file__).resolve().parent.parent
+    script = repo_root / "tools" / "validate_signals.py"
+    log = open(_VALIDATION_LOG, "w")          # truncate: one run per log
+    proc = subprocess.Popen(
+        [_sys.executable, str(script), "--markets", str(markets), "--propose"],
+        cwd=str(repo_root), stdout=log, stderr=subprocess.STDOUT)
+    _validation_run.update({
+        "proc": proc,
+        "started_at": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+        "markets": markets,
+    })
+    return JSONResponse({"success": True, "markets": markets,
+                         "started_at": _validation_run["started_at"]})
+
+
+@app.get("/api/lane-validation/status")
+def lane_validation_status(_auth: str = Depends(verify_auth)):
+    """Poll target for the Signal Lab: running state + log tail + exit code."""
+    proc = _validation_run["proc"]
+    tail = ""
+    try:
+        if _VALIDATION_LOG.exists():
+            tail = _VALIDATION_LOG.read_text()[-2000:]
+    except OSError:
+        pass
+    return JSONResponse({
+        "running": _validation_running(),
+        "started_at": _validation_run["started_at"],
+        "markets": _validation_run["markets"],
+        "returncode": (None if proc is None else proc.poll()),
+        "log_tail": tail,
+    })
+
+
 @app.get("/api/bots")
 def get_bots():
     active = db.get_active_bots()

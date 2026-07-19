@@ -314,10 +314,18 @@ td { padding: 6px 4px; border-bottom: 1px solid #21262d; }
             <div style="color:#8b949e">Loading&hellip;</div>
         </div>
 
-        <div class="section-title">Last Validation Run</div>
+        <div class="section-title" style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px">
+            <span>Last Validation Run</span>
+            <span style="display:flex;gap:8px;align-items:center">
+                <input type="number" id="validation-markets" min="50" max="1000" step="50" value="300"
+                       style="width:80px;background:#0d1117;color:#c9d1d9;border:1px solid #30363d;border-radius:6px;padding:6px 8px;font-family:inherit"
+                       title="Resolved markets to sample (50-1000)">
+                <button class="btn btn-primary" id="run-validation-btn" onclick="runValidation()">Run Validation</button>
+            </span>
+        </div>
+        <div id="validation-status" style="color:#8b949e;font-size:12px;margin:-6px 0 10px;display:none"></div>
         <div class="card" id="lane-run-card">
-            <div style="color:#8b949e">No validation run recorded yet. Run:<br>
-            <code style="color:#c9d1d9">.venv/bin/python3 tools/validate_signals.py --markets 300 --propose</code></div>
+            <div style="color:#8b949e">No validation run recorded yet &mdash; click <b>Run Validation</b> above (takes a few minutes; results and any proposals appear here when it finishes).</div>
         </div>
     </div>
 
@@ -495,7 +503,7 @@ function switchTab(name) {
         if (b.textContent.trim().toLowerCase().replace(/\s+/g, '-') === name) b.classList.add('active');
     });
     if (name === 'settings') refreshSettings();
-    if (name === 'signal-lab') loadSignalLab();
+    if (name === 'signal-lab') { loadSignalLab(); pollValidation(); }
 }
 
 // ---------- Warning banner ----------
@@ -1215,6 +1223,57 @@ async function disableLane(lane) {
     const res = await postJSON(`/api/lane-overrides/${lane}/disable`, {});
     if (res.error) alert(res.error);
     loadSignalLab();
+}
+
+// ---------- Signal Lab: run the harness from the dashboard ----------
+let _validationPoll = null;
+
+function setValidationStatus(html) {
+    const el = document.getElementById('validation-status');
+    el.style.display = html ? 'block' : 'none';
+    el.innerHTML = html || '';
+}
+
+async function runValidation() {
+    const markets = parseInt(document.getElementById('validation-markets').value) || 300;
+    const btn = document.getElementById('run-validation-btn');
+    btn.disabled = true;
+    const res = await postJSON('/api/lane-validation/run', { markets });
+    if (res.error) {
+        alert(res.error);
+        btn.disabled = false;
+        return;
+    }
+    setValidationStatus(`&#9203; Validation running (${res.markets} markets, started ${res.started_at} UTC)&hellip;`);
+    pollValidation();
+}
+
+async function pollValidation() {
+    if (_validationPoll) clearTimeout(_validationPoll);
+    let st;
+    try { st = await fetchJSON('/api/lane-validation/status'); }
+    catch (e) { _validationPoll = setTimeout(pollValidation, 5000); return; }
+
+    const btn = document.getElementById('run-validation-btn');
+    if (st.running) {
+        btn.disabled = true;
+        // Last non-empty log line as a lightweight progress indicator.
+        const lines = (st.log_tail || '').trim().split('\n').filter(l => l.trim());
+        const last = lines.length ? lines[lines.length - 1].slice(0, 120) : 'starting...';
+        setValidationStatus(`&#9203; Running (${st.markets} markets, started ${st.started_at} UTC) &mdash; <span style="color:#c9d1d9">${last.replace(/</g, '&lt;')}</span>`);
+        _validationPoll = setTimeout(pollValidation, 3000);
+        return;
+    }
+    btn.disabled = false;
+    if (st.returncode === null) { setValidationStatus(''); return; }  // never ran this session
+    if (st.returncode === 0) {
+        setValidationStatus(`&#9989; Run finished (started ${st.started_at} UTC) &mdash; results below.`);
+    } else {
+        const lines = (st.log_tail || '').trim().split('\n').filter(l => l.trim());
+        const last = lines.length ? lines[lines.length - 1].slice(0, 160) : 'no output';
+        setValidationStatus(`&#10060; Run failed (exit ${st.returncode}): <span style="color:#f85149">${last.replace(/</g, '&lt;')}</span>`);
+    }
+    loadSignalLab();  // pull in the freshly recorded run + any new proposals
 }
 
 refresh();
