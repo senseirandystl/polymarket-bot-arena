@@ -36,6 +36,7 @@ from typing import Callable, Dict, List, Optional
 
 import config
 import polymarket_markets
+from signals import orderflow_signals
 from arena.market_utils import (
     compute_time_remaining_seconds,
     is_5min_market,
@@ -82,7 +83,7 @@ class MarketDiscovery(threading.Thread):
             f"Market discovery started (interval={config.DISCOVERY_INTERVAL_SEC}s)"
         )
         # First tick fires immediately on start so the trader sees a
-        # current_market on its first iteration rather than waiting 60s.
+        # current_market on its first iteration rather than waiting 20s.
         while not self._stop_event.is_set():
             try:
                 self._do_scan()
@@ -214,7 +215,7 @@ class MarketDiscovery(threading.Thread):
         # Refresh orderflow for the current market AND for the maker
         # fallback (when present).  When both exist they are guaranteed
         # distinct markets so we issue two calls.  Total cost: 1-2
-        # HTTPS calls per 60s cycle -- the fallback call only fires
+        # HTTPS calls per 20s cycle -- the fallback call only fires
         # in the no-current-market gap, so the hot path stays at one.
         #
         # NOTE: keep these calls LOCK-FREE; _fetch_orderflow_for_market
@@ -253,8 +254,17 @@ class MarketDiscovery(threading.Thread):
         the book is unavailable.
         """
         polymarket_markets.refresh_price(m)  # sets m["current_price"] from CLOB
+        # Order-book imbalance on the Up/YES token — one extra book call per
+        # discovery cycle (~20s), off the trader hot path. obi > 0 = bid-heavy
+        # (upward/YES pressure). Best-effort: 0.0 when the book is unavailable.
+        obi = 0.0
+        up_tok = m.get("polymarket_token_id")
+        if up_tok:
+            book = polymarket_markets.get_order_book(up_tok)
+            obi = orderflow_signals.order_book_imbalance(book)
         m["orderflow"] = {
             "current_probability": m.get("current_price") or 0.5,
             "volume_24h": m.get("volume_24h", 0) or 0,
+            "obi": obi,
             "warnings": [],
         }

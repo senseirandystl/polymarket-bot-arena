@@ -248,22 +248,43 @@ def _fetch_fapi(path: str, params: dict, start_ms: int, end_ms: int,
     return Series(points)
 
 
+# The /futures/data/* 5m aggregates (OI hist, taker ratio) carry the BUCKET
+# timestamp, and a bucket's aggregate describes activity across its whole 5m
+# period — keying it at the raw timestamp lets a backfill sample mid-bucket
+# read flow that hadn't finished printing yet (lookahead). Live never sees
+# that: futures_meta polls the latest COMPLETED values. Shift visibility to
+# the period end so the harness matches what live could actually know; the
+# 24h live audit of the approved fut lane (52.9% direction-accuracy vs the
+# 66-74% harness read) is exactly the gap this class of bias produces.
+FUTURES_BUCKET_VISIBILITY_LAG_SEC = 300.0
+
+
+def _shift_series(series: Series, lag_sec: float) -> Series:
+    return Series([(t + lag_sec, v)
+                   for t, v in zip(series._ts, series._vals)])
+
+
 def fetch_futures_series(start_ms: int, end_ms: int) -> dict:
     """funding / oi / taker Series for BTCUSDT over [start, end].
 
     The /futures/data/* endpoints retain ~30 days; on empty responses the
     Series is simply empty and affected samples read None (excluded).
+    OI/taker buckets are shifted to their period END (see
+    FUTURES_BUCKET_VISIBILITY_LAG_SEC); funding timestamps mark an already-
+    applied event, so they stay as-is.
     """
     return {
         "funding": _fetch_fapi(
             "/fapi/v1/fundingRate", {"symbol": "BTCUSDT"},
             start_ms, end_ms, 1000, "fundingTime", "fundingRate"),
-        "oi": _fetch_fapi(
+        "oi": _shift_series(_fetch_fapi(
             "/futures/data/openInterestHist",
             {"symbol": "BTCUSDT", "period": "5m"},
             start_ms, end_ms, 500, "timestamp", "sumOpenInterest"),
-        "taker": _fetch_fapi(
+            FUTURES_BUCKET_VISIBILITY_LAG_SEC),
+        "taker": _shift_series(_fetch_fapi(
             "/futures/data/takerlongshortRatio",
             {"symbol": "BTCUSDT", "period": "5m"},
             start_ms, end_ms, 500, "timestamp", "buySellRatio"),
+            FUTURES_BUCKET_VISIBILITY_LAG_SEC),
     }

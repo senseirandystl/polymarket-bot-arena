@@ -301,7 +301,8 @@ def get_bot_performance(bot_name, hours=12, mode=None):
                 SUM(CASE WHEN outcome IN ('win', 'exit_tp') THEN 1 ELSE 0 END) as wins,
                 SUM(CASE WHEN outcome IN ('loss', 'exit_sl') THEN 1 ELSE 0 END) as losses,
                 COALESCE(SUM(pnl), 0) as total_pnl,
-                COALESCE(AVG(pnl), 0) as avg_pnl
+                COALESCE(AVG(pnl), 0) as avg_pnl,
+                AVG(entry_price) as avg_entry
             FROM trades WHERE {where}
         """, params).fetchone()
         result = dict(row)
@@ -309,6 +310,13 @@ def get_bot_performance(bot_name, hours=12, mode=None):
         result["losses"] = result["losses"] or 0
         total = result["wins"] + result["losses"]
         result["win_rate"] = result["wins"] / total if total > 0 else 0
+        # Break-even gap: WR must beat the avg entry price to profit (the
+        # core PBA profitability lens). None without resolved entry data.
+        avg_entry = result.get("avg_entry")
+        result["breakeven_gap"] = (
+            result["win_rate"] - avg_entry
+            if total > 0 and avg_entry is not None else None
+        )
         return result
 
 
@@ -769,6 +777,44 @@ def disable_lane_override(lane):
         set_arena_state("lane_overrides", json.dumps(overrides))
         return True
     return False
+
+
+def get_auto_approve_lanes() -> bool:
+    """Whether the promoter may auto-approve lane proposals (dashboard toggle).
+
+    Stored in arena_state; falls back to config.AUTO_APPROVE_LANES_ENABLED as
+    the boot default when the operator has never touched the switch.
+    """
+    raw = get_arena_state("auto_approve_lanes")
+    if raw is None:
+        return bool(getattr(config, "AUTO_APPROVE_LANES_ENABLED", True))
+    return str(raw) == "1"
+
+
+def set_auto_approve_lanes(enabled: bool):
+    """Flip the auto-approve toggle (dashboard Signal Lab)."""
+    set_arena_state("auto_approve_lanes", "1" if enabled else "0")
+
+
+def annotate_lane_proposal(proposal_id, live: dict):
+    """Attach live-attribution evidence to a proposal's metrics under 'live'.
+
+    Lets the dashboard show live shadow numbers next to the harness metrics
+    whether or not auto-approve is on. No-op if the proposal is gone.
+    """
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT metrics FROM lane_proposals WHERE id=?", (proposal_id,)
+        ).fetchone()
+        if not row:
+            return
+        try:
+            metrics = json.loads(row["metrics"])
+        except (TypeError, ValueError):
+            metrics = {}
+        metrics["live"] = live
+        conn.execute("UPDATE lane_proposals SET metrics=? WHERE id=?",
+                     (json.dumps(metrics), proposal_id))
 
 
 def _paper_pnl_and_reserved():

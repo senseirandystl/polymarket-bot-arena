@@ -68,7 +68,7 @@ class BtcMakerBot(BaseBot):
         """
         p = self.strategy_params
         prices = signals.get("prices", [])
-        market_price = market.get("current_price", 0.5)
+        market_price = market.get("current_price") or 0.5  # None if book down
 
         # --- Directional lean from recent BTC candles ---
         momentum = 0.0

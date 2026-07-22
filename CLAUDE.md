@@ -2,7 +2,7 @@
 
 ## What This Is
 
-An automated trading bot arena that runs competing bots on **Polymarket's** BTC 5-minute up/down markets. The **default slate is 8 bots** (five directional defaults incl. the sniper + the market-neutral **arbitrage** bot + two **maker** bots — late-window and fee-zone; roster updated 2026-07-18); a terminal launch can instead select any subset of strategies (see **Startup flow** below). The maker bots are first-class members of the slate but run on the discovery-cycle (maker) cadence, not the 1s trader tick. Directional bots evolve every 4 hours — the bottom performers are replaced by mutated copies of the top ones; the arbitrage bot is **evolution-exempt** (`arena.EVOLUTION_EXEMPT_TYPES`) and the maker bots are excluded from evolution too (they are partitioned out of the trader/evolution list in `main_loop`). **Paper mode simulates against real Polymarket order books** (discovery, prices, depth-based fills, fees, resolution — everything except order submission); **live mode** submits real CLOB orders. Simmer has been fully removed (its 5-min market feed was inconsistent and its free tier capped at 50 buys/day). See [BUG_HISTORY.md](./BUG_HISTORY.md) #10.
+An automated trading bot arena that runs competing bots on **Polymarket's** BTC 5-minute up/down markets. The **default slate is 8 bots** (five directional defaults incl. the sniper + the market-neutral **arbitrage** bot + two **maker** bots — late-window and fee-zone; roster updated 2026-07-18); a terminal launch can instead select any subset of strategies (see **Startup flow** below). The maker bots are first-class members of the slate but run on the discovery-cycle (maker) cadence, not the 1s trader tick. Directional bots are judged for evolution every `EVOLUTION_INTERVAL_HOURS` (2h) on a rolling `EVOLUTION_WINDOW_HOURS` (24h) window — survive if window P&L > 0 or break-even gap (WR − avg entry) ≥ `EVOLUTION_BE_GAP_MIN` (0.03); losers are replaced by mutated copies of the winners (BUG #29: the old 2h-window + flat-65%-WR bar made every bot permanently immune). The arbitrage bot is **evolution-exempt** (`arena.EVOLUTION_EXEMPT_TYPES`) and the maker bots are excluded from evolution too (they are partitioned out of the trader/evolution list in `main_loop`). **Paper mode simulates against real Polymarket order books** (discovery, prices, depth-based fills, fees, resolution — everything except order submission); **live mode** submits real CLOB orders. Simmer has been fully removed (its 5-min market feed was inconsistent and its free tier capped at 50 buys/day). See [BUG_HISTORY.md](./BUG_HISTORY.md) #10.
 
 ### Startup flow (terminal launches only — `arena.py` / `bin/arena`)
 On an interactive tty, `arena/startup.py` runs before the threads boot. If the DB holds a previous run it asks **Continue** (resume the exact prior slate) or **Start fresh** (wipe DB rows via `db.wipe_all()` + truncate `logs/*.log`, then choose bots). Bot choice is **Default** (Enter → the 8-bot slate incl. sniper + both makers) or **Manual** (numbered strategy menu — now includes the two maker bots as selectable entries; accepts `1,3,5`, `1-6`, or a mix → launches exactly those). Under launchd / any non-tty parent there is no prompt — it silently resumes the existing DB config, so the service never blocks.
@@ -113,9 +113,68 @@ kill-switched to live through a measured, human-approved path:
    profile (strategies not named stay 0). The Signal Lab **Disable** button
    (`/api/lane-overrides/{lane}/disable`) reverts a lane to weight 0 within
    seconds — the safety hatch if live performance diverges from the harness.
-Schedule the measurement (e.g. nightly cron/launchd:
-`.venv/bin/python3 tools/validate_signals.py --markets 300 --propose`);
-promotion itself stays a dashboard decision.
+5. **Live monitor auto-demotes (2026-07-19)** — `arena/lane_monitor.py`
+   (called from the evolution loop every `LANE_MONITOR_INTERVAL_SEC`) parses
+   the raw `cand(...)` reads out of resolved trades placed since a lane's
+   approval, scores the lane's SIGN against the actual market direction, and
+   auto-calls `db.disable_lane_override` when accuracy < `LANE_MONITOR_MIN_ACCURACY`
+   (0.53) after ≥ `LANE_MONITOR_MIN_TRADES` (50) readings. The report lands in
+   arena_state `lane_monitor` and shows in Signal Lab next to each override.
+   Why: the 24h v5 run approved tech at a harness-read 74–80% follow-WR; live
+   it scored 51.7% over 209 trades (harness numbers carry adverse-selection +
+   stale-mid optimism — an approved lane must keep re-earning its weight; fut
+   was likewise auto-demoted at 52.6%, xasset stayed healthy at 57.2%).
+6. **Closed-loop auto-approve (BUG #31, 2026-07-21)** — `arena/lane_promoter.py`
+   (evolution-loop host, right after the monitor) flips the pipeline's JUDGE
+   from the optimistic offline harness to **live shadow attribution**. The
+   harness only NOMINATES (files a pending proposal); the promoter scores each
+   pending lane's own `cand(...)` reads across resolved trades — measured at
+   ZERO live weight, so it is the lane's live predictiveness before it can move
+   a trade — and, when the dashboard toggle `auto_approve_lanes` is ON (default
+   `config.AUTO_APPROVE_LANES_ENABLED`, stored in arena_state), auto-approves
+   lanes that clear a LIVE bar (`AUTO_APPROVE_MIN_ACCURACY` 0.55 over
+   `AUTO_APPROVE_MIN_TRADES` 60 — deliberately stricter than the monitor's 0.53
+   demotion floor, hysteresis so a borderline lane can't flap). Bounded: one
+   promotion per cycle, and never past `AUTO_APPROVE_MAX_ACTIVE` (3) live
+   candidate lanes. OFF → it still annotates every proposal with the live
+   evidence (shown in Signal Lab next to the harness metrics) and waits for a
+   human click; demotion stays automatic either way. Why: the harness approved
+   tech at 74–80% that scored 51.7% live — a lane must clear LIVE ground truth,
+   not the harness number, before (and to keep) carrying weight.
+7. **Core-lane auto-tuner (BUG #31)** — `arena/core_lane_tuner.py` (same
+   evolution-loop host, after the promoter) is the CORE half of the loop: it
+   tunes the lanes that drive **every** directional trade — drift/mom/strat —
+   **per strategy**, on that strategy's own live attribution (the drift=/mom=/
+   strat= readings logged in its trades' reasoning, joined to strategy_type via
+   bot_configs). A lane predictive for a strategy (sign accuracy ≥
+   `CORE_TUNE_HIGH_ACC` 0.56 over ≥ `CORE_TUNE_MIN_TRADES` 40) earns a small
+   `CORE_TUNE_STEP` (0.05) weight nudge UP; anti-predictive (≤ `CORE_TUNE_LOW_ACC`
+   0.48) nudges DOWN; the dead band between holds. Heavily bounded because these
+   lanes decide 100% of a decision: one step/lane/strategy/cycle, and a per-lane
+   `CORE_TUNE_BAND` (±0.20) around the hand-set class default so no lane can run
+   away or collapse (drift can never be tuned to zero). It writes a COMPLETE
+   per-strategy profile per tuned lane (marked `core:true` in `lane_overrides`)
+   — a core-lane override zeroes any strategy it omits, unlike a candidate lane.
+   Gated by the SAME toggle: OFF → computes and persists suggested weights to
+   arena_state `core_lane_tuner` (dashboard Core-Lane Tuning card) but never
+   applies. This is the mechanism that "fine-tunes all active bot strategies on
+   real data" — the candidate-lane loop only touches fut/tech/xasset.
+8. **Directed evolution (BUG #31)** — evolution now spawns replacements from the
+   **best-ranked survivor** (not `random.choice`) and mutates at the tighter
+   `MUTATION_RATE_DIRECTED` (0.07 vs 0.15), so a mutant stays near a proven
+   config instead of re-rolling params. Lane weights are no longer evolution's
+   job at all — the core-lane tuner owns them per strategy_type, which mutants
+   inherit automatically. Evolution manages the ROSTER; the tuner manages the
+   SIGNAL BLEND; they no longer fight over the same surface.
+The measurement is now **self-scheduling**: `arena/validation_scheduler.py`
+(same evolution-loop host) spawns `validate_signals.py --markets
+AUTO_VALIDATE_WINDOW_MARKETS --propose` every `AUTO_VALIDATE_EVERY_MARKETS`
+5-min windows (defaults: 300-market window, every 100 markets ≈ 8.3h —
+frequency gives regime freshness, the window keeps the n≥200 sample bar fed;
+timer persists in arena_state, output shares `logs/lane_validation.log` with
+the dashboard's Run Validation button). The loop is now **fully hands-off** end
+to end (harness nominate → live-verify → auto-approve → auto-demote) with the
+Signal Lab toggle the single human override.
 
 **Hard model-lean floor (BUG #27):** conviction scaling damped weak models but
 their residual edge still scaled with MARKET displacement, so trust_eff=0.03
@@ -240,6 +299,14 @@ old blanket **NO ban is gone** (see BUG_HISTORY #20).
 - **Model-lean floor + book-consistency gate (BUG #27):** see Signal
   Hierarchy above — lean < `MODEL_LEAN_MIN` (0.10) or books summing outside
   1±`BOOK_SUM_TOLERANCE` (0.04) skip before any edge is computed.
+- **Dead-zone gate (BUG #31):** a directional bot sits flat when the chosen
+  side's MID is in `[DEAD_ZONE_PRICE_LO, DEAD_ZONE_PRICE_HI]` (0.42–0.58) AND
+  `|drift| < DEAD_ZONE_DRIFT_MIN` (0.10) — fires in `make_decision` *before*
+  the edge gate. This was the single biggest live leak (0.42–0.58 & flat drift:
+  59 trades, 39% WR, −$77.83 — a model opinion against a coin-flip market). It
+  is drift-CONDITIONAL: `|drift| ≥ 0.10` in the same band is the profitable
+  "market lags drift" trade (+$30.10, 65.7% WR) and passes through. Zone bots
+  (sniper/makers) override `make_decision` and carry their own drift gates.
 - **Shared-pool concentration cap (BUG #27):** total OPEN cost per (market,
   side) across ALL bots is capped at `config.MARKET_SIDE_EXPOSURE_CAP` (0.10)
   × the gross paper pool (`db.get_open_exposure` / `db.get_paper_pool_gross`;
@@ -275,9 +342,22 @@ old blanket **NO ban is gone** (see BUG_HISTORY #20).
   $3.76 over 453 trades — size ignored edge, odds, and bankroll). Still
   **shares-first**: exact share count derived before USD (`amount =
   target_shares × price`) — never USD → shares, which rounds away PnL at low
-  prices. Flow-only trades (|drift| < `DRIFT_VETO_MIN`) must clear
-  `MIN_EDGE × FLOW_ONLY_EDGE_MULT` (2×) — a claim resting purely on noisy
-  flow lanes needs proportionally more edge (they ran 29% WR on cheap sides).
+  prices. **Kelly edge cap (2026-07-19):** the edge fed into SIZING is
+  clamped at `KELLY_EDGE_CAP` (0.10; trade/skip still uses the raw edge) —
+  outsized edges mean maximal model-vs-market disagreement, which live
+  correlates with stale inputs (the 24h run's 15 biggest bets went 8/15 for
+  −$34). **Flow-only edge tax made CONTINUOUS (BUG #30, 2026-07-20):** the
+  old step (raised 0.05 → 0.10 on 2026-07-19) only penalized |drift| < 0.10;
+  the next 24h/279-trade run showed the 0.10–0.30 band it released to full
+  trust was the single biggest dollar loss (135 trades, 49.6% WR, −$76.32),
+  while only |drift| ≥ 0.30 was genuinely predictive (79.3% WR). `min_edge`
+  now tapers linearly — `1 + (FLOW_ONLY_EDGE_MULT_MAX − 1) × max(0, 1 −
+  |drift|/FLOW_ONLY_DRIFT_FULL_TRUST)` (max 2.0×, full trust at 0.30) —
+  instead of stepping to full trust at 0.10; a claim resting purely on noisy
+  flow lanes now pays a graduated tax that only fully lifts near the
+  harness's genuinely-predictive drift range. The BTC mom lane is also damped
+  ×`MOM_QUIET_REGIME_DAMP` (0.5) when the volatility regime reads "quiet"
+  (one candle of chop-tape noise is not a trend).
 - **Price-justified-by-drift gate (zone bots):** the late-window maker,
   fee-zone maker, and sniper require `0.5 + 0.5·|drift|` (the calibrated
   drift-implied probability) `≥ side_price + taker_fee + min_edge` — a 71%-WR
@@ -320,15 +400,23 @@ Fidelity redesign (BUG #27): with pm/obi/cvd killed pending validation, the
 LIVE lanes are drift, mom and strat — and the strat lane now carries a
 **per-strategy profile weight** (the flat global 0.15 differentiated nobody).
 Both live signal lanes are harness-validated for net edge (drift +7.6¢, mom
-+10.2¢/share):
++10.2¢/share); the **strat** lane (`analyze()` thesis) is NOT yet
+harness-validated the same way — BUG #30/#31 found live WR falling as its own
+confidence rose (|strat| ≥ 0.6: 36.1–46% WR; the only profitable band was
+|strat| < 0.3 at +$41.23), so `config.STRAT_LANE_CONF_CAP` (**0.30**, lowered
+from 0.60 in BUG #31) clamps its magnitude to that band before the blend
+pending a proper offline validation of the lane. **momentum and hybrid
+profiles rebalanced toward drift (BUG #30)** — see below; both had been the
+worst live performers and the most exposed to the mom/strat lanes just shown
+harmful at high magnitude:
 
 | Strategy | Live profile (drift/mom/strat) | Trust | Character |
 |----------|-------------------------------|-------|-----------|
-| momentum | .25/.45/.30 | 0.50 | trades the BTC short-term trend (mom lane + its trend analyze()) |
+| momentum | .35/.40/.25 | 0.50 | trades the BTC short-term trend (mom lane + its trend analyze()) |
 | phantom  | .20/.30/.50 | 0.50 | EMA-crossover/breakout swing — analyze()-thesis-dominant |
 | mean_reversion (meanrev-v1, +tp) | .70/0/.30 | 0.60 | drift anchor + z-score fade, **drift-gated** (BUG #28: the fade only fires toward the side signed drift ≥ `min_drift` 0.10 already favors — drift picks the side, the z-score times the pullback; ungated it went 0/11) + max side mid 0.58 (`STRATEGY_MAX_SIDE_PRICE`, the harness's "market lags" rule) |
 | sentiment | .30/0/.70 | 0.50 | in-market flow reader (raw pm+cvd via analyze(); its lanes stay killed until validated) — not in the default slate |
-| hybrid | .40/.20/.40 | 0.50 | balanced ensemble of the sub-strategies |
+| hybrid | .50/.20/.30 | 0.50 | balanced ensemble of the sub-strategies |
 | arbitrage | n/a — **overrides** `make_decision`/`execute` (market-neutral, two-legged) | n/a | n/a |
 
 (pm/cvd/obi profile weights are all 0 while their kill-switches are 0. The

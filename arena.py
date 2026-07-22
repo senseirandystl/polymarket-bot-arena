@@ -6,29 +6,30 @@ trade execution, resolution, evolution, copy-trade polling, maker
 quoting, SL/TP monitoring.  After the refactor it has been split:
 
     ┌───────────────────────┬──────────────────────────────────────────────┐
-    │ MarketDiscovery       │ 60s tick — scans Simmer SDK + public endpoint│
-    │ (arena/discovery.py)  │ and refreshes orderflow context for the live │
-    │                       │ market only. Owns ``current_market`` under a │
-    │                       │ snapshot lock. No speculative next-market.    │
+    │ MarketDiscovery       │ 20s tick — scans the Gamma BTC-5m series and  │
+    │ (arena/discovery.py)  │ selects the live window. Owns ``current_market│
+    │                       │ `` under a snapshot lock. No speculative next.│
+    ├───────────────────────┼──────────────────────────────────────────────┤
+    │ MarketDataWarmer      │ 1s tick — single owner of ALL per-market      │
+    │ (arena/market_data.py)│ network reads (YES+NO books, prices, OBI,     │
+    │                       │ CVD, PM momentum) into a shared warm cache.   │
     ├───────────────────────┼──────────────────────────────────────────────┤
     │ Trader                │ 1s tick — runs bot ``make_decision`` +       │
-    │ (arena/trader.py)     │ ``execute`` against ``current_market``.      │
-    │                       │ Zero network IO per tick.                    │
+    │ (arena/trader.py)     │ ``execute`` against ``current_market``,      │
+    │                       │ reading warm data. Zero network IO per tick. │
     ├───────────────────────┼──────────────────────────────────────────────┤
-    │ TradeResolver         │ 60s tick — checks Simmer for resolved        │
-    │ (arena/resolver.py)   │ markets, writes outcomes + P&L, sweeps      │
-    │                       │ stale-pending >1h trades.                   │
+    │ TradeResolver         │ 60s tick — reads Polymarket closed events for │
+    │ (arena/resolver.py)   │ resolved markets, writes outcomes + P&L.     │
     ├───────────────────────┼──────────────────────────────────────────────┤
     │ PositionMonitorThread │ 0.5s tick — SL/TP exit engine against open  │
     │ (arena/position...py) │ positions on bots with ``exit_strategy``.    │
     └───────────────────────┴──────────────────────────────────────────────┘
 
 This file (root ``arena.py``) is now strictly the coordinator.  It builds
-the bots, boots the four worker threads, runs the periodic evolution
-cycle on its main thread, registers one ``on_cycle_complete`` hook that
-drives the maker section + copy-trade bots, and wires Ctrl-C cleanly to
-all four workers.  Every actual piece of trading logic lives in the
-``arena/`` package next door.
+the bots, boots the worker threads, runs the periodic evolution cycle on
+its main thread, registers one ``on_cycle_complete`` hook that drives the
+maker section, and wires Ctrl-C cleanly to all workers.  Every actual
+piece of trading logic lives in the ``arena/`` package next door.
 """
 
 import argparse
@@ -59,16 +60,19 @@ from bots.bot_sniper import SniperBot
 from bots.bot_phantom import PhantomBot
 from bots.bot_late_window_maker import LateWindowMakerBot
 from bots.bot_fee_zone_maker import FeeZoneMakerBot
+from bots.bot_arbitrage import ArbitrageBot
 from signals.price_feed import get_feed as get_price_feed
 from signals.sentiment import get_feed as get_sentiment_feed
 from signals.polymarket_prices import get_feed as get_pm_price_feed
 
 from arena.discovery import MarketDiscovery
+from arena.market_data import MarketDataWarmer
 from arena.trader import Trader
 from arena.resolver import TradeResolver
 from arena.position_monitor import PositionMonitorThread
 from arena.signals import build_combined_signals
 from arena.state import SharedArenaState
+from signals.orderflow_signals import get_cvd_feed
 
 logging.basicConfig(
     format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
@@ -96,7 +100,22 @@ TAKER_BOT_CLASSES = {
     "phantom": PhantomBot,
     "sentiment": SentimentBot,
     "hybrid": HybridBot,
+    "arbitrage": ArbitrageBot,
 }
+
+# Maker strategy types that have a concrete default instance. Used to rebuild
+# the maker slate from DB configs on the 'continue' path (where create_default_bots
+# filters maker rows out of the trader list).
+MAKER_BOT_CLASSES = {
+    "late_window_maker": LateWindowMakerBot,
+    "fee_zone_maker": FeeZoneMakerBot,
+}
+
+# Strategy types that run in the fast (1s) trader loop but are NEVER culled or
+# mutated by evolution. The arbitrage bot is market-neutral — judging it by a
+# directional win-rate threshold makes no sense, so it is kept as a permanent
+# fixture alongside the evolving directional bots.
+EVOLUTION_EXEMPT_TYPES = {"arbitrage"}
 
 
 # ----------------------------------------------------------------------
@@ -127,14 +146,15 @@ def create_default_bots():
                 lineage=cfg.get("lineage"),
             ))
         if bots:
+            # Faithful to the DB: whatever was active last run comes back exactly
+            # as it was (this is the 'continue' path). The arbitrage bot is only
+            # part of the DEFAULT slate — it is not force-injected here, so a
+            # manually-selected slate that excluded it stays excluded on restart.
             return bots
-    # First-run fallback
-    return [
-        MomentumBot(name="momentum-v1", generation=0),
-        HybridBot(name="hybrid-v1", generation=0),
-        MeanRevSLBot(name="meanrev-sl25-v1", generation=0),
-        PhantomBot(name="phantom-v1", generation=0),
-    ]
+    # First-run fallback (empty DB, non-interactive): canonical 5-bot default
+    # slate (the four directional defaults + the arbitrage bot).
+    from arena import startup
+    return startup.build_default_bots()
 
 
 def _validate_bot(bot) -> bool:
@@ -175,7 +195,11 @@ def create_evolved_bot(winner, loser_type: str, gen_number: int):
         if key in winner_params:
             base_params[key] = winner_params[key]
 
-    new_params = winner.mutate(base_params)
+    # Exploitation-biased mutation (BUG #31): tighter than the exploratory
+    # MUTATION_RATE since the parent is now the best-ranked survivor — stay near
+    # the proven config rather than re-rolling params at 15%.
+    new_params = winner.mutate(
+        base_params, mutation_rate=getattr(config, "MUTATION_RATE_DIRECTED", 0.07))
     import random
     name = f"{loser_type}-g{gen_number}-{random.randint(100, 999)}"
 
@@ -189,12 +213,23 @@ def create_evolved_bot(winner, loser_type: str, gen_number: int):
 
 
 def run_evolution(bots, cycle_number):
-    """Run evolution cycle — kill bots below WR threshold, mutate from survivors."""
+    """Run evolution cycle — kill bots below WR threshold, mutate from survivors.
+
+    Evolution-exempt bots (e.g. the market-neutral arbitrage bot) are set aside
+    up front, never ranked or replaced, and re-appended to the returned slate.
+    """
     logger.info(f"=== Evolution Cycle {cycle_number} ===")
 
+    exempt = [b for b in bots if b.strategy_type in EVOLUTION_EXEMPT_TYPES]
+    bots = [b for b in bots if b.strategy_type not in EVOLUTION_EXEMPT_TYPES]
+
+    # Judged on the EVOLUTION_WINDOW_HOURS window (24h), not the 2h cycle
+    # cadence — judging on the interval window made every bot permanently
+    # immune (5-12 trades per 2h vs a 20-trade floor; zero evolutions fired
+    # in the whole 24h v5 run while momentum-v1 lost $86).
     rankings = []
     for bot in bots:
-        perf = bot.get_performance(hours=config.EVOLUTION_INTERVAL_HOURS)
+        perf = bot.get_performance(hours=config.EVOLUTION_WINDOW_HOURS)
         rankings.append({
             "name": bot.name,
             "strategy_type": bot.strategy_type,
@@ -202,9 +237,21 @@ def run_evolution(bots, cycle_number):
             "pnl": perf["total_pnl"],
             "win_rate": perf["win_rate"],
             "trades": perf["total_trades"],
+            "be_gap": perf.get("breakeven_gap"),
         })
 
-    rankings.sort(key=lambda x: x["win_rate"], reverse=True)
+    # Fitness = P&L (the actual objective); the survival test below uses the
+    # break-even gap so a high WR bought at high prices can't hide behind it.
+    rankings.sort(key=lambda x: x["pnl"], reverse=True)
+
+    def _survives(r) -> bool:
+        # Positive window P&L survives outright; otherwise the break-even gap
+        # (WR - avg entry) must clear the floor. A flat WR bar mis-judges
+        # both cheap and expensive books (65% at 70c loses; 55% at 45c wins).
+        if r["pnl"] > 0:
+            return True
+        gap = r["be_gap"]
+        return gap is not None and gap >= config.EVOLUTION_BE_GAP_MIN
 
     immune = []
     above = []
@@ -212,19 +259,20 @@ def run_evolution(bots, cycle_number):
     for r in rankings:
         if r["trades"] < config.MIN_TRADES_FOR_JUDGMENT:
             immune.append(r)
-        elif r["win_rate"] >= config.MIN_WIN_RATE:
+        elif _survives(r):
             above.append(r)
         else:
             below.append(r)
 
-    logger.info("Rankings (WR-based):")
+    logger.info(f"Rankings ({config.EVOLUTION_WINDOW_HOURS}h window, P&L-ranked):")
     for r in rankings:
         if r in immune: status = "IMMUNE"
         elif r in above: status = "SURVIVES"
         else: status = "REPLACED"
+        gap_s = f"{r['be_gap']:+.3f}" if r["be_gap"] is not None else "n/a"
         logger.info(
             f"  {r['name']}: WR={r['win_rate']:.1%}, "
-            f"P&L=${r['pnl']:.2f}, Trades={r['trades']} [{status}]"
+            f"P&L=${r['pnl']:.2f}, Trades={r['trades']}, gap={gap_s} [{status}]"
         )
 
     if not immune and not above and below:
@@ -232,14 +280,14 @@ def run_evolution(bots, cycle_number):
         above.append(best)
         logger.info(
             f"  Safety net: keeping {best['name']} "
-            f"(best WR {best['win_rate']:.1%}) as sole survivor"
+            f"(best P&L ${best['pnl']:.2f}) as sole survivor"
         )
 
     if not below:
         logger.info("  No bots below threshold — skipping evolution")
         for bot in bots:
             bot.reset_daily()
-        return bots
+        return bots + exempt
 
     survivor_names = {r["name"] for r in immune + above}
     replaced_names = {r["name"] for r in below}
@@ -248,12 +296,23 @@ def run_evolution(bots, cycle_number):
     for b in new_bots:
         b.reset_daily()
 
-    import random
     winners = [b for b in bots if b.name in survivor_names]
     replaced = [b for b in bots if b.name in replaced_names]
 
+    # Directed parent selection (BUG #31): spawn replacements from the
+    # BEST-ranked survivor, not a random one — a mutation of the proven winner
+    # dominates a mutation of a merely-adequate one, and the old random.choice
+    # let a thin survivor seed the next generation. Ordered by the same
+    # window-P&L ranking used for survival. The mutant also inherits the
+    # attribution-tuned per-strategy lane weights automatically (the core-lane
+    # tuner keys off strategy_type, which the new bot shares), so "directed"
+    # covers both the parent config and the live-tuned signal blend.
+    rank_order = {r["name"]: i for i, r in enumerate(rankings)}
+    winners_by_rank = sorted(winners, key=lambda b: rank_order.get(b.name, 1 << 30))
+    best_parent = winners_by_rank[0] if winners_by_rank else None
+
     for dead_bot in replaced:
-        parent = random.choice(winners)
+        parent = best_parent
         evolved = create_evolved_bot(parent, dead_bot.strategy_type, cycle_number)
 
         if not _validate_bot(evolved):
@@ -310,20 +369,33 @@ def run_evolution(bots, cycle_number):
             f"params_keys={list(bot.strategy_params.keys())}"
         )
 
-    return new_bots
+    return new_bots + exempt
 
 
 # ----------------------------------------------------------------------
 # Secondary bots: maker section + copy-trade bots.
-# Run on the same 60s cadence as MarketDiscovery, in on_cycle_complete.
+# Run on the same 20s cadence as MarketDiscovery, in on_cycle_complete.
 # ----------------------------------------------------------------------
 
-def _create_maker_bots() -> list:
-    """Persistent experimental maker bots. NOT part of evolution."""
-    maker_bots = [
-        LateWindowMakerBot(name="late-window-maker-v1"),
-        FeeZoneMakerBot(name="fee-zone-maker-v1"),
-    ]
+def _resolve_maker_bots(slate: list) -> list:
+    """The maker bots to run this session, drawn from the launched slate.
+
+    Maker bots are now first-class members of the default lineup (see
+    ``startup.STRATEGY_MENU``), so on a fresh/interactive launch they arrive
+    inside ``slate`` and are simply partitioned out here. On the 'continue'
+    path ``create_default_bots`` filters maker rows out of the trader list, so
+    we rebuild them from the DB's active maker configs instead. Their configs
+    are persisted so the dashboard's Active Bots roster stays in sync.
+    """
+    maker_bots = [b for b in slate if b.strategy_type in MAKER_TYPES]
+    if not maker_bots:
+        for cfg in db.get_active_bots():
+            cls = MAKER_BOT_CLASSES.get(cfg["strategy_type"])
+            if cls is not None:
+                maker_bots.append(cls(
+                    name=cfg["bot_name"], generation=cfg["generation"]
+                ))
+
     existing = {b["bot_name"] for b in db.get_active_bots()}
     for bot in maker_bots:
         if bot.name not in existing:
@@ -351,7 +423,7 @@ def _publish_maker_state(discovery, maker_targets):
     """Persist the maker section's current target/mode to ``arena_state``.
 
     Powers the Maker Section card on the dashboard's Overview tab.
-    Called once per discovery cycle (60s cadence) -- cheap because it's
+    Called once per discovery cycle (20s cadence) -- cheap because it's
     a single upsert into a small key/value table.  Idempotent so the
     dashboard just reads the latest row.
 
@@ -473,7 +545,14 @@ def _run_maker_section(maker_bot, market: dict, signals: dict, state) -> bool:
         )
 
         if signal.get("action") == "hold":
-            state.mark_traded(key)
+            # A HOLD is NOT a trade — do NOT add it to the dedup set. The maker
+            # section sees each market up to MAKER_UPCOMING_WINDOW_SEC (20 min)
+            # early, in PRE-WINDOW mode. Time-gated makers like LateWindowMaker
+            # deliberately hold until the final ~90s; marking that early hold as
+            # "traded" locked the market out of the dedup set forever, so the
+            # bot never got to re-evaluate during its actual entry window
+            # (=> zero trades). Return without marking so the next discovery
+            # cycle re-runs analyze() with fresh time_remaining / price.
             return False
 
         result = maker_bot.execute(signal, market)
@@ -510,8 +589,22 @@ def _evolution_check_loop(bots, state, pos_monitor, trader):
     wrapped in try/except so a single bad evolution cycle can't silently
     crash the main coordinator while the four daemon workers continue
     independently without any clear log.
+
+    This loop also hosts the two slow-cadence maintenance jobs (they need a
+    periodic home, not their own threads): the live lane monitor
+    (arena/lane_monitor.py — auto-demotes approved lanes whose live accuracy
+    falls below the bar) and the auto-validation scheduler
+    (arena/validation_scheduler.py — spawns the harness every
+    AUTO_VALIDATE_EVERY_MARKETS windows so Signal Lab proposals appear
+    without any manual run).
     """
+    from arena import lane_monitor, lane_promoter, core_lane_tuner
+    from arena.validation_scheduler import ValidationScheduler
+
     evolution_interval = config.EVOLUTION_INTERVAL_HOURS * 3600
+    validation_scheduler = ValidationScheduler()
+    lane_monitor_interval = getattr(config, "LANE_MONITOR_INTERVAL_SEC", 1800)
+    last_lane_check = 0.0
 
     saved_cycle = db.get_arena_state("evolution_cycle", "0")
     cycle_number = int(saved_cycle)
@@ -543,6 +636,27 @@ def _evolution_check_loop(bots, state, pos_monitor, trader):
                 pos_monitor.update_bots(bots)
         except Exception as e:
             logger.error(f"Evolution cycle error (caught): {e}")
+
+        try:
+            if time.time() - last_lane_check >= lane_monitor_interval:
+                # Demote live candidate lanes that decayed, then judge pending
+                # proposals against live shadow evidence (auto-approve when the
+                # toggle is on). Order matters: demotion frees an active-lane
+                # slot before the promoter checks the concentration cap. Finally
+                # the core-lane tuner nudges drift/mom/strat per strategy on live
+                # attribution (same toggle: OFF = suggest-only).
+                lane_monitor.check_lanes()
+                lane_promoter.check_proposals()
+                core_lane_tuner.tune()
+                last_lane_check = time.time()
+        except Exception as e:
+            logger.error(f"Lane monitor/promoter/tuner error (caught): {e}")
+
+        try:
+            validation_scheduler.check()
+        except Exception as e:
+            logger.error(f"Auto-validation scheduler error (caught): {e}")
+
         time.sleep(30)
 
 
@@ -670,14 +784,21 @@ def main_loop(bots):
         f"Loaded {loaded} recent trade keys from DB (dedup across restarts)"
     )
 
-    maker_bots = _create_maker_bots()
+    # The launched slate mixes 1s-trader bots and discovery-cadence maker bots.
+    # Partition so the Trader / position-monitor / evolution only ever see the
+    # trader bots, while the maker section drives the maker bots on its own
+    # cadence. (Makers are now part of the default lineup — see startup.py.)
+    maker_bots = _resolve_maker_bots(bots)
+    maker_names = {b.name for b in maker_bots}
+    trader_bots = [b for b in bots if b.name not in maker_names]
     copy_bots = []  # Copy-trading was Simmer-based and has been removed.
     logger.info(
-        f"Maker bots (experimental, paper-only): {[b.name for b in maker_bots]}"
+        f"Trader bots: {[b.name for b in trader_bots]} | "
+        f"Maker bots: {[b.name for b in maker_bots]}"
     )
 
     pos_monitor = PositionMonitorThread()
-    pos_monitor.update_bots(bots)
+    pos_monitor.update_bots(trader_bots)
     pos_monitor.start()
 
     discovery = MarketDiscovery(
@@ -686,6 +807,13 @@ def main_loop(bots):
         )
     )
     discovery.start()
+
+    # Market-data warmer: single owner of all per-market network reads (YES+NO
+    # books, prices, OBI, CVD, PM momentum) refreshed every ~1s into a shared
+    # warm cache, so the trader hot path and the arbitrage bot never touch the
+    # network on their 1s tick.
+    warmer = MarketDataWarmer(discovery, get_cvd_feed(), pm_price_feed)
+    warmer.start()
 
     resolver = TradeResolver()
     resolver.start()
@@ -697,7 +825,7 @@ def main_loop(bots):
         sentiment_feed=sentiment_feed,
         polymarket_price_feed=pm_price_feed,
     )
-    trader.set_bots(bots)
+    trader.set_bots(trader_bots)
     trader.start()
 
     # Mark the start of this session so the dashboard's "Current Session"
@@ -709,17 +837,20 @@ def main_loop(bots):
     )
 
     logger.info(
-        f"Arena started with {len(bots)} bots in {config.get_current_mode()} mode"
+        f"Arena started with {len(trader_bots)} trader + {len(maker_bots)} maker "
+        f"bots in {config.get_current_mode()} mode"
     )
     logger.info(f"Bots: {[b.name for b in bots]}")
     logger.info(f"Evolution every {config.EVOLUTION_INTERVAL_HOURS}h")
 
     try:
-        _evolution_check_loop(bots, state, pos_monitor, trader)
+        # Evolution only culls/mutates the directional trader bots; makers (and
+        # the arbitrage bot, via EVOLUTION_EXEMPT_TYPES) are left untouched.
+        _evolution_check_loop(trader_bots, state, pos_monitor, trader)
     except KeyboardInterrupt:
         logger.info("Arena stopped by user")
     finally:
-        for w in (trader, resolver, discovery, pos_monitor):
+        for w in (trader, resolver, discovery, warmer, pos_monitor):
             w.stop()
         time.sleep(0.5)
         logger.info("All workers stopped.")
@@ -755,7 +886,12 @@ def main() -> None:
         config.set_trading_mode(args.mode)
         logger.info(f"Trading mode set to: {args.mode}")
 
-    bots = create_default_bots()
+    # Terminal launches get the interactive startup flow (continue-vs-fresh,
+    # then default-vs-manual bot selection). It returns an explicit bot slate,
+    # or None to mean "use the existing DB configuration" (continue / launchd).
+    from arena import startup
+    selected = startup.interactive_startup()
+    bots = selected if selected is not None else create_default_bots()
 
     existing = {b["bot_name"] for b in db.get_active_bots()}
     for bot in bots:

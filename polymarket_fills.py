@@ -82,3 +82,56 @@ def simulate_fill(book: dict, amount_usdc: float) -> dict:
         "avg_price": avg_price,
         "fee": taker_fee(shares, avg_price),
     }
+
+
+def simulate_fill_shares(book: dict, target_shares: float) -> dict:
+    """Walk a normalized book's asks to buy exactly ``target_shares`` shares.
+
+    The share-based sibling of :func:`simulate_fill`. Whereas ``simulate_fill``
+    spends a fixed USDC budget (variable share count), this fills a fixed SHARE
+    count (variable USDC cost) — essential for a market-neutral arbitrage where
+    the two legs MUST end up share-matched to lock in ``$1`` per pair regardless
+    of which leg walks deeper into its book. Returns the same shape as
+    ``simulate_fill``; ``full`` means the whole share request was fillable::
+
+        {"filled", "full", "shares", "cost", "avg_price", "fee"}
+
+    If the book has less depth than ``target_shares`` the fill is partial
+    (``full`` is False and ``shares`` < ``target_shares``); callers that need a
+    matched pair should re-match on the smaller of the two legs' ``shares``.
+    """
+    empty = {"filled": False, "full": False, "shares": 0.0,
+             "cost": 0.0, "avg_price": 0.0, "fee": 0.0}
+    if not book.get("valid") or target_shares <= 0:
+        return empty
+
+    remaining = target_shares
+    shares = 0.0
+    cost = 0.0
+    for price, size in book.get("asks", []):
+        if remaining <= 1e-9 or price <= 0:
+            break
+        if size <= remaining:
+            # Take the whole level.
+            shares += size
+            cost += price * size
+            remaining -= size
+        else:
+            # Partial take of this level for the leftover share request.
+            shares += remaining
+            cost += price * remaining
+            remaining = 0.0
+            break
+
+    if shares <= 0:
+        return empty
+
+    avg_price = cost / shares
+    return {
+        "filled": True,
+        "full": remaining <= 1e-6,
+        "shares": shares,
+        "cost": cost,
+        "avg_price": avg_price,
+        "fee": taker_fee(shares, avg_price),
+    }

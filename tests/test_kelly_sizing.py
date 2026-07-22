@@ -46,11 +46,31 @@ def test_size_scales_with_bankroll():
     assert large["suggested_amount"] > small["suggested_amount"]
 
 
-def test_size_scales_with_edge():
-    weak = _decide(200.0, 0.52, 0.5)
-    strong = _decide(200.0, 0.52, 0.9)
+def test_size_scales_with_edge_below_cap():
+    # Both drifts trade, and while both edges sit below KELLY_EDGE_CAP the
+    # stronger one sizes bigger.
+    weak = _decide(200.0, 0.52, 0.10)
+    strong = _decide(200.0, 0.52, 0.14)
     assert weak["action"] == strong["action"] == "buy"
+    weak_edge = float(weak["reasoning"].split("edge=")[1].split(" ")[0])
+    strong_edge = float(strong["reasoning"].split("edge=")[1].split(" ")[0])
+    assert weak_edge < strong_edge <= config.KELLY_EDGE_CAP
     assert strong["suggested_amount"] > weak["suggested_amount"]
+
+
+def test_size_clamped_above_edge_cap():
+    # Edges above KELLY_EDGE_CAP size identically: outsized "edges" mean
+    # maximal model-vs-market disagreement, which live correlates with stale
+    # inputs (the 15 biggest bets of the 24h run went 8/15 for -$34).
+    capped = _decide(200.0, 0.52, 0.5)     # edge == cap region boundary check
+    big = _decide(200.0, 0.52, 0.9)
+    assert big["action"] == "buy"
+    big_edge = float(big["reasoning"].split("edge=")[1].split(" ")[0])
+    if big_edge > config.KELLY_EDGE_CAP:
+        expected = (0.25 * config.KELLY_EDGE_CAP
+                    / (1 - big["entry_price"]) * 200.0)
+        assert abs(big["suggested_amount"] - expected) <= 0.05
+        assert big["suggested_amount"] >= capped["suggested_amount"]
 
 
 def test_kelly_fraction_math():

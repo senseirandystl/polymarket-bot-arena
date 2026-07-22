@@ -27,6 +27,10 @@ class SharedArenaState:
         # but isn't needed.
         self._lock = threading.Lock()
         self.traded: set = set()
+        # Skip is a first-class outcome (the research: the best bots skip far
+        # more than they trade). Tally skip reasons so runs are explainable —
+        # why the arena sat flat, not just what it traded.
+        self.skip_counts: dict = {}
 
     def is_traded(self, key: tuple) -> bool:
         with self._lock:
@@ -35,6 +39,16 @@ class SharedArenaState:
     def mark_traded(self, key: tuple) -> None:
         with self._lock:
             self.traded.add(key)
+
+    def note_skip(self, reason: str) -> None:
+        """Record a skip by coarse reason (e.g. 'session', 'no_edge', 'no_book')."""
+        with self._lock:
+            self.skip_counts[reason] = self.skip_counts.get(reason, 0) + 1
+
+    def skip_snapshot(self) -> dict:
+        """A copy of the skip-reason tally for reporting."""
+        with self._lock:
+            return dict(self.skip_counts)
 
     def load_from_db(self, conn) -> int:
         """Rehydrate the dedup set from the trades table (1h lookback).

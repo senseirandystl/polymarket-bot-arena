@@ -143,12 +143,33 @@ def test_drift_veto_blocks_contradicting_side():
 
 
 def test_drift_veto_allows_flow_trades_when_drift_flat():
-    # Below the veto floor (drift ~ 0) flow-only trades stay allowed — they
-    # measured break-even live and are the sentiment bot's identity.
+    # Below the veto floor (drift ~ 0) the drift veto itself does not block a
+    # flow-only trade. Priced OUTSIDE the 0.42-0.58 dead zone (see the
+    # dead-zone gate tests below) so only the veto behaviour is under test.
+    from bots.bot_sentiment import SentimentBot
+    d = SentimentBot(name="s").make_decision(
+        _market(yes=0.38, tr=150), _sig(cvd=0.8))
+    assert d["action"] == "buy"
+
+
+# --- Dead-zone gate (2026-07-21): the single biggest live leak ---
+
+def test_dead_zone_gate_blocks_flat_drift_coinflip():
+    # A flat-drift opinion against a near-coin-flip market (mid in 0.42-0.58 &
+    # |drift| < 0.10) was 59 trades, 39% WR, -$77.83 — gated flat now.
     from bots.bot_sentiment import SentimentBot
     d = SentimentBot(name="s").make_decision(
         _market(yes=0.50, tr=150), _sig(cvd=0.8))
-    assert d["action"] == "buy"
+    assert d["action"] == "skip"
+    assert "dead-zone" in d["reasoning"].lower()
+
+
+def test_dead_zone_gate_allows_high_drift_in_band():
+    # |drift| >= 0.30 in the SAME price band is the profitable "market lags
+    # drift" trade (+$30.10, 65.7% WR) and must pass through the gate.
+    m = _market(yes=0.50, tr=150)
+    s = _sig(btc_drift=0.35, cvd=0.5, prices=[100.0, 100.3], latest=100.3)
+    assert _bot().make_decision(m, s)["action"] == "buy"
 
 
 def test_momentum_lane_not_saturated_by_median_move():

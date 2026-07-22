@@ -137,14 +137,25 @@ class BaseBot(ABC):
     # per-strategy weight, never an accidental default-1.0 fallthrough.)
     _DEAD_LANES = {"pm": 0.00, "cvd": 0.00, "obi": 0.00,
                    "fut": 0.00, "tech": 0.00, "xasset": 0.00}
+    # momentum/hybrid REBALANCED (BUG #30, 2026-07-20): the 24h/279-trade run
+    # made momentum-v1 the worst-performing bot (-$31.85, 40.9% WR) and the
+    # hybrid family collectively negative across all 4 live generations
+    # (-$43 total) — both profiles lean heavily on the two lanes shown live to
+    # be currently harmful (mid-magnitude mom noise pushing model_prob into
+    # the toxic 0.10-0.30 drift band; high-confidence strat reads, see
+    # STRAT_LANE_CONF_CAP above). Shifted weight toward drift, the one lane
+    # that measured genuinely predictive at high magnitude (79.3% WR) and
+    # whose own conviction scaling (MODEL_CONVICTION_SCALE) already keeps it
+    # honest when uninformative — a smaller, conservative nudge, not a full
+    # re-derivation, pending a longer run to confirm the direction.
     STRATEGY_SIGNAL_PROFILE = {
-        "momentum":          {"drift": 0.25, "mom": 0.45, "strat": 0.30, **_DEAD_LANES},
+        "momentum":          {"drift": 0.35, "mom": 0.40, "strat": 0.25, **_DEAD_LANES},
         "phantom":           {"drift": 0.20, "mom": 0.30, "strat": 0.50, **_DEAD_LANES},
         "mean_reversion":    {"drift": 0.70, "mom": 0.00, "strat": 0.30, **_DEAD_LANES},
         "mean_reversion_sl": {"drift": 0.70, "mom": 0.00, "strat": 0.30, **_DEAD_LANES},
         "mean_reversion_tp": {"drift": 0.70, "mom": 0.00, "strat": 0.30, **_DEAD_LANES},
         "sentiment":         {"drift": 0.30, "mom": 0.00, "strat": 0.70, **_DEAD_LANES},
-        "hybrid":            {"drift": 0.40, "mom": 0.20, "strat": 0.40, **_DEAD_LANES},
+        "hybrid":            {"drift": 0.50, "mom": 0.20, "strat": 0.30, **_DEAD_LANES},
         "sniper":            {"drift": 0.50, "mom": 0.10, "strat": 0.15, **_DEAD_LANES},
     }
     DEFAULT_SIGNAL_PROFILE = {"drift": 0.50, "mom": 0.10, "strat": 0.15, **_DEAD_LANES}
@@ -177,15 +188,20 @@ class BaseBot(ABC):
         "mean_reversion_sl": 0.58,
         "mean_reversion_tp": 0.58,
     }
+    # 2026-07-21 (data-gathering): floors lowered (0.015->0.010, 0.02->0.012) to
+    # un-starve the evaluation dataset — the fee-net bar + flow tax + conviction
+    # scaling stacked into a ~6.5pt model-vs-ask requirement, yielding ~63k
+    # no_edge skips per ~12 trades. Safety guards (drift-veto, dead-zone,
+    # consensus, book-sum) are unchanged. Restore 0.015/0.02 after the window.
     MIN_EDGE = {
-        "momentum": 0.015,
-        "mean_reversion": 0.02,
-        "mean_reversion_sl": 0.02,
-        "mean_reversion_tp": 0.02,
-        "sniper": 0.02,
-        "phantom": 0.015,
-        "sentiment": 0.02,
-        "hybrid": 0.02,
+        "momentum": 0.010,
+        "mean_reversion": 0.012,
+        "mean_reversion_sl": 0.012,
+        "mean_reversion_tp": 0.012,
+        "sniper": 0.012,
+        "phantom": 0.010,
+        "sentiment": 0.012,
+        "hybrid": 0.012,
     }
 
     def __init__(self, name, strategy_type, params, generation=0, lineage=None):
@@ -304,6 +320,13 @@ class BaseBot(ABC):
         # tanh keeps the same slope near zero as the old hard clamp but rolls
         # off smoothly instead of pinning every >p97 move at exactly 1.0.
         momentum_signal = soft_saturate(price_momentum, 0.002)
+        # Quiet-regime damp (2026-07-19): in chop a one-candle move is noise,
+        # not trend — momentum-driven trades at |drift| < 0.10 ran 47.9% WR /
+        # -$74 for the mom-heavy profile. Only "quiet" damps; trending /
+        # volatile / normal (and "unknown" during feed warmup) are untouched.
+        vol_regime = (signals.get("vol_regime", {}) or {}).get("regime")
+        if vol_regime == "quiet":
+            momentum_signal *= getattr(config, "MOM_QUIET_REGIME_DAMP", 0.5)
 
         # --- Lane: strategy thesis from analyze() ---
         raw_signal = self.analyze(market, signals)
@@ -311,6 +334,12 @@ class BaseBot(ABC):
         if raw_signal["action"] != "hold":
             strategy_yes = 1.0 if raw_signal["side"] == "yes" else -1.0
             strategy_signal = strategy_yes * raw_signal["confidence"]
+        # Strat-lane confidence cap (BUG #30): live data showed WR falls as
+        # the thesis gets MORE confident (>=0.6 magnitude ran 36.1% WR/-$60,
+        # 0.3-0.6 ran 55.9%) — clamp so an overconfident read still blends at
+        # the magnitude that actually performed instead of amplifying edge.
+        strat_cap = getattr(config, "STRAT_LANE_CONF_CAP", 0.60)
+        strategy_signal = max(-strat_cap, min(strat_cap, strategy_signal))
 
         # --- Signal 4: Learning bias ---
         of_data = signals.get("orderflow", {})
@@ -551,15 +580,52 @@ class BaseBot(ABC):
         else:
             side, side_price, chosen_edge, confidence = "no", no_exec, edge_no, conf_no
 
+        # --- Dead-zone gate (2026-07-21): the single biggest live leak ---
+        # A flat-drift opinion against a near-coin-flip market was 59 trades,
+        # 39% WR, -$77.83 over the 290-trade run — the model manufacturing an
+        # edge from noisy flow/strat lanes where the crowd is genuinely 50/50.
+        # It fires BEFORE the edge gate: the coin-flip band with no drift
+        # conviction is a "sit flat" region regardless of computed edge. The
+        # SAME price band with |drift| >= DEAD_ZONE_DRIFT_MIN is the profitable
+        # "market lags drift" trade (+$30.10, 65.7% WR) and passes through, so
+        # the gate is drift-CONDITIONAL and regime-agnostic (keys off |drift|).
+        side_mid_dz = yes_price if side == "yes" else no_price
+        dz_lo = getattr(config, "DEAD_ZONE_PRICE_LO", 0.42)
+        dz_hi = getattr(config, "DEAD_ZONE_PRICE_HI", 0.58)
+        dz_drift = getattr(config, "DEAD_ZONE_DRIFT_MIN", 0.10)
+        if dz_lo <= side_mid_dz <= dz_hi and abs(drift_signal_val) < dz_drift:
+            return {
+                "action": "skip",
+                "side": side,
+                "confidence": confidence,
+                "reasoning": (
+                    f"Dead-zone gate: {side} mid={side_mid_dz:.2f} in "
+                    f"[{dz_lo:.2f},{dz_hi:.2f}] & |drift|={abs(drift_signal_val):.3f}"
+                    f"<{dz_drift:.2f} (coin-flip, no conviction)"
+                ),
+                "suggested_amount": 0,
+                "features": features,
+            }
+
         # --- Minimum-edge gate (no edge = no bet) — SAME bar on both sides ---
         # Information-scaled: with drift flat the model's disagreement with the
         # market rests entirely on the noisy flow/momentum lanes, so a
         # flow-only claim must clear a HIGHER bar (overnight run: flow-only
         # cheap-side trades by the trend bots ran 29% WR in the 0.30-0.42
         # bucket; drift-backed trades in the same bucket were profitable).
+        # Flow-only boundary raised 0.05 -> 0.10 after the 2026-07-19 24h run,
+        # then made CONTINUOUS (BUG #30, 2026-07-20): the step function only
+        # penalized |drift| < 0.10, but the next 24h run showed the 0.10-0.30
+        # band it released to full trust was the biggest dollar loss (135
+        # trades, 49.6% WR, -$76.32) while only |drift| >= 0.30 was genuinely
+        # predictive (79.3% WR). The multiplier now tapers linearly from
+        # FLOW_ONLY_EDGE_MULT_MAX at drift=0 to 1.0x at FLOW_ONLY_DRIFT_FULL_TRUST
+        # instead of stepping to full trust at 0.10.
         min_edge = self.MIN_EDGE.get(self.strategy_type, config.MIN_EDGE_DEFAULT)
-        if abs(drift_signal_val) < getattr(config, "DRIFT_VETO_MIN", 0.05):
-            min_edge *= getattr(config, "FLOW_ONLY_EDGE_MULT", 2.0)
+        mult_max = getattr(config, "FLOW_ONLY_EDGE_MULT_MAX", 2.0)
+        full_trust = max(getattr(config, "FLOW_ONLY_DRIFT_FULL_TRUST", 0.30), 1e-6)
+        taper = max(0.0, 1.0 - abs(drift_signal_val) / full_trust)
+        min_edge *= 1.0 + (mult_max - 1.0) * taper
         if chosen_edge < min_edge:
             return {
                 "action": "skip",
@@ -628,7 +694,13 @@ class BaseBot(ABC):
         # identically ($3.83 vs $3.76).
         price = max(side_price, 0.01)
         bankroll = _sizing_bankroll(self.trading_mode)
-        kelly_f = max(0.0, chosen_edge) / max(1.0 - price, 0.05)
+        # Edge is CLAMPED for sizing only (the trade/skip gate above used the
+        # raw edge): outsized edges mean maximal model-vs-market disagreement,
+        # which live correlates with stale inputs, not extra information (the
+        # 15 biggest bets of the 24h run went 8/15 for -$34).
+        sizing_edge = min(max(0.0, chosen_edge),
+                          getattr(config, "KELLY_EDGE_CAP", 0.10))
+        kelly_f = sizing_edge / max(1.0 - price, 0.05)
         kelly_usd = kelly_f * _kelly_fraction() * bankroll
         # SHARES-FIRST: derive the exact share count, then the USD from it.
         # Sizing USD-first and dividing by price rounds away PnL at low prices.

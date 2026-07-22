@@ -79,10 +79,34 @@ MAX_TRADES_PER_HOUR_PER_BOT = 60  # Bots trade every 5-min market they find
 # Evolution Settings
 EVOLUTION_INTERVAL_HOURS = 2
 MUTATION_RATE = 0.15  # 15% random adjustment to params
+# Directed evolution (BUG #31): with the parent now chosen as the BEST-ranked
+# survivor (not random) and lane weights auto-tuned per strategy by the
+# core-lane tuner, mutation should EXPLOIT the proven config, not wander off it
+# — a tighter jiggle keeps the mutant near a configuration that actually earned
+# its survival instead of re-rolling the dice at 15%.
+MUTATION_RATE_DIRECTED = 0.07
 NUM_BOTS = 4
 SURVIVORS_PER_CYCLE = 1  # Top 1 survives, bottom 3 replaced
-MIN_TRADES_FOR_JUDGMENT = 20   # Bots with fewer resolved trades are immune
-MIN_WIN_RATE = 0.65            # 65% WR threshold to survive evolution
+# Judgment WINDOW is decoupled from the 2h cycle CADENCE (2026-07-19): judging
+# on the 2h window with a 20-trade floor made every bot permanently IMMUNE
+# (bots average 5-12 trades per 2h), so zero evolutions fired in the whole
+# 24h v5 run while momentum-v1 bled -$86. The window is what a bot is judged
+# ON; the interval is only how often the judgment runs.
+EVOLUTION_WINDOW_HOURS = 24
+# Raised 15 -> 30 (2026-07-21): a 5-min-market window of 15-20 resolved trades
+# is dominated by noise — cycle 6 killed sniper-v1 on a 17-trade / -$8.49 dip
+# one cycle after it survived at 61% WR, and mutated survivors were "judged" on
+# 1-2 trades. Empirically the per-bucket WR/P&L numbers in the run only
+# stabilized past ~30 samples, so a bot needs at least that many resolved this
+# window before it can be replaced.
+MIN_TRADES_FOR_JUDGMENT = 30   # Fewer resolved trades in the window = immune
+# Survival bar is the BREAK-EVEN GAP (win_rate - avg_entry_price), not a flat
+# WR threshold: 65% WR bought at 70c loses money while 55% bought at 45c
+# prints. A bot survives if its gap clears this floor OR its window P&L is
+# positive (good sizing can rescue a thin gap). The old MIN_WIN_RATE=0.65
+# would have culled every bot in the v5 run including the profitable ones
+# (best WR was 63.3%).
+EVOLUTION_BE_GAP_MIN = 0.03    # survive if WR beats avg entry by >= 3c
 
 # Signal Feed Settings
 BINANCE_WS_URL = "wss://stream.binance.com:9443/ws"
@@ -151,6 +175,34 @@ SIGNAL_WEIGHT_PM = 0.0
 # keep the lane at 0 until the calibrated form measures POSITIVE NET edge in
 # the offline harness (house rule: validate-before-weighting).
 SIGNAL_WEIGHT_CVD = 0.0
+# Quiet-regime damp on the BTC momentum lane (2026-07-19 24h run): momentum-
+# driven trades in chop (|drift| < 0.10) ran 47.9% WR / -$74 for momentum-v1
+# alone — one candle of quiet-tape noise is not a trend. When the volatility
+# regime (signals/volatility_regime.py, computed from the live candle stream)
+# reads "quiet", the mom lane's value is multiplied by this before blending.
+# Trending/volatile/normal regimes are untouched.
+MOM_QUIET_REGIME_DAMP = 0.5
+# Strat-lane confidence cap (BUG #30, 2026-07-20). The per-strategy analyze()
+# thesis (EMA-crossover/breakout, z-score fade, trend-follow, etc.) has never
+# been offline-validated the way drift/mom were — it was assumed reasonable
+# as "differentiation by emphasis". The 24h/279-trade run showed the opposite
+# of a working signal: WR fell as the thesis got MORE confident (|strat| >=
+# 0.6: 36.1% WR, -$60.15 over 36 trades — the single worst bucket in the run;
+# |strat| 0.3-0.6: 55.9% WR; |strat| < 0.3: 46.5%). A maximally confident
+# thesis correlates with the strategy pattern-matching a move that's already
+# priced in, not with extra information (same shape as KELLY_EDGE_CAP's
+# rationale for outsized model-vs-market edges). Clamp the lane's magnitude
+# before it enters the blend so overconfident reads fall back into the
+# 0.3-0.6 band that actually performed, rather than removing the lane
+# outright. A full offline harness validation of the strat lane (same
+# treatment as fut/tech/xasset in tools/validate_signals.py) is the
+# recommended follow-up before trusting it further.
+# Lowered 0.60 -> 0.30 (2026-07-21): after the 290-trade run, live per-lane
+# attribution showed strat is anti-predictive at any magnitude >= 0.3
+# (|strat| 0.3-0.6 ran 52.7% WR / -$14.81; >= 0.6 ran 46.0% / -$34.05), while
+# |strat| < 0.3 was the only profitable band (+$41.23). Clamp to 0.30 so the
+# blend only ever sees the magnitude that actually performed.
+STRAT_LANE_CONF_CAP = 0.30
 # Tape volume (shares) below which CVD magnitude is damped: cvd =
 # net / max(total, floor). A 30-share one-sided tape reads 0.15, not 1.0;
 # a 1500-share one-sided tape still reads ~1.0. Calibrate offline before
@@ -170,6 +222,72 @@ SIGNAL_WEIGHT_XASSET = 0.0   # ETH/SOL cross-asset confirmation (signals/cross_a
 # above this smooth 0..1 caution score, directional takers stand down (same
 # philosophy as the session filter — "build the skip, default flat").
 MACRO_CAUTION_SKIP = 0.75
+
+# --- Live lane monitor (arena/lane_monitor.py) — the DEMOTION half of the
+# lane-promotion pipeline. The harness promotes on backfilled data; this
+# demotes on live ground truth. Every trade logs the raw candidate-lane reads
+# in its reasoning; the monitor parses them from RESOLVED trades placed after
+# a lane's approval and scores the lane's sign against the actual outcome.
+# Why it must exist: the 2026-07-19 run approved tech at a harness-measured
+# 74-80% follow-WR — live it scored 51.7% over 209 trades (harness numbers
+# carry adverse-selection and stale-mid optimism the live tape doesn't).
+LANE_MONITOR_MIN_TRADES = 50        # resolved readings before a verdict
+LANE_MONITOR_MIN_ACCURACY = 0.53    # live sign-vs-outcome accuracy to stay live
+LANE_MONITOR_DEADBAND = 0.05        # |reading| below this = no directional read
+LANE_MONITOR_INTERVAL_SEC = 1800    # check cadence (piggybacks the evolution loop)
+
+# --- Auto-validation scheduler (arena/validation_scheduler.py) ---
+# Runs tools/validate_signals.py --propose from inside the arena every
+# AUTO_VALIDATE_EVERY_MARKETS 5-min windows (markets are strictly one per
+# 5 minutes, so 100 markets ~ 8.3h => ~3 fresh reads/day). The WINDOW stays
+# at 300 markets (~25h) because the promotion bar needs n>=200 samples and
+# the sparser lanes (fut_oi) only collect ~300-360 samples per 300 markets —
+# a shorter window would starve them below the bar. Frequency gives regime
+# freshness; window size gives statistical power. Proposals still require
+# dashboard approval (Signal Lab) — this only automates the measurement.
+AUTO_VALIDATE_ENABLED = True
+AUTO_VALIDATE_EVERY_MARKETS = 100   # run cadence, in 5-min market windows
+AUTO_VALIDATE_WINDOW_MARKETS = 300  # --markets passed to the harness
+
+# --- Auto-approve promoter (arena/lane_promoter.py) — closed loop ---
+# The harness NOMINATES candidate lanes (offline, optimistic); LIVE attribution
+# JUDGES them. A pending proposal is auto-approved only once the lane's own
+# shadow reads (logged in every directional trade's cand(...) string, pre
+# kill-switch) clear a LIVE bar over a real resolved sample — never on the
+# harness number alone, which measured tech at 74-80% but scored 51.7% live.
+# Bar is intentionally HIGHER than LANE_MONITOR_MIN_ACCURACY (0.53) so a lane
+# must earn promotion by a clearer margin than it needs to merely survive —
+# hysteresis that stops a borderline lane flapping between approve and demote.
+# The toggle is stored in arena_state ('auto_approve_lanes', dashboard-editable);
+# this constant is only the boot default. OFF => the promoter still annotates
+# each proposal with live evidence for the human, but never flips it.
+AUTO_APPROVE_LANES_ENABLED = True
+AUTO_APPROVE_MIN_TRADES = 60      # live shadow readings before a promotion verdict
+AUTO_APPROVE_MIN_ACCURACY = 0.55  # live sign-vs-outcome accuracy to auto-promote
+AUTO_APPROVE_MAX_ACTIVE = 3       # cap on simultaneously-enabled CANDIDATE lanes
+
+# --- Core-lane auto-tuner (arena/core_lane_tuner.py) — the loop's core half ---
+# The candidate-lane loop above tunes fut/tech/xasset (which feed a few bots at
+# ~0.10 weight). This tunes the lanes that drive EVERY directional trade —
+# drift/mom/strat — PER strategy, on that strategy's own live attribution
+# (sign-vs-outcome of the lane reading logged in its trades' reasoning). Because
+# these lanes decide 100% of a decision, the tuner is deliberately timid: small
+# capped nudges, a per-lane band around the hand-set class default so no lane
+# can run away or collapse (drift especially — the one validated lane), a real
+# per-(strategy,lane) sample floor, and hysteresis (nudge up only above
+# HIGH_ACC, down only below LOW_ACC; the dead band between them holds steady).
+# Gated by the SAME auto-approve toggle as the promoter: OFF => compute and
+# surface the suggested weights for a human, never apply. Writes a COMPLETE
+# per-strategy profile for each tuned lane (a core-lane override zeroes any
+# strategy it omits, unlike a candidate lane that defaults to 0).
+CORE_TUNE_ENABLED = True
+CORE_TUNE_MIN_TRADES = 40      # per-(strategy,lane) resolved readings before tuning
+CORE_TUNE_HIGH_ACC = 0.56      # lane sign-accuracy above this => nudge weight UP
+CORE_TUNE_LOW_ACC = 0.48       # below this => nudge weight DOWN (toward the band floor)
+CORE_TUNE_STEP = 0.05          # per-cycle weight nudge (bounded, one step/lane/strategy)
+CORE_TUNE_BAND = 0.20          # max |deviation| of a tuned weight from its class default
+CORE_TUNE_WEIGHT_MAX = 0.90    # absolute ceiling on any single lane weight
+CORE_TUNE_WEIGHT_MIN = 0.0     # absolute floor (the band around the default binds first)
 
 # Sentiment feed master switch (2026-07-18): OFF — no local LLM will be run
 # and the keyword/CryptoPanic pipeline isn't worth its noise on 5-min BTC
@@ -217,10 +335,43 @@ MODEL_PROB_MAX = 0.98
 # drift-contradicting trades 26% WR / -$55 vs 52% agreeing. Below the floor
 # (drift ~ 0) flow-only trades are allowed — they measured break-even.
 DRIFT_VETO_MIN = 0.05
-# When drift is below the veto floor (flow-only trade), the MIN_EDGE bar is
-# multiplied by this — a claim resting purely on the noisy flow/momentum lanes
-# must be proportionally stronger (flow-only cheap-side trades ran 29% WR).
-FLOW_ONLY_EDGE_MULT = 2.0
+# Continuous flow-only edge scaling (BUG #30, 2026-07-20). The old step
+# function only penalized |drift| < 0.10 (full 2x tax below, full trust at or
+# above). The 279-trade / 24h run that followed showed the STEP was in the
+# wrong place: |drift| < 0.10 ran 33.3% WR / -$49.35 as expected, but the
+# 0.10-0.30 "mid" band — released to full trust by the step — was actually
+# the single biggest dollar loss (135 trades, 49.6% WR, -$76.32), while only
+# |drift| >= 0.30 cleared real predictiveness (79.3% WR, +$25.58). A drift
+# reading of 0.12 carries barely more information than 0.05; the old function
+# treated it as fully trustworthy. The multiplier now tapers LINEARLY from
+# FLOW_ONLY_EDGE_MULT_MAX at drift=0 down to 1.0x (full trust) at
+# FLOW_ONLY_DRIFT_FULL_TRUST, so the mid band pays a graduated tax instead of
+# a cliff-edge free pass. DRIFT_VETO_MIN (0.05) is unchanged — contradicting
+# even a small drift reading is still vetoed outright regardless of this scale.
+# 2026-07-21 (data-gathering): loosened 2.0 -> 1.5. The full 2.0x tax + the
+# fee-net MIN_EDGE floors + conviction scaling stacked into a ~6.5pt model-vs-ask
+# bar that produced ~63k no_edge skips per ~12 trades (run starved of evaluation
+# data). This partially reopens the moderate-drift band for measurement; the
+# drift-veto, dead-zone, consensus and book-sum guards are unchanged. Revert to
+# 2.0 once enough trades accumulate to judge per-drift-band P&L live.
+FLOW_ONLY_EDGE_MULT_MAX = 1.5
+FLOW_ONLY_DRIFT_FULL_TRUST = 0.30
+
+# --- Dead-zone gate (2026-07-21) — the single biggest live leak ---
+# Over the 290-trade run the 0.42-0.58 price band with |drift| below
+# DEAD_ZONE_DRIFT_MIN was 59 trades, 39.0% WR, -$77.83: the model taking a
+# low-conviction opinion against a near-coin-flip market. The continuous
+# flow-only tax alone (above) did not suppress them. Crucially the SAME price
+# band with |drift| >= 0.30 still profited (+$30.10, 65.7% WR) — the validated
+# "market lags drift" money — so the gate is drift-CONDITIONAL: a directional
+# bot sits flat when the chosen side's MID is in the coin-flip band AND drift
+# is flat. Zone bots (sniper/makers) override make_decision and carry their own
+# drift gates, so this only affects the directional signal path. Regime-agnostic
+# (keys off |drift|, not a side).
+DEAD_ZONE_PRICE_LO = 0.42
+DEAD_ZONE_PRICE_HI = 0.58
+DEAD_ZONE_DRIFT_MIN = 0.10
+
 # Conviction-scaled trust (2026-07-17 chop-regime leak): trust_eff =
 # trust * min(1, |P_model - 0.5| / MODEL_CONVICTION_SCALE). The edge formula
 # trust*(P_model - mid) derives its MAGNITUDE from the market's displacement,
@@ -231,7 +382,11 @@ FLOW_ONLY_EDGE_MULT = 2.0
 # leaving the validated market-lags-drift rule (+19.5c/share offline, model
 # lean >= 0.10) at full trust. 0.10 = the lean where trust saturates; a
 # drift-0.5 reading (lean 0.1125 on the momentum profile) keeps full trust.
-MODEL_CONVICTION_SCALE = 0.10
+# 2026-07-21 (data-gathering): lowered 0.10 -> 0.06 so trust_eff saturates at a
+# moderate lean (0.06) instead of 0.10, giving moderate-conviction models real
+# edge instead of near-zero. Part of the loosening to un-starve the dataset (see
+# FLOW_ONLY_EDGE_MULT_MAX note); revert to 0.10 after the eval window.
+MODEL_CONVICTION_SCALE = 0.06
 # Hard model-lean floor (BUG #27, 2026-07-17 evening run). Conviction-scaled
 # trust DAMPED weak models but still let them trade into large market
 # displacement (a trust_eff=0.03 trade is in the log). Below the floor the
@@ -269,6 +424,13 @@ BOOK_SUM_TOLERANCE = 0.04
 # PURE Kelly (2026-07-17): no per-trade or %-of-balance caps in paper mode
 # (the shared-pool gate is the only spend limit); live keeps LIVE_MAX_POSITION.
 KELLY_FRACTION = 0.25
+# Clamp on the edge fed into Kelly SIZING (the trade/skip decision still uses
+# the raw edge). Live evidence (2026-07-19 24h run): the 15 biggest bets went
+# 8/15 for -$34, and avg loss size exceeded avg win size — an outsized "edge"
+# usually means the model maximally disagrees with the market, which is when
+# its inputs are most likely stale/wrong, not when it knows the most. Edges
+# above the cap size as if they were exactly the cap.
+KELLY_EDGE_CAP = 0.10
 # How long make_decision may reuse the last bankroll read (it runs per-bot
 # per-second; the pool changes only on fills/resolutions).
 SIZING_BANKROLL_CACHE_SEC = 5.0
@@ -277,7 +439,7 @@ SIZING_BANKROLL_CACHE_SEC = 5.0
 # pending the edge-calibrated redesign. See spec R5.
 LEARNING_ENABLED = False
 # Fallback minimum cost-adjusted edge (probability units) to place a trade.
-MIN_EDGE_DEFAULT = 0.02
+MIN_EDGE_DEFAULT = 0.012  # 2026-07-21 data-gathering: 0.02 -> 0.012 (see base_bot.MIN_EDGE)
 # Maps the chosen side's edge -> sizing confidence (~0.10 edge -> 0.45 cap).
 EDGE_TO_CONFIDENCE = 4.5
 # A bot never buys a side priced above HIGH_PRICE_GUARD (bad risk/reward) or

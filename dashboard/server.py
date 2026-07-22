@@ -458,11 +458,41 @@ def get_lane_proposals(_auth: str = Depends(verify_auth)):
     when a kill-switched lane clears the promotion thresholds; approving one
     here activates the lane live via the DB override (no restart).
     """
+    # Live lane monitor report (arena/lane_monitor.py): per-lane live
+    # direction-accuracy for enabled overrides — the demotion half of the
+    # pipeline. Written by the arena every LANE_MONITOR_INTERVAL_SEC.
+    try:
+        monitor = json.loads(db.get_arena_state("lane_monitor") or "{}")
+    except (json.JSONDecodeError, TypeError):
+        monitor = {}
+    # Core-lane tuner report (arena/core_lane_tuner.py): per-(strategy, lane)
+    # live accuracy + current/suggested drift/mom/strat weights.
+    try:
+        core_tuner = json.loads(db.get_arena_state("core_lane_tuner") or "{}")
+    except (json.JSONDecodeError, TypeError):
+        core_tuner = {}
     return JSONResponse({
         "proposals": db.get_lane_proposals(),
         "overrides": db.get_lane_overrides(),
         "last_run": db.get_latest_lane_run(),
+        "monitor": monitor,
+        "core_tuner": core_tuner,
+        "auto_approve": db.get_auto_approve_lanes(),
     })
+
+
+@app.post("/api/lane-auto-approve")
+async def set_lane_auto_approve(request: Request,
+                                _auth: str = Depends(verify_auth)):
+    """Flip the closed-loop auto-approve toggle (body: {"enabled": true}).
+
+    ON: the promoter auto-approves candidate lanes that clear the LIVE bar.
+    OFF: it only annotates proposals with live evidence for a human decision.
+    """
+    body = await request.json()
+    enabled = bool(body.get("enabled"))
+    db.set_auto_approve_lanes(enabled)
+    return JSONResponse({"success": True, "auto_approve": enabled})
 
 
 @app.post("/api/lane-proposals/{proposal_id}/decide")

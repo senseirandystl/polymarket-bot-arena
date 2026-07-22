@@ -304,13 +304,34 @@ td { padding: 6px 4px; border-bottom: 1px solid #21262d; }
 
     <!-- ===== SIGNAL LAB TAB ===== -->
     <div class="tab-content hidden" id="tab-signal-lab">
-        <div class="section-title">Pending Lane Proposals <span style="color:#8b949e;font-size:11px;text-transform:none;letter-spacing:0;">&mdash; filed by the offline harness when a kill-switched signal lane clears the promotion bar (n&ge;200, follow-WR&ge;55%, net edge &ge;+0.5&cent;/share after price+fee). Approving activates the lane live within seconds.</span></div>
+        <div class="card" id="auto-approve-card" style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px;margin-bottom:14px">
+            <div>
+                <div style="font-weight:600">Closed-loop auto-approve</div>
+                <div style="color:#8b949e;font-size:12px;max-width:640px">
+                    When ON, a proposal is promoted automatically once the lane's own
+                    live shadow reads clear the bar (&ge;<span id="aa-min-trades">60</span> resolved,
+                    &ge;<span id="aa-min-acc">55%</span> sign accuracy) &mdash; judged on live P&amp;L, not the
+                    optimistic harness number. When OFF, the loop only attaches the live
+                    evidence and waits for your click below. Demotion stays automatic either way.
+                </div>
+            </div>
+            <label style="display:flex;align-items:center;gap:8px;cursor:pointer;white-space:nowrap">
+                <input type="checkbox" id="auto-approve-toggle" onchange="setAutoApprove(this.checked)" style="width:18px;height:18px;cursor:pointer">
+                <span id="auto-approve-label" style="font-weight:600;color:#8b949e">&hellip;</span>
+            </label>
+        </div>
+        <div class="section-title">Pending Lane Proposals <span style="color:#8b949e;font-size:11px;text-transform:none;letter-spacing:0;">&mdash; filed by the offline harness when a kill-switched signal lane clears the promotion bar (n&ge;200, follow-WR&ge;55%, net edge &ge;+0.5&cent;/share after price+fee). Live shadow accuracy (judged on real fills) is shown per proposal; approving activates the lane live within seconds.</span></div>
         <div class="card" id="lane-proposals-card">
             <div style="color:#8b949e">Loading&hellip;</div>
         </div>
 
         <div class="section-title">Active Lane Overrides</div>
         <div class="card" id="lane-overrides-card">
+            <div style="color:#8b949e">Loading&hellip;</div>
+        </div>
+
+        <div class="section-title">Core-Lane Tuning <span style="color:#8b949e;font-size:11px;text-transform:none;letter-spacing:0;">&mdash; per-strategy live accuracy of the lanes that drive every trade (drift/mom/strat) and the weight the tuner is nudging toward. Bounded to &plusmn;<span id="ct-band">0.20</span> of each strategy's default; applied only when auto-approve is ON.</span></div>
+        <div class="card" id="core-tuner-card">
             <div style="color:#8b949e">Loading&hellip;</div>
         </div>
 
@@ -730,6 +751,7 @@ function updateBots(bots) {
     bots.forEach((bot, i) => {
         const cfg = bot.config;
         const p12 = bot.performance_12h || {};
+        const p24 = bot.performance_24h || {};
         const trades = bot.recent_trades || [];
         const params = typeof cfg.params === 'string' ? JSON.parse(cfg.params) : cfg.params;
         const botMode = bot.trading_mode || 'paper';
@@ -754,7 +776,8 @@ function updateBots(bots) {
             <div class="bot-meta">${cfg.strategy_type} | Gen ${cfg.generation} | ${cfg.lineage || '-'}</div>
             <div class="stat-row"><span class="stat-label">Balance</span><span class="stat-value bot-balance">${balanceStr}</span></div>
             <div class="stat-row"><span class="stat-label">${statsLabel} P&L</span><span class="stat-value ${pnlClass(p12.total_pnl)}">${fmtPnl(p12.total_pnl || 0)}</span></div>
-            <div class="stat-row"><span class="stat-label">Win Rate</span><span class="stat-value">${winRate(p12.wins, p12.losses)}</span></div>
+            <div class="stat-row"><span class="stat-label">Win Rate (${statsLabel})</span><span class="stat-value">${winRate(p12.wins, p12.losses)}</span></div>
+            ${isLive ? '' : `<div class="stat-row"><span class="stat-label">24h P&L / WR</span><span class="stat-value"><span class="${pnlClass(p24.total_pnl)}">${fmtPnl(p24.total_pnl || 0)}</span> / ${winRate(p24.wins, p24.losses)}</span></div>`}
             <div class="stat-row"><span class="stat-label">Trades (${statsLabel})</span><span class="stat-value">${p12.total_trades || 0}${pending ? ' <span style="color:#f0883e">+' + pending + ' pending</span>' : ''}</span></div>
             <div class="trade-list">${trades.slice(0, 5).map(t => `
                 <div class="trade-item">
@@ -1132,6 +1155,23 @@ function fmtMetric(m) {
     return `n=${m.net_n ?? m.n ?? 0} &middot; follow-WR ${wr} &middot; net EV ${ev} &middot; avg entry ${price}`;
 }
 
+function fmtLive(live) {
+    if (!live || live.accuracy == null) return '';
+    const acc = (live.accuracy * 100).toFixed(1) + '%';
+    const ok = live.n >= (live.min_trades || 0) && live.accuracy >= (live.min_accuracy || 0);
+    const color = live.n < (live.min_trades || 0) ? '#8b949e' : (ok ? '#3fb950' : '#f85149');
+    const verdict = live.n < (live.min_trades || 0) ? 'collecting'
+        : (ok ? 'clears live bar' : 'below live bar');
+    return `<div style="color:${color};font-size:12px;margin-top:2px">Live shadow (real fills): ${acc} sign-acc over ${live.n} reads &mdash; ${verdict}</div>`;
+}
+
+async function setAutoApprove(enabled) {
+    try {
+        await postJSON('/api/lane-auto-approve', { enabled });
+    } catch (e) { /* label refresh below reflects server truth */ }
+    loadSignalLab();
+}
+
 async function loadSignalLab() {
     let data;
     try { data = await fetchJSON('/api/lane-proposals'); }
@@ -1140,6 +1180,13 @@ async function loadSignalLab() {
             '<div style="color:#f85149">Failed to load proposals</div>';
         return;
     }
+
+    // Auto-approve toggle state
+    const aa = !!data.auto_approve;
+    const cb = document.getElementById('auto-approve-toggle');
+    if (cb) cb.checked = aa;
+    const lbl = document.getElementById('auto-approve-label');
+    if (lbl) { lbl.textContent = aa ? 'ON' : 'OFF'; lbl.style.color = aa ? '#3fb950' : '#8b949e'; }
 
     // Pending proposals with approve/deny
     const pending = (data.proposals || []).filter(p => p.status === 'pending');
@@ -1157,7 +1204,8 @@ async function loadSignalLab() {
                 <div>
                     <b style="color:#f0f6fc">${LANE_LABELS[p.lane] || p.lane}</b>
                     <span style="color:#8b949e;font-size:11px"> (lane: ${p.lane}, proposal #${p.id}, ${p.created_at} UTC)</span>
-                    <div style="color:#c9d1d9;font-size:12px;margin-top:4px">${fmtMetric(p.metrics)}</div>
+                    <div style="color:#c9d1d9;font-size:12px;margin-top:4px">Harness: ${fmtMetric(p.metrics)}</div>
+                    ${fmtLive(p.metrics && p.metrics.live)}
                     <div style="color:#8b949e;font-size:12px;margin-top:2px">Proposed profile weights &rarr; ${profile || '(none)'}</div>
                 </div>
                 <div style="display:flex;gap:8px">
@@ -1174,26 +1222,75 @@ async function loadSignalLab() {
     }
     document.getElementById('lane-proposals-card').innerHTML = html;
 
-    // Active overrides
+    // Active overrides (CANDIDATE lanes only — core-lane overrides written by
+    // the tuner carry core:true and render in their own card below).
     const ov = data.overrides || {};
-    const active = Object.entries(ov).filter(([, v]) => v.enabled);
+    const active = Object.entries(ov).filter(([, v]) => v.enabled && !v.core);
     let ovHtml = '';
     if (active.length === 0) {
         ovHtml = '<div style="color:#8b949e">None — all candidate lanes are kill-switched at weight 0.</div>';
     }
+    const monitor = data.monitor || {};
     for (const [lane, v] of active) {
         const profile = Object.entries(v.profile || {}).map(([s, w]) => `${s}:${w}`).join(', ');
+        // Live monitor verdict (arena/lane_monitor.py): sign-vs-outcome
+        // accuracy on resolved trades since approval. The arena auto-disables
+        // a lane that fails the bar; this line shows the running score.
+        const m = monitor[lane];
+        let liveLine = '<span style="color:#8b949e">live accuracy: collecting…</span>';
+        if (m && m.n > 0 && m.accuracy != null) {
+            const color = m.verdict === 'healthy' ? '#3fb950'
+                : m.verdict === 'disabled' ? '#f85149' : '#f0883e';
+            liveLine = `<span style="color:${color}">live accuracy: ${(m.accuracy * 100).toFixed(1)}% over ${m.n} trades [${m.verdict}]</span>`;
+        }
         ovHtml += `
         <div style="display:flex;justify-content:space-between;align-items:center;padding:8px 0;border-bottom:1px solid #21262d">
             <div>
                 <b style="color:#3fb950">${LANE_LABELS[lane] || lane}</b>
                 <span style="color:#8b949e;font-size:11px"> approved ${v.approved_at || ''} UTC</span>
                 <div style="color:#8b949e;font-size:12px">profile: ${profile || '(none)'}</div>
+                <div style="font-size:12px">${liveLine}</div>
             </div>
             <button class="btn btn-danger" onclick="disableLane('${lane}')">Disable</button>
         </div>`;
     }
     document.getElementById('lane-overrides-card').innerHTML = ovHtml;
+
+    // Core-lane tuner (drift/mom/strat per strategy)
+    const ct = data.core_tuner || {};
+    const ctLanes = ct.lanes || {};
+    let ctHtml = '';
+    const ctRows = [];
+    for (const lane of ['drift', 'mom', 'strat']) {
+        const perStrat = ctLanes[lane] || {};
+        for (const [strat, c] of Object.entries(perStrat)) {
+            const acc = c.accuracy != null ? (c.accuracy * 100).toFixed(0) + '%' : 'n/a';
+            const arrow = c.action === 'up' ? '&uarr;' : c.action === 'down' ? '&darr;' : '&ndash;';
+            const color = c.action === 'up' ? '#3fb950' : c.action === 'down' ? '#f85149' : '#8b949e';
+            ctRows.push(`<tr>
+                <td>${strat}</td><td>${lane}</td>
+                <td style="text-align:right">${acc}</td>
+                <td style="text-align:right">${c.n}</td>
+                <td style="text-align:right">${c.current}</td>
+                <td style="text-align:right;color:${color}">${arrow} ${c.suggested}</td>
+            </tr>`);
+        }
+    }
+    if (ctRows.length === 0) {
+        ctHtml = '<div style="color:#8b949e">Collecting&hellip; the tuner needs &ge;40 resolved trades per (strategy, lane) before it nudges a weight.</div>';
+    } else {
+        const applied = ct.applied
+            ? '<span style="color:#3fb950">applied live (auto-approve ON)</span>'
+            : '<span style="color:#f0883e">suggest-only (auto-approve OFF)</span>';
+        ctHtml = `<div style="color:#8b949e;font-size:12px;margin-bottom:6px">${applied}</div>
+            <table style="width:100%;font-size:13px;border-collapse:collapse">
+            <thead><tr style="color:#8b949e;text-align:left">
+                <th>Strategy</th><th>Lane</th><th style="text-align:right">Live acc</th>
+                <th style="text-align:right">n</th><th style="text-align:right">Weight</th>
+                <th style="text-align:right">&rarr; Suggested</th>
+            </tr></thead><tbody>${ctRows.join('')}</tbody></table>`;
+    }
+    document.getElementById('core-tuner-card').innerHTML = ctHtml;
 
     // Last run summary
     if (data.last_run) {

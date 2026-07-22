@@ -23,10 +23,14 @@ from typing import Optional
 
 import requests
 
+import config
+
 logger = logging.getLogger(__name__)
 
 PRICE_HISTORY_URL = "https://clob.polymarket.com/prices-history"
-CACHE_TTL = 20          # seconds — refresh every ~20s (one trade interval)
+# Coalescing-guard TTL only — the 1s market-data warmer refreshes every cycle,
+# so keep this just under the warm interval (20s fallback if knob absent).
+CACHE_TTL = getattr(config, "SIGNAL_CACHE_TTL_SEC", 20)
 LOOKBACK_POINTS = 5     # number of recent price points to measure momentum over
 MAX_SIGNAL = 0.15       # clamp output to [-0.15, +0.15]
 SCALE = 80.0            # amplifier: 0.01 price move → 0.8 signal units (before clamp)
