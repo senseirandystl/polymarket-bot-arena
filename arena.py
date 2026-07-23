@@ -75,6 +75,7 @@ from arena.state import SharedArenaState
 from signals.orderflow_signals import get_cvd_feed
 
 from arena.log_setup import configure_logging, log_event
+from evolution.ga import EVOLUTION_EXEMPT_TYPES
 
 # Structured logging: JSON when ARENA_LOG_JSON is set, else the same text
 # format as before (byte-identical console/file output). See arena/log_setup.py.
@@ -108,11 +109,8 @@ MAKER_BOT_CLASSES = {
     "fee_zone_maker": FeeZoneMakerBot,
 }
 
-# Strategy types that run in the fast (1s) trader loop but are NEVER culled or
-# mutated by evolution. The arbitrage bot is market-neutral — judging it by a
-# directional win-rate threshold makes no sense, so it is kept as a permanent
-# fixture alongside the evolving directional bots.
-EVOLUTION_EXEMPT_TYPES = {"arbitrage"}
+# EVOLUTION_EXEMPT_TYPES imported from evolution.ga — arbitrage (market-neutral)
+# and pure makers are never culled or mutated by the GA.
 
 
 # ----------------------------------------------------------------------
@@ -167,211 +165,70 @@ def _validate_bot(bot) -> bool:
 
 
 def create_evolved_bot(winner, loser_type: str, gen_number: int):
-    """Create an evolved bot: loser's strategy defaults, winner's shared
-    params wherever they overlap, then mutation."""
-    from bots.bot_momentum import DEFAULT_PARAMS as MOMENTUM_DEFAULTS
-    from bots.bot_mean_rev import DEFAULT_PARAMS as MEANREV_DEFAULTS
-    from bots.bot_hybrid import DEFAULT_PARAMS as HYBRID_DEFAULTS
-    from bots.bot_sentiment import DEFAULT_PARAMS as SENTIMENT_DEFAULTS
-    from bots.bot_sniper import DEFAULT_PARAMS as SNIPER_DEFAULTS
-    from bots.bot_phantom import DEFAULT_PARAMS as PHANTOM_DEFAULTS
+    """Legacy helper — single-parent mutate. Prefer :func:`run_evolution` (GA).
 
-    default_params_map = {
-        "momentum": MOMENTUM_DEFAULTS,
-        "mean_reversion": MEANREV_DEFAULTS,
-        "mean_reversion_sl": MEANREV_DEFAULTS,
-        "mean_reversion_tp": MEANREV_DEFAULTS,
-        "sniper": SNIPER_DEFAULTS,
-        "phantom": PHANTOM_DEFAULTS,
-        "sentiment": SENTIMENT_DEFAULTS,
-        "hybrid": HYBRID_DEFAULTS,
-    }
-    base_params = default_params_map.get(loser_type, MOMENTUM_DEFAULTS).copy()
+    Kept for callers/tests that construct one mutant without a full cycle.
+    Uses Gaussian mutation inside sensible bounds (evolution.operators.mutate).
+    """
+    from evolution.operators import mutate as ga_mutate
+    from evolution.ga import _default_params_for
+    import random as _random
+
+    base_params = _default_params_for(loser_type)
     winner_params = winner.export_params()["params"]
     for key in base_params:
         if key in winner_params:
             base_params[key] = winner_params[key]
-
-    # Exploitation-biased mutation (BUG #31): tighter than the exploratory
-    # MUTATION_RATE since the parent is now the best-ranked survivor — stay near
-    # the proven config rather than re-rolling params at 15%.
-    new_params = winner.mutate(
-        base_params, mutation_rate=getattr(config, "MUTATION_RATE_DIRECTED", 0.07))
-    import random
-    name = f"{loser_type}-g{gen_number}-{random.randint(100, 999)}"
-
+    new_params = ga_mutate(
+        base_params,
+        rate=getattr(config, "GA_MUTATION_RATE", config.MUTATION_RATE_DIRECTED),
+    )
+    name = f"{loser_type}-g{gen_number}-{_random.randint(100, 999)}"
     cls = TAKER_BOT_CLASSES.get(loser_type, MomentumBot)
     return cls(
         name=name,
         params=new_params,
         generation=gen_number,
-        lineage=f"{winner.name} -> {name}",
+        lineage=f"{winner.name} -> {name} (mutate)",
     )
 
 
 def run_evolution(bots, cycle_number):
-    """Run evolution cycle — kill bots below WR threshold, mutate from survivors.
+    """Run one Genetic Algorithm generation over the directional slate.
 
-    Evolution-exempt bots (e.g. the market-neutral arbitrage bot) are set aside
-    up front, never ranked or replaced, and re-appended to the returned slate.
+    Multi-objective fitness (P&L + Sharpe + low drawdown + consistency),
+    tournament selection, crossover, Gaussian mutation, and elitism.
+    Evolution-exempt bots (arbitrage + pure makers) pass through untouched.
     """
-    logger.info(f"=== Evolution Cycle {cycle_number} ===")
+    from evolution.ga import run_ga_cycle
 
-    exempt = [b for b in bots if b.strategy_type in EVOLUTION_EXEMPT_TYPES]
-    bots = [b for b in bots if b.strategy_type not in EVOLUTION_EXEMPT_TYPES]
-
-    # Judged on the EVOLUTION_WINDOW_HOURS window (24h), not the 2h cycle
-    # cadence — judging on the interval window made every bot permanently
-    # immune (5-12 trades per 2h vs a 20-trade floor; zero evolutions fired
-    # in the whole 24h v5 run while momentum-v1 lost $86).
-    rankings = []
-    for bot in bots:
-        perf = bot.get_performance(hours=config.EVOLUTION_WINDOW_HOURS)
-        rankings.append({
-            "name": bot.name,
-            "strategy_type": bot.strategy_type,
-            "generation": bot.generation,
-            "pnl": perf["total_pnl"],
-            "win_rate": perf["win_rate"],
-            "trades": perf["total_trades"],
-            "be_gap": perf.get("breakeven_gap"),
-        })
-
-    # Fitness = P&L (the actual objective); the survival test below uses the
-    # break-even gap so a high WR bought at high prices can't hide behind it.
-    rankings.sort(key=lambda x: x["pnl"], reverse=True)
-
-    def _survives(r) -> bool:
-        # Positive window P&L survives outright; otherwise the break-even gap
-        # (WR - avg entry) must clear the floor. A flat WR bar mis-judges
-        # both cheap and expensive books (65% at 70c loses; 55% at 45c wins).
-        if r["pnl"] > 0:
-            return True
-        gap = r["be_gap"]
-        return gap is not None and gap >= config.EVOLUTION_BE_GAP_MIN
-
-    immune = []
-    above = []
-    below = []
-    for r in rankings:
-        if r["trades"] < config.MIN_TRADES_FOR_JUDGMENT:
-            immune.append(r)
-        elif _survives(r):
-            above.append(r)
-        else:
-            below.append(r)
-
-    logger.info(f"Rankings ({config.EVOLUTION_WINDOW_HOURS}h window, P&L-ranked):")
-    for r in rankings:
-        if r in immune: status = "IMMUNE"
-        elif r in above: status = "SURVIVES"
-        else: status = "REPLACED"
-        gap_s = f"{r['be_gap']:+.3f}" if r["be_gap"] is not None else "n/a"
-        logger.info(
-            f"  {r['name']}: WR={r['win_rate']:.1%}, "
-            f"P&L=${r['pnl']:.2f}, Trades={r['trades']}, gap={gap_s} [{status}]"
-        )
-
-    if not immune and not above and below:
-        best = below.pop(0)
-        above.append(best)
-        logger.info(
-            f"  Safety net: keeping {best['name']} "
-            f"(best P&L ${best['pnl']:.2f}) as sole survivor"
-        )
-
-    if not below:
-        logger.info("  No bots below threshold — skipping evolution")
-        for bot in bots:
-            bot.reset_daily()
-        return bots + exempt
-
-    survivor_names = {r["name"] for r in immune + above}
-    replaced_names = {r["name"] for r in below}
-
-    new_bots = [b for b in bots if b.name in survivor_names]
-    for b in new_bots:
-        b.reset_daily()
-
-    winners = [b for b in bots if b.name in survivor_names]
-    replaced = [b for b in bots if b.name in replaced_names]
-
-    # Directed parent selection (BUG #31): spawn replacements from the
-    # BEST-ranked survivor, not a random one — a mutation of the proven winner
-    # dominates a mutation of a merely-adequate one, and the old random.choice
-    # let a thin survivor seed the next generation. Ordered by the same
-    # window-P&L ranking used for survival. The mutant also inherits the
-    # attribution-tuned per-strategy lane weights automatically (the core-lane
-    # tuner keys off strategy_type, which the new bot shares), so "directed"
-    # covers both the parent config and the live-tuned signal blend.
-    rank_order = {r["name"]: i for i, r in enumerate(rankings)}
-    winners_by_rank = sorted(winners, key=lambda b: rank_order.get(b.name, 1 << 30))
-    best_parent = winners_by_rank[0] if winners_by_rank else None
-
-    for dead_bot in replaced:
-        parent = best_parent
-        evolved = create_evolved_bot(parent, dead_bot.strategy_type, cycle_number)
-
-        if not _validate_bot(evolved):
-            logger.warning(
-                f"  {evolved.name} failed validation, recreating with pure defaults"
-            )
-            from bots.bot_momentum import DEFAULT_PARAMS as MOMENTUM_DEFAULTS
-            from bots.bot_mean_rev import DEFAULT_PARAMS as MEANREV_DEFAULTS
-            from bots.bot_hybrid import DEFAULT_PARAMS as HYBRID_DEFAULTS
-            from bots.bot_sentiment import DEFAULT_PARAMS as SENTIMENT_DEFAULTS
-            from bots.bot_sniper import DEFAULT_PARAMS as SNIPER_DEFAULTS
-            from bots.bot_phantom import DEFAULT_PARAMS as PHANTOM_DEFAULTS
-            fallback_map = {
-                "momentum": MOMENTUM_DEFAULTS, "mean_reversion": MEANREV_DEFAULTS,
-                "mean_reversion_sl": MEANREV_DEFAULTS,
-                "mean_reversion_tp": MEANREV_DEFAULTS,
-                "sniper": SNIPER_DEFAULTS, "phantom": PHANTOM_DEFAULTS,
-                "sentiment": SENTIMENT_DEFAULTS, "hybrid": HYBRID_DEFAULTS,
-            }
-            cls = TAKER_BOT_CLASSES.get(dead_bot.strategy_type, MomentumBot)
-            fallback_params = fallback_map.get(
-                dead_bot.strategy_type, MOMENTUM_DEFAULTS,
-            ).copy()
-            evolved = cls(
-                name=f"{parent.name}-g{cycle_number}-fallback",
-                params=fallback_params,
-                generation=cycle_number,
-                lineage=f"{parent.name} -> fallback",
-            )
-
-        db.retire_bot(dead_bot.name)
-        db.save_bot_config(
-            evolved.name, evolved.strategy_type, evolved.generation,
-            evolved.strategy_params, evolved.lineage,
-        )
-
-        new_bots.append(evolved)
+    new_bots, report = run_ga_cycle(
+        bots,
+        cycle_number,
+        class_map=TAKER_BOT_CLASSES,
+        validate_fn=_validate_bot,
+    )
+    for spawn in report.get("spawned") or []:
         log_event(
             logger, logging.INFO,
-            f"  Created {evolved.name} (from {parent.name}): "
-            f"{json.dumps(evolved.strategy_params)[:200]}",
+            f"  GA spawn {spawn.get('name')} parents={spawn.get('parents')} "
+            f"op={spawn.get('operator')}",
             event_type="evolution", action="spawn", cycle=cycle_number,
-            bot=evolved.name, parent=parent.name,
-            strategy=evolved.strategy_type, generation=evolved.generation,
-            retired=dead_bot.name,
+            bot=spawn.get("name"), parents=spawn.get("parents"),
+            strategy=spawn.get("strategy_type"),
+            generation=spawn.get("generation"),
+            retired=spawn.get("replaced"),
+            operator=spawn.get("operator"),
         )
-
-    db.log_evolution(
-        cycle_number,
-        list(survivor_names),
-        list(replaced_names),
-        [b.name for b in new_bots if b.name not in survivor_names],
-        rankings,
-    )
-
     for bot in new_bots:
+        if bot.strategy_type in EVOLUTION_EXEMPT_TYPES:
+            continue
         logger.info(
-            f"  Post-evolution: {bot.name} ({bot.strategy_type}) "
-            f"params_keys={list(bot.strategy_params.keys())}"
+            f"  Post-GA: {bot.name} ({bot.strategy_type}) "
+            f"params_keys={list(bot.strategy_params.keys())} "
+            f"lineage={getattr(bot, 'lineage', None)}"
         )
-
-    return new_bots + exempt
+    return new_bots
 
 
 # ----------------------------------------------------------------------
@@ -600,13 +457,19 @@ def _evolution_check_loop(bots, state, pos_monitor, trader):
     AUTO_VALIDATE_EVERY_MARKETS windows so Signal Lab proposals appear
     without any manual run).
     """
-    from arena import lane_monitor, lane_promoter, core_lane_tuner
+    from arena import lane_monitor, lane_promoter, core_lane_tuner, portfolio
+    from arena import risk_engine
     from arena.validation_scheduler import ValidationScheduler
 
     evolution_interval = config.EVOLUTION_INTERVAL_HOURS * 3600
+    ga_min_interval = float(getattr(config, "GA_MIN_INTERVAL_SEC", 1800))
     validation_scheduler = ValidationScheduler()
     lane_monitor_interval = getattr(config, "LANE_MONITOR_INTERVAL_SEC", 1800)
+    portfolio_interval = float(
+        getattr(config, "PORTFOLIO_REBALANCE_INTERVAL_SEC", 1800))
     last_lane_check = 0.0
+    last_portfolio_check = 0.0
+    last_pool_pnl = None  # for performance-trigger drop detection
 
     saved_cycle = db.get_arena_state("evolution_cycle", "0")
     cycle_number = int(saved_cycle)
@@ -626,12 +489,54 @@ def _evolution_check_loop(bots, state, pos_monitor, trader):
 
     while True:
         try:
-            if time.time() - last_evolution >= evolution_interval:
+            now = time.time()
+            elapsed = now - last_evolution
+            due_timer = elapsed >= evolution_interval
+            due_perf = False
+            perf_reason = ""
+            # Performance trigger only after the anti-thrash floor
+            if (not due_timer) and elapsed >= ga_min_interval:
+                from evolution.ga import should_trigger_evolution
+                due_perf, perf_reason = should_trigger_evolution(
+                    bots, last_trigger_pnl=last_pool_pnl,
+                )
+            if due_timer or due_perf:
+                trigger = "timer" if due_timer else f"performance:{perf_reason}"
                 cycle_number += 1
+                logger.info(
+                    "GA cycle %s trigger=%s (elapsed=%.1fh)",
+                    cycle_number, trigger, elapsed / 3600,
+                )
                 bots = run_evolution(bots, cycle_number)
                 last_evolution = time.time()
                 db.set_arena_state("evolution_cycle", str(cycle_number))
                 db.set_arena_state("last_evolution_time", str(last_evolution))
+                db.set_arena_state("last_evolution_trigger", trigger)
+
+                # Snapshot pool P&L for next drop check
+                try:
+                    total = 0.0
+                    for b in bots:
+                        if b.strategy_type in EVOLUTION_EXEMPT_TYPES:
+                            continue
+                        total += float(
+                            b.get_performance(
+                                hours=config.EVOLUTION_WINDOW_HOURS
+                            ).get("total_pnl") or 0.0
+                        )
+                    last_pool_pnl = total
+                except Exception:
+                    pass
+
+                try:
+                    from arena.alerts import alert_evolution
+                    names = ", ".join(b.name for b in bots[:8])
+                    alert_evolution(
+                        cycle_number, trigger,
+                        summary=f"roster={names} pool_pnl={last_pool_pnl}",
+                    )
+                except Exception:
+                    pass
 
                 state.reset()
                 trader.set_bots(bots)
@@ -640,6 +545,11 @@ def _evolution_check_loop(bots, state, pos_monitor, trader):
             log_event(logger, logging.ERROR, f"Evolution cycle error (caught): {e}",
                       exc_info=True, event_type="error", where="evolution_cycle",
                       cycle=cycle_number)
+            try:
+                from arena.alerts import alert_error
+                alert_error("evolution_cycle", str(e))
+            except Exception:
+                pass
 
         try:
             if time.time() - last_lane_check >= lane_monitor_interval:
@@ -662,6 +572,54 @@ def _evolution_check_loop(bots, state, pos_monitor, trader):
         except Exception as e:
             log_event(logger, logging.ERROR, f"Auto-validation scheduler error (caught): {e}",
                       exc_info=True, event_type="error", where="validation_scheduler")
+
+        try:
+            # Portfolio capital allocation: rebalance on timer and/or regime
+            # change (arena/portfolio.py). Weights feed Kelly bankroll slices
+            # and zone-bot size multipliers; dashboard can force a rebalance.
+            if time.time() - last_portfolio_check >= min(60.0, portfolio_interval / 4):
+                portfolio.maybe_rebalance()
+                last_portfolio_check = time.time()
+        except Exception as e:
+            log_event(logger, logging.ERROR, f"Portfolio rebalance error (caught): {e}",
+                      exc_info=True, event_type="error", where="portfolio_rebalance")
+
+        try:
+            # Risk engine: recompute drawdowns / daily loss / VaR / size
+            # multipliers; honor kill-switch file. Runs every ~15s (interval
+            # gated inside maybe_evaluate). Hot-path pre_trade reads the
+            # cached state on every execute.
+            risk_engine.maybe_evaluate()
+            # Sync bot._paused flags from risk state so UI/status matches
+            risk_state = risk_engine.load_state()
+            for b in bots:
+                st = (risk_state.get("bots") or {}).get(b.name) or {}
+                if st.get("status") == "paused" or risk_state.get("kill_switch"):
+                    b._paused = True
+                elif st.get("status") in ("active", "reduced") and not st.get(
+                        "manual_pause"):
+                    # Only auto-clear risk pauses (not daily-loss legacy)
+                    if getattr(b, "_paused", False) and (
+                            st.get("reason") or "").startswith(
+                            ("bot_daily", "bot_max", "underperform",
+                             "portfolio_")):
+                        b._paused = False
+        except Exception as e:
+            log_event(logger, logging.ERROR, f"Risk engine error (caught): {e}",
+                      exc_info=True, event_type="error", where="risk_engine")
+
+        try:
+            # Health checks + optional alerts when status worsens (gated)
+            from arena import health as health_mod
+            import time as _t
+            _hi = float(getattr(config, "HEALTH_EVAL_INTERVAL_SEC", 60))
+            _last_h = float(db.get_arena_state("health_last_eval") or 0)
+            if _t.time() - _last_h >= _hi:
+                health_mod.maybe_alert_on_health()
+                db.set_arena_state("health_last_eval", str(_t.time()))
+        except Exception as e:
+            log_event(logger, logging.ERROR, f"Health check error (caught): {e}",
+                      exc_info=True, event_type="error", where="health")
 
         time.sleep(30)
 

@@ -14,9 +14,44 @@ import config
 import db
 import learning
 import polymarket_fills
-from signals.curves import soft_saturate, smooth_ramp
+from signals.curves import smooth_ramp
+from signals.lab import SignalView, get_lab
 
 logger = logging.getLogger(__name__)
+
+# Keys every analyze()/make_decision result carries — the structured decision
+# contract. Plain dicts (not a class) so every existing caller, DB row and
+# test fixture keeps working; strategy_decision() below guarantees the shape.
+DECISION_KEYS = ("action", "side", "edge", "confidence", "reasoning",
+                 "signals", "suggested_amount")
+
+
+def strategy_decision(action: str, side: str = "yes", *, edge: float = 0.0,
+                      confidence: float = 0.0, reasoning: str = "",
+                      signals: dict | None = None,
+                      suggested_amount: float = 0.0, **extra) -> dict:
+    """Build a structured strategy decision.
+
+    Every bot's analyze()/make_decision returns this shape: the action, the
+    side, the strategy's own EDGE estimate (probability units, 0 when
+    unknown/hold), a confidence in [0, 1], human-readable reasoning, and
+    ``signals`` — the named signal readings that CONTRIBUTED to the decision
+    (for attribution/debugging; the model-blend lanes have their own
+    attribution via BlendResult). ``extra`` carries strategy-specific fields
+    (maker_* quotes, arb legs, features, entry_price) through unchanged.
+    """
+    d = {
+        "action": action,
+        "side": side,
+        "edge": float(edge),
+        "confidence": max(0.0, min(1.0, float(confidence))),
+        "reasoning": reasoning,
+        "signals": dict(signals or {}),
+        "suggested_amount": float(suggested_amount),
+    }
+    d.update(extra)
+    return d
+
 
 # Bankroll read for Kelly sizing, cached off the 1s hot path (the pool only
 # changes on fills/resolutions). Shared across bots — the pool is shared too.
@@ -44,6 +79,12 @@ def _lane_overrides() -> dict:
     return value
 
 
+# The SignalLab reads overrides through this module-level function (late
+# bound), so the backtest runtime's isolation patch on `_lane_overrides`
+# reaches the lab too.
+get_lab().overrides_provider = lambda: _lane_overrides()
+
+
 def _kelly_fraction() -> float:
     """Kelly fraction for sizing, live-editable in dashboard Settings.
 
@@ -66,6 +107,9 @@ def _sizing_bankroll(mode: str) -> float:
     Paper: the shared virtual pool's available cash. Live: a notional bankroll
     consistent with the per-trade cap (wallet reads are too slow for the 1s
     tick; LIVE_MAX_POSITION already hard-caps exposure).
+
+    Portfolio allocation (when enabled) multiplies this by the bot's capital
+    weight in ``make_decision`` / ``execute`` — this helper returns the *pool*.
     """
     if mode == "live":
         pct = max(config.MAX_POSITION_PCT_OF_BALANCE, 0.01)
@@ -77,6 +121,39 @@ def _sizing_bankroll(mode: str) -> float:
     value = max(0.0, db.get_paper_available())
     _bankroll_cache = (now, value)
     return value
+
+
+def _portfolio_weight(bot_name: str) -> float:
+    """Fraction of the shared pool this bot may Kelly-size against.
+
+    1.0 when portfolio allocation is off (legacy full-pool Kelly).
+    """
+    try:
+        from arena.portfolio import get_weight
+        return float(get_weight(bot_name))
+    except Exception:
+        return 1.0
+
+
+def _portfolio_size_mult(bot_name: str) -> float:
+    """Scale factor for zone/maker bots that size via max_position × pct.
+
+    Equal weight → 1.0; winners size up, losers down. 1.0 when disabled.
+    """
+    try:
+        from arena.portfolio import size_multiplier
+        return float(size_multiplier(bot_name))
+    except Exception:
+        return 1.0
+
+
+def _risk_size_mult(bot_name: str) -> float:
+    """Risk-engine size taper (drawdown / portfolio stress). 0 = paused."""
+    try:
+        from arena.risk_engine import size_multiplier
+        return float(size_multiplier(bot_name))
+    except Exception:
+        return 1.0
 
 
 class BaseBot(ABC):
@@ -219,41 +296,120 @@ class BaseBot(ABC):
 
     @abstractmethod
     def analyze(self, market: dict, signals: dict) -> dict:
-        """Analyze market + signals and return a trade signal.
+        """Analyze market + signals and return a structured decision.
 
-        Returns:
+        Build the return value with :func:`strategy_decision` so every bot
+        exposes the same contract:
             {
-                "action": "buy" | "sell" | "hold",
+                "action": "buy" | "hold",
                 "side": "yes" | "no",
+                "edge": float,          # strategy's own edge estimate (prob units)
                 "confidence": 0.0-1.0,
                 "reasoning": "why this trade",
+                "signals": {...},       # named readings that contributed
                 "suggested_amount": float,
             }
+        Regime context is available via :meth:`regime_context` (the
+        vol_regime block of ``signals``) — regime-sensitive strategies
+        condition their confidence on it.
         """
         pass
+
+    @staticmethod
+    def regime_context(signals) -> dict:
+        """Regime awareness input for strategies.
+
+        Prefers the robust detector block (``market_regime`` / enriched
+        ``vol_regime``): rich ids like ``high_vol_trend``, continuous
+        feature scores, confidence, and legacy quiet/normal/trending/
+        volatile labels for older conditionals.
+
+        ``known`` is False when the regime feed hasn't produced a reading —
+        strategies must treat that as NEUTRAL (no boost, no damp), never as
+        chop. ``trend_score`` is 0..1 trendiness; ``trending``/``ranging``
+        are convenience booleans at the 0.65/0.35 boundaries.
+        """
+        sv = SignalView.of(signals)
+        mr = sv.market_regime
+        vr = sv.vol_regime
+        # Prefer detector snapshot; fall back to vol_regime enrichment.
+        src = mr if mr.get("regime_id") or mr.get("label") else vr
+        ts = src.get("trend_score", vr.get("trend_score"))
+        vs = src.get("vol_score", vr.get("vol_score"))
+        known = bool(src.get("known")) if "known" in src else (ts is not None)
+        if ts is None and vs is None and not src.get("regime_id"):
+            known = False
+        trend_score = 0.5 if ts is None else max(0.0, min(1.0, float(ts)))
+        vol_score = 0.5 if vs is None else max(0.0, min(1.0, float(vs)))
+        rid = (
+            src.get("regime_id")
+            or src.get("label")
+            or vr.get("regime_id")
+            or vr.get("regime")
+            or "unknown"
+        )
+        legacy = src.get("legacy") or vr.get("regime") or "unknown"
+        return {
+            "label": rid,                 # rich id preferred
+            "legacy": legacy,             # quiet/normal/trending/volatile
+            "known": known,
+            "trend_score": trend_score,
+            "vol_score": vol_score,
+            "confidence": float(src.get("confidence") or 0.0),
+            "features": dict(src.get("features") or vr.get("features") or {}),
+            "meta_bucket": src.get("meta_bucket") or vr.get("meta_bucket") or "mixed",
+            "trending": known and trend_score >= 0.65,
+            "ranging": known and trend_score <= 0.35,
+            "high_vol": known and vol_score >= 0.55,
+            "chop": rid == "high_vol_chop" or (
+                known and vol_score >= 0.55 and trend_score <= 0.35
+            ),
+        }
+
+    def _inventory_usd(self, market: dict, side: str) -> float:
+        """Open USD exposure already held on (market, side) across ALL bots.
+
+        The maker bots use this for inventory management — quoting into a
+        side the pool is already loaded on compounds one BTC candle's risk.
+        Fails open to 0.0 (missing ids / DB hiccup): the shared-pool
+        exposure cap in execute() still applies downstream.
+        """
+        market_id = (market or {}).get("condition_id") or (market or {}).get("id")
+        if not market_id or side not in ("yes", "no"):
+            return 0.0
+        try:
+            return db.get_open_exposure(market_id, side, self.trading_mode)
+        except Exception:
+            return 0.0
+
+    @staticmethod
+    def _normalize_analysis(raw: dict) -> dict:
+        """Fill the structured-decision contract on a legacy analyze() dict.
+
+        Subclasses (and evolution-spawned mutants of older code) may still
+        return bare action/side/confidence dicts — normalize in one place so
+        every downstream consumer can rely on DECISION_KEYS.
+        """
+        raw.setdefault("edge", 0.0)
+        raw.setdefault("signals", {})
+        raw.setdefault("suggested_amount", 0.0)
+        raw.setdefault("reasoning", "")
+        return raw
+
+    def _signal_profile(self) -> dict:
+        return self.STRATEGY_SIGNAL_PROFILE.get(
+            self.strategy_type, self.DEFAULT_SIGNAL_PROFILE)
 
     def _model_prob_yes(self, lanes: dict) -> float:
         """Model probability of YES from normalized signal lanes.
 
-        ``lanes`` maps lane name -> value in [-1, 1] (YES-frame). Weighted by
-        this strategy's profile and mapped to a probability. Lanes not in the
-        profile (e.g. ``strat``/``learn``) carry their weight in the value.
+        Thin wrapper over SignalLab.blend (per-strategy profile + approved
+        lane overrides + live-validation gate). Kept as the bot-facing entry
+        so strategy code and tests never touch the lab's internals.
         """
-        prof = self.STRATEGY_SIGNAL_PROFILE.get(
-            self.strategy_type, self.DEFAULT_SIGNAL_PROFILE)
-        overrides = _lane_overrides()
-        s = 0.0
-        for k, v in lanes.items():
-            ov = overrides.get(k)
-            if ov and ov.get("enabled"):
-                # Approved lane: weight comes from the approved proposal's
-                # per-strategy profile; strategies it doesn't name stay 0.
-                w = float(ov.get("profile", {}).get(self.strategy_type, 0.0))
-            else:
-                w = prof.get(k, 1.0)
-            s += w * v
-        return max(config.MODEL_PROB_MIN,
-                   min(config.MODEL_PROB_MAX, 0.5 + 0.5 * s))
+        return get_lab().blend(self.strategy_type, lanes,
+                               self._signal_profile(),
+                               overrides=_lane_overrides()).prob
 
     def _compute_fair_yes(self, yes_mid: float, model_prob: float,
                           trust: float) -> float:
@@ -301,35 +457,23 @@ class BaseBot(ABC):
         # is momentarily unavailable leaves it None — coalesce to neutral 0.5.
         market_price = market.get("current_price") or 0.5
 
-        # --- Lane: BTC momentum (normalized to [-1, 1]) ---
-        prices = signals.get("prices", [])
-        btc_latest = signals.get("latest", 0)
-        price_momentum = 0.0
-        if len(prices) >= 2 and prices[-1] > 0:
-            price_momentum = (prices[-1] - prices[-2]) / prices[-2]
-        elif btc_latest > 0 and len(prices) >= 1 and prices[-1] > 0:
-            # Use live price vs last closed candle
-            price_momentum = (btc_latest - prices[-1]) / prices[-1]
-        # No candles at all -> 0. (The old fallback leaked the market price in
-        # as "momentum", i.e. favorite-following in disguise.)
-        # Saturation at a 0.2% one-candle move (~p97 of real BTC 1-min moves;
-        # median is 0.022%). The first normalization saturated at 0.05% — BELOW
-        # the median — so the lane sat at +/-0.5..1.0 of pure noise and outvoted
-        # the time-damped drift early in the window (26% WR on the 34 trades
-        # that contradicted drift, -$55 — the whole loss of that run).
-        # tanh keeps the same slope near zero as the old hard clamp but rolls
-        # off smoothly instead of pinning every >p97 move at exactly 1.0.
-        momentum_signal = soft_saturate(price_momentum, 0.002)
-        # Quiet-regime damp (2026-07-19): in chop a one-candle move is noise,
-        # not trend — momentum-driven trades at |drift| < 0.10 ran 47.9% WR /
-        # -$74 for the mom-heavy profile. Only "quiet" damps; trending /
-        # volatile / normal (and "unknown" during feed warmup) are untouched.
-        vol_regime = (signals.get("vol_regime", {}) or {}).get("regime")
-        if vol_regime == "quiet":
-            momentum_signal *= getattr(config, "MOM_QUIET_REGIME_DAMP", 0.5)
+        # --- Market-level lanes from the SignalLab ---
+        # One cached computation per tick shared by EVERY bot: drift, mom
+        # (incl. the quiet-regime damp), pm/cvd/obi and the fut/tech/xasset
+        # candidates, with kill-switches and approved-lane overrides already
+        # applied. ``raw`` carries the pre-kill-switch reads for feature
+        # extraction and the cand(...) validation log. The lane math lives in
+        # signals/lab.py — the calibration history stays documented there.
+        lab = get_lab()
+        overrides = _lane_overrides()
+        market_lanes, raw = lab.compute_lanes(market, signals,
+                                              overrides=overrides)
+        price_momentum = raw["price_momentum"]
+        momentum_signal = market_lanes["mom"]
+        drift_signal_val = market_lanes["drift"]
 
         # --- Lane: strategy thesis from analyze() ---
-        raw_signal = self.analyze(market, signals)
+        raw_signal = self._normalize_analysis(self.analyze(market, signals))
         strategy_signal = 0.0
         if raw_signal["action"] != "hold":
             strategy_yes = 1.0 if raw_signal["side"] == "yes" else -1.0
@@ -342,14 +486,24 @@ class BaseBot(ABC):
         strategy_signal = max(-strat_cap, min(strat_cap, strategy_signal))
 
         # --- Signal 4: Learning bias ---
-        of_data = signals.get("orderflow", {})
-        volume = of_data.get("volume_24h")
+        sv = SignalView.of(signals)
+        volume = sv.orderflow.get("volume_24h")
         time_rem = market.get("time_remaining_seconds")
         
         features = learning.extract_features(
             market_price, price_momentum, 
             volume=volume, time_rem=time_rem
         )
+        # Stamp regime at decision time so evolution fitness / post-hoc
+        # analysis can condition on the regime the trade was taken in.
+        try:
+            rctx = self.regime_context(signals)
+            if rctx.get("label") and rctx["label"] != "unknown":
+                features = list(features) + [f"regime:{rctx['label']}"]
+                if rctx.get("legacy"):
+                    features.append(f"regime_legacy:{rctx['legacy']}")
+        except Exception:
+            pass
         prior = self.STRATEGY_PRIORS.get(self.strategy_type, 0.5)
         learned_yes_bias = learning.get_learned_bias(self.name, features, prior)
         # Convert from 0-1 to -0.5 to +0.5
@@ -377,96 +531,39 @@ class BaseBot(ABC):
         else:
             learning_weight = 0.0
 
-        # --- Lane: Polymarket in-market price momentum (normalized) ---
-        # Rate of change of the YES price on Polymarket itself (from price history API).
-        # Distinct from BTC spot momentum — this captures how *traders in this market*
-        # are actually positioning, which can lead or lag BTC spot price.
-        # A 0.15 YES-price move saturates the lane.
-        pm_momentum_raw = float(signals.get("pm_momentum", 0.0) or 0.0)
-        pm_momentum_signal = max(-1.0, min(1.0, pm_momentum_raw / 0.15))
-        # Global kill-switch (see config comment): the live lane saturates at
-        # a 0.19c/step move -> sign(last tick), and the raw quantity measured
-        # NET-NEGATIVE after the price in the offline harness (-0.80c/share).
-        pm_momentum_signal *= config.SIGNAL_WEIGHT_PM
-
-        # --- Lane: Order flow (OBI + CVD), already in [-1, 1] ---
-        # CVD = executed aggression (validated edge); OBI = resting depth,
-        # globally killed via config.SIGNAL_WEIGHT_OBI until validated offline.
-        obi_signal = max(-1.0, min(1.0, float(signals.get("obi", 0.0) or 0.0)))
-        obi_signal *= config.SIGNAL_WEIGHT_OBI
-        cvd_signal = max(-1.0, min(1.0, float(signals.get("cvd", 0.0) or 0.0)))
-        # Global kill-switch (BUG #27): live cvd-driven trades measured
-        # statistically flat (53.1% WR); the feed now has a volume floor but
-        # stays at weight 0 until the calibrated form validates offline.
-        cvd_signal *= config.SIGNAL_WEIGHT_CVD
-
-        # --- Lane: BTC drift from the window's "price to beat" (strike) ---
-        # The fundamental anchor: where BTC sits vs the window open price.
-        # Already bounded [-1, 1] and time-scaled (signals/strike.py). Regime-
-        # agnostic: >0 favors YES, <0 favors NO. Because it is time-damped, the
-        # model has little conviction early in the window — so with the honest
-        # blend below, bots naturally sit out the noisy first minute instead of
-        # spending their one trade per market there (the -$79 early-window leak).
-        drift_signal_val = max(-1.0, min(1.0, float(signals.get("btc_drift", 0.0) or 0.0)))
-
-        # --- Model probability, then fair value as market-vs-model blend ---
-        # Edge appears ONLY where the model disagrees with the market price
-        # ("follow drift only when the market lags" was the top rule in the
-        # offline net-edge harness). Weighted per-strategy for real
-        # differentiation; strat/learn lanes carry their weight in the value.
-        # --- Candidate lanes (2026-07-18): derivatives context, technicals,
-        # cross-asset. Computed + logged every tick but globally kill-switched
-        # at 0 (config.SIGNAL_WEIGHT_FUT/TECH/XASSET) until the offline
-        # harness validates positive NET edge. A harness-validated,
-        # HUMAN-APPROVED lane (dashboard Signal Lab -> db lane_overrides)
-        # trades live through the override: the kill-switch multiplier
-        # becomes 1.0 and the lane's per-strategy profile weight comes from
-        # the approved proposal (applied in _model_prob_yes).
-        overrides = _lane_overrides()
-
-        def _lane_mult(lane: str, config_switch: float) -> float:
-            if overrides.get(lane, {}).get("enabled"):
-                return 1.0
-            return config_switch
-
-        fut = signals.get("futures", {}) or {}
-        fut_signal = max(-1.0, min(1.0, float(fut.get("taker_delta", 0.0) or 0.0)))
-        fut_signal *= _lane_mult("fut", getattr(config, "SIGNAL_WEIGHT_FUT", 0.0))
-        tech = signals.get("technicals", {}) or {}
-        tech_signal = max(-1.0, min(1.0, float(tech.get("mtf_score", 0.0) or 0.0)))
-        tech_signal *= _lane_mult("tech", getattr(config, "SIGNAL_WEIGHT_TECH", 0.0))
-        xasset_signal = max(-1.0, min(1.0, float(signals.get("xasset", 0.0) or 0.0)))
-        xasset_signal *= _lane_mult("xasset", getattr(config, "SIGNAL_WEIGHT_XASSET", 0.0))
-
+        # --- Model probability via the SignalLab blend ---
+        # Market lanes (computed above, shared) + this bot's own strat/learn
+        # lanes, weighted by the per-strategy profile, approved-lane
+        # overrides (the tuner/promoter closed loop) and the live-validation
+        # gate. Edge appears ONLY where the model disagrees with the market
+        # price ("follow drift only when the market lags" was the top rule in
+        # the offline net-edge harness).
         lanes = {
-            "drift": drift_signal_val,
-            "mom": momentum_signal,
-            "pm": pm_momentum_signal,
-            "cvd": cvd_signal,
-            "obi": obi_signal,
-            "fut": fut_signal,
-            "tech": tech_signal,
-            "xasset": xasset_signal,
+            **market_lanes,
             "strat": strategy_signal,
             "learn": learning_signal * 2.0 * learning_weight,
         }
-        model_prob = self._model_prob_yes(lanes)
+        blend = lab.blend(self.strategy_type, lanes, self._signal_profile(),
+                          overrides=overrides, signals=signals)
+        model_prob = blend.prob
 
         # --- Macro-release caution: stand down around high-impact prints ---
         # Non-directional context (signals/macro_calendar.py): the smooth 0..1
         # caution peaks in the minutes around 08:30/14:00 ET weekday release
         # slots, where the window can gap violently against any model. Same
         # philosophy as the session filter — build the skip, default flat.
-        macro = float(signals.get("macro_caution", 0.0) or 0.0)
+        # Structured skip: same contract as buys (edge 0, contributing
+        # signals attached) so downstream consumers never branch on shape.
+        def _skip(reason: str, side: str = "yes", confidence: float = 0.0):
+            return strategy_decision(
+                "skip", side, confidence=confidence, reasoning=reason,
+                signals={"drift": drift_signal_val, "mom": momentum_signal,
+                         "strat": strategy_signal},
+                features=features)
+
+        macro = sv.macro_caution
         if macro >= getattr(config, "MACRO_CAUTION_SKIP", 0.75):
-            return {
-                "action": "skip",
-                "side": "yes",
-                "confidence": 0.0,
-                "reasoning": f"Macro-release caution {macro:.2f} — high-impact window",
-                "suggested_amount": 0,
-                "features": features,
-            }
+            return _skip(f"Macro-release caution {macro:.2f} — high-impact window")
 
         # --- Hard model-lean floor: no opinion, no trade (BUG #27) ---
         # Conviction-scaled trust damps a weak model but its residual edge
@@ -476,17 +573,9 @@ class BaseBot(ABC):
         # model has nothing tradable to say — skip outright.
         model_lean = abs(model_prob - 0.5)
         if model_lean < config.MODEL_LEAN_MIN:
-            return {
-                "action": "skip",
-                "side": "yes",
-                "confidence": 0.0,
-                "reasoning": (
-                    f"Model lean too weak: |{model_prob:.3f}-0.5|="
-                    f"{model_lean:.3f} < {config.MODEL_LEAN_MIN:.2f}"
-                ),
-                "suggested_amount": 0,
-                "features": features,
-            }
+            return _skip(
+                f"Model lean too weak: |{model_prob:.3f}-0.5|="
+                f"{model_lean:.3f} < {config.MODEL_LEAN_MIN:.2f}")
 
         trust = self.STRATEGY_MODEL_TRUST.get(self.strategy_type, 0.5)
         # --- Conviction-scaled trust: the model's say is proportional to how
@@ -521,17 +610,9 @@ class BaseBot(ABC):
         # exactly those (sums 0.84-0.85 -> "13c edges" -> -$29.15 in 2 trades).
         book_sum = yes_price + no_price
         if abs(book_sum - 1.0) > config.BOOK_SUM_TOLERANCE:
-            return {
-                "action": "skip",
-                "side": "yes",
-                "confidence": 0.0,
-                "reasoning": (
-                    f"Book inconsistency: yes={yes_price:.2f}+no={no_price:.2f}"
-                    f"={book_sum:.2f} outside 1±{config.BOOK_SUM_TOLERANCE:.2f}"
-                ),
-                "suggested_amount": 0,
-                "features": features,
-            }
+            return _skip(
+                f"Book inconsistency: yes={yes_price:.2f}+no={no_price:.2f}"
+                f"={book_sum:.2f} outside 1±{config.BOOK_SUM_TOLERANCE:.2f}")
 
         # --- Executable prices: edge is measured against what a taker PAYS ---
         # Decisions used to price edge + entry off the MID while the fill
@@ -594,18 +675,11 @@ class BaseBot(ABC):
         dz_hi = getattr(config, "DEAD_ZONE_PRICE_HI", 0.58)
         dz_drift = getattr(config, "DEAD_ZONE_DRIFT_MIN", 0.10)
         if dz_lo <= side_mid_dz <= dz_hi and abs(drift_signal_val) < dz_drift:
-            return {
-                "action": "skip",
-                "side": side,
-                "confidence": confidence,
-                "reasoning": (
-                    f"Dead-zone gate: {side} mid={side_mid_dz:.2f} in "
-                    f"[{dz_lo:.2f},{dz_hi:.2f}] & |drift|={abs(drift_signal_val):.3f}"
-                    f"<{dz_drift:.2f} (coin-flip, no conviction)"
-                ),
-                "suggested_amount": 0,
-                "features": features,
-            }
+            return _skip(
+                f"Dead-zone gate: {side} mid={side_mid_dz:.2f} in "
+                f"[{dz_lo:.2f},{dz_hi:.2f}] & |drift|={abs(drift_signal_val):.3f}"
+                f"<{dz_drift:.2f} (coin-flip, no conviction)",
+                side=side, confidence=confidence)
 
         # --- Minimum-edge gate (no edge = no bet) — SAME bar on both sides ---
         # Information-scaled: with drift flat the model's disagreement with the
@@ -627,17 +701,10 @@ class BaseBot(ABC):
         taper = max(0.0, 1.0 - abs(drift_signal_val) / full_trust)
         min_edge *= 1.0 + (mult_max - 1.0) * taper
         if chosen_edge < min_edge:
-            return {
-                "action": "skip",
-                "side": side,
-                "confidence": confidence,
-                "reasoning": (
-                    f"No edge: {side} edge={chosen_edge:+.3f} < {min_edge:.3f} "
-                    f"| fair={fair_yes:.2f} yes={yes_price:.2f} no={no_price:.2f}"
-                ),
-                "suggested_amount": 0,
-                "features": features,
-            }
+            return _skip(
+                f"No edge: {side} edge={chosen_edge:+.3f} < {min_edge:.3f} "
+                f"| fair={fair_yes:.2f} yes={yes_price:.2f} no={no_price:.2f}",
+                side=side, confidence=confidence)
 
         # --- Symmetric guards — keyed on the chosen side's MID (BUG #28) ---
         # The mid is the market's INFORMATION (what the crowd believes); the
@@ -648,29 +715,15 @@ class BaseBot(ABC):
         max_price = min(config.HIGH_PRICE_GUARD,
                         self.STRATEGY_MAX_SIDE_PRICE.get(self.strategy_type, 1.0))
         if side_mid > max_price:
-            return {
-                "action": "skip",
-                "side": side,
-                "confidence": confidence,
-                "reasoning": (
-                    f"High-price guard: {side} mid={side_mid:.2f} "
-                    f">{max_price:.2f}, priced-in / bad risk-reward"
-                ),
-                "suggested_amount": 0,
-                "features": features,
-            }
+            return _skip(
+                f"High-price guard: {side} mid={side_mid:.2f} "
+                f">{max_price:.2f}, priced-in / bad risk-reward",
+                side=side, confidence=confidence)
         if side_mid < config.CONSENSUS_GUARD:
-            return {
-                "action": "skip",
-                "side": side,
-                "confidence": confidence,
-                "reasoning": (
-                    f"Consensus guard: {side} mid={side_mid:.2f} "
-                    f"<{config.CONSENSUS_GUARD:.2f}, fighting consensus"
-                ),
-                "suggested_amount": 0,
-                "features": features,
-            }
+            return _skip(
+                f"Consensus guard: {side} mid={side_mid:.2f} "
+                f"<{config.CONSENSUS_GUARD:.2f}, fighting consensus",
+                side=side, confidence=confidence)
 
         # --- Late-window conviction boost (smooth) ---
         # BTC direction increasingly locked in toward market close. The boost
@@ -693,7 +746,12 @@ class BaseBot(ABC):
         # (flat % of max_pos by confidence) sized wins and losses almost
         # identically ($3.83 vs $3.76).
         price = max(side_price, 0.01)
-        bankroll = _sizing_bankroll(self.trading_mode)
+        # Portfolio capital slice: when allocation is on, this bot sizes
+        # against bankroll × weight (weights sum to 1 across the roster).
+        # Risk engine may further taper (drawdown / stress) via size_mult.
+        bankroll = (_sizing_bankroll(self.trading_mode)
+                    * _portfolio_weight(self.name)
+                    * _risk_size_mult(self.name))
         # Edge is CLAMPED for sizing only (the trade/skip gate above used the
         # raw edge): outsized edges mean maximal model-vs-market disagreement,
         # which live correlates with stale inputs, not extra information (the
@@ -709,28 +767,41 @@ class BaseBot(ABC):
         target_shares = round(target_shares, 4)
         amount = target_shares * price
 
+        # NOTE: the drift=/mom=/strat= and cand(...) tokens below are parsed
+        # by arena/core_lane_tuner.py and arena/lane_monitor.py — keep their
+        # exact format. blend.log_str() appends the per-lane CONTRIBUTIONS
+        # (weight x value) so every decision's attribution is persisted.
         reasoning = (
             f"fair={fair_yes:.2f} model={model_prob:.2f} "
             f"trust={trust:.2f}x{conviction:.2f}={trust_eff:.2f} "
             f"yes={yes_price:.2f} no={no_price:.2f} "
             f"ask={yes_exec:.2f}/{no_exec:.2f} "
             f"=> {side} edge={chosen_edge:+.3f} (eY={edge_yes:+.3f} eN={edge_no:+.3f}) "
-            f"drift={drift_signal_val:+.3f} mom={momentum_signal:+.3f} pm={pm_momentum_signal:+.3f} "
-            f"of(obi={obi_signal:+.3f} cvd={cvd_signal:+.3f}) "
+            f"drift={drift_signal_val:+.3f} mom={momentum_signal:+.3f} "
+            f"pm={lanes['pm']:+.3f} "
+            f"of(obi={lanes['obi']:+.3f} cvd={lanes['cvd']:+.3f}) "
             # Raw candidate-lane reads (pre-kill-switch) — logged for the
             # offline validation dataset, they carry zero decision weight.
-            f"cand(fut={float(fut.get('taker_delta', 0.0) or 0.0):+.2f} "
-            f"tech={float(tech.get('mtf_score', 0.0) or 0.0):+.2f} "
-            f"xa={float(signals.get('xasset', 0.0) or 0.0):+.2f}) "
+            f"cand(fut={raw['fut_taker']:+.2f} "
+            f"tech={raw['tech_mtf']:+.2f} "
+            f"xa={raw['xasset']:+.2f}) "
             f"strat={strategy_signal:+.3f} "
-            f"{target_shares:.2f}sh conf={confidence:.2f}"
+            f"{target_shares:.2f}sh conf={confidence:.2f} "
+            f"reg={self.regime_context(signals).get('label', '?')} "
+            f"{blend.log_str()}"
         )
 
         return {
             "action": "buy",
             "side": side,
+            "edge": chosen_edge,
             "confidence": confidence,
             "reasoning": reasoning,
+            # Contributing signal readings (structured contract) — the model
+            # blend's own lane attribution is in lane_contributions below.
+            "signals": {"drift": drift_signal_val, "mom": momentum_signal,
+                        "strat": strategy_signal, "model_prob": model_prob,
+                        "trust_eff": trust_eff},
             "suggested_amount": amount,
             "target_shares": target_shares,
             # Price the decision expects to pay. execute() turns this into a
@@ -738,6 +809,9 @@ class BaseBot(ABC):
             # rejects the trade instead of filling worse (config.MAX_FILL_SLIPPAGE).
             "entry_price": round(price, 4),
             "features": features,
+            # Per-lane weight x value attribution for this decision (also in
+            # the persisted reasoning via blend.log_str()).
+            "lane_contributions": dict(blend.contributions),
         }
 
     def execute(self, signal: dict, market: dict) -> dict:
@@ -750,24 +824,52 @@ class BaseBot(ABC):
         self.trading_mode = db.get_bot_mode(self.name)
         mode = self.trading_mode
 
-        # Check risk limits
-        daily_loss = db.get_bot_daily_loss(self.name, mode)
-        max_daily = config.get_max_daily_loss_per_bot()
-        if daily_loss >= max_daily:
-            self._paused = True
-            logger.warning(f"[{self.name}] Daily loss limit hit (${daily_loss:.2f}), pausing")
-            return {"success": False, "reason": "daily_loss_limit"}
-
-        total_daily = db.get_total_daily_loss(mode)
-        max_total = config.get_max_daily_loss_total()
-        if total_daily >= max_total:
-            logger.warning(f"[{self.name}] Total arena daily loss limit hit (${total_daily:.2f})")
-            return {"success": False, "reason": "arena_loss_limit"}
-
         # Pure Kelly sizing: paper amounts are uncapped (the shared-pool gate
         # in venues/paper.py still refuses to overspend the pool). LIVE keeps
         # the hard per-trade safety cap — real money.
         amount = signal.get("suggested_amount", 0.0)
+        # Zone/maker bots size via max_position × pct and skip the Kelly path
+        # above — scale their amount by portfolio weight so capital allocation
+        # still applies. Kelly decisions already baked weight into bankroll;
+        # size_multiplier is 1.0 when allocation is off, and for equal-weight
+        # Kelly we'd double-count if we always multiplied — so only scale when
+        # the signal was NOT produced by the model-blend Kelly path (no
+        # target_shares from make_decision). Heuristic: apply multiplier when
+        # target_shares is absent (sniper/makers/phantom analyze amounts).
+        if signal.get("target_shares") is None:
+            mult = _portfolio_size_mult(self.name)
+            if mult != 1.0:
+                amount = amount * mult
+
+        # Centralized Risk Engine: kill switch, daily/DD limits, size taper.
+        # Replaces the inline daily-loss checks (still available as legacy
+        # fallback when the engine is disabled).
+        try:
+            from arena.risk_engine import pre_trade
+            risk = pre_trade(self.name, mode=mode, amount=amount)
+            if not risk.allow:
+                if risk.action in ("pause", "kill"):
+                    self._paused = True
+                logger.warning(
+                    f"[{self.name}] Risk block: {risk.reason} (action={risk.action})")
+                return {"success": False, "reason": risk.reason}
+            # Kelly path already applied risk mult via bankroll in
+            # make_decision; zone/maker bots (no target_shares) need the
+            # taper applied to their max_pos-based amount here.
+            if risk.size_mult < 0.999 and signal.get("target_shares") is None:
+                amount = amount * risk.size_mult
+        except Exception as e:
+            logger.warning(f"[{self.name}] Risk engine error (fail-open to legacy): {e}")
+            daily_loss = db.get_bot_daily_loss(self.name, mode)
+            max_daily = config.get_max_daily_loss_per_bot()
+            if daily_loss >= max_daily:
+                self._paused = True
+                return {"success": False, "reason": "daily_loss_limit"}
+            total_daily = db.get_total_daily_loss(mode)
+            max_total = config.get_max_daily_loss_total()
+            if total_daily >= max_total:
+                return {"success": False, "reason": "arena_loss_limit"}
+
         if mode == "live":
             amount = min(amount, config.LIVE_MAX_POSITION)
 
@@ -861,24 +963,16 @@ class BaseBot(ABC):
         }
 
     def mutate(self, winning_params: dict, mutation_rate: float | None = None) -> dict:
-        """Create mutated params from winning bot's params."""
-        rate = mutation_rate or config.MUTATION_RATE
-        new_params = copy.deepcopy(winning_params)
+        """Create mutated params via Gaussian noise inside sensible bounds.
 
-        numeric_keys = [k for k, v in new_params.items() if isinstance(v, (int, float))]
-        num_mutations = min(random.randint(2, 3), len(numeric_keys))
-        keys_to_mutate = random.sample(numeric_keys, num_mutations) if numeric_keys else []
-
-        for key in keys_to_mutate:
-            val = new_params[key]
-            delta = val * random.uniform(-rate, rate)
-            new_val = val + delta
-            if isinstance(val, int):
-                new_params[key] = max(1, int(new_val))
-            else:
-                new_params[key] = max(0.01, round(new_val, 4))
-
-        return new_params
+        Delegates to ``evolution.operators.mutate`` (the GA operator). The
+        optional ``mutation_rate`` is the per-gene flip probability.
+        """
+        from evolution.operators import mutate as ga_mutate
+        rate = mutation_rate
+        if rate is None:
+            rate = getattr(config, "GA_MUTATION_RATE", None) or config.MUTATION_RATE
+        return ga_mutate(winning_params, rate=rate)
 
     def reset_daily(self):
         """Reset daily pause state."""

@@ -33,26 +33,32 @@ class SentimentBot(BaseBot):
         flow), which leads/lags BTC spot and differs from the momentum bot's
         BTC-spot trend read.
         """
-        pm = float(signals.get("pm_momentum", 0.0) or 0.0)   # PM YES price momentum
-        cvd = float(signals.get("cvd", 0.0) or 0.0)          # executed buy-sell flow, [-1,1]
+        from signals.lab import SignalView
+        from bots.base_bot import strategy_decision
+        sv = SignalView.of(signals)
+        pm = sv.pm_momentum    # PM YES price momentum
+        cvd = sv.cvd           # executed buy-sell flow, [-1,1]
 
         pm_w = self.strategy_params.get("pm_weight", 3.0)
         cvd_w = self.strategy_params.get("cvd_weight", 0.5)
         score = pm * pm_w + cvd * cvd_w                       # >0 bullish YES, <0 bearish
 
+        contributing = {"pm_momentum": pm, "cvd": cvd, "score": score}
         deadband = self.strategy_params.get("deadband", 0.05)
         if abs(score) <= deadband:
-            return {"action": "hold", "side": "yes", "confidence": 0,
-                    "reasoning": f"Neutral market sentiment: score={score:+.3f}"}
+            return strategy_decision(
+                "hold", signals=contributing,
+                reasoning=f"Neutral market sentiment: score={score:+.3f}")
 
         import config
         amount = config.get_max_position() * self.strategy_params["position_size_pct"]
         side = "yes" if score > 0 else "no"
         confidence = min(0.95, 0.35 + abs(score))
-        return {
-            "action": "buy",
-            "side": side,
-            "confidence": confidence,
-            "reasoning": f"Market sentiment {side}: pm={pm:+.3f} cvd={cvd:+.3f} score={score:+.3f}",
-            "suggested_amount": amount,
-        }
+        return strategy_decision(
+            "buy", side,
+            edge=min(0.10, (abs(score) - deadband) * 0.10),
+            confidence=confidence,
+            reasoning=f"Market sentiment {side}: pm={pm:+.3f} cvd={cvd:+.3f} score={score:+.3f}",
+            signals=contributing,
+            suggested_amount=amount,
+        )

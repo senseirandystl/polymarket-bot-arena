@@ -51,11 +51,19 @@ logger = logging.getLogger("credentials_store")
 # Paths
 # ---------------------------------------------------------------------------
 
-# Encrypted blob: in the repo, gitignored. The arena reads / writes this.
-CREDENTIALS_FILE = Path(__file__).parent / ".credentials.enc"
+# Encrypted blob: in the repo by default, gitignored. Override with
+# ARENA_CREDENTIALS_FILE for Docker (persist under a data volume).
+CREDENTIALS_FILE = Path(
+    os.environ.get("ARENA_CREDENTIALS_FILE")
+    or (Path(__file__).parent / ".credentials.enc")
+)
 
-# Fernet key: outside the repo, 0600 perms. Generated on first write.
-CREDENTIALS_KEY_FILE = Path.home() / ".config/polymarket/arena_fernet.key"
+# Fernet key: outside the repo by default, 0600 perms. Generated on first write.
+# Override with ARENA_CREDENTIALS_KEY_FILE so containers can mount a secrets dir.
+CREDENTIALS_KEY_FILE = Path(
+    os.environ.get("ARENA_CREDENTIALS_KEY_FILE")
+    or (Path.home() / ".config/polymarket/arena_fernet.key")
+)
 
 # Legacy plaintext locations we auto-migrate from (if present) on first run.
 # After migration these are renamed to `.bak` so the plaintext copy can never
@@ -85,6 +93,43 @@ CREDENTIAL_LABELS = {
     "polymarket_private_key": (
         "Polymarket private key",
         "Live trading only — signs on-chain order transactions. Never logged.",
+    ),
+    # Optional production alerts (arena/alerts.py) — all optional
+    "alert_telegram_bot_token": (
+        "Telegram bot token",
+        "Alerts — from @BotFather. Used with chat id below.",
+    ),
+    "alert_telegram_chat_id": (
+        "Telegram chat id",
+        "Alerts — numeric chat/channel id that receives messages.",
+    ),
+    "alert_discord_webhook": (
+        "Discord webhook URL",
+        "Alerts — channel Integrations → Webhooks URL.",
+    ),
+    "alert_smtp_host": (
+        "SMTP host",
+        "Email alerts — e.g. smtp.gmail.com",
+    ),
+    "alert_smtp_port": (
+        "SMTP port",
+        "Email alerts — 587 (STARTTLS) or 465 (SSL).",
+    ),
+    "alert_smtp_user": (
+        "SMTP username",
+        "Email alerts — login user (often the from address).",
+    ),
+    "alert_smtp_password": (
+        "SMTP password",
+        "Email alerts — app password / SMTP secret. Never logged.",
+    ),
+    "alert_smtp_from": (
+        "SMTP from address",
+        "Email alerts — From: header (defaults to SMTP user).",
+    ),
+    "alert_smtp_to": (
+        "SMTP to address(es)",
+        "Email alerts — comma-separated recipients.",
     ),
 }
 

@@ -21,7 +21,8 @@ Competing hypothesis:
 import config
 import learning
 import polymarket_fills
-from bots.base_bot import BaseBot
+from bots.base_bot import BaseBot, strategy_decision
+from signals.lab import SignalView
 
 # Retune (was: window=90s, min_mom=0.0008, price [0.58,0.92]): the bot had ZERO
 # trades all session. By T-90s a 5-min BTC market has almost always resolved to
@@ -54,6 +55,11 @@ DEFAULT_PARAMS = {
     "maker_offset_pct": 0.06,  # Simulated limit = market_price + 6¢ (logged maker metric only)
     "position_size_pct": 0.10, # 10% of max — large because entries are highly selective
     "lookback_candles": 3,     # BTC candles used for momentum calculation
+    # Inventory management: max open USD the shared pool may already hold on
+    # this (market, side) before this maker stands down; below the cap the
+    # quote size is clamped to the remaining headroom. Quoting INTO existing
+    # inventory concentrates one BTC candle's risk (the hour-22 pile-in class).
+    "max_inventory_usd": 30.0,
 }
 
 
@@ -78,17 +84,14 @@ class LateWindowMakerBot(BaseBot):
         market_price = market.get("current_price") or 0.5  # None if book down
 
         # Maker quote fields always returned so run_maker_section() can log them
-        def _hold(reason):
-            return {
-                "action": "hold",
-                "side": "yes",
-                "confidence": 0.0,
-                "reasoning": reason,
-                "maker_bid": round(max(0.01, market_price - 0.02), 2),
-                "maker_ask": round(min(0.99, market_price + 0.02), 2),
-                "maker_mid": market_price,
-                "maker_side": "both",
-            }
+        def _hold(reason, signals_out=None):
+            return strategy_decision(
+                "hold", reasoning=reason, signals=signals_out or {},
+                maker_bid=round(max(0.01, market_price - 0.02), 2),
+                maker_ask=round(min(0.99, market_price + 0.02), 2),
+                maker_mid=market_price,
+                maker_side="both",
+            )
 
         # ── Time gate ────────────────────────────────────────────────────────
         entry_window = p["entry_window_sec"]
@@ -99,13 +102,14 @@ class LateWindowMakerBot(BaseBot):
         # btc_drift is the validated "price to beat" fundamental (signals/
         # strike.py) — time-scaled, so late in the window a strong value means
         # the direction is close to locked in. It PICKS the side.
-        drift = float(signals.get("btc_drift", 0.0) or 0.0)
+        sv = SignalView.of(signals)
+        drift = sv.btc_drift
         min_drift = p.get("min_drift", 0.25)
         if abs(drift) < min_drift:
             return _hold(f"lwm: weak drift ({drift:+.3f} < {min_drift})")
 
         # ── BTC momentum (confirmation only) ─────────────────────────────────
-        prices = signals.get("prices", [])
+        prices = sv.prices
         lb = p["lookback_candles"]
         momentum = 0.0
         if len(prices) >= lb and prices[-lb] > 0:
@@ -154,6 +158,16 @@ class LateWindowMakerBot(BaseBot):
                 f"lwm: price {side_price:.2f} not justified by drift "
                 f"(implied_P={implied_p:.2f}, edge={lwm_edge:+.3f} < {min_edge})")
 
+        # ── Inventory management: don't quote into a side the pool already
+        # holds. Cap total open USD on (market, side); clamp size to headroom.
+        inventory = self._inventory_usd(market, side)
+        max_inv = p.get("max_inventory_usd", 30.0)
+        inv_headroom = max_inv - inventory
+        if inv_headroom <= 0:
+            return _hold(
+                f"lwm: inventory cap — ${inventory:.2f} open on {side} "
+                f"≥ ${max_inv:.2f}")
+
         # ── Maker quote computation (on the chosen side's price) ──────────────
         # What we'd post as a limit order: slightly ahead of market to capture spread
         maker_ask = round(min(max_price, side_price + p["maker_offset_pct"]), 2)
@@ -169,34 +183,39 @@ class LateWindowMakerBot(BaseBot):
                          + time_weight * 0.20 + mom_strength * 0.10)
 
         # ── Features ─────────────────────────────────────────────────────────
-        of_data = signals.get("orderflow", {})
+        of_data = sv.orderflow
         features = learning.extract_features(
             market_price, momentum,
             volume=of_data.get("volume_24h"),
             time_rem=time_rem,
         )
 
-        amount = config.get_max_position() * p["position_size_pct"]
+        amount = min(config.get_max_position() * p["position_size_pct"],
+                     inv_headroom)
 
-        return {
-            "action": "buy",
-            "side": side,
-            "confidence": confidence,
-            "reasoning": (
+        return strategy_decision(
+            "buy", side,
+            edge=lwm_edge,
+            confidence=confidence,
+            reasoning=(
                 f"lwm: time={time_rem:.0f}s mom={momentum:+.5f} "
                 f"{side} price={side_price:.2f} limit={maker_ask:.2f} "
-                f"edge={edge_bps:.0f}bps tw={time_weight:.2f}"
+                f"edge={edge_bps:.0f}bps tw={time_weight:.2f} "
+                f"inv=${inventory:.2f}"
             ),
-            "suggested_amount": amount,
+            signals={"drift": drift, "momentum": momentum,
+                     "implied_p": implied_p, "time_weight": time_weight,
+                     "inventory_usd": inventory},
+            suggested_amount=amount,
             # Expected taker price: the fill walks the real book from the best
             # ask, so expect ~the side's current price. Feeds the execute()
             # slippage guard (config.MAX_FILL_SLIPPAGE). Using maker_ask here
             # (side_price + 6c) silently widened the guard to ~9c over mid —
             # the maker_* fields below are logged metrics, not fill targets.
-            "entry_price": round(side_price, 4),
-            "features": features,
-            "maker_bid": maker_bid,
-            "maker_ask": maker_ask,
-            "maker_mid": maker_mid,
-            "maker_side": side,
-        }
+            entry_price=round(side_price, 4),
+            features=features,
+            maker_bid=maker_bid,
+            maker_ask=maker_ask,
+            maker_mid=maker_mid,
+            maker_side=side,
+        )

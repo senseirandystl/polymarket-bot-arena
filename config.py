@@ -61,8 +61,8 @@ POLYMARKET_TAKER_FEE_RATE = 0.07
 # is used until they set one. Live mode uses the real wallet USDC balance.
 PAPER_BANKROLL_DEFAULT = 200.0
 
-# Database
-DB_PATH = Path(__file__).parent / "bot_arena.db"
+# Database — override with ARENA_DB_PATH for Docker / non-default layouts.
+DB_PATH = Path(os.environ.get("ARENA_DB_PATH") or (Path(__file__).parent / "bot_arena.db"))
 
 # Target Market: BTC 5-min up/down
 TARGET_MARKET_QUERY = "btc"  # Search term for market discovery
@@ -91,15 +91,13 @@ MAX_TRADES_PER_HOUR_PER_BOT = 60  # Bots trade every 5-min market they find
 
 # Evolution Settings
 EVOLUTION_INTERVAL_HOURS = 2
-MUTATION_RATE = 0.15  # 15% random adjustment to params
-# Directed evolution (BUG #31): with the parent now chosen as the BEST-ranked
-# survivor (not random) and lane weights auto-tuned per strategy by the
-# core-lane tuner, mutation should EXPLOIT the proven config, not wander off it
-# — a tighter jiggle keeps the mutant near a configuration that actually earned
-# its survival instead of re-rolling the dice at 15%.
+MUTATION_RATE = 0.15  # legacy exploratory rate (used as GA fallback ceiling)
+# Directed / GA default gene-flip probability (BUG #31 → full GA 2026-07-23):
+# with elitism protecting top performers and crossover blending parents,
+# per-gene mutation should stay modest so offspring stay near proven regions.
 MUTATION_RATE_DIRECTED = 0.07
 NUM_BOTS = 4
-SURVIVORS_PER_CYCLE = 1  # Top 1 survives, bottom 3 replaced
+SURVIVORS_PER_CYCLE = 1  # legacy; GA uses GA_ELITE_COUNT instead
 # Judgment WINDOW is decoupled from the 2h cycle CADENCE (2026-07-19): judging
 # on the 2h window with a 20-trade floor made every bot permanently IMMUNE
 # (bots average 5-12 trades per 2h), so zero evolutions fired in the whole
@@ -118,8 +116,43 @@ MIN_TRADES_FOR_JUDGMENT = 30   # Fewer resolved trades in the window = immune
 # prints. A bot survives if its gap clears this floor OR its window P&L is
 # positive (good sizing can rescue a thin gap). The old MIN_WIN_RATE=0.65
 # would have culled every bot in the v5 run including the profitable ones
-# (best WR was 63.3%).
+# (best WR was 63.3%). Still used by the GA as the *replacement eligibility*
+# bar (elites are protected regardless).
 EVOLUTION_BE_GAP_MIN = 0.03    # survive if WR beats avg entry by >= 3c
+
+# --- Genetic Algorithm (replaces simple mutate-from-winner, 2026-07-23) ---
+GA_ELITE_COUNT = 1             # top-N by multi-obj fitness never replaced
+GA_TOURNAMENT_K = 3            # tournament selection size
+GA_MUTATION_RATE = 0.20        # per-gene probability of Gaussian noise
+GA_MUTATION_SIGMA = 0.12       # noise scale as fraction of param range
+GA_CROSSOVER_ALPHA_LO = 0.30   # blend weight range for parent A
+GA_CROSSOVER_ALPHA_HI = 0.70
+GA_CONSISTENCY_BLOCK = 10      # trades per consistency window
+# Multi-objective weights (re-normalized at score time). Higher = more influence.
+GA_FITNESS_WEIGHTS = {
+    "pnl": 0.35,
+    "sharpe": 0.20,
+    "drawdown": 0.18,
+    "consistency": 0.12,
+    "regime_robustness": 0.15,  # cross-regime stability (stamped trade features)
+}
+GA_REGIME_CONDITION = True
+GA_REGIME_MIN_TRADES = 5       # min samples in a regime to score robustness
+
+# --- Regime detector (signals/regime_detector.py) ---
+REGIME_EMA_ALPHA = 0.25        # feature EMA (higher = faster)
+REGIME_HOLD_TICKS = 3          # hysteresis: candidate must hold N ticks
+REGIME_SWITCH_MARGIN = 0.08    # required confidence edge to start switch
+REGIME_USE_CENTROIDS = True    # lightweight online clustering soft vote
+MOM_CHOP_REGIME_DAMP = 0.45    # mom lane damp under high_vol_chop
+STRAT_CHOP_REGIME_DAMP = 0.70  # strat lane damp under high_vol_chop
+# Performance-triggered early evolution (in addition to EVOLUTION_INTERVAL_HOURS).
+GA_PERF_TRIGGER_ENABLED = True
+GA_PERF_TRIGGER_PNL = -25.0    # fire early if pool window P&L ≤ this
+GA_PERF_TRIGGER_MIN_TRADES = 40
+GA_PERF_TRIGGER_DROP = 40.0    # optional: fire if pool P&L drops this much vs last check
+# Minimum seconds between GA cycles even when performance-triggered (anti-thrash).
+GA_MIN_INTERVAL_SEC = 30 * 60
 
 # Signal Feed Settings
 BINANCE_WS_URL = "wss://stream.binance.com:9443/ws"
@@ -447,6 +480,60 @@ KELLY_EDGE_CAP = 0.10
 # How long make_decision may reuse the last bankroll read (it runs per-bot
 # per-second; the pool changes only on fills/resolutions).
 SIZING_BANKROLL_CACHE_SEC = 5.0
+
+# --- Portfolio capital allocation (arena/portfolio.py) ---
+# When enabled, each bot Kelly-sizes against bankroll × weight instead of the
+# full shared pool (N bots × full bankroll oversubscribed correlated risk).
+# Weights sum to 1; rebalance on timer and/or regime change. Editable in the
+# dashboard Settings → Portfolio Allocation card.
+PORTFOLIO_ALLOCATION_ENABLED = False  # opt-in; off preserves legacy full-pool Kelly
+PORTFOLIO_METHOD = "kelly_portfolio"  # equal | sharpe | expectancy | kelly_portfolio
+PORTFOLIO_WINDOW_HOURS = 24.0         # lookback for Sharpe / expectancy / corr
+PORTFOLIO_MIN_TRADES = 10             # sample floor before a bot's score counts
+PORTFOLIO_MIN_WEIGHT = 0.05           # floor so losers still explore
+PORTFOLIO_MAX_WEIGHT = 0.45           # cap so one bot can't dominate
+PORTFOLIO_CORR_SHRINK = 0.65          # 0..1: how hard correlation cuts raw score
+PORTFOLIO_CORR_MIN_OVERLAP = 8        # shared markets needed to estimate ρ
+PORTFOLIO_COLD_START_SCORE = 0.05     # tiny score for bots under sample floor
+PORTFOLIO_REBALANCE_INTERVAL_SEC = 30 * 60  # 30 min periodic rebalance
+PORTFOLIO_REBALANCE_ON_REGIME = True  # also rebalance on regime_detector flip
+
+# --- Risk Engine (arena/risk_engine.py) ---
+# Central pre-trade gates + continuous evaluation: daily loss, drawdown,
+# size taper, underperformance pause, historical VaR, kill switch (dashboard /
+# API / flag file). Soft paper defaults are real (not 999999) so paper runs
+# exercise the same muscle memory as live; override in dashboard or config.
+RISK_ENGINE_ENABLED = True
+RISK_EVAL_INTERVAL_SEC = 15          # full recompute on evolution-loop host
+RISK_HOTPATH_CACHE_SEC = 2.0         # pre_trade / size_mult cache
+RISK_PAPER_BOT_DAILY_LOSS = 75.0     # net daily P&L floor per bot (paper)
+RISK_PAPER_PORTFOLIO_DAILY_LOSS = 150.0
+# None → use LIVE_MAX_DAILY_LOSS_* in live mode, paper defaults above in paper
+RISK_BOT_DAILY_LOSS = None
+RISK_PORTFOLIO_DAILY_LOSS = None
+RISK_BOT_MAX_DRAWDOWN = 0.35         # pause bot at 35% peak-to-trough
+RISK_PORTFOLIO_MAX_DRAWDOWN = 0.40
+RISK_DRAWDOWN_WINDOW_HOURS = 24.0
+RISK_SIZE_REDUCE_DD_FRAC = 0.50      # start tapering size at 50% of max DD
+RISK_SIZE_REDUCE_MIN_MULT = 0.25     # floor mult before hard pause
+RISK_UNDERPERFORM_PAUSE_PNL = -40.0  # window P&L ≤ this → pause
+RISK_UNDERPERFORM_WINDOW_HOURS = 12.0
+RISK_UNDERPERFORM_MIN_TRADES = 15
+RISK_VAR_CONFIDENCE = 0.95
+RISK_VAR_MIN_TRADES = 20
+RISK_VAR_LIMIT_USD = None            # optional portfolio VaR hard reduce
+RISK_EVENT_LOG_MAX = 500
+# Kill-switch flag file (create to arm, delete to clear). Also settable via
+# dashboard / POST /api/risk/kill-switch and arena_state kill_switch.
+# Re-bound under LOG_DIR after that path is resolved (see below).
+RISK_KILL_SWITCH_FILE = str(Path(__file__).parent / "logs" / "KILL_SWITCH")
+
+# --- Production alerts + health (arena/alerts.py, arena/health.py) ---
+ALERTS_ENABLED = False              # master switch; enable in dashboard Settings
+ALERT_DEBOUNCE_SEC = 300            # min seconds between identical alerts
+ARENA_LOG_STALE_SEC = 300           # health /healthz stale threshold
+HEALTH_EVAL_INTERVAL_SEC = 60       # full health recompute on evolution loop
+
 # Live learning bias: the raw-YES-WR learner was anti-predictive (-24pp) and
 # double-counted price. Disabled in live decisions (outcomes still recorded)
 # pending the edge-calibrated redesign. See spec R5.
@@ -506,9 +593,9 @@ COPYTRADING_MAX_PRICE = 0.65            # Skip trades where whale's entry price 
 COPYTRADING_COPY_NO_BETS = False        # Copy NO bets — data shows NO side loses money, skip by default
 COPYTRADING_BLOCKED_HOURS_UTC = [22]    # UTC hours to skip entirely (22:00 = -$76 in data)
 
-# Dashboard Settings
-DASHBOARD_PORT = 8501
-DASHBOARD_HOST = "0.0.0.0"
+# Dashboard Settings (env overrides match bin/arena / docker-compose)
+DASHBOARD_PORT = int(os.environ.get("DASHBOARD_PORT") or "8501")
+DASHBOARD_HOST = os.environ.get("DASHBOARD_HOST") or "0.0.0.0"
 
 # Arena Loop Cadences
 # Each loop is its own daemon thread; root arena.py starts them all up.  Before
@@ -588,9 +675,14 @@ STALENESS_DISPLAY_MAX_SEC = 300  # Upper clamp on the staleness value shown
                                   # honest.  Operates as a sanity ceiling, not
                                   # an STALE policy.
 
-# Logging
-LOG_DIR = Path(__file__).parent / "logs"
-LOG_DIR.mkdir(exist_ok=True)
+# Logging — override with ARENA_LOG_DIR for Docker / non-default layouts.
+LOG_DIR = Path(os.environ.get("ARENA_LOG_DIR") or (Path(__file__).parent / "logs"))
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+# Kill-switch lives next to the logs so a mounted data volume covers both.
+RISK_KILL_SWITCH_FILE = str(
+    Path(os.environ.get("ARENA_KILL_SWITCH_FILE") or (LOG_DIR / "KILL_SWITCH"))
+)
 
 
 # ---------------------------------------------------------------------------

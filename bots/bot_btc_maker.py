@@ -26,7 +26,8 @@ min_edge_bps       : int   — minimum edge in basis points to bother quoting
 max_open_orders    : int   — cancel oldest orders if this many are already open
 """
 
-from bots.base_bot import BaseBot
+from bots.base_bot import BaseBot, strategy_decision
+from signals.lab import SignalView
 
 DEFAULT_PARAMS = {
     "spread_ticks": 2,         # Half-spread: 2 ticks = ±$0.02 around mid
@@ -36,6 +37,9 @@ DEFAULT_PARAMS = {
     "max_open_orders": 4,      # Max concurrent live orders before cancelling old ones
     "position_size_pct": 0.05, # Fallback size (% of max position) for paper mode
     "lookback_candles": 3,     # BTC candles used for directional lean
+    # Inventory management: skip quoting when the shared pool already holds
+    # this much open USD on the quoted (market, side).
+    "max_inventory_usd": 25.0,
 }
 
 
@@ -67,7 +71,7 @@ class BtcMakerBot(BaseBot):
             maker_bid, maker_ask, maker_mid, maker_side
         """
         p = self.strategy_params
-        prices = signals.get("prices", [])
+        prices = SignalView.of(signals).prices
         market_price = market.get("current_price") or 0.5  # None if book down
 
         # --- Directional lean from recent BTC candles ---
@@ -93,20 +97,19 @@ class BtcMakerBot(BaseBot):
         # Edge check: is the spread meaningful vs the current book?
         edge_bps = abs(fair_value - market_price) * 10000
         min_edge = p["min_edge_bps"]
+        contributing = {"momentum": momentum, "fair_value": fair_value,
+                        "edge_bps": edge_bps}
         if edge_bps < min_edge and abs(momentum) < 0.001:
-            return {
-                "action": "hold",
-                "side": "yes",
-                "confidence": 0.0,
-                "reasoning": (
-                    f"Edge too thin: {edge_bps:.0f}bps < {min_edge}bps, "
-                    f"market_price={market_price:.2f}"
-                ),
-                "maker_bid": maker_bid,
-                "maker_ask": maker_ask,
-                "maker_mid": fair_value,
-                "maker_side": "both",
-            }
+            return strategy_decision(
+                "hold",
+                reasoning=(f"Edge too thin: {edge_bps:.0f}bps < {min_edge}bps, "
+                           f"market_price={market_price:.2f}"),
+                signals=contributing,
+                maker_bid=maker_bid,
+                maker_ask=maker_ask,
+                maker_mid=fair_value,
+                maker_side="both",
+            )
 
         # Directional lean: if momentum is positive lean YES (post bid),
         # if negative lean NO (post ask on YES == posting bid on NO).
@@ -120,23 +123,46 @@ class BtcMakerBot(BaseBot):
             maker_side = "both"
             conf = min(0.60, edge_bps / 1000)
 
-        import config
-        amount = config.get_max_position() * p["position_size_pct"]
+        side = "yes" if maker_side in ("yes", "both") else "no"
 
-        return {
-            "action": "buy",
-            "side": "yes" if maker_side in ("yes", "both") else "no",
-            "confidence": conf,
-            "reasoning": (
+        # Inventory discipline: don't stack quotes onto a side the shared
+        # pool is already loaded on; clamp size to the remaining headroom.
+        inventory = self._inventory_usd(market, side)
+        max_inv = p.get("max_inventory_usd", 25.0)
+        inv_headroom = max_inv - inventory
+        if inv_headroom <= 0:
+            return strategy_decision(
+                "hold",
+                reasoning=(f"Maker inventory cap: ${inventory:.2f} open on "
+                           f"{side} ≥ ${max_inv:.2f}"),
+                signals={**contributing, "inventory_usd": inventory},
+                maker_bid=maker_bid,
+                maker_ask=maker_ask,
+                maker_mid=fair_value,
+                maker_side="both",
+            )
+
+        import config
+        amount = min(config.get_max_position() * p["position_size_pct"],
+                     inv_headroom)
+
+        return strategy_decision(
+            "buy", side,
+            edge=edge_bps / 10000.0,
+            confidence=conf,
+            reasoning=(
                 f"Maker: fair={fair_value:.3f} bid={maker_bid:.2f} ask={maker_ask:.2f} "
-                f"edge={edge_bps:.0f}bps mom={momentum:+.4f} lean={maker_side}"
+                f"edge={edge_bps:.0f}bps mom={momentum:+.4f} lean={maker_side} "
+                f"inv=${inventory:.2f}"
             ),
-            "suggested_amount": amount,
-            "maker_bid": maker_bid,
-            "maker_ask": maker_ask,
-            "maker_mid": fair_value,
-            "maker_side": maker_side,
-        }
+            signals={**contributing, "lean": maker_side,
+                     "inventory_usd": inventory},
+            suggested_amount=amount,
+            maker_bid=maker_bid,
+            maker_ask=maker_ask,
+            maker_mid=fair_value,
+            maker_side=maker_side,
+        )
 
     # ------------------------------------------------------------------
     # Execution override — maker-specific logic for live mode

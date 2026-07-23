@@ -39,7 +39,8 @@ Competing hypothesis:
 import config
 import learning
 import polymarket_fills
-from bots.base_bot import BaseBot
+from bots.base_bot import BaseBot, strategy_decision
+from signals.lab import SignalView
 
 
 def taker_fee(price: float) -> float:
@@ -72,6 +73,11 @@ DEFAULT_PARAMS = {
     "position_size_pct": 0.06, # 6% of max — smaller per-trade, higher frequency
     "lookback_candles": 5,     # BTC candles for momentum context
     "min_confidence": 0.25,    # Skip if we can't reach this confidence
+    # Inventory management: stand down when the shared pool already holds
+    # this much open USD on the quoted (market, side); clamp size to the
+    # remaining headroom below the cap. An always-on quoter is the easiest
+    # bot to pile correlated inventory with — the cap is its discipline.
+    "max_inventory_usd": 25.0,
 }
 
 
@@ -102,17 +108,14 @@ class FeeZoneMakerBot(BaseBot):
         maker_ask = round(min(0.99, market_price + half_spread), 2)
         maker_mid = market_price
 
-        def _hold(reason):
-            return {
-                "action": "hold",
-                "side": "yes",
-                "confidence": 0.0,
-                "reasoning": reason,
-                "maker_bid": maker_bid,
-                "maker_ask": maker_ask,
-                "maker_mid": maker_mid,
-                "maker_side": "both",
-            }
+        def _hold(reason, signals_out=None):
+            return strategy_decision(
+                "hold", reasoning=reason, signals=signals_out or {},
+                maker_bid=maker_bid,
+                maker_ask=maker_ask,
+                maker_mid=maker_mid,
+                maker_side="both",
+            )
 
         # ── Fee-zone gate: quote whichever SIDE's price is in the fee zone ────
         # The fee zone [56¢,86¢] never contains both yes and no (yes+no ~= 1),
@@ -150,7 +153,8 @@ class FeeZoneMakerBot(BaseBot):
         # Paper/live fills cross the book as takers (we pay the very fee that
         # defines the zone), so the quoted side needs real fundamental backing,
         # not just a favorable price. Signed drift toward the side ≥ min_drift.
-        drift = float(signals.get("btc_drift", 0.0) or 0.0)
+        sv = SignalView.of(signals)
+        drift = sv.btc_drift
         signed_drift = drift if side == "yes" else -drift
         min_drift = p.get("min_drift", 0.15)
         if signed_drift < min_drift:
@@ -170,8 +174,17 @@ class FeeZoneMakerBot(BaseBot):
                 f"fzm: price {side_price:.2f} not justified by drift "
                 f"(implied_P={implied_p:.2f}, edge={fzm_edge:+.3f} < {min_edge})")
 
+        # ── Inventory discipline: never quote into a loaded side ─────────────
+        inventory = self._inventory_usd(market, side)
+        max_inv = p.get("max_inventory_usd", 25.0)
+        inv_headroom = max_inv - inventory
+        if inv_headroom <= 0:
+            return _hold(
+                f"fzm: inventory cap — ${inventory:.2f} open on {side} "
+                f"≥ ${max_inv:.2f}")
+
         # ── BTC momentum context ──────────────────────────────────────────────
-        prices = signals.get("prices", [])
+        prices = sv.prices
         lb = p["lookback_candles"]
         momentum = 0.0
         if len(prices) >= lb and prices[-lb] > 0:
@@ -200,33 +213,38 @@ class FeeZoneMakerBot(BaseBot):
             return _hold(f"fzm: conf {confidence:.3f} < {min_conf}")
 
         # ── Features ─────────────────────────────────────────────────────────
-        of_data = signals.get("orderflow", {})
+        of_data = sv.orderflow
         features = learning.extract_features(
             market_price, momentum,
             volume=of_data.get("volume_24h"),
             time_rem=time_rem,
         )
 
-        amount = config.get_max_position() * p["position_size_pct"]
+        amount = min(config.get_max_position() * p["position_size_pct"],
+                     inv_headroom)
 
-        return {
-            "action": "buy",
-            "side": side,
-            "confidence": confidence,
-            "reasoning": (
+        return strategy_decision(
+            "buy", side,
+            edge=fzm_edge,
+            confidence=confidence,
+            reasoning=(
                 f"fzm: {side} price={side_price:.2f} fee={fee_bps:.0f}bps "
                 f"mom={momentum:+.5f} psig={price_signal:.2f} conf={confidence:.3f} "
-                f"bid={maker_bid:.2f} ask={maker_ask:.2f}"
+                f"bid={maker_bid:.2f} ask={maker_ask:.2f} inv=${inventory:.2f}"
             ),
-            "suggested_amount": amount,
+            signals={"drift": drift, "signed_drift": signed_drift,
+                     "momentum": momentum, "fee_bps": fee_bps,
+                     "price_signal": price_signal, "implied_p": implied_p,
+                     "inventory_usd": inventory},
+            suggested_amount=amount,
             # Expected taker price: the fill walks the real book from the best
             # ask, so expect ~the side's current price (not our quoted ask, a
             # logged maker metric — using it widened the slippage guard by the
             # half-spread). Feeds the execute() guard (config.MAX_FILL_SLIPPAGE).
-            "entry_price": round(side_price, 4),
-            "features": features,
-            "maker_bid": maker_bid,
-            "maker_ask": maker_ask,
-            "maker_mid": maker_mid,
-            "maker_side": side,
-        }
+            entry_price=round(side_price, 4),
+            features=features,
+            maker_bid=maker_bid,
+            maker_ask=maker_ask,
+            maker_mid=maker_mid,
+            maker_side=side,
+        )

@@ -1,7 +1,8 @@
-"""Hybrid bot: regime-switching meta-learner over the sub-strategies.
+"""Hybrid bot: regime-switching, online-learning meta-learner.
 
-Upgraded from a static-weight ensemble (2026-07-18). Sub-strategy weights are
-now dynamic, combining two smooth multipliers onto the evolvable base weights:
+Upgraded from a static-weight ensemble (2026-07-18; online layer 2026-07-23).
+Sub-strategy weights are dynamic, combining three smooth multipliers onto the
+evolvable base weights:
 
 1. **Volatility/trend regime** (``signals["vol_regime"]``, local compute from
    the BTC candle stream): trending tape up-weights the trend followers
@@ -12,6 +13,17 @@ now dynamic, combining two smooth multipliers onto the evolvable base weights:
    shared DB, cached off the 1s hot path): a smooth logistic tilt around 50%
    WR, only trusted in proportion to sample size. A sub-strategy that is
    actually losing this session gets a quieter voice.
+3. **Online meta-learning** (``bots/meta_learner.py``): every hybrid buy logs
+   its sub-votes in the trade reasoning (``meta(...)`` token); at resolution
+   each vote is scored against the actual market direction and the sub's
+   multiplier updates Hedge-style (exp(±eta), clipped), kept PER REGIME
+   BUCKET with sample-size shrinkage. State persists in arena_state
+   ``hybrid_meta`` — shared across hybrid generations, visible in the
+   dashboard (/api/hybrid-meta).
+
+The regime also tilts the hybrid's own SIGNAL profile (``_signal_profile``):
+the mom lane's weight scales continuously with trend_score, bounded, while
+drift — the validated fundamental — is never reduced below its class default.
 
 The ensemble score still feeds the ``strat`` lane of the shared model blend —
 all of BaseBot's validated guards (lean floor, drift veto, book-sum gate,
@@ -23,12 +35,13 @@ import time
 
 import db
 import config
-from bots.base_bot import BaseBot
+from bots.base_bot import BaseBot, strategy_decision
 from bots.bot_momentum import MomentumBot
 from bots.bot_mean_rev import MeanRevBot
 from bots.bot_sentiment import SentimentBot
 from bots.bot_phantom import PhantomBot
-from signals.curves import sigmoid
+from bots.meta_learner import HybridMetaLearner, bucket_for, format_token
+from signals.lab import SignalLab, SignalView
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +60,15 @@ DEFAULT_PARAMS = {
     "regime_tilt": 0.5,
     # How far recent live WR may swing any weight (+/-).
     "perf_tilt": 0.4,
+    # Online meta-learner (bots/meta_learner.py): Hedge step size and the
+    # clip band for the per-sub multipliers learned from the hybrid's OWN
+    # resolved trades. Evolution may tune these like any numeric param.
+    "online_eta": 0.12,
+    "online_min_mult": 0.4,
+    "online_max_mult": 2.5,
+    # How far the regime may tilt the hybrid's OWN mom-lane profile weight
+    # (signal-level dynamic weighting; drift is never tilted down).
+    "signal_regime_tilt": 0.4,
     "position_size_pct": 0.06,
     "min_confidence": 0.5,
 }
@@ -81,6 +103,17 @@ class HybridBot(BaseBot):
             "phantom": PhantomBot(name="_internal_ph"),
         }
         self._perf_tilt_cache: tuple = (0.0, {})  # (ts, {sub: tilt})
+        # Online meta-learner: state is shared via arena_state, so every
+        # hybrid generation (and each mutant) reads/extends one record.
+        self._meta = HybridMetaLearner(
+            eta=self.strategy_params.get("online_eta", 0.12),
+            min_mult=self.strategy_params.get("online_min_mult", 0.4),
+            max_mult=self.strategy_params.get("online_max_mult", 2.5),
+        )
+        # Regime context stashed by analyze() for _signal_profile(), which
+        # BaseBot.make_decision calls AFTER analyze() on the same tick.
+        self._last_regime: dict | None = None
+        self._last_weight_detail: dict = {}
 
     # ------------------------------------------------------------------
     # Dynamic weighting
@@ -89,71 +122,114 @@ class HybridBot(BaseBot):
     def _perf_tilts(self) -> dict:
         """Per-sub multiplicative tilt from recent LIVE arena performance.
 
-        Logistic around 50% WR, damped by sample size (a 3-trade streak
-        should barely move the needle). Cached off the 1s hot path.
+        The scoring (logistic around 50% WR, sample-size damped) lives in
+        SignalLab.score_perf_tilts; the fetch stays here (this module's
+        ``db``) with the per-instance hot-path cache.
         """
         now = time.time()
         ttl = getattr(config, "HOTPATH_CACHE_TTL_SEC", 30)
         if (now - self._perf_tilt_cache[0]) < ttl:
             return self._perf_tilt_cache[1]
 
-        tilts = {}
+        subs = {sub: prefix for sub, _param, prefix, _sens in SUBS}
         try:
             perf = db.get_all_bots_performance(hours=PERF_LOOKBACK_HOURS)
-            max_tilt = self.strategy_params.get("perf_tilt", 0.4)
-            for sub, _param, prefix, _sens in SUBS:
-                rows = [p for name, p in perf.items()
-                        if name.startswith(prefix)]
-                trades = sum(p["total_trades"] for p in rows)
-                wins = sum(p["wins"] for p in rows)
-                if trades == 0:
-                    tilts[sub] = 1.0
-                    continue
-                wr = wins / trades
-                trust = min(1.0, trades / (2.0 * PERF_MIN_TRADES))
-                # sigmoid(wr; 0.5, 12): 40% WR -> ~0.23, 60% WR -> ~0.77
-                lean = 2.0 * sigmoid(wr, center=0.5, steepness=12.0) - 1.0
-                tilts[sub] = 1.0 + max_tilt * lean * trust
+            tilts = SignalLab.score_perf_tilts(
+                perf, subs, min_trades=PERF_MIN_TRADES,
+                max_tilt=self.strategy_params.get("perf_tilt", 0.4))
         except Exception as e:
             logger.debug(f"perf tilt unavailable: {e}")
-            tilts = {sub: 1.0 for sub, *_ in SUBS}
+            tilts = {sub: 1.0 for sub in subs}
 
         self._perf_tilt_cache = (now, tilts)
         return tilts
 
     def _dynamic_weights(self, signals: dict) -> dict:
-        """Base weights x smooth regime tilt x smooth performance tilt."""
-        regime = signals.get("vol_regime", {}) or {}
+        """Base weights x regime tilt x performance tilt x online multiplier.
+
+        The full attribution (per-layer multipliers) is stashed on
+        ``self._last_weight_detail`` for the reasoning/signals/dashboard.
+        """
+        sv = SignalView.of(signals)
+        regime = sv.vol_regime
         # trend_score 0..1; recentre so 0.5-ish tape is neutral. NOTE: 0.0 is
         # a legitimate reading (pure chop) — only a MISSING key means neutral,
         # so no `or 0.5` coalescing here.
         raw_trend = regime.get("trend_score")
+        if raw_trend is None:
+            raw_trend = sv.market_regime.get("trend_score")
         trend = 2.0 * (0.5 if raw_trend is None else float(raw_trend)) - 1.0
         regime_tilt = self.strategy_params.get("regime_tilt", 0.5)
         perf_tilts = self._perf_tilts()
 
+        # Online layer: lazily fold any newly-resolved hybrid trades into the
+        # multipliers (TTL-throttled), then read the current-bucket blend.
+        # Prefer robust detector id so high_vol_chop gets its own book.
+        rid = (sv.regime_label
+               or regime.get("regime_id")
+               or (self._last_regime or {}).get("label"))
+        bucket = bucket_for(
+            raw_trend if raw_trend is None else float(raw_trend),
+            regime_id=rid,
+        )
+        try:
+            self._meta.maybe_update()
+            online = self._meta.online_mults(bucket)
+        except Exception as e:  # learner must never stall a tick
+            logger.debug(f"meta learner unavailable: {e}")
+            online = {sub: 1.0 for sub, *_ in SUBS}
+
         weights = {}
         for sub, param, _prefix, sens in SUBS:
             base = self.strategy_params.get(param, 0.25)
-            w = base * (1.0 + regime_tilt * sens * trend) * perf_tilts.get(sub, 1.0)
+            w = (base * (1.0 + regime_tilt * sens * trend)
+                 * perf_tilts.get(sub, 1.0) * online.get(sub, 1.0))
             weights[sub] = max(0.0, w)
 
         total = sum(weights.values())
         if total <= 0:
-            return {sub: 0.25 for sub, *_ in SUBS}
-        return {sub: w / total for sub, w in weights.items()}
+            weights = {sub: 0.25 for sub, *_ in SUBS}
+        else:
+            weights = {sub: w / total for sub, w in weights.items()}
+
+        self._last_weight_detail = {
+            "bucket": bucket, "trend": trend,
+            "perf": dict(perf_tilts), "online": dict(online),
+        }
+        return weights
+
+    def _signal_profile(self) -> dict:
+        """Signal-level dynamic weighting: regime-tilted mom-lane weight.
+
+        The mom lane (BTC 1-candle trend) earns more say on trending tape
+        and less in chop, continuously and bounded by ``signal_regime_tilt``.
+        Drift — the validated fundamental — keeps its class-default weight
+        untouched. Uses the regime stashed by analyze() (make_decision calls
+        analyze() first); no stash → class default profile.
+        """
+        prof = dict(super()._signal_profile())
+        ctx = self._last_regime
+        if ctx and ctx.get("known"):
+            tilt = self.strategy_params.get("signal_regime_tilt", 0.4)
+            t = 2.0 * ctx["trend_score"] - 1.0
+            prof["mom"] = max(0.0, prof.get("mom", 0.0) * (1.0 + tilt * t))
+        return prof
 
     # ------------------------------------------------------------------
     # Ensemble
     # ------------------------------------------------------------------
 
     def analyze(self, market: dict, signals: dict) -> dict:
-        """Regime- and performance-weighted vote over the sub-strategies."""
+        """Regime-, performance- and online-weighted vote over the subs."""
+        # Stash regime for _signal_profile() (called later on this tick).
+        self._last_regime = self.regime_context(signals)
         weights = self._dynamic_weights(signals)
+        detail = self._last_weight_detail
 
         weighted_score = 0.0
         active = []
         reasons = []
+        votes = {}
         for sub, _param, _prefix, _sens in SUBS:
             sig = self._analyzers[sub].analyze(market, signals)
             if sig["action"] == "hold":
@@ -161,11 +237,27 @@ class HybridBot(BaseBot):
             direction = 1 if sig["side"] == "yes" else -1
             weighted_score += direction * sig["confidence"] * weights[sub]
             active.append((sub, direction))
+            votes[sub] = direction * sig["confidence"]
             reasons.append(f"{sub}[w={weights[sub]:.2f}]:{sig.get('reasoning', '')[:40]}")
 
+        contributing = {"weights": dict(weights), "votes": votes,
+                        "weighted_score": weighted_score,
+                        "online": detail.get("online", {}),
+                        "perf": detail.get("perf", {}),
+                        "regime_bucket": detail.get("bucket", "mixed")}
+
+        # Keep the dashboard's view of the effective weights fresh
+        # (arena_state 'hybrid_meta' -> /api/hybrid-meta; persist throttled).
+        try:
+            self._meta.record_last(
+                weights, detail.get("online", {}),
+                self._last_regime["label"], detail.get("bucket", "mixed"))
+        except Exception as e:
+            logger.debug(f"meta record_last failed: {e}")
+
         if not active:
-            return {"action": "hold", "side": "yes", "confidence": 0,
-                    "reasoning": "All sub-strategies say hold"}
+            return strategy_decision("hold", signals=contributing,
+                                     reasoning="All sub-strategies say hold")
 
         yes_votes = sum(1 for _, d in active if d > 0)
         no_votes = sum(1 for _, d in active if d < 0)
@@ -178,18 +270,28 @@ class HybridBot(BaseBot):
 
         threshold = self.strategy_params["confidence_threshold"]
         if confidence < threshold:
-            return {"action": "hold", "side": "yes", "confidence": confidence,
-                    "reasoning": f"Ensemble confidence {confidence:.2f} below threshold {threshold}"}
+            return strategy_decision(
+                "hold", confidence=confidence, signals=contributing,
+                reasoning=f"Ensemble confidence {confidence:.2f} below threshold {threshold}")
 
         side = "yes" if weighted_score > 0 else "no"
         amount = config.get_max_position() * self.strategy_params["position_size_pct"]
-        regime_label = (signals.get("vol_regime", {}) or {}).get("regime", "?")
+        regime_label = SignalView.of(signals).regime_label or "?"
 
-        return {
-            "action": "buy",
-            "side": side,
-            "confidence": confidence,
-            "reasoning": (f"Meta[{regime_label}] ({yes_votes}Y/{no_votes}N, "
-                          f"agree={agreement}): " + " | ".join(reasons)),
-            "suggested_amount": amount,
-        }
+        # meta(...) token: parsed back out of the persisted reasoning at
+        # resolution by HybridMetaLearner.update_from_trades — the online
+        # learner's training data. Keep the exact format.
+        meta_token = format_token(votes, detail.get("bucket", "mixed"))
+        weights_str = " ".join(f"{s[:3]}={weights[s]:.2f}" for s, *_ in SUBS)
+
+        return strategy_decision(
+            "buy", side,
+            edge=min(0.10, abs(weighted_score) * 0.10),
+            confidence=confidence,
+            reasoning=(f"Meta[{regime_label}] ({yes_votes}Y/{no_votes}N, "
+                       f"agree={agreement}) w[{weights_str}] {meta_token}: "
+                       + " | ".join(reasons)),
+            signals={**contributing, "agreement": agreement,
+                     "regime": regime_label},
+            suggested_amount=amount,
+        )

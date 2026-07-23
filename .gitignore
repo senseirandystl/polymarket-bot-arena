@@ -6,6 +6,10 @@ credentials.json
 # outside the repo at ~/.config/polymarket/arena_fernet.key, 0600 perms)
 .credentials.enc
 
+# Docker Compose local env + bind-mounted data volume
+.env
+data/
+
 # Database & state
 *.db
 *.sqlite

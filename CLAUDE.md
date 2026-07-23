@@ -1,50 +1,96 @@
 # Polymarket Bot Arena — Developer Guide
 
+Operator-facing overview, path-to-live checklist, and architecture diagrams:
+**[README.md](./README.md)**. Strategy contract: **[strategy.md](./strategy.md)**.
+This file is the **implementation map** for agents and contributors (signals,
+guards, evolution, deployment). Read **[BUG_HISTORY.md](./BUG_HISTORY.md)**
+before touching resolver, strike/drift, P&L, or learning.
+
 ## What This Is
 
-An automated trading bot arena that runs competing bots on **Polymarket's** BTC 5-minute up/down markets. The **default slate is 8 bots** (five directional defaults incl. the sniper + the market-neutral **arbitrage** bot + two **maker** bots — late-window and fee-zone; roster updated 2026-07-18); a terminal launch can instead select any subset of strategies (see **Startup flow** below). The maker bots are first-class members of the slate but run on the discovery-cycle (maker) cadence, not the 1s trader tick. Directional bots are judged for evolution every `EVOLUTION_INTERVAL_HOURS` (2h) on a rolling `EVOLUTION_WINDOW_HOURS` (24h) window — survive if window P&L > 0 or break-even gap (WR − avg entry) ≥ `EVOLUTION_BE_GAP_MIN` (0.03); losers are replaced by mutated copies of the winners (BUG #29: the old 2h-window + flat-65%-WR bar made every bot permanently immune). The arbitrage bot is **evolution-exempt** (`arena.EVOLUTION_EXEMPT_TYPES`) and the maker bots are excluded from evolution too (they are partitioned out of the trader/evolution list in `main_loop`). **Paper mode simulates against real Polymarket order books** (discovery, prices, depth-based fills, fees, resolution — everything except order submission); **live mode** submits real CLOB orders. Simmer has been fully removed (its 5-min market feed was inconsistent and its free tier capped at 50 buys/day). See [BUG_HISTORY.md](./BUG_HISTORY.md) #10.
+An automated trading bot arena on **Polymarket BTC 5-minute up/down** markets.
+The **default slate is 8 bots** (momentum, phantom, meanrev, hybrid, sniper,
+market-neutral **arbitrage**, late-window maker, fee-zone maker). Terminal
+launches can pick any subset (see **Startup flow**). Makers run on the
+discovery-cycle cadence, not the 1s trader tick.
+
+**Paper mode** simulates against real Polymarket order books (discovery,
+depth-walked fills, fees, resolution — everything except order submission).
+**Live mode** submits real CLOB orders. Simmer is fully removed (BUG #10).
+
+**Evolution** is a multi-objective **genetic algorithm** (`evolution/ga.py`):
+every `EVOLUTION_INTERVAL_HOURS` (2h) on a rolling `EVOLUTION_WINDOW_HOURS`
+(24h) window — survive if window P&L > 0 or break-even gap (WR − avg entry)
+≥ `EVOLUTION_BE_GAP_MIN` (0.03); losers replaced via tournament → crossover →
+mutation of elites (BUG #29 / full GA 2026-07-23). Exempt types live in
+`evolution.ga.EVOLUTION_EXEMPT_TYPES` (arb, makers, copy-trade). **Lane
+weights are not evolved** — `arena/core_lane_tuner.py` owns core lanes;
+candidate lanes go through Signal Lab + live shadow (`lane_promoter` /
+`lane_monitor`).
+
+**Risk:** `arena/risk_engine.py` — daily loss, drawdown taper/pause,
+underperform pause, optional VaR, kill switch. **Regimes:**
+`signals/regime_detector.py` (continuous context for hybrid, damps, GA
+fitness). **Backtests:** `python -m backtest` — real `make_decision` path
+([docs/backtesting.md](./docs/backtesting.md)). **24/7 deploy:** Docker
+Compose preferred ([docs/docker.md](./docs/docker.md)); launchd / systemd
+remain alternatives.
 
 ### Startup flow (terminal launches only — `arena.py` / `bin/arena`)
-On an interactive tty, `arena/startup.py` runs before the threads boot. If the DB holds a previous run it asks **Continue** (resume the exact prior slate) or **Start fresh** (wipe DB rows via `db.wipe_all()` + truncate `logs/*.log`, then choose bots). Bot choice is **Default** (Enter → the 8-bot slate incl. sniper + both makers) or **Manual** (numbered strategy menu — now includes the two maker bots as selectable entries; accepts `1,3,5`, `1-6`, or a mix → launches exactly those). Under launchd / any non-tty parent there is no prompt — it silently resumes the existing DB config, so the service never blocks.
+On an interactive tty, `arena/startup.py` runs before the threads boot. If the
+DB holds a previous run it asks **Continue** (resume the exact prior slate) or
+**Start fresh** (wipe DB rows via `db.wipe_all()` + truncate `logs/*.log`, then
+choose bots). Bot choice is **Default** (Enter → the 8-bot slate incl. sniper +
+both makers) or **Manual** (numbered strategy menu; accepts `1,3,5`, `1-6`, or
+a mix). Under launchd / Docker / any non-tty parent there is no prompt — it
+silently resumes the existing DB config (or seeds defaults on a fresh DB).
 
-## Current State (v4 — Feb 15, 2026)
+## Current State (2026-07)
 
-**GitHub:** https://github.com/senseirandystl/polymarket-bot-arena.git (branch: main)
+**GitHub:** https://github.com/senseirandystl/polymarket-bot-arena.git
 
-### Performance (historical baseline)
-Absolute numbers from the Feb 2026 v4 baseline (276 resolved trades, total P&L `-52.10`, per-bot WR/P&L split) cannot be reproduced against the current `<repo>/bot_arena.db` — the historical source file is not in the repo tree and the live DB starts fresh. Once ~50+ trades accumulate against the v4 fixes (consensus guard, bet sizing cap, aggression normalisation), re-run the **Priority 3** query below to recompute. Qualitative takeaways from that baseline (the ones that actually drive arena design) are preserved in **Key Data Insights** directly underneath — they remain valid guidance while the live dataset rebuilds.
+### Load-bearing insights (do not re-break)
+- **Edge = model vs executable ask after fees** — not mid + narrative tilt (BUG #24).
+- **Predictive ≠ profitable** — e.g. `pm_mom` ~70% follow-WR with negative net edge → kill-switch.
+- **`btc_drift` needs the true window-open strike** (Binance 1m open at `eventStartTime`). Wrong strike blew the account (BUG #23).
+- **Harness nominates; live shadow promotes/demotes** — tech harness ~75% WR → live ~52% → auto-demoted.
+- **Dead-zone** (mid ~0.42–0.58 + flat drift) was the largest $ leak; drift-conditional skip stays.
+- **Shared-pool exposure cap** stops tandem bots from 4× one candle (BUG #27).
+- **Pure fractional Kelly** + sizing edge cap; confidence-only sizing overbet weak edges.
+- **Break-even gap** (WR − avg entry) judges survival, not a flat 65% WR bar.
+- **NO is first-class** — two-sided net edge (blanket NO ban removed, BUG #20).
+- **Consensus guard (0.35)** — fighting strong crowd historically 0–10% WR.
+- **Strat lane overconfidence loses** — `|strat|` capped (`STRAT_LANE_CONF_CAP` ~0.30).
+- **Regimes are context** — damp chop / tilt hybrid; not free direction.
 
-### Key Data Insights (use these for future iterations)
-- **Market price is the strongest signal** — when YES is priced >65c, YES wins ~100% of the time
-- **Contrarian/mean-reversion strategies lose money** in 5-min markets
-- **Confidence 0.30-0.50 is the sweet spot** — 67.9% WR, +$48 total
-- **Confidence >0.50 LOSES money** — 48.6% WR but large bet sizes = big losses
-- **NO bets had 44.9% WR vs YES at 49.2%** in the Simmer-era data — this was the
-  basis for the old blanket NO ban, now **removed** (BUG_HISTORY #20). That stat
-  came from Simmer's inconsistent 5-min feed and a YES-centric decision path, so
-  it did not measure a fair NO decision. NO is now traded on a cost-adjusted
-  per-side net edge; re-evaluate NO vs YES WR once Polymarket-native trades
-  accumulate (Priority 3 query).
-- **Buying cheap YES (<40c) against market consensus = 0-10% WR** (catastrophic)
-  — now enforced symmetrically for both sides via the consensus guard (0.35).
+Older Simmer-era stats (confidence buckets, YES-only WR) are historical context
+only; recompute from the live DB after paper soaks.
 
 ### What's Running
-- **Arena process:** launchd service `com.polymarket.botarena` (loadable via `launchctl load -w ~/Library/LaunchAgents/com.polymarket.botarena.plist`; auto-restarts on crash via `KeepAlive`). Check status with `launchctl list | grep polymarket`.
-- **Dashboard:** launchd service `com.polymarket.dashboard` on FastAPI port 8501 (loadable via `launchctl load -w ~/Library/LaunchAgents/com.polymarket.dashboard.plist`). For **manual/terminal runs on any OS**, `arena.py`'s `start_dashboard()` now auto-manages it: it probes `http://127.0.0.1:8501/api/status`, and if nothing is answering it spawns `dashboard/server.py` with `sys.executable` (the same venv interpreter running the arena — `.venv/bin/python3` on macOS/Linux, `.venv\Scripts\python.exe` on Windows), waits up to ~30s for uvicorn to bind, then opens the browser only once the server responds. The spawned child is terminated via an `atexit` hook when the arena exits (no orphan on :8501), and its stdout/stderr are captured to `<LOG_DIR>/dashboard.log`. If the port is *already* served (launchd service, or a manual `dashboard/server.py`), `start_dashboard()` detects it and does **not** double-spawn. Set `ARENA_NO_DASHBOARD=1` to disable auto-spawn (e.g. when the launchd service owns the dashboard). The dashboard is gated by HTTP-Basic auth read from the `DASHBOARD_USER` / `DASHBOARD_PASS` **environment variables** (defaults `admin` / `Thor` in `dashboard/server.py`, kept so a fresh clone works on localhost; the server logs a warning while the default password is in use). Override both in the environment (or the launchd plist) before exposing the dashboard beyond localhost; the browser will prompt for credentials on first visit.
-- **Remote access:** localtunnel (not persistent, needs manual restart: `npx localtunnel --port 8050`)
-- **Price feed:** Binance WebSocket for BTC/USDT 1-min candles
+| Mode | How |
+|------|-----|
+| **Docker (preferred 24/7)** | `docker compose up -d` — arena + dashboard, shared `./data` volume ([docs/docker.md](./docs/docker.md)) |
+| **macOS launchd** | `com.polymarket.botarena` + `com.polymarket.dashboard` plists (KeepAlive) |
+| **Linux systemd** | `deploy/systemd/*.service` |
+| **Terminal** | `./bin/arena` — interactive slate; auto-spawns dashboard unless `ARENA_NO_DASHBOARD=1` |
 
-> **Deployment note:** The two plists in `~/Library/LaunchAgents/` are symlinks back to the project tree (see [launchd Services](#launchd-services) below), so the repo is the single source of truth — `git pull` automatically propagates plist edits. Logs live in `~/Library/Logs/`, not in the repo.
+- **Dashboard:** FastAPI port **8501**, HTTP Basic (`DASHBOARD_USER` / `DASHBOARD_PASS`; default password warns in logs — change before public expose). Unauthenticated **`/healthz`** for probes (arena log age + kill switch).
+- **Price feed:** Binance WebSocket BTC/ETH 1m candles (+ futures meta background thread when candidates enabled).
+- **DB:** SQLite `bot_arena.db` (or `ARENA_DB_PATH` / Docker `/data/bot_arena.db`), WAL mode for dual-process access.
+
+> **launchd note:** plists in `~/Library/LaunchAgents/` should be **symlinks** to the repo so `git pull` updates them. Logs under `~/Library/Logs/`. See [launchd Services](#launchd-services).
 
 ### Credentials
-Paper mode needs **no keys** — all market data (discovery, books, resolutions) is public. Live mode needs Polymarket credentials, added via the dashboard Settings tab (encrypted store, `credentials_store.py`). The old Simmer key files (`~/.config/simmer/*`) are obsolete — Simmer is fully removed (BUG #10).
+Paper mode needs **no keys**. Live mode: Polymarket L2 credentials via dashboard
+Settings → encrypted store (`credentials_store.py`; paths overridable with
+`ARENA_CREDENTIALS_FILE` / `ARENA_CREDENTIALS_KEY_FILE` for Docker).
 
 ## Architecture
 
 ### Signal Hierarchy (make_decision in base_bot.py) — MODEL-BLEND fair value (BUG #24)
 ```
 P_model   = 0.5 + 0.5 · Σ w_lane · lane          # lanes normalized to [-1,1], YES-frame
-|P_model − 0.5| < MODEL_LEAN_MIN (0.10) → SKIP   # hard lean floor, BUG #27
+|P_model − 0.5| < MODEL_LEAN_MIN (0.05) → SKIP   # hard lean floor, BUG #27 (recal 0.10→0.05)
 trust_eff = trust · min(1, |P_model − 0.5| / MODEL_CONVICTION_SCALE)   # BUG #26
 edge_side = trust_eff · (P_model_side − side_price) − taker_fee        # BUG #27:
             # each side anchored on its OWN book price — a cross-book gap is
@@ -159,13 +205,14 @@ kill-switched to live through a measured, human-approved path:
    arena_state `core_lane_tuner` (dashboard Core-Lane Tuning card) but never
    applies. This is the mechanism that "fine-tunes all active bot strategies on
    real data" — the candidate-lane loop only touches fut/tech/xasset.
-8. **Directed evolution (BUG #31)** — evolution now spawns replacements from the
-   **best-ranked survivor** (not `random.choice`) and mutates at the tighter
-   `MUTATION_RATE_DIRECTED` (0.07 vs 0.15), so a mutant stays near a proven
-   config instead of re-rolling params. Lane weights are no longer evolution's
-   job at all — the core-lane tuner owns them per strategy_type, which mutants
-   inherit automatically. Evolution manages the ROSTER; the tuner manages the
-   SIGNAL BLEND; they no longer fight over the same surface.
+8. **Genetic algorithm + directed offspring (BUG #31 → full GA 2026-07-23)** —
+   `evolution/ga.py` ranks bots with multi-objective fitness (P&L, Sharpe-like,
+   drawdown, consistency, regime robustness), protects elites, and replaces
+   losers via tournament selection → crossover → Gaussian mutation near proven
+   params (`GA_*` knobs in `config.py`). Early evolution can fire on pool
+   drawdown triggers (`GA_PERF_TRIGGER_*`). Lane weights are **not** evolution's
+   job — the core-lane tuner owns them per strategy_type; mutants inherit the
+   blend. Evolution manages the ROSTER; the tuner manages the SIGNAL BLEND.
 The measurement is now **self-scheduling**: `arena/validation_scheduler.py`
 (same evolution-loop host) spawns `validate_signals.py --markets
 AUTO_VALIDATE_WINDOW_MARKETS --propose` every `AUTO_VALIDATE_EVERY_MARKETS`
@@ -297,7 +344,7 @@ old blanket **NO ban is gone** (see BUG_HISTORY #20).
 
 ### Safeguards
 - **Model-lean floor + book-consistency gate (BUG #27):** see Signal
-  Hierarchy above — lean < `MODEL_LEAN_MIN` (0.10) or books summing outside
+  Hierarchy above — lean < `MODEL_LEAN_MIN` (0.05) or books summing outside
   1±`BOOK_SUM_TOLERANCE` (0.04) skip before any edge is computed.
 - **Dead-zone gate (BUG #31):** a directional bot sits flat when the chosen
   side's MID is in `[DEAD_ZONE_PRICE_LO, DEAD_ZONE_PRICE_HI]` (0.42–0.58) AND
@@ -436,34 +483,70 @@ byte-identical duplicate; `db.init_db` migrates old rows idempotently.)
 - Learning records win/loss by feature bucket (price level + momentum)
 - Weight ramps from 10% to 60% as bot accumulates resolved trades
 - Learning data in `bot_learning` table
+- **Live blend weight is OFF** (`LEARNING_ENABLED=False`) — outcomes still recorded;
+  do not re-enable until edge-calibrated redesign (historical bias was inverted)
+
+## Risk engine (`arena/risk_engine.py`)
+
+Single authority for pre-trade gates + periodic evaluation (evolution-loop host,
+`RISK_EVAL_INTERVAL_SEC`). Hot path (`pre_trade` / `size_multiplier` / kill)
+is short-TTL cached.
+
+- Per-bot / portfolio **daily loss** floors (`RISK_PAPER_*` defaults for paper)
+- **Max drawdown** → size taper (`RISK_SIZE_REDUCE_*`) then pause
+- **Underperform** pause (window P&L / min trades)
+- Optional historical **VaR** limit
+- **Kill switch** — dashboard, `arena_state.kill_switch`, or
+  `RISK_KILL_SWITCH_FILE` (under `LOG_DIR` / Docker `data/logs/KILL_SWITCH`)
+- Events in `risk_events` + arena_state snapshot; `/healthz` surfaces kill flag
+
+## Regime detector (`signals/regime_detector.py`)
+
+Continuous classification on the warm path: `high_vol_trend`, `low_vol_trend`,
+`high_vol_chop`, `low_vol_range`, `normal`, `unknown`. Context only — hybrid
+meta-learner, mom/strat chop damps, GA regime robustness, trade feature stamps.
+Hysteresis: `REGIME_HOLD_TICKS`, `REGIME_SWITCH_MARGIN`.
+
+## Backtesting (`backtest/`)
+
+```bash
+.venv/bin/python3 -m backtest --days 2
+.venv/bin/python3 -m backtest --walk-forward --folds 3 --top-k 3
+```
+
+Replays resolved markets through **production** `make_decision` (synthetic
+books). Does not write live trades. Full contract: [docs/backtesting.md](./docs/backtesting.md).
+Honesty: stale PM mids → optimistic WR; ranking/regime splits only — live DB
+for absolute P&L.
 
 ## Key Files
 
 ```
-arena.py              # Coordinator: interactive startup, boot threads, evolution cycle
-arena/market_data.py  # MarketDataWarmer (1s) — sole owner of per-market network reads → warm store
-arena/startup.py      # Interactive continue/fresh + default/manual bot selection (tty only)
-bots/base_bot.py      # BaseBot with make_decision() signal hierarchy + execute() → venue engine
-bots/bot_momentum.py  # MomentumBot (follows trends)
-bots/bot_mean_rev.py  # MeanRevBot (was contrarian, now nearly neutral)
-bots/bot_sentiment.py # SentimentBot
-bots/bot_hybrid.py    # HybridBot
-bots/bot_arbitrage.py # ArbitrageBot: market-neutral YES+NO cross-book arb (evolution-exempt)
-venues/__init__.py    # get_engine(mode) + TradeResult — paper vs live split
-venues/paper.py       # PaperEngine: simulate fills vs real CLOB book + shared bankroll
-venues/live.py        # LiveEngine: Polymarket CLOB order placement
-polymarket_markets.py # Market data: discovery (Gamma), book/prices, resolution
-polymarket_fills.py   # Order-book fill simulation + taker fee formula
-polymarket_client.py  # CLOB client: market/limit orders, balances, order book
-config.py             # All config: paths, limits, evolution interval, API URLs, SIMMER_MIRROR_ENABLED
-db.py                 # SQLite: trades (+ fill_source/entry_price), bot_configs, evolution, bot_learning
-learning.py           # Feature extraction, bias calculation, outcome recording
-signals/price_feed.py # Binance WS for BTC candles (staleness detection)
-signals/sentiment.py  # Sentiment signals
-signals/orderflow.py  # Order flow signals
-dashboard/server.py   # FastAPI dashboard backend
-dashboard/index.html  # Dashboard frontend
-copytrading/          # Wallet tracking + copy trading (not actively used)
+arena.py                 # Coordinator: startup, threads, evolution host
+arena/market_data.py     # MarketDataWarmer (1s) → warm store
+arena/trader.py          # 1s bot eval / execute
+arena/risk_engine.py     # Portfolio / bot risk + kill switch
+arena/lane_monitor.py    # Auto-demote candidate lanes
+arena/lane_promoter.py   # Live-shadow auto-approve
+arena/core_lane_tuner.py # Core drift/mom/strat weight nudges
+arena/startup.py         # Interactive continue/fresh + bot menu (tty only)
+bots/base_bot.py         # make_decision blend + Kelly + execute → venue
+bots/meta_learner.py     # Hybrid online regime-bucket weights
+bots/bot_*.py            # Per-strategy implementations
+evolution/               # GA fitness, operators, bounds
+signals/strike.py        # Accurate strike + btc_drift
+signals/regime_detector.py
+venues/paper.py | live.py
+backtest/                # Offline replay CLI (`python -m backtest`)
+tools/validate_signals.py
+polymarket_markets.py    # Gamma discovery + CLOB + resolution
+polymarket_fills.py      # Depth walk + taker fee (single source of truth)
+config.py                # Knobs + env overrides + pydantic invariants
+db.py                    # SQLite (WAL); path via ARENA_DB_PATH
+credentials_store.py     # Fernet-encrypted live keys
+dashboard/server.py      # FastAPI + /healthz
+docker-compose.yml       # 24/7 arena + dashboard
+docs/docker.md | backtesting.md | signal-suite.md
 ```
 
 ### launchd Services
@@ -567,49 +650,62 @@ launchctl load   -w ~/Library/LaunchAgents/com.polymarket.botarena.plist
 ```
 
 ### Database
-SQLite at `<repo>/bot_arena.db` (= `config.DB_PATH`) — tables: trades, bot_configs, evolution_events, daily_stats, bot_learning, copytrading_wallets, copytrading_trades
+SQLite at `config.DB_PATH` (default `<repo>/bot_arena.db`; override `ARENA_DB_PATH`
+or Docker `/data/bot_arena.db`). WAL mode for arena+dashboard concurrency.
+Core tables: trades, bot_configs, evolution_events, daily_stats, bot_learning,
+lane_proposals / validation runs, risk_events, backtest_runs, copytrading_*,
+arena_state JSON keys (lane_overrides, risk, hybrid_meta, …).
 
 ## Bug History (avoid re-introducing)
 
-Moved to **[BUG_HISTORY.md](./BUG_HISTORY.md)** to keep this guide lean. Read it before touching the resolver, discovery, learning, or P&L code — it records nine already-fixed bugs (circular learning, the various `$0` P&L causes, stale-trade clogging, and the next-day/15-min market selection bug) and the reasoning behind each fix.
+Moved to **[BUG_HISTORY.md](./BUG_HISTORY.md)**. Read it before touching the
+resolver, discovery, strike/drift, learning, or P&L code — circular learning,
+`$0` P&L causes, wrong market selection, wrong strike (BUG #23), additive fair
+value (BUG #24), and related traps are documented there.
 
-## Next Steps for Iteration
+## Path to live & current priorities
 
-### Priority 1: Let v4 accumulate data
-The v4 fixes (consensus guard, bet sizing cap, aggression fix) need 50+ resolved trades with stored features to evaluate. Check after ~2-4 hours of running.
+Full checklist (phases A–D): **[README.md → Path to live trading](./README.md#path-to-live-trading)**.
+Short version for agents:
 
-### Priority 2: Verify learning is working correctly
-Once trades with stored features start resolving, verify:
+1. **Paper first** — Docker or `./bin/arena`; `/healthz` ok; trades resolve with fees.
+2. **Evidence** — hundreds of resolved trades; 24h pool P&L ≥ 0 and BE gap ≥ ~3¢ on
+   bots you intend to live; entry buckets not only expensive favorites; risk
+   engine quiet; walk-forward backtest does not collapse the slate.
+3. **One bot live** — strong dashboard password, credentials backed up, min
+   `LIVE_MAX_POSITION`, compare fills vs paper; kill switch known.
+4. **Never** disable dead-zone / exposure / lean floor to “get more trades.”
+
+### Useful paper analysis
+
 ```python
-# In python3 from trading_bot dir:
 import db
 with db.get_conn() as conn:
-    rows = conn.execute("SELECT * FROM bot_learning ORDER BY updated_at DESC LIMIT 20").fetchall()
-    for r in rows: print(dict(r))
-```
-
-### Priority 3: Analyze v4 performance
-After 50+ resolved trades with features, run the analysis:
-```python
-import db
-with db.get_conn() as conn:
-    # Compare pre-v4 vs post-v4 by checking trades after the restart
     rows = conn.execute('''
         SELECT bot_name, side, COUNT(*) as trades,
             SUM(CASE WHEN outcome='win' THEN 1 ELSE 0 END) as wins,
-            ROUND(SUM(pnl), 2) as pnl
-        FROM trades WHERE outcome IN ('win','loss') AND trade_features IS NOT NULL
-        GROUP BY bot_name
+            ROUND(SUM(pnl), 2) as pnl,
+            ROUND(AVG(entry_price), 3) as avg_entry
+        FROM trades WHERE outcome IN ('win','loss','exit_tp','exit_sl')
+        GROUP BY bot_name, side
     ''').fetchall()
-    for r in rows: print(dict(r))
+    for r in rows:
+        print(dict(r))
 ```
 
-### Priority 4: Future improvements to explore
-- **Time-of-day analysis:** Do certain hours have better WR?
-- **BTC volatility filter:** Skip trading during low-volatility periods (no edge)
-- **Adaptive confidence thresholds:** Adjust min_confidence based on recent WR
-- **Ensemble voting (optional):** When 3+ bots agree, increase bet size
-- **Live trading readiness:** Once consistently profitable in paper, consider switching to live
+```bash
+.venv/bin/python3 tools/validate_signals.py --markets 300 --rank
+.venv/bin/python3 -m backtest --days 5 --walk-forward --folds 3
+make test
+```
+
+### Iteration backlog (data-gated)
+
+- Promote only lanes that clear **live** shadow (xasset-class); keep fut/tech demoted until they re-earn
+- Regime-conditioned size / skip refinements from stamped trade features
+- True maker limit-order posting (makers currently fill as takers)
+- Re-enable learning only after edge-calibrated redesign (`LEARNING_ENABLED` stays False)
+- Alerting for unattended VPS (`ALERTS_ENABLED`, health stale restarts)
 
 ### User Incentive
 "$10 in tokens for every $100 earned" — both user and bot benefit from profitability.

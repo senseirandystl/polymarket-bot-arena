@@ -18,8 +18,9 @@ strategy, not a banned side. The NO zones are unvalidated by live data yet
 
 import config
 import learning
-from bots.base_bot import BaseBot
+from bots.base_bot import BaseBot, strategy_decision
 from signals.curves import gaussian_zone, smooth_ramp
+from signals.lab import SignalView
 
 DEFAULT_PARAMS = {
     "min_price_yes": 0.40,     # Min YES price for YES bets
@@ -35,6 +36,11 @@ DEFAULT_PARAMS = {
     # the sniped side it flips to 62.9% WR / +16.3c per share. Zones say WHERE
     # to look; drift says WHETHER the pattern is backed by BTC's actual position.
     "min_drift": 0.15,
+    # Regime conditioning: in QUIET tape a drift reading is more likely noise
+    # (small absolute moves inflate the normalized z), so the drift bar rises
+    # by this bump when the vol regime reads "quiet". No effect when the
+    # regime feed is silent.
+    "quiet_drift_bump": 0.05,
     "position_size_pct": 0.08, # Larger positions since we're more selective
     "min_confidence": 0.10,    # Only trade with real edge
 }
@@ -52,7 +58,7 @@ class SniperBot(BaseBot):
 
     def analyze(self, market, signals):
         """Only emit a signal when conditions match high-WR patterns."""
-        return {"action": "hold", "side": "yes", "confidence": 0, "reasoning": "sniper: no signal"}
+        return strategy_decision("hold", reasoning="sniper: no signal")
 
     def _zone_signal(self, price):
         """Snipe-worthiness of a token priced ``price`` (side-agnostic).
@@ -93,12 +99,13 @@ class SniperBot(BaseBot):
         require_mom = p.get("require_momentum", True)
 
         # Extract BTC momentum from signals
-        prices = signals.get("prices", [])
+        sv = SignalView.of(signals)
+        prices = sv.prices
         btc_momentum = 0.0
         if len(prices) >= 2 and prices[-1] > 0:
             btc_momentum = (prices[-1] - prices[-2]) / prices[-2]
 
-        of_data = signals.get("orderflow", {})
+        of_data = sv.orderflow
         volume = of_data.get("volume_24h")
         time_rem = market.get("time_remaining_seconds")
 
@@ -130,36 +137,52 @@ class SniperBot(BaseBot):
         # (0.5 + 0.5*signed_drift ≥ price + fee + min_edge) — same gate that
         # fixed the late-window maker's buy-conviction-already-in-the-price leak.
         import polymarket_fills
-        drift = float(signals.get("btc_drift", 0.0) or 0.0)
+        drift = sv.btc_drift
         min_drift = p.get("min_drift", 0.15)
         min_edge = p.get("min_edge", 0.02)
 
-        def _justified(side_price, signed_drift):
+        # Regime awareness: quiet tape inflates drift's normalized reading
+        # relative to the information it carries — demand more of it.
+        regime = self.regime_context(signals)
+        # Quiet / low-vol regimes: drift readings are noisier — raise the bar.
+        quiet = (
+            regime.get("legacy") == "quiet"
+            or regime.get("label") in ("low_vol_range", "low_vol_trend", "quiet")
+            or (regime.get("known") and regime.get("vol_score", 0.5) < 0.35)
+        )
+        if quiet:
+            min_drift += p.get("quiet_drift_bump", 0.05)
+
+        def _drift_edge(side_price, signed_drift):
+            """Drift-implied net edge for a side (prob units, fee-adjusted)."""
             implied_p = 0.5 + 0.5 * signed_drift
             return (implied_p - side_price
-                    - polymarket_fills.taker_fee(1.0, side_price)) >= min_edge
+                    - polymarket_fills.taker_fee(1.0, side_price))
 
-        yes_ok = yes_ok and drift >= min_drift and _justified(market_price, drift)
-        no_ok = no_ok and -drift >= min_drift and _justified(no_price, -drift)
+        yes_edge = _drift_edge(market_price, drift)
+        no_edge = _drift_edge(no_price, -drift)
+        yes_ok = yes_ok and drift >= min_drift and yes_edge >= min_edge
+        no_ok = no_ok and -drift >= min_drift and no_edge >= min_edge
+
+        contributing = {"drift": drift, "btc_momentum": btc_momentum,
+                        "regime": regime["label"], "min_drift": min_drift,
+                        "yes_edge": yes_edge, "no_edge": no_edge}
 
         side = None
         confidence = 0
         reasoning_parts = [f"yes={market_price:.2f} no={no_price:.2f}"]
         if yes_ok and yes_conf >= no_conf:
-            side, confidence = "yes", yes_conf
+            side, confidence, side_edge = "yes", yes_conf, yes_edge
             reasoning_parts.append(f"{yes_label}-YES zone ({market_price:.0%})")
         elif no_ok:
-            side, confidence = "no", no_conf
+            side, confidence, side_edge = "no", no_conf, no_edge
             reasoning_parts.append(f"{no_label}-NO zone ({no_price:.0%})")
         else:
-            return {
-                "action": "skip", "side": "yes", "confidence": 0,
-                "reasoning": (
-                    f"sniper: no snipe zone (yes={market_price:.2f} "
-                    f"no={no_price:.2f} mom={btc_momentum:+.4f})"
-                ),
-                "suggested_amount": 0, "features": features,
-            }
+            return strategy_decision(
+                "skip",
+                reasoning=(f"sniper: no snipe zone (yes={market_price:.2f} "
+                           f"no={no_price:.2f} mom={btc_momentum:+.4f})"),
+                signals=contributing, features=features)
 
         # --- Learned bias adjustment ---
         prior = 0.50
@@ -175,11 +198,10 @@ class SniperBot(BaseBot):
         # --- Minimum confidence gate ---
         min_conf = p.get("min_confidence", 0.10)
         if confidence < min_conf:
-            return {
-                "action": "skip", "side": side, "confidence": confidence,
-                "reasoning": f"sniper: conf {confidence:.2f} < {min_conf}",
-                "suggested_amount": 0, "features": features,
-            }
+            return strategy_decision(
+                "skip", side, confidence=confidence,
+                reasoning=f"sniper: conf {confidence:.2f} < {min_conf}",
+                signals=contributing, features=features)
 
         # (Early-window boost REMOVED 2026-07-16: live data showed early-window
         # entries were the arena's entire loss — 107 trades, 49% WR, -$79.53 —
@@ -213,12 +235,13 @@ class SniperBot(BaseBot):
         else:
             entry = market.get("no_ask") or no_price
 
-        return {
-            "action": "buy",
-            "side": side,
-            "confidence": confidence,
-            "reasoning": "sniper: " + " ".join(reasoning_parts),
-            "suggested_amount": amount,
-            "entry_price": round(float(entry), 4),
-            "features": features,
-        }
+        return strategy_decision(
+            "buy", side,
+            edge=side_edge,
+            confidence=confidence,
+            reasoning="sniper: " + " ".join(reasoning_parts),
+            signals=contributing,
+            suggested_amount=amount,
+            entry_price=round(float(entry), 4),
+            features=features,
+        )

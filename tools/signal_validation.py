@@ -27,11 +27,13 @@ class Sample:
     yes_won: bool              # ground truth: did Up (YES) win?
     signals: dict              # signal_name -> value (YES-frame: >0 leans Up)
     pm_yes: Optional[float] = None   # Polymarket YES mid at this decision point
+    market_seq: int = 0        # market recency rank (0 = most recent market)
 
 
 def build_samples(market_id: str, strike: float, trajectory: list,
                   yes_won: bool, window_sec: int = 300,
-                  pm_prices: Optional[list] = None) -> list:
+                  pm_prices: Optional[list] = None,
+                  market_seq: int = 0) -> list:
     """Build decision-time samples from a BTC price trajectory.
 
     ``trajectory`` is a list of ``(seconds_from_open, btc_price)`` points (e.g.
@@ -81,6 +83,7 @@ def build_samples(market_id: str, strike: float, trajectory: list,
                 "pm_mom": pm_mom,
             },
             pm_yes=pm_yes,
+            market_seq=market_seq,
         ))
         prev = btc
     return samples
@@ -148,7 +151,8 @@ def magnitude_distribution(samples: list, signal_key: str,
 
 
 def net_edge(samples: list, side_of: Callable, fee: Callable,
-             filt: Optional[Callable] = None) -> dict:
+             filt: Optional[Callable] = None,
+             slippage: float = 0.0) -> dict:
     """Realised per-share net EV of a decision rule against the ACTUAL PM price.
 
     ``side_of(sample) -> "yes" | "no" | None`` picks the side to buy (None =
@@ -156,6 +160,11 @@ def net_edge(samples: list, side_of: Callable, fee: Callable,
     ``fee(shares, price)`` is the canonical taker fee. This is the metric that
     matters: a signal can be predictive yet have NO edge once the market has
     already priced it in (BUG: raw follow-WR ≠ profit).
+
+    ``slippage`` is a flat per-share execution penalty added onto the mid
+    (fraction of $1, e.g. 0.005 = half a cent). PM history mids are stale and
+    optimistic; the live fill walks the asks. A signal that only survives at
+    zero slippage has no real edge.
     """
     n = wins = 0
     ev_sum = price_sum = 0.0
@@ -168,18 +177,162 @@ def net_edge(samples: list, side_of: Callable, fee: Callable,
         price = s.pm_yes if side == "yes" else (1.0 - s.pm_yes)
         if price <= 0.01 or price >= 0.99:
             continue
+        paid = min(0.99, price + slippage)
         won = s.yes_won if side == "yes" else (not s.yes_won)
-        ev = (1.0 - price if won else -price) - fee(1.0, price)
+        ev = (1.0 - paid if won else -paid) - fee(1.0, paid)
         n += 1
         wins += 1 if won else 0
         ev_sum += ev
-        price_sum += price
+        price_sum += paid
     return {
         "n": n,
         "winrate": (wins / n) if n else None,
         "avg_price": (price_sum / n) if n else None,
         "ev_per_share": (ev_sum / n) if n else None,
     }
+
+
+def information_coefficient(samples: list, signal_key: str,
+                            filt: Optional[Callable] = None) -> dict:
+    """Point-biserial correlation between signal value and the Up outcome.
+
+    IC in [-1, 1]: positive = higher signal values associate with Up wins
+    (correctly signed), negative = inverted, ~0 = no information. Unlike
+    follow-WR this uses the signal's MAGNITUDE, so a lane whose size means
+    something scores higher than a same-sign coin-flip.
+    """
+    xs, ys = [], []
+    for s in samples:
+        if filt is not None and not filt(s):
+            continue
+        v = s.signals.get(signal_key)
+        if v is None:
+            continue
+        xs.append(float(v))
+        ys.append(1.0 if s.yes_won else 0.0)
+    n = len(xs)
+    if n < 3:
+        return {"signal": signal_key, "n": n, "ic": None}
+    mx = sum(xs) / n
+    my = sum(ys) / n
+    sx = (sum((x - mx) ** 2 for x in xs) / n) ** 0.5
+    sy = (sum((y - my) ** 2 for y in ys) / n) ** 0.5
+    if sx <= 0 or sy <= 0:
+        return {"signal": signal_key, "n": n, "ic": None}
+    cov = sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / n
+    return {"signal": signal_key, "n": n, "ic": cov / (sx * sy)}
+
+
+def decay_analysis(samples: list, signal_key: str, buckets: int = 3) -> list:
+    """Predictiveness + IC split by market recency (performance decay check).
+
+    Markets are fetched newest-first, so ``market_seq`` 0 is the most recent.
+    Splitting the seq range into ``buckets`` chronological slices shows
+    whether a signal's edge is decaying: strong in the OLD slice but flat in
+    the RECENT slice = the market has adapted (or the regime moved on) — do
+    not weight it off the pooled number.
+    """
+    seqs = sorted({s.market_seq for s in samples})
+    if not seqs:
+        return []
+    per = max(1, (len(seqs) + buckets - 1) // buckets)
+    out = []
+    for b in range(buckets):
+        chunk = set(seqs[b * per:(b + 1) * per])
+        if not chunk:
+            continue
+        subset = [s for s in samples if s.market_seq in chunk]
+        res = predictiveness(subset, signal_key)
+        res["ic"] = information_coefficient(subset, signal_key)["ic"]
+        res["bucket"] = ("recent" if b == 0 else
+                         ("oldest" if b == buckets - 1 else f"mid-{b}"))
+        out.append(res)
+    return out
+
+
+def regime_split(samples: list, signal_key: str, regime_key: str,
+                 fee: Callable, slippage: float = 0.0,
+                 deadband: float = 1e-6) -> list:
+    """Follow-WR / IC / net edge of a signal per tercile of a regime feature.
+
+    ``regime_key`` is a non-directional context feature attached to the same
+    samples (e.g. ``regime_trend``, ``ms_rvol_5m``). Answers "where does this
+    signal actually earn?" — a lane that only pays in trending tape should be
+    gated by that context, not run flat.
+    """
+    vals = sorted(s.signals[regime_key] for s in samples
+                  if s.signals.get(regime_key) is not None)
+    if len(vals) < 9:
+        return []
+    lo_cut = vals[len(vals) // 3]
+    hi_cut = vals[(2 * len(vals)) // 3]
+
+    def rule(s):
+        v = s.signals.get(signal_key)
+        if v is None or abs(v) <= deadband:
+            return None
+        return "yes" if v > 0 else "no"
+
+    out = []
+    bounds = [("low", lambda v: v <= lo_cut),
+              ("mid", lambda v: lo_cut < v <= hi_cut),
+              ("high", lambda v: v > hi_cut)]
+    for label, member in bounds:
+        def filt(s, member=member):
+            rv = s.signals.get(regime_key)
+            return rv is not None and member(rv)
+        subset = [s for s in samples if filt(s)]
+        pred = predictiveness(subset, signal_key, deadband=deadband)
+        ne = net_edge(subset, rule, fee, slippage=slippage)
+        out.append({
+            "regime": f"{regime_key}:{label}",
+            "n": pred["n"],
+            "follow_winrate": pred["follow_winrate"],
+            "ic": information_coefficient(subset, signal_key)["ic"],
+            "net_n": ne["n"],
+            "ev_per_share": ne["ev_per_share"],
+        })
+    return out
+
+
+def rank_signals(samples: list, keys: list, fee: Callable,
+                 slippage: float = 0.005,
+                 deadband: float = 1e-6) -> list:
+    """Ranked scorecard for a set of DIRECTIONAL signal keys.
+
+    Per key: n, IC, follow-WR, net EV at mid, net EV after ``slippage``, and
+    the recent-third follow-WR (decay check). Sorted by slippage-adjusted EV
+    (the number a live taker actually keeps), IC as tiebreaker. A signal
+    earns/keeps weight only when slip-adjusted EV is positive AND the recent
+    slice hasn't collapsed — the pooled number alone is exactly how pm_mom
+    almost got weighted (BUG #26).
+    """
+    rows = []
+    for key in keys:
+        def rule(s, key=key):
+            v = s.signals.get(key)
+            if v is None or abs(v) <= deadband:
+                return None
+            return "yes" if v > 0 else "no"
+        pred = predictiveness(samples, key, deadband=deadband)
+        ic = information_coefficient(samples, key)["ic"]
+        ne_mid = net_edge(samples, rule, fee, slippage=0.0)
+        ne_slip = net_edge(samples, rule, fee, slippage=slippage)
+        decay = decay_analysis(samples, key)
+        recent_wr = decay[0]["follow_winrate"] if decay else None
+        rows.append({
+            "signal": key,
+            "n": pred["n"],
+            "ic": ic,
+            "follow_wr": pred["follow_winrate"],
+            "ev_mid": ne_mid["ev_per_share"],
+            "ev_slip": ne_slip["ev_per_share"],
+            "net_n": ne_slip["n"],
+            "recent_wr": recent_wr,
+        })
+    return sorted(rows, key=lambda r: ((r["ev_slip"] is None),
+                                       -(r["ev_slip"] or 0.0),
+                                       -(r["ic"] or 0.0)))
 
 
 def net_edge_time_buckets(samples: list, side_of: Callable, fee: Callable,

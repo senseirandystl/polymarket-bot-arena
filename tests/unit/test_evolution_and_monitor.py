@@ -1,16 +1,14 @@
-"""Tests for the 2026-07-19 set-and-forget fixes:
+"""Tests for evolution judgment + lane monitor + validation scheduler.
 
-- Evolution judgment: EVOLUTION_WINDOW_HOURS window, break-even-gap /
-  P&L survival rule (the old 2h-window + flat-WR bar made every bot
-  permanently immune — zero evolutions in the whole 24h v5 run).
-- Live lane monitor: parses the cand(...) readings out of resolved trades
-  and auto-disables approved lanes whose live accuracy fails the bar.
-- Auto-validation scheduler: market-count cadence, restart persistence,
-  no double-spawn while a run is in flight.
+Evolution judgment now runs through the Genetic Algorithm
+(``evolution.ga.run_ga_cycle``). These tests cover the arena-facing
+survival rules (window, BE-gap, immune floor) and the lane-monitor /
+scheduler utilities that share the evolution host loop.
 """
 
 import importlib.util
 import pathlib
+import random
 import time
 from contextlib import contextmanager
 from unittest import mock
@@ -20,6 +18,7 @@ import pytest
 import config
 from arena import lane_monitor
 from arena.validation_scheduler import ValidationScheduler
+from evolution.ga import run_ga_cycle
 
 # ``import arena`` resolves to the ``arena/`` package, which shadows the
 # top-level ``arena.py`` script that owns ``run_evolution``. Load the script
@@ -31,15 +30,20 @@ _spec.loader.exec_module(arena)
 
 
 # ---------------------------------------------------------------------------
-# Evolution classification
+# Evolution classification (via GA)
 # ---------------------------------------------------------------------------
 
 class FakeBot:
-    def __init__(self, name, strategy_type, perf):
+    def __init__(self, name, strategy_type, perf, params=None):
         self.name = name
         self.strategy_type = strategy_type
         self.generation = 0
-        self.strategy_params = {}
+        self.strategy_params = params or {
+            "lookback_candles": 5,
+            "momentum_threshold": 0.0003,
+            "position_size_pct": 0.05,
+            "min_confidence": 0.55,
+        }
         self.lineage = None
         self._perf = perf
         self.reset_calls = 0
@@ -55,18 +59,88 @@ class FakeBot:
     def reset_daily(self):
         self.reset_calls += 1
 
+    def export_params(self):
+        return {"name": self.name, "strategy_type": self.strategy_type,
+                "generation": self.generation, "lineage": self.lineage,
+                "params": dict(self.strategy_params)}
+
+
+def _trade_rows(perf):
+    n = int(perf["trades"])
+    total = float(perf["pnl"])
+    if n <= 0:
+        return []
+    avg = total / n
+    return [
+        {"pnl": avg, "outcome": "win" if avg >= 0 else "loss",
+         "created_at": f"2026-07-20 12:{i:02d}:00"}
+        for i in range(n)
+    ]
+
+
+def _patch_db(monkeypatch, bots):
+    trade_map = {b.name: _trade_rows(b._perf) for b in bots}
+    replaced = []
+
+    class FakeCursor:
+        def __init__(self, rows):
+            self._rows = rows
+
+        def fetchall(self):
+            return self._rows
+
+    class FakeConn:
+        def execute(self, sql, params=None):
+            name = params[0] if params else None
+            return FakeCursor(trade_map.get(name, []))
+
+    @contextmanager
+    def fake_get_conn():
+        yield FakeConn()
+
+    monkeypatch.setattr("evolution.ga.db.get_conn", fake_get_conn)
+    monkeypatch.setattr("evolution.ga.db.retire_bot",
+                        lambda name: replaced.append(name))
+    monkeypatch.setattr("evolution.ga.db.save_bot_config", lambda *a, **k: None)
+    monkeypatch.setattr("evolution.ga.db.log_evolution", lambda *a, **k: None)
+    monkeypatch.setattr("evolution.ga.db.log_ga_generation", lambda *a, **k: None)
+    monkeypatch.setattr("evolution.ga.db.set_arena_state", lambda *a, **k: None)
+    monkeypatch.setattr("evolution.ga.db.get_arena_state",
+                        lambda *a, **k: None)
+    return replaced
+
+
+def _factory(strategy_type, name, params, generation, lineage):
+    b = FakeBot(name, strategy_type, {"pnl": 0, "wr": 0, "trades": 0},
+                params=params)
+    b.generation = generation
+    b.lineage = lineage
+    return b
+
 
 def _run(bots, monkeypatch):
-    replaced = []
-    monkeypatch.setattr(arena.db, "retire_bot", lambda name: replaced.append(name))
-    monkeypatch.setattr(arena.db, "save_bot_config", lambda *a, **k: None)
-    monkeypatch.setattr(arena.db, "log_evolution", lambda *a, **k: None)
-
-    def fake_evolved(parent, strategy_type, cycle):
-        return FakeBot(f"{parent.name}-g{cycle}", strategy_type,
-                       {"pnl": 0, "wr": 0, "trades": 0})
-    monkeypatch.setattr(arena, "create_evolved_bot", fake_evolved)
+    replaced = _patch_db(monkeypatch, bots)
+    # Arena run_evolution → run_ga_cycle; patch validate
     monkeypatch.setattr(arena, "_validate_bot", lambda b: True)
+
+    def fake_ga(bots_in, cycle_number, **kwargs):
+        return run_ga_cycle(
+            bots_in, cycle_number,
+            bot_factory=_factory,
+            validate_fn=lambda b: True,
+            rng=random.Random(0),
+        )
+
+    monkeypatch.setattr("evolution.ga.run_ga_cycle", fake_ga)
+    # run_evolution imports run_ga_cycle inside the function
+    import evolution.ga as ga_mod
+    monkeypatch.setattr(ga_mod, "run_ga_cycle",
+                        lambda bots_in, cycle_number, **kw: run_ga_cycle(
+                            bots_in, cycle_number,
+                            bot_factory=_factory,
+                            validate_fn=lambda b: True,
+                            rng=random.Random(0),
+                        ))
     result = arena.run_evolution(bots, cycle_number=1)
     return result, replaced
 
@@ -80,11 +154,14 @@ def test_bot_below_min_trades_is_immune(monkeypatch):
 
 
 def test_negative_pnl_and_gap_is_replaced(monkeypatch):
-    # momentum-v1's actual v5 run shape: plenty of trades, negative P&L,
-    # WR barely above entry — must finally be culled.
     bots = [
         FakeBot("winner", "mean_reversion",
-                {"pnl": 47.0, "wr": 0.63, "trades": 30, "gap": 0.13}),
+                {"pnl": 47.0, "wr": 0.63, "trades": 30, "gap": 0.13},
+                params={"lookback_candles": 10, "min_drift": 0.1,
+                        "position_size_pct": 0.05, "min_confidence": 0.55,
+                        "reversion_threshold": 0.4, "bb_std_dev": 2.0,
+                        "rsi_period": 14, "rsi_oversold": 40,
+                        "rsi_overbought": 60, "trending_conf_damp": 0.6}),
         FakeBot("loser", "momentum",
                 {"pnl": -86.0, "wr": 0.508, "trades": 126, "gap": -0.006}),
     ]
@@ -92,7 +169,8 @@ def test_negative_pnl_and_gap_is_replaced(monkeypatch):
     assert replaced == ["loser"]
     names = [b.name for b in result]
     assert "winner" in names and "loser" not in names
-    assert any(n.startswith("winner-g1") for n in names)  # mutated replacement
+    # Replacement keeps the loser's strategy type under GA
+    assert any("momentum" in n for n in names if n != "winner")
 
 
 def test_positive_pnl_survives_even_with_thin_gap(monkeypatch):
@@ -103,25 +181,38 @@ def test_positive_pnl_survives_even_with_thin_gap(monkeypatch):
 
 
 def test_gap_clears_floor_survives_despite_negative_pnl(monkeypatch):
-    # Good book, unlucky sizing: gap >= EVOLUTION_BE_GAP_MIN keeps it alive.
     bots = [
         FakeBot("ok", "sniper",
-                {"pnl": -2.0, "wr": 0.62, "trades": 20, "gap": 0.05}),
+                {"pnl": -2.0, "wr": 0.62, "trades": 20, "gap": 0.05},
+                params={"min_price_yes": 0.4, "max_price_yes": 0.78,
+                        "max_price_no": 0.25, "skip_zone_low": 0.48,
+                        "skip_zone_high": 0.64, "momentum_threshold": 0.0003,
+                        "min_drift": 0.15, "quiet_drift_bump": 0.05,
+                        "position_size_pct": 0.08, "min_confidence": 0.1}),
         FakeBot("winner", "mean_reversion",
-                {"pnl": 30.0, "wr": 0.60, "trades": 25, "gap": 0.10}),
+                {"pnl": 30.0, "wr": 0.60, "trades": 25, "gap": 0.10},
+                params={"lookback_candles": 10, "min_drift": 0.1,
+                        "position_size_pct": 0.05, "min_confidence": 0.55,
+                        "reversion_threshold": 0.4, "bb_std_dev": 2.0,
+                        "rsi_period": 14, "rsi_oversold": 40,
+                        "rsi_overbought": 60, "trending_conf_damp": 0.6}),
     ]
+    # MIN_TRADES may be 30 — lower for this test so both are judged
+    monkeypatch.setattr(config, "MIN_TRADES_FOR_JUDGMENT", 15, raising=False)
     result, replaced = _run(bots, monkeypatch)
     assert replaced == []
 
 
 def test_flat_65_wr_bar_is_gone(monkeypatch):
-    # 63.3% WR + positive pnl — the old MIN_WIN_RATE=0.65 would have culled
-    # the arena's most profitable bot.
     bots = [FakeBot("meanrev", "mean_reversion",
                     {"pnl": 47.0, "wr": 0.633, "trades": 30, "gap": 0.13})]
     result, replaced = _run(bots, monkeypatch)
     assert replaced == []
     assert not hasattr(config, "MIN_WIN_RATE")
+
+
+def test_arbitrage_exempt_via_arena_constant():
+    assert "arbitrage" in arena.EVOLUTION_EXEMPT_TYPES
 
 
 # ---------------------------------------------------------------------------
@@ -172,7 +263,6 @@ def _patch_monitor_db(monkeypatch, overrides, rows):
 
 def test_lane_monitor_disables_failing_lane(monkeypatch):
     monkeypatch.setattr(config, "LANE_MONITOR_MIN_TRADES", 10, raising=False)
-    # 10 readings, 5 correct (50%) — below the 53% bar.
     rows = ([_trade("yes", "win", tech=+0.5)] * 5
             + [_trade("no", "win", tech=+0.5)] * 5)
     overrides = {"tech": {"enabled": True, "approved_at": "2026-07-19 03:17:47"}}
@@ -253,7 +343,6 @@ def test_scheduler_spawns_and_persists(monkeypatch):
         assert "--propose" in argv
         assert str(getattr(config, "AUTO_VALIDATE_WINDOW_MARKETS", 300)) in argv
 
-    # Timer persisted -> restart-safe; and no double-spawn while running.
     assert float(state["last_auto_validation_time"]) > past
     assert not sched.due()
     assert sched.check() is False

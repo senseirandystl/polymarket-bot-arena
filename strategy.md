@@ -1,228 +1,254 @@
-# Phantom Swing Bot – Strategy v0.1
+# Strategy design — Polymarket Bot Arena
 
-Goal: Paper trade a 1,000 USDC account on Solana spot markets (via public price API), with **synthetic leverage up to 20x**, using a transparent, rule-based swing strategy.
+**Market:** Polymarket recurring series *BTC Up or Down 5m* (Gamma `series_id=10684`).  
+**Resolution:** window closes **Up** iff BTC ≥ the price-to-beat at window open (reconstructed from Binance 1m open at `eventStartTime`).  
+**Goal:** positive expected value after **taker fees and slippage**, under paper-then-live discipline.
 
-This is a **first version** designed to be:
-- Simple enough to implement and debug quickly
-- Explicit (no black-box ML)
-- Reasonably conservative on risk even with a 20x ceiling
-
----
-
-## 1. Market & Instruments
-
-- Chain: Solana
-- Venue: Spot prices via a public API (e.g., Jupiter/Birdeye/Pyth) – no real trades, **paper only**.
-- Base currency: USDC
-- Initial equity: **1,000 USDC** (paper account)
-
-### 1.1. Tradeable universe (v0.1)
-
-Start with a single, liquid pair:
-
-- **SOL/USDC**
-
-Rationale: high liquidity, continuous trading, clearer trend structure. The code will be written so additional pairs can be added later.
+This document is the strategy contract for bots, signals, evolution, and risk. Implementation detail lives in `CLAUDE.md` and `BUG_HISTORY.md`.
 
 ---
 
-## 2. Timeframes & Data
+## 1. Market microstructure facts
 
-- **Signal timeframe:** 1 hour (1h)
-- **Execution/check interval:** 1 minute
-- **Lookback window for indicators:** at least 200 1h candles (or equivalent history from the API)
+| Fact | Implication |
+|------|-------------|
+| Binary payoff $1 / $0 per share | Kelly `f* = edge / (1 − price)` is the natural size |
+| Taker fee peaks near 50¢ (`fee ∝ p(1−p)`) | Mid-priced “coin flips” are expensive; need real edge |
+| Books can be wide / gapped | Decide on **ask** for cost; use **mid** for consensus; reject bad book sums |
+| 5-minute horizon | Drift vs strike dominates multi-hour swing heuristics |
+| Crowd prices are strong | Fighting high consensus (&lt;35¢ underdog) historically catastrophic |
 
-The bot updates every minute, but only makes decisions on the close of each 1h candle.
-
----
-
-## 3. Indicators
-
-All indicators are computed on the 1h timeframe.
-
-1. **Trend filter:**
-   - EMA_fast = 20-period EMA of close
-   - EMA_slow = 50-period EMA of close
-
-2. **Volatility (ATR):**
-   - ATR_14 = 14-period Average True Range of close/high/low
-
-3. **Range structure:**
-   - Recent swing high/low over last N bars (e.g., 20 bars) to define breakout levels
+**Key insight:** a signal can be **predictive** (follow-WR ≫ 50%) and still **lose money** once you pay the market price + fee. Live weight requires **net edge**, not accuracy alone.
 
 ---
 
-## 4. Entry Rules
+## 2. Decision architecture
 
-We only trade **with the prevailing trend** defined by the EMAs.
+```mermaid
+flowchart TD
+  S[Warm market + signals] --> A[analyze thesis strat lane]
+  S --> L[Lanes: drift mom strat + candidates]
+  L --> M[P_model blend]
+  M --> G1{lean floor?}
+  G1 -->|no| SKIP1[skip]
+  G1 -->|yes| G2[Guards: book sum dead-zone<br/>session drift-veto consensus]
+  G2 --> E[Per-side net edge vs ask − fee]
+  E --> K{max edge ≥ MIN_EDGE?}
+  K -->|no| SKIP2[skip]
+  K -->|yes| SZ[Kelly size × risk mult]
+  SZ --> R[Risk engine pre_trade]
+  R --> F[Venue fill paper or live]
+```
 
-### 4.1. Long entries
+### 2.1 Model blend (directional)
 
-Conditions (all must be true at the close of a 1h candle):
+```
+P_model = 0.5 + 0.5 · Σ_i w_i · x_i     # x_i ∈ [-1, 1], YES-positive
+```
 
-1. **Trend:**
-   - EMA_fast > EMA_slow
-2. **Price position:**
-   - Close price > EMA_fast
-3. **Breakout:**
-   - Close price > highest close of the last 20 bars (recent swing high)
-4. **Volatility sanity:**
-   - ATR_14 / Close is between 0.5% and 10% (avoid ultra-low or insane vol)
+Per-strategy weights `w_i` come from `BaseBot.STRATEGY_SIGNAL_PROFILE`, optionally nudged by the **core-lane tuner** and candidate **lane_overrides** (Signal Lab).
 
-If all conditions are met and we are not already long, we open a **long** position.
+| Lane | Role | Default live weight |
+|------|------|---------------------|
+| **drift** | BTC vs accurate window strike (time-scaled tanh) | Core (highest trust fundamental) |
+| **mom** | Short BTC candle momentum | Core |
+| **strat** | Strategy `analyze()` thesis | Core, **magnitude capped** (`STRAT_LANE_CONF_CAP` ≈ 0.30) |
+| pm / cvd / obi | In-market / flow | Kill-switched 0 until revalidated |
+| fut / tech / xasset | Perp meta, technicals, cross-asset | Candidates; promote via Lab only |
+| learn | Historical bias buckets | Off (`LEARNING_ENABLED=False`) |
 
-### 4.2. Short entries (v0.1.1)
+**Trust:** `trust_eff = trust × min(1, |P_model−0.5| / MODEL_CONVICTION_SCALE)` so near-coin-flip models cannot mint large “edge” from market displacement alone.
 
-We now allow **short trades** as a mirror of the long logic.
+### 2.2 Side selection
 
-Conditions (all must be true at the close of a 1h candle):
+For each side `s ∈ {YES, NO}` with executable ask `a_s`:
 
-1. **Trend:**
-   - EMA_fast < EMA_slow
-2. **Price position:**
-   - Close price < EMA_fast
-3. **Breakdown:**
-   - Close price < lowest close of the last 20 bars (recent swing low)
-4. **Volatility sanity:**
-   - ATR_14 / Close is between 0.5% and 10% (avoid ultra-low or insane vol)
+```
+edge_s = trust_eff · (P_s − a_s) − taker_fee(1, a_s)
+```
 
-If all conditions are met and we are not already in a position, we open a **short** position.
+Buy `argmax edge_s` if that edge clears the strategy’s `MIN_EDGE` (after flow-only tax when |drift| is small). Model must **lean** toward the side (`P_model` on the correct side of 0.5).
 
----
+### 2.3 Default profiles (emphasis, not direction)
 
-## 5. Position Sizing & Leverage
+| Strategy | drift / mom / strat | Trust | Notes |
+|----------|---------------------|-------|-------|
+| momentum | 0.35 / 0.40 / 0.25 | 0.50 | Trend-following analyze() |
+| phantom | 0.20 / 0.30 / 0.50 | 0.50 | EMA/breakout thesis-heavy |
+| mean_reversion | 0.70 / 0 / 0.30 | 0.60 | Drift-gated fade; max mid ~0.58 |
+| hybrid | 0.50 / 0.20 / 0.30 | 0.50 | Meta over sub-bots |
+| sentiment | 0.30 / 0 / 0.70 | 0.50 | Flow thesis; not default slate |
 
-Account equity at time of decision: **E** (USDC).
+Sniper and makers **override** `make_decision` with zone/band logic but share drift-confirmation and many venue guards.
 
-### 5.1. Base risk per trade
+### 2.4 Arbitrage (separate path)
 
-- Target risk per trade (if stopped out): **1% of E**
-
-Let:
-- `R` = 0.01 * E  (max loss if stop is hit)
-- `SL_dist` = distance between entry price and stop-loss price (in USDC)
-
-Then **position size in base currency** (SOL) at 1x would be:
-
-- `size_1x = R / SL_dist`
-
-### 5.2. Stop-loss placement
-
-For long trades:
-
-- Initial stop-loss price = Entry price – `k * ATR_14`
-- With k = 1.5 (v0.1)
-
-So:
-- `SL_dist = 1.5 * ATR_14`
-
-### 5.3. Synthetic leverage
-
-We allow effective leverage up to 20x but **scale by trend strength and volatility**.
-
-Define a **trend strength score**:
-
-- `TS = (EMA_fast – EMA_slow) / Close`
-
-Heuristic mapping:
-
-- If TS < 0.5%  → max_leverage_for_trade = 1x (weak trend)
-- If 0.5% ≤ TS < 1% → max_leverage_for_trade = 3x
-- If 1% ≤ TS < 2% → max_leverage_for_trade = 5x
-- If TS ≥ 2% → max_leverage_for_trade = 10x (cap v0.1 here, even though global cap is 20x)
-
-We **cap v0.1 at 10x** to avoid insane risk until the strategy is proven.
-
-Effective position size in SOL:
-
-- `size = size_1x * leverage`
-- Where `leverage <= max_leverage_for_trade` and is chosen as the max allowed in that band.
+Market-neutral: when depth-walked VWAP(YES)+VWAP(NO) leaves margin after fees, buy **matched shares** on both legs. Not a directional model; evolution-exempt. One-legged fills are failures (naked risk).
 
 ---
 
-## 6. Exit Rules
+## 3. Guardrails (must not regress)
 
-For any open long position:
+These exist because of measured loss modes:
 
-1. **Stop-loss:**
-   - Exit fully if price hits stop-loss price.
+| Guard | Rule of thumb | Failure mode if removed |
+|-------|----------------|-------------------------|
+| Model lean floor | Skip weak `|P−0.5|` | Noise trades clear MIN_EDGE |
+| Book sum | \|YES+NO−1\| ≤ tol | Phantom cross-book edge |
+| Consensus / high price | Side mid ∈ [~0.35, ~0.72] | Fight crowd / bad R:R |
+| Dead-zone | Skip mid ∈ [0.42,0.58] if \|drift\| small | Largest historical $ leak |
+| Drift veto | Don’t fight strong drift | ~26% WR class |
+| Mid vs ask | Guards on mid, cost on ask | Wide books bypass consensus |
+| Exposure cap | Cap open cost per (market, side) across bots | Correlated 4× pile-in |
+| Session skip | Flat at NYSE open/close ET | Flip-heavy windows |
+| Flow-only edge tax | Higher bar when drift flat | Noisy flow overtrade |
+| Kelly edge cap | Size uses capped edge | Stale-input max bets |
 
-2. **Take-profit via R-multiple and trailing:**
-
-   - Compute R-multiple: `(current_price – entry_price) / (entry_price – stop_price)`
-
-   - If R ≥ 1.5:
-     - Move stop-loss to breakeven (entry price).
-
-   - If R ≥ 3:
-     - Start trailing stop at `trailing_stop = max(trailing_stop, current_price – 2 * ATR_14)`
-
-   - Exit fully when price hits trailing stop.
-
-3. **Trend reversal exit:**
-
-   - If EMA_fast < EMA_slow (trend flips bearish) **and** price closes below EMA_slow, exit at market on the close of that bar (even if stop not hit).
+Zone bots (sniper, makers) additionally require **signed drift** toward the chosen side — price pattern alone is not edge.
 
 ---
 
-## 7. Trade Management & Constraints
+## 4. Sizing
 
-1. **One position at a time (v0.1):**
-   - Only one SOL/USDC position open at any time.
+1. Fee-adjusted edge on the chosen ask.  
+2. Optional continuous **flow-only tax** on `min_edge` when |drift| is low.  
+3. `f* = edge_sized / (1 − price)` with edge **capped** for sizing only.  
+4. `bet = KELLY_FRACTION × f* × bankroll` (dashboard-editable fraction).  
+5. Shares-first (`amount = shares × price`); floor to venue min shares.  
+6. Risk engine may multiply size or block.  
+7. Shared pool: cannot spend cash the paper pool lacks; live uses wallet + `LIVE_MAX_POSITION`.
 
-2. **Max daily loss:**
-   - If realized PnL for the current UTC day drops below **–5% of starting equity for that day**, the bot:
-     - Closes any open position.
-     - Stops opening new trades until the next day.
-
-3. **Max overall drawdown guard (soft):**
-   - If equity falls below 800 USDC (–20% from 1,000), the bot logs a warning and can optionally reduce max leverage bands by half.
-
----
-
-## 8. Logging Requirements
-
-Every **closed trade** must log:
-
-- `timestamp_open` (ISO)
-- `timestamp_close` (ISO)
-- `pair` (e.g., SOL/USDC)
-- `side` (long)
-- `entry_price`
-- `exit_price`
-- `size_base` (SOL)
-- `notional_usdc` at entry
-- `leverage`
-- `initial_stop_price`
-- `final_stop_price` (after trailing)
-- `pnl_usdc`
-- `pnl_pct` (relative to equity at entry)
-- `equity_after`
-- `reason_exit` (stop, TP, trail, trend_flip)
-
-Additionally, **every 1-minute tick** should log equity to a separate file (or summary), e.g.:
-
-- `timestamp`
-- `equity`
+Paper: one shared virtual pool (default bankroll $200, Settings top-up).  
+Live: hard per-trade and daily loss caps in `config.py`.
 
 ---
 
-## 9. Simulation & Paper Trading
+## 5. Regimes
 
-- The bot **never sends real orders**. It only simulates fills at the observed prices.
-- Slippage/fees (v0.1):
-  - Assume fee of 0.1% per trade (roundtrip 0.2%).
-  - Slippage is ignored in v0.1 but can be added later.
+`regime_detector` emits continuous labels used as **context**:
 
----
+- **high_vol_trend / low_vol_trend** — allow trend-oriented emphasis  
+- **high_vol_chop** — damp mom/strat; hybrid shifts toward fade book  
+- **low_vol_range** — quieter tape; mom quiet-regime damp  
 
-## 10. Future Extensions (not in v0.1, just notes)
+Hybrid’s online meta-learner keeps **per-regime-bucket** multipliers so “phantom works in trends, fails in chop” can be learned without averaging to zero.
 
-- Add more pairs (e.g., WIF/USDC, BONK/USDC) with per-pair risk limits.
-- Add basic sentiment filters (funding, open interest proxies) if data is cheap.
-- Add short-side logic when trend filter is bearish.
-- Add more realistic transaction cost/slippage modeling.
+Evolution fitness includes **regime robustness** so a bot that only wins in one micro-regime is not over-promoted.
 
 ---
 
-This spec is intentionally simple and opinionated so we can implement `bot.py` quickly and iterate on real paper-trade results instead of theory.
+## 6. Evolution (GA) vs signal tuning
+
+| System | Owns | Does not own |
+|--------|------|--------------|
+| **GA** (`evolution/`) | Which bot instances / params survive | Lane weights |
+| **Core-lane tuner** | drift/mom/strat weights per strategy_type | Bot roster |
+| **Lane promoter/monitor** | Candidate fut/tech/xasset on/off | Strategy params |
+
+**Survival (directional):** enough trades in the 24h window; survive if window P&L &gt; 0 **or** break-even gap ≥ `EVOLUTION_BE_GAP_MIN` (~3¢). Elites protected. Offspring: tournament → blend crossover → modest mutation.
+
+**Exempt:** arbitrage, makers, copy-trade.
+
+---
+
+## 7. Signal promotion pipeline
+
+1. **Offline harness** — resolved markets + Binance + PM history → follow-WR, IC, net EV after fee (+ optional slippage).  
+2. **Nominate** — `--propose` if n, WR, net edge clear bars.  
+3. **Live shadow** — `cand(...)` in trade reasoning at weight 0.  
+4. **Approve** — human or auto if live accuracy clears hysteresis bar.  
+5. **Monitor** — auto-demote if live accuracy decays.  
+
+Never promote on harness alone. Empirical lesson: harness “tech” ~75% → live ~52% → demoted.
+
+Expanded pure features (multiscale, microstructure, flow, session, regime context) stay at weight 0 until the same pipeline promotes them. See `docs/signal-suite.md`.
+
+---
+
+## 8. Risk engine
+
+Central `arena/risk_engine.py`:
+
+- Per-bot / portfolio daily loss floors (paper defaults stricter than legacy “uncapped”)  
+- Max drawdown → size taper then pause  
+- Underperformance pause (window P&L)  
+- Optional historical VaR  
+- Kill switch (dashboard / state / flag file)  
+
+Risk is **orthogonal** to strategy edge: a good edge with unbounded correlation still needs portfolio caps.
+
+---
+
+## 9. Backtest contract
+
+Backtests must call the **same** `make_decision` path as paper/live. Acceptable approximations:
+
+- Synthetic ask ladder from historical mid  
+- Fixed or compounding bankroll flag  
+- No arb/maker (missing historical depth for two-sided microstructure)
+
+Unacceptable: reimplementing edge math only in the backtester; training on future windows without walk-forward.
+
+---
+
+## 10. Strategy-specific notes
+
+### Momentum
+Rides short BTC impulse + mom lane. Vulnerable in chop → regime damp. Needs drift agreement on strong moves.
+
+### Phantom
+EMA 9/26 + breakout (warmup ~36 candles). Thesis-heavy; strat cap limits overconfident analyze().
+
+### Mean reversion
+**Not** classic fade-the-move against drift. Drift picks the side; z-score times pullbacks **with** drift (`min_drift`). Max side mid ~0.58 (“market lags” harness rule). Ungated meanrev historically 0/11.
+
+### Hybrid
+Ensemble of sub-analyzers with regime tilt × live WR tilt × online meta weights. Best as a **portfolio diversifier**, not a free lunch.
+
+### Sniper
+Price zones only with **min_drift** confirmation. Early-window size boosts removed (BUG #24).
+
+### Makers
+Quote bands + drift; currently execute as **taker** fills (limit posting not yet first-class). Evolution-exempt; judged on their own P&L, not GA.
+
+### Arbitrage
+Depth VWAP + share match. Edge is mechanical; inventory risk is incomplete fill.
+
+---
+
+## 11. Anti-patterns (do not reintroduce)
+
+1. Additive fair value (`mid + tilt + alpha`) — invents edge by construction.  
+2. Mid-priced decisions with ask-priced fills — systematic slippage rejects / bad fills.  
+3. Wrong strike (first sighting mid-window) — destroys drift.  
+4. Flat WR threshold (e.g. 65%) for evolution — expensive winners die, cheap losers live.  
+5. Promoting lanes on follow-WR without net edge or live shadow.  
+6. Disabling dead-zone / exposure cap “to get more trades.”  
+7. Full-Kelly or uncapped live size before paper stability.  
+8. Learning bias in the blend while inverted / uncalibrated.
+
+---
+
+## 12. Success metrics
+
+| Horizon | Paper success | Live success |
+|---------|---------------|--------------|
+| Trade | Positive fee-aware EV, sane skip mix | Fill within slippage band |
+| Day | Pool P&L; gap ≥ ~3–5¢ on active bots | Same after costs |
+| Week | Survives evolution without thrash; no risk pause storm | Tracks paper within expected slip |
+| Month | Stable lane set; harness rank still agrees with live monitor | Bankroll up after all fees |
+
+**Break-even gap:** `win_rate − average_entry_price`. High WR at high entry still loses.
+
+---
+
+## 13. Change control
+
+Any change to guards, fees, strike, Kelly, or lane weights should ship with:
+
+1. Unit/integration tests for the regression class (see `tests/`).  
+2. Offline harness or backtest comparison when the decision surface moves.  
+3. Paper soak before live.  
+4. BUG_HISTORY note if it fixes a named loss mode.
+
+When in doubt: **skip** is the default action.

@@ -109,6 +109,17 @@ class Trader(threading.Thread):
         if not market_id:
             return
 
+        # Global kill switch — cheapest possible gate (cached ~2s). When armed
+        # (dashboard / API / logs/KILL_SWITCH file) the whole taker loop sits
+        # flat; risk_engine logs the arming event separately.
+        try:
+            from arena.risk_engine import is_killed
+            if is_killed():
+                self._state.note_skip("kill_switch")
+                return
+        except Exception:
+            pass
+
         # Session-timing gate — 'build the skip, default state is flat'. Sit out
         # high-flip session handovers (NYSE open/close) entirely, one check for
         # all taker bots. Cheap and off the per-bot path.

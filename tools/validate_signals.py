@@ -41,8 +41,9 @@ import requests
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from tools.signal_validation import (
-    build_samples, magnitude_distribution, net_edge, net_edge_time_buckets,
-    predictiveness, time_buckets,
+    build_samples, decay_analysis, information_coefficient,
+    magnitude_distribution, net_edge, net_edge_time_buckets,
+    predictiveness, rank_signals, regime_split, time_buckets,
 )
 from polymarket_fills import taker_fee
 
@@ -187,8 +188,21 @@ def main() -> int:
                     help="record the run in bot_arena.db and file lane "
                          "proposals for candidates clearing the promotion "
                          "thresholds (implies --candidates)")
+    ap.add_argument("--rank", action="store_true",
+                    help="re-validate EVERY signal (live lanes, candidate "
+                         "lanes, and the expanded feature suite) and produce "
+                         "a ranked scorecard: IC, follow-WR, net edge at mid "
+                         "and after slippage, decay, and regime splits. "
+                         "Implies --candidates. Writes a markdown report.")
+    ap.add_argument("--slippage", type=float, default=0.005,
+                    help="per-share execution penalty (fraction of $1) for "
+                         "the slippage-adjusted net-edge column "
+                         "(default 0.005 = 0.5c)")
+    ap.add_argument("--report", type=str, default=None,
+                    help="markdown report path for --rank "
+                         "(default logs/signal_report.md)")
     args = ap.parse_args()
-    if args.propose:
+    if args.propose or args.rank:
         args.candidates = True
 
     use_cache = not args.no_cache
@@ -236,10 +250,13 @@ def main() -> int:
         up_count += 1 if mkt["yes_won"] else 0
         mkt_samples = build_samples(mkt["id"], strike, traj,
                                     mkt["yes_won"], WINDOW_SEC,
-                                    pm_prices=pm)
+                                    pm_prices=pm, market_seq=i)
         if args.candidates and series:
             from tools import lane_candidates as lc
             lc.attach_candidates(mkt_samples, _ms(mkt["start"]) / 1000.0, series)
+            if args.rank:
+                lc.attach_features(mkt_samples, _ms(mkt["start"]) / 1000.0,
+                                   series)
         all_samples.extend(mkt_samples)
         if use_cache and i % 25 == 0:
             _save_cache(cache)
@@ -367,6 +384,115 @@ def main() -> int:
             print("  >> would propose: "
                   + ", ".join(p["lane"] for p in proposals)
                   + "  (re-run with --propose to file)")
+
+    # --- Ranked full-suite scorecard (--rank): IC + edge after fees/slippage
+    # + decay + regime-specific value, for every signal the arena knows.
+    if args.rank:
+        from tools import lane_candidates as lc
+        directional = (["drift_prod", "drift_raw", "mom2", "pm_mom"]
+                       + lc.CANDIDATE_KEYS + lc.FEATURE_DIRECTIONAL_KEYS)
+        rows = rank_signals(all_samples, directional, taker_fee,
+                            slippage=args.slippage)
+
+        def _c(x, pct=False):
+            if x is None:
+                return "   n/a"
+            return f"{x*100:+6.2f}" if not pct else f"{x*100:5.1f}%"
+
+        def _ic(x):
+            return "  n/a" if x is None else f"{x:+.2f}"
+
+        print(f"\n=== RANKED signal scorecard (slippage {args.slippage*100:.1f}c/share; "
+              "keep/weight ONLY positive ev_slip with a healthy recent slice) ===")
+        header = (f"  {'signal':<12} {'n':>6} {'IC':>7} {'follow':>7} "
+                  f"{'ev_mid c':>9} {'ev_slip c':>10} {'recentWR':>9}  verdict")
+        print(header)
+        for r in rows:
+            ev_slip = r["ev_slip"]
+            wr_recent = r["recent_wr"]
+            if ev_slip is None or r["net_n"] < 50:
+                verdict = "insufficient"
+            elif ev_slip >= 0.005 and (wr_recent or 0) >= 0.53:
+                verdict = "POSITIVE EDGE"
+            elif ev_slip > 0:
+                verdict = "marginal"
+            else:
+                verdict = "no edge"
+            print(f"  {r['signal']:<12} {r['n']:>6} "
+                  f"{_ic(r['ic']):>7} {_c(r['follow_wr'], pct=True):>7} "
+                  f"{_c(r['ev_mid']):>9} {_c(ev_slip):>10} "
+                  f"{_c(wr_recent, pct=True):>9}  {verdict}")
+
+        print("\n=== Performance decay (chronological thirds; recent first) ===")
+        decay_keys = ["drift_prod", "mom2"] + [
+            r["signal"] for r in rows[:3]
+            if r["signal"] not in ("drift_prod", "mom2")]
+        for key in decay_keys:
+            parts = []
+            for b in decay_analysis(all_samples, key):
+                wr = b["follow_winrate"]
+                parts.append(f"{b['bucket']}: n={b['n']} "
+                             f"wr={_c(wr, pct=True).strip()} "
+                             f"ic={_ic(b['ic'])}")
+            print(f"  [{key:<12}] " + "  |  ".join(parts))
+
+        print("\n=== Regime-specific value (terciles of context features) ===")
+        regime_pairs = [("drift_prod", "regime_trend"),
+                        ("drift_prod", "ms_rvol_5m"),
+                        ("mom2", "regime_trend"),
+                        ("mom2", "ms_rvol_5m")]
+        regime_results = {}
+        for sig, ctx in regime_pairs:
+            buckets = regime_split(all_samples, sig, ctx, taker_fee,
+                                   slippage=args.slippage)
+            regime_results[(sig, ctx)] = buckets
+            for b in buckets:
+                print(f"  [{sig:<10} | {b['regime']:<20}] n={b['n']:5d} "
+                      f"wr={_c(b['follow_winrate'], pct=True)} "
+                      f"ic={_ic(b['ic']):>6} "
+                      f"ev_slip={_c(b['ev_per_share'])}c")
+
+        report_path = Path(args.report) if args.report else (
+            Path(__file__).resolve().parent.parent / "logs" / "signal_report.md")
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        lines = [
+            "# Signal validation report",
+            f"- generated: {datetime.now(timezone.utc).isoformat(timespec='seconds')}",
+            f"- markets: {len(markets)}  samples: {len(all_samples)}  "
+            f"UP base rate: {100*up_count/max(len(markets),1):.0f}%",
+            f"- slippage assumption: {args.slippage*100:.1f}c/share "
+            "(added to stale PM mids; fee = canonical taker fee)",
+            "",
+            "## Ranked scorecard (by net edge after fees + slippage)",
+            "",
+            "| signal | n | IC | follow-WR | EV@mid c | EV@slip c | recent WR |",
+            "|---|---|---|---|---|---|---|",
+        ]
+        for r in rows:
+            lines.append(
+                f"| {r['signal']} | {r['n']} | {_ic(r['ic'])} | "
+                f"{_c(r['follow_wr'], pct=True).strip()} | "
+                f"{_c(r['ev_mid']).strip()} | {_c(r['ev_slip']).strip()} | "
+                f"{_c(r['recent_wr'], pct=True).strip()} |")
+        lines += ["", "## Regime splits", ""]
+        for (sig, ctx), buckets in regime_results.items():
+            for b in buckets:
+                lines.append(
+                    f"- `{sig}` in `{b['regime']}`: n={b['n']}, "
+                    f"WR={_c(b['follow_winrate'], pct=True).strip()}, "
+                    f"IC={_ic(b['ic'])}, "
+                    f"EV@slip={_c(b['ev_per_share']).strip()}c")
+        lines += [
+            "",
+            "## Policy",
+            "Only signals with positive EV after fees + slippage AND a "
+            "healthy recent slice may carry (or grow) live weight. "
+            "Candidate lanes still graduate exclusively through the "
+            "lane-proposal pipeline (harness nominates, live attribution "
+            "judges).",
+        ]
+        report_path.write_text("\n".join(lines) + "\n")
+        print(f"\nReport written to {report_path}")
 
     if wrote_db:
         print("\nNote: wrote lane_validation_runs/lane_proposals only — trade "

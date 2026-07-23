@@ -1,5 +1,7 @@
 # Backtesting Framework (`backtest/`)
 
+> Parent overview: [README.md](../README.md) · strategy contract: [strategy.md](../strategy.md)
+
 Offline replay of resolved BTC 5-min markets through the arena's **real
 decision path** — the same `BaseBot.make_decision` signal stack, guards,
 Kelly sizing, depth-walked fills and taker-fee math that paper/live use.

@@ -1,0 +1,38 @@
+# Polymarket Bot Arena dashboard — systemd unit (bare metal)
+#
+# Install (edit paths/User and set DASHBOARD_PASS first):
+#   sudo cp deploy/systemd/polymarket-dashboard.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now polymarket-dashboard
+
+[Unit]
+Description=Polymarket Bot Arena Dashboard (FastAPI :8501)
+Documentation=file:///opt/pba/docs/docker.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pba
+Group=pba
+WorkingDirectory=/opt/pba
+Environment=PYTHONUNBUFFERED=1
+Environment=DASHBOARD_HOST=127.0.0.1
+Environment=DASHBOARD_PORT=8501
+Environment=DASHBOARD_USER=admin
+# Override via drop-in or EnvironmentFile — do not leave the default password
+# on a network-exposed host.
+Environment=DASHBOARD_PASS=change-me
+Environment=TZ=America/New_York
+# Optional: EnvironmentFile=/opt/pba/.env
+ExecStart=/opt/pba/.venv/bin/python3 /opt/pba/dashboard/server.py
+Restart=on-failure
+RestartSec=10
+NoNewPrivileges=true
+PrivateTmp=true
+
+StandardOutput=append:/var/log/polymarket-dashboard.out.log
+StandardError=append:/var/log/polymarket-dashboard.err.log
+
+[Install]
+WantedBy=multi-user.target
