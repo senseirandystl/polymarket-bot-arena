@@ -539,7 +539,7 @@ async def run_lane_validation(request: Request, _auth: str = Depends(verify_auth
     """Launch `validate_signals.py --markets N --propose` in the background."""
     import subprocess
     import sys as _sys
-    from datetime import datetime
+    from datetime import datetime, timezone
 
     if _validation_running():
         return JSONResponse({"error": "a validation run is already in progress"},
@@ -562,7 +562,7 @@ async def run_lane_validation(request: Request, _auth: str = Depends(verify_auth
         cwd=str(repo_root), stdout=log, stderr=subprocess.STDOUT)
     _validation_run.update({
         "proc": proc,
-        "started_at": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+        "started_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
         "markets": markets,
     })
     return JSONResponse({"success": True, "markets": markets,

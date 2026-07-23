@@ -37,6 +37,7 @@ from config import TRADE_LOOP_INTERVAL_SEC
 from arena import market_data
 from arena.market_utils import compute_time_remaining_seconds
 from arena.session_filter import session_skip
+from arena.log_setup import log_event
 from arena.signals import build_combined_signals
 from arena.state import SharedArenaState
 
@@ -86,7 +87,8 @@ class Trader(threading.Thread):
             try:
                 self._tick()
             except Exception as e:
-                logger.error(f"Trader tick error: {e}")
+                log_event(logger, logging.ERROR, f"Trader tick error: {e}",
+                          exc_info=True, event_type="error", where="trader_run")
             self._stop_event.wait(TRADE_LOOP_INTERVAL_SEC)
         logger.info("Trader stopped")
 
@@ -168,8 +170,13 @@ class Trader(threading.Thread):
                     # Do NOT mark traded — re-evaluate next tick. Skip is a
                     # first-class outcome; tally it so runs are explainable.
                     self._state.note_skip("no_edge")
-                    logger.debug(
-                        f"[{bot.name}] skip | {signal.get('reasoning', '')}"
+                    log_event(
+                        logger, logging.DEBUG,
+                        f"[{bot.name}] skip | {signal.get('reasoning', '')}",
+                        event_type="decision", outcome="skip",
+                        bot=bot.name, strategy=bot.strategy_type,
+                        market_id=market_id, side=signal.get("side"),
+                        reason=signal.get("reasoning"),
                     )
                     continue
 
@@ -177,21 +184,43 @@ class Trader(threading.Thread):
                 if result.get("success"):
                     self._state.mark_traded(key)  # one position per market
                     new_trades += 1
-                    logger.info(
+                    log_event(
+                        logger, logging.INFO,
                         f"[{bot.name}] {signal['side'].upper()} "
                         f"${signal['suggested_amount']:.2f} "
                         f"(conf={signal['confidence']:.2f}) on "
-                        f"{market.get('question', '')[:50]}"
+                        f"{market.get('question', '')[:50]}",
+                        event_type="trade", outcome="placed",
+                        bot=bot.name, strategy=bot.strategy_type,
+                        market_id=market_id, side=signal.get("side"),
+                        amount=round(float(signal.get("suggested_amount", 0.0)), 4),
+                        confidence=round(float(signal.get("confidence", 0.0)), 4),
+                        entry_price=signal.get("entry_price"),
+                        target_shares=signal.get("target_shares"),
+                        trade_id=result.get("trade_id"),
+                        fill_source=result.get("fill_source"),
+                        mode=bot.trading_mode,
                     )
                 else:
                     # Transient (no book / bankroll dry) — don't mark, retry
                     # next tick. Debug-level so a dry pool doesn't spam warnings.
-                    logger.debug(
+                    log_event(
+                        logger, logging.DEBUG,
                         f"[{bot.name}] trade not placed on {market_id[:12]}…: "
-                        f"{result.get('reason')}"
+                        f"{result.get('reason')}",
+                        event_type="trade", outcome="not_placed",
+                        bot=bot.name, strategy=bot.strategy_type,
+                        market_id=market_id, side=signal.get("side"),
+                        reason=result.get("reason"),
                     )
             except Exception as e:
-                logger.error(f"[{bot.name}] Error on {market_id}: {e}")
+                log_event(
+                    logger, logging.ERROR,
+                    f"[{bot.name}] Error on {market_id}: {e}",
+                    exc_info=True,
+                    event_type="error", where="trader_tick",
+                    bot=bot.name, market_id=market_id,
+                )
 
         if new_trades > 0:
             logger.debug(

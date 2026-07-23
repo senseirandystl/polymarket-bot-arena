@@ -162,7 +162,12 @@ def test_wide_spread_kills_marginal_edge_at_decision_time():
     d_tight = bot.make_decision(m_tight, sig)
     assert d_tight["action"] == "buy"
     m_wide = _market(yes=0.52, no=0.48)
-    m_wide["yes_ask"] = 0.60  # 8c above mid — spread eats the edge
+    # 10c above mid: the ask collapses the +0.060 mid-edge to ~+0.001, below
+    # even the data-gathering MIN_EDGE floor (0.012). The example spread tracks
+    # the current floor — the invariant under test is that edge is priced at
+    # the executable ASK (BUG #27/#28), not the mid, so a marginal edge that
+    # only exists at the mid dies once the ask eats it.
+    m_wide["yes_ask"] = 0.62
     d_wide = bot.make_decision(m_wide, sig)
     assert d_wide["action"] == "skip"
 

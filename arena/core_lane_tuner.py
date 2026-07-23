@@ -35,7 +35,7 @@ never trade tables. Safe on any cadence; hosted by the evolution loop.
 import json
 import logging
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 
 import config
 import db
@@ -135,7 +135,7 @@ def tune() -> dict:
     report = {"applied": apply, "lanes": {}}
     new_overrides = dict(overrides)
     dirty = False
-    stamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
     for lane in CORE_LANES:
         lane_report = {}
