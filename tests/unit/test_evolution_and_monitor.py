@@ -24,7 +24,7 @@ from arena.validation_scheduler import ValidationScheduler
 # ``import arena`` resolves to the ``arena/`` package, which shadows the
 # top-level ``arena.py`` script that owns ``run_evolution``. Load the script
 # explicitly by path (same pattern as test_maker_section.py).
-_ARENA_PY = pathlib.Path(__file__).resolve().parent.parent / "arena.py"
+_ARENA_PY = pathlib.Path(__file__).resolve().parents[2] / "arena.py"
 _spec = importlib.util.spec_from_file_location("arena_main", _ARENA_PY)
 arena = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(arena)

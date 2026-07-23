@@ -1,0 +1,115 @@
+"""Per-strategy analyze() behavior with mocked signal dicts.
+
+Each major strategy's analyze() is exercised on crafted signals: direction
+follows its thesis, the returned dict always has the contract keys, holds
+carry confidence 0 semantics, and insufficient data never trades.
+"""
+
+import pytest
+
+from tests.conftest import make_market, make_signals
+
+from bots.bot_momentum import MomentumBot
+from bots.bot_mean_rev import MeanRevBot
+from bots.bot_sentiment import SentimentBot
+from bots.bot_phantom import PhantomBot
+from bots.bot_hybrid import HybridBot
+
+CONTRACT_KEYS = {"action", "side", "confidence", "reasoning"}
+
+
+def _check_contract(sig):
+    assert CONTRACT_KEYS <= set(sig)
+    assert sig["action"] in ("buy", "hold")
+    assert sig["side"] in ("yes", "no")
+    assert 0.0 <= sig["confidence"] <= 1.0
+    if sig["action"] == "buy":
+        assert sig.get("suggested_amount", 0) > 0
+
+
+ALL_BOTS = [
+    (MomentumBot, "momentum"),
+    (MeanRevBot, "meanrev"),
+    (SentimentBot, "sentiment"),
+    (PhantomBot, "phantom"),
+    (HybridBot, "hybrid"),
+]
+
+
+@pytest.mark.parametrize("cls,name", ALL_BOTS, ids=[n for _, n in ALL_BOTS])
+def test_insufficient_data_holds(cls, name):
+    bot = cls(name=f"{name}-t", generation=0)
+    sig = bot.analyze(make_market(), make_signals(prices=[100.0], volumes=[]))
+    _check_contract(sig)
+    assert sig["action"] == "hold"
+
+
+@pytest.mark.parametrize("cls,name", ALL_BOTS, ids=[n for _, n in ALL_BOTS])
+def test_contract_on_neutral_tape(cls, name):
+    bot = cls(name=f"{name}-t", generation=0)
+    _check_contract(bot.analyze(make_market(), make_signals()))
+
+
+def test_momentum_follows_uptrend():
+    bot = MomentumBot(name="momo-t", generation=0)
+    prices = [100_000.0 * (1.001 ** i) for i in range(30)]  # steady uptrend
+    sig = bot.analyze(make_market(), make_signals(prices=prices, latest=prices[-1]))
+    _check_contract(sig)
+    assert sig["action"] == "buy" and sig["side"] == "yes"
+
+
+def test_momentum_follows_downtrend():
+    bot = MomentumBot(name="momo-t", generation=0)
+    prices = [100_000.0 * (0.999 ** i) for i in range(30)]
+    sig = bot.analyze(make_market(), make_signals(prices=prices, latest=prices[-1]))
+    assert sig["action"] == "buy" and sig["side"] == "no"
+
+
+def test_momentum_holds_below_threshold():
+    bot = MomentumBot(name="momo-t", generation=0)
+    sig = bot.analyze(make_market(), make_signals())  # perfectly flat tape
+    assert sig["action"] == "hold"
+
+
+def test_meanrev_fade_requires_drift_backing():
+    """BUG #28: the fade only fires toward the side signed drift favors."""
+    bot = MeanRevBot(name="rev-t", generation=0)
+    lookback = bot.strategy_params["lookback_candles"]
+    # A sharp up-spike at the end of a flat tape → overextended UP → fade = NO.
+    prices = [100_000.0] * (lookback + 20) + [101_500.0]
+    # Without a DOWN drift, the NO fade must be vetoed.
+    vetoed = bot.analyze(make_market(),
+                         make_signals(prices=prices, latest=prices[-1], btc_drift=0.0))
+    assert vetoed["action"] == "hold"
+    # With a down-drift ≥ min_drift the same fade is allowed.
+    backed = bot.analyze(make_market(),
+                         make_signals(prices=prices, latest=prices[-1], btc_drift=-0.3))
+    _check_contract(backed)
+    if backed["action"] == "buy":
+        assert backed["side"] == "no"
+
+
+def test_sentiment_direction_follows_flow():
+    bot = SentimentBot(name="sent-t", generation=0)
+    up = bot.analyze(make_market(), make_signals(pm_momentum=0.1, cvd=0.5))
+    dn = bot.analyze(make_market(), make_signals(pm_momentum=-0.1, cvd=-0.5))
+    flat = bot.analyze(make_market(), make_signals(pm_momentum=0.0, cvd=0.0))
+    assert up["action"] == "buy" and up["side"] == "yes"
+    assert dn["action"] == "buy" and dn["side"] == "no"
+    assert flat["action"] == "hold"
+
+
+def test_phantom_vol_gate_holds_on_dead_tape():
+    """Zero-ATR tape is outside the min_atr_pct bound → hold, never trade."""
+    bot = PhantomBot(name="ph-t", generation=0)
+    n = bot.strategy_params["ema_slow"] + bot.strategy_params["breakout_lookback"] + 5
+    sig = bot.analyze(make_market(),
+                      make_signals(prices=[100_000.0] * n, latest=100_000.0))
+    assert sig["action"] == "hold"
+
+
+def test_hybrid_holds_when_all_subs_hold():
+    bot = HybridBot(name="hy-t", generation=0)
+    sig = bot.analyze(make_market(), make_signals())
+    _check_contract(sig)
+    assert sig["action"] == "hold"

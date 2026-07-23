@@ -16,7 +16,7 @@ from arena.state import SharedArenaState
 # ``import arena`` resolves to the ``arena/`` package, which shadows the
 # top-level ``arena.py`` script that owns ``_run_maker_section``. Load the
 # script explicitly by path so we can exercise the maker-section logic.
-_ARENA_PY = pathlib.Path(__file__).resolve().parent.parent / "arena.py"
+_ARENA_PY = pathlib.Path(__file__).resolve().parents[2] / "arena.py"
 _spec = importlib.util.spec_from_file_location("arena_main", _ARENA_PY)
 arena = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(arena)
