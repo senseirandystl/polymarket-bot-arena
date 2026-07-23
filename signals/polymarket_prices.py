@@ -102,7 +102,7 @@ class PolymarketPriceFeed:
         )
         return result
 
-    def clear(self, token_id: str = None):
+    def clear(self, token_id: str | None = None):
         with self._lock:
             if token_id:
                 self._cache.pop(token_id, None)

@@ -48,7 +48,7 @@ def build_combined_signals(
         sentiment_feed.get_signals("btc") if sentiment_feed is not None else {}
     )
 
-    orderflow = {}
+    orderflow: dict = {}
     if market is not None:
         orderflow = market.get("orderflow", {}) or {}
 

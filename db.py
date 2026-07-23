@@ -456,7 +456,7 @@ def wipe_all():
     return len(tables)
 
 
-def add_copy_wallet(address: str, label: str = None, mode: str = "paper"):
+def add_copy_wallet(address: str, label: str | None = None, mode: str = "paper"):
     """Add or reactivate a wallet to copy-trade. mode: 'paper' or 'live'."""
     with get_conn() as conn:
         conn.execute(

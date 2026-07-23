@@ -191,6 +191,8 @@ class BtcMakerBot(BaseBot):
         log = logging.getLogger(__name__)
 
         market_id = market.get("id") or market.get("market_id")
+        if not market_id:
+            return {"success": False, "reason": "no_market_id"}
         maker_side = signal.get("maker_side", "yes")
         maker_bid = signal.get("maker_bid")
         maker_ask = signal.get("maker_ask")

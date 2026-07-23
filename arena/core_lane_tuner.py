@@ -68,7 +68,7 @@ def compute_core_attribution(conn, deadband: float) -> dict:
         """SELECT bot_name, side, outcome, reasoning FROM trades
            WHERE outcome IN ('win', 'loss') AND reasoning LIKE 'fair=%'"""
     ).fetchall()
-    agg = {}
+    agg: dict = {}
     for r in rows:
         strat = smap.get(r["bot_name"])
         if strat is None:
@@ -86,7 +86,7 @@ def compute_core_attribution(conn, deadband: float) -> dict:
             cell["n"] += 1
             cell["correct"] += int((reading > 0) == market_up)
     # finalize accuracy
-    out = {}
+    out: dict = {}
     for strat, lanes in agg.items():
         out[strat] = {}
         for lane, c in lanes.items():
@@ -132,7 +132,7 @@ def tune() -> dict:
         attribution = compute_core_attribution(conn, deadband)
 
     overrides = db.get_lane_overrides()
-    report = {"applied": apply, "lanes": {}}
+    report: dict = {"applied": apply, "lanes": {}}
     new_overrides = dict(overrides)
     dirty = False
     stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
@@ -141,7 +141,7 @@ def tune() -> dict:
         lane_report = {}
         # Seed a COMPLETE profile from current effective weights so we never
         # zero a strategy the override omits.
-        profile = {}
+        profile: dict = {}
         changed = False
         for strat in strategies:
             default = float(profiles.get(strat, BaseBot.DEFAULT_SIGNAL_PROFILE)

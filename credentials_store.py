@@ -123,6 +123,7 @@ class CredentialsStore:
         # First write ever — generate a fresh 32-byte URL-safe key.
         CREDENTIALS_KEY_FILE.parent.mkdir(parents=True, exist_ok=True)
         key = Fernet.generate_key()
+        fd: int | None
         fd, tmp_path = tempfile.mkstemp(
             dir=str(CREDENTIALS_KEY_FILE.parent), prefix=".arena_fernet."
         )
@@ -218,6 +219,7 @@ class CredentialsStore:
             raise
 
         CREDENTIALS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        fd: int | None
         fd, tmp_path = tempfile.mkstemp(
             dir=str(CREDENTIALS_FILE.parent), prefix=".credentials."
         )

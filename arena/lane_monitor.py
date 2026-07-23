@@ -73,7 +73,7 @@ def check_lanes() -> dict:
     """
     overrides = db.get_lane_overrides()
     enabled = {k: v for k, v in overrides.items() if v.get("enabled")}
-    report = {}
+    report: dict = {}
     if not enabled:
         db.set_arena_state("lane_monitor", json.dumps(report))
         return report

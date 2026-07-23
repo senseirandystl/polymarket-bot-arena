@@ -60,7 +60,7 @@ def check_proposals() -> dict:
     Returns a per-proposal report {lane: {...}} for callers/tests/dashboard.
     """
     pending = [p for p in db.get_lane_proposals(status="pending")]
-    report = {}
+    report: dict = {}
     if not pending:
         return report
 
