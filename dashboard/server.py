@@ -2,6 +2,7 @@
 
 import json
 import logging
+import os
 import secrets
 import sys
 import time
@@ -21,10 +22,22 @@ from arena.market_utils import is_5min_market
 
 security = HTTPBasic()
 
-DASHBOARD_USER = "admin"
-DASHBOARD_PASS = "Thor"
-
 logger = logging.getLogger(__name__)
+
+# Dashboard Basic-auth credentials — read from the environment so the secret is
+# not hardcoded. Defaults preserve the historical local-dev values so nothing
+# breaks on a fresh clone (the dashboard binds to localhost). Set DASHBOARD_USER
+# / DASHBOARD_PASS in the environment (or the launchd plist) to override; the
+# bin/arena probe reads the SAME env vars so the two stay in sync.
+_DEFAULT_USER = "admin"
+_DEFAULT_PASS = "Thor"
+DASHBOARD_USER = os.environ.get("DASHBOARD_USER", _DEFAULT_USER)
+DASHBOARD_PASS = os.environ.get("DASHBOARD_PASS", _DEFAULT_PASS)
+if DASHBOARD_PASS == _DEFAULT_PASS:
+    logger.warning(
+        "Dashboard is using the DEFAULT password — set DASHBOARD_PASS in the "
+        "environment before exposing the dashboard beyond localhost."
+    )
 
 
 def verify_auth(credentials: HTTPBasicCredentials = Depends(security)):
