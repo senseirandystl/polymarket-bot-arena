@@ -78,6 +78,43 @@ td { padding: 6px 4px; border-bottom: 1px solid #21262d; }
 .mkt-trades { margin-top: 12px; border-top: 1px solid #21262d; padding-top: 8px; }
 .mkt-trades-title { color: #8b949e; font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 6px; }
 .mkt-trade { display: flex; justify-content: space-between; gap: 8px; font-size: 12px; padding: 3px 0; }
+
+/* --- Ops command center --- */
+.ops-strip { display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 16px; }
+.ops-chip {
+    background: #161b22; border: 1px solid #30363d; border-radius: 8px;
+    padding: 10px 14px; min-width: 140px; flex: 1 1 140px;
+}
+.ops-chip .lbl { font-size: 10px; text-transform: uppercase; letter-spacing: 0.06em; color: #8b949e; margin-bottom: 4px; }
+.ops-chip .val { font-size: 15px; font-weight: 700; color: #f0f6fc; }
+.ops-chip .sub { font-size: 11px; color: #8b949e; margin-top: 3px; }
+.ops-chip.ok { border-left: 3px solid #3fb950; }
+.ops-chip.warn { border-left: 3px solid #f0883e; }
+.ops-chip.crit { border-left: 3px solid #f85149; }
+.ops-chip.info { border-left: 3px solid #58a6ff; }
+.chip-btn-row { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+.chip-btn {
+    background: #21262d; color: #c9d1d9; border: 1px solid #30363d;
+    border-radius: 14px; padding: 4px 12px; font-size: 12px; cursor: pointer;
+    font-family: inherit;
+}
+.chip-btn:hover { border-color: #58a6ff; color: #f0f6fc; }
+.chip-btn.primary { background: #238636; border-color: #2ea043; color: #fff; }
+.contrib-bar {
+    display: flex; align-items: center; gap: 8px; margin-bottom: 6px; font-size: 12px;
+}
+.contrib-bar .bar-track {
+    flex: 1; height: 8px; background: #21262d; border-radius: 4px; overflow: hidden;
+}
+.contrib-bar .bar-fill {
+    height: 100%; border-radius: 4px; background: #58a6ff; min-width: 2px;
+}
+.contrib-bar .bar-fill.neg { background: #f85149; }
+.health-rec {
+    background: #21262d; border-left: 3px solid #f0883e; padding: 8px 12px;
+    margin-bottom: 6px; border-radius: 0 6px 6px 0; font-size: 12px;
+}
+.health-rec.crit { border-left-color: #f85149; }
 .mkt-trade .who { color: #58a6ff; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .mkt-empty { color: #484f58; font-size: 12px; }
 
@@ -227,6 +264,77 @@ td { padding: 6px 4px; border-bottom: 1px solid #21262d; }
 <div class="container">
     <!-- ===== OVERVIEW TAB ===== -->
     <div class="tab-content" id="tab-overview">
+        <!-- Ops command center -->
+        <div class="ops-strip" id="ops-strip">
+            <div class="ops-chip info" id="ops-health"><div class="lbl">Health</div><div class="val">…</div><div class="sub">—</div></div>
+            <div class="ops-chip info" id="ops-regime"><div class="lbl">Regime</div><div class="val">…</div><div class="sub">—</div></div>
+            <div class="ops-chip info" id="ops-risk"><div class="lbl">Risk</div><div class="val">…</div><div class="sub">—</div></div>
+            <div class="ops-chip info" id="ops-alloc"><div class="lbl">Allocation</div><div class="val">…</div><div class="sub">—</div></div>
+            <div class="ops-chip info" id="ops-evo"><div class="lbl">Evolution</div><div class="val">…</div><div class="sub">—</div></div>
+            <div class="ops-chip info" id="ops-size"><div class="lbl">Pool / Kelly</div><div class="val">…</div><div class="sub">—</div></div>
+        </div>
+
+        <!-- Quick capital controls -->
+        <div class="card" style="margin-bottom:16px">
+            <h2>Quick capital</h2>
+            <div style="display:flex;flex-wrap:wrap;gap:20px;align-items:flex-start">
+                <div style="flex:1;min-width:240px">
+                    <div style="color:#8b949e;font-size:12px;margin-bottom:6px">Paper balance (available now: <b id="quick-bankroll-avail">—</b>)</div>
+                    <div class="chip-btn-row">
+                        <button class="chip-btn" onclick="quickTopup(100)">$100</button>
+                        <button class="chip-btn primary" onclick="quickTopup(200)">$200</button>
+                        <button class="chip-btn" onclick="quickTopup(500)">$500</button>
+                        <button class="chip-btn" onclick="quickTopup(1000)">$1000</button>
+                    </div>
+                    <div class="chip-btn-row" style="margin-top:8px;align-items:center">
+                        <input type="number" id="quick-bankroll-input" min="0" step="1" placeholder="Custom"
+                               style="width:100px;background:#0d1117;color:#c9d1d9;border:1px solid #30363d;border-radius:6px;padding:6px 8px;font-family:inherit">
+                        <button class="chip-btn primary" onclick="quickTopupCustom()">Top up</button>
+                    </div>
+                </div>
+                <div style="flex:1;min-width:240px">
+                    <div style="color:#8b949e;font-size:12px;margin-bottom:6px">Kelly fraction (current: <b id="quick-kelly-cur">—</b>)</div>
+                    <div class="chip-btn-row">
+                        <button class="chip-btn" onclick="quickKelly(0.10)">0.10</button>
+                        <button class="chip-btn primary" onclick="quickKelly(0.25)">0.25</button>
+                        <button class="chip-btn" onclick="quickKelly(0.50)">0.50</button>
+                        <button class="chip-btn" onclick="quickKelly(1.00)">1.00</button>
+                    </div>
+                </div>
+            </div>
+            <div class="test-result" id="quick-capital-result" style="margin-top:8px"></div>
+        </div>
+
+        <!-- Health + restart -->
+        <div class="card" id="health-card" style="margin-bottom:16px;border-left:3px solid #58a6ff">
+            <h2>Health &amp; monitoring</h2>
+            <div id="health-summary" style="color:#8b949e;font-size:13px;margin-bottom:10px">Loading…</div>
+            <div id="health-recs"></div>
+            <div id="health-restart" style="margin-top:8px;font-size:12px;color:#8b949e"></div>
+            <table id="health-checks-table" style="margin-top:10px">
+                <thead><tr><th>Check</th><th>Status</th><th>Detail</th></tr></thead>
+                <tbody id="health-checks-tbody"><tr><td colspan="3" style="color:#484f58">—</td></tr></tbody>
+            </table>
+        </div>
+
+        <!-- Regime + Signals + Allocation -->
+        <div class="grid" style="margin-bottom:16px">
+            <div class="card" id="ov-regime-card" style="border-left:3px solid #a371f7">
+                <h2>Market regime</h2>
+                <div id="ov-regime-summary" style="color:#8b949e;font-size:13px;margin-bottom:8px">—</div>
+                <table id="ov-regime-features"><thead><tr><th>Feature</th><th>Score</th></tr></thead><tbody></tbody></table>
+            </div>
+            <div class="card" id="ov-signals-card" style="border-left:3px solid #58a6ff">
+                <h2>Signal contributions <span style="color:#8b949e;font-size:10px;font-weight:normal">6h mean |blend|</span></h2>
+                <div id="ov-signals-body" style="color:#8b949e;font-size:12px">—</div>
+            </div>
+            <div class="card" id="ov-alloc-card" style="border-left:3px solid #3fb950">
+                <h2>Capital allocation</h2>
+                <div id="ov-alloc-summary" style="color:#8b949e;font-size:13px;margin-bottom:8px">—</div>
+                <table id="ov-alloc-table"><thead><tr><th>Bot</th><th>Weight</th></tr></thead><tbody></tbody></table>
+            </div>
+        </div>
+
         <!-- Performance summary (Today / This Week / All Time) -->
         <div class="card" style="margin-bottom: 20px;">
             <h2>Performance <span style="color:#8b949e;font-size:11px;text-transform:none;letter-spacing:0;">&mdash; ET</span></h2>
@@ -246,6 +354,47 @@ td { padding: 6px 4px; border-bottom: 1px solid #21262d; }
                 <h2>Next Market</h2>
                 <div id="next-market-body"><div style="color:#484f58;">Checking for next market&hellip;</div></div>
             </div>
+        </div>
+
+        <!-- Risk Engine -->
+        <div class="section-title" style="margin-top:20px">Risk Engine</div>
+        <div class="card" id="risk-card" style="margin-bottom:16px;border-left:3px solid #f0883e">
+            <div style="display:flex;flex-wrap:wrap;gap:12px;align-items:center;justify-content:space-between;margin-bottom:12px">
+                <div id="risk-summary" style="color:#8b949e;font-size:13px">Loading risk state&hellip;</div>
+                <div class="actions-row" style="margin:0">
+                    <button class="btn btn-danger" id="risk-kill-btn" onclick="toggleKillSwitch()">KILL SWITCH</button>
+                    <button class="btn btn-secondary" onclick="forceRiskEval()">Re-evaluate</button>
+                </div>
+            </div>
+            <div class="grid" style="margin-bottom:12px">
+                <div>
+                    <div style="font-weight:600;font-size:12px;color:#8b949e;margin-bottom:6px">Portfolio</div>
+                    <table id="risk-portfolio-table">
+                        <thead><tr><th>Status</th><th>Daily P&amp;L</th><th>DD</th><th>VaR</th><th>Size</th></tr></thead>
+                        <tbody id="risk-portfolio-tbody"><tr><td colspan="5" style="color:#484f58">—</td></tr></tbody>
+                    </table>
+                </div>
+                <div>
+                    <div style="font-weight:600;font-size:12px;color:#8b949e;margin-bottom:6px">Limits</div>
+                    <div id="risk-limits" style="font-size:12px;color:#c9d1d9;line-height:1.6">—</div>
+                </div>
+            </div>
+            <div style="font-weight:600;font-size:12px;color:#8b949e;margin-bottom:6px">Per-bot risk</div>
+            <table id="risk-bots-table" style="margin-bottom:12px">
+                <thead>
+                    <tr>
+                        <th>Bot</th><th>Status</th><th>Size</th><th>Daily P&amp;L</th>
+                        <th>DD</th><th>VaR</th><th>Reason</th><th></th>
+                    </tr>
+                </thead>
+                <tbody id="risk-bots-tbody"><tr><td colspan="8" style="color:#484f58">—</td></tr></tbody>
+            </table>
+            <div style="font-weight:600;font-size:12px;color:#8b949e;margin-bottom:6px">Recent risk decisions</div>
+            <table id="risk-events-table">
+                <thead><tr><th>Time</th><th>Lvl</th><th>Action</th><th>Bot</th><th>Reason</th></tr></thead>
+                <tbody id="risk-events-tbody"><tr><td colspan="5" style="color:#484f58">—</td></tr></tbody>
+            </table>
+            <div class="test-result" id="risk-result" style="margin-top:8px"></div>
         </div>
     </div>
 
@@ -284,10 +433,43 @@ td { padding: 6px 4px; border-bottom: 1px solid #21262d; }
             </table>
         </div>
 
+        <div class="section-title">Market Regime</div>
+        <div class="card" id="regime-card" style="margin-bottom:14px">
+            <div id="regime-summary" style="color:#8b949e;font-size:13px;margin-bottom:10px">Detecting…</div>
+            <table id="regime-features-table" style="margin-bottom:12px">
+                <thead><tr><th>Feature</th><th>Score</th></tr></thead>
+                <tbody></tbody>
+            </table>
+            <div style="font-weight:600;font-size:12px;margin-bottom:6px;color:#8b949e">Per-regime performance (online)</div>
+            <table id="regime-perf-table">
+                <thead><tr><th>Regime</th><th>N</th><th>WR</th><th>P&amp;L</th><th>Avg</th></tr></thead>
+                <tbody></tbody>
+            </table>
+            <div style="font-weight:600;font-size:12px;margin:12px 0 6px;color:#8b949e">Recent transitions</div>
+            <table id="regime-trans-table">
+                <thead><tr><th>From</th><th>To</th><th>Conf</th><th>When</th></tr></thead>
+                <tbody></tbody>
+            </table>
+        </div>
+
+        <div class="section-title">Genetic Algorithm</div>
+        <div class="card" id="ga-status-card" style="margin-bottom:14px">
+            <div id="ga-status-summary" style="color:#8b949e;font-size:13px;margin-bottom:10px">No GA cycles yet</div>
+            <div id="ga-fitness-spark" class="sparkline" style="margin-bottom:12px"></div>
+            <table id="ga-fitness-table">
+                <thead>
+                    <tr>
+                        <th>Bot</th><th>Fit</th><th>P&amp;L</th><th>Sharpe</th>
+                        <th>DD</th><th>Cons</th><th>Status</th>
+                    </tr>
+                </thead>
+                <tbody></tbody>
+            </table>
+        </div>
         <div class="section-title">Evolution History</div>
         <div class="card" id="evolution-card">
             <table id="evolution-table">
-                <thead><tr><th>Cycle</th><th>Survivors</th><th>Killed (WR / P&L)</th><th>New Bots</th><th>Time</th></tr></thead>
+                <thead><tr><th>Cycle</th><th>Survivors / Elites</th><th>Replaced (fit / P&amp;L)</th><th>New Bots (lineage)</th><th>Time</th></tr></thead>
                 <tbody></tbody>
             </table>
         </div>
@@ -335,6 +517,11 @@ td { padding: 6px 4px; border-bottom: 1px solid #21262d; }
             <div style="color:#8b949e">Loading&hellip;</div>
         </div>
 
+        <div class="section-title">Hybrid Meta-Learner <span style="color:#8b949e;font-size:11px;text-transform:none;letter-spacing:0;">&mdash; the ensemble's dynamic sub-strategy weights: base &times; regime tilt &times; live-WR tilt &times; ONLINE multiplier (Hedge-updated from the hybrid's own resolved trades, per regime bucket). Multiplier &gt;1 = that sub has been calling the market right.</span></div>
+        <div class="card" id="hybrid-meta-card">
+            <div style="color:#8b949e">Loading&hellip;</div>
+        </div>
+
         <div class="section-title" style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px">
             <span>Last Validation Run</span>
             <span style="display:flex;gap:8px;align-items:center">
@@ -356,26 +543,187 @@ td { padding: 6px 4px; border-bottom: 1px solid #21262d; }
 
         <div class="settings-section">
             <h3>Paper Balance</h3>
-            <div class="settings-blurb">Shared virtual USDC pool for paper mode. All bots trade from this one balance against real Polymarket order books. Enter the balance you want and click Save — it <b>tops the pool up to that amount</b> (past P&amp;L and open positions are preserved), so entering 200 makes the available balance $200.</div>
-
+            <div class="settings-blurb">Shared virtual USDC pool for paper mode. Enter the balance you want — it <b>tops the pool up to that amount</b> (history preserved). One-click presets also on Overview → Quick capital.</div>
+            <div class="chip-btn-row" style="margin-bottom:10px">
+                <button class="chip-btn" onclick="presetBankroll(100)">$100</button>
+                <button class="chip-btn primary" onclick="presetBankroll(200)">$200</button>
+                <button class="chip-btn" onclick="presetBankroll(500)">$500</button>
+                <button class="chip-btn" onclick="presetBankroll(1000)">$1000</button>
+            </div>
             <div class="cred-row">
                 <label>Balance (USDC)<small>Available now: <span id="bankroll-available">&mdash;</span></small></label>
                 <input type="number" id="paper-bankroll-input" min="0" step="1" placeholder="200">
-                <button class="btn" onclick="saveBankroll()">Save</button>
+                <button class="btn btn-primary" onclick="saveBankroll()">Top up</button>
             </div>
             <div class="test-result" id="bankroll-result"></div>
         </div>
 
         <div class="settings-section">
             <h3>Kelly Fraction</h3>
-            <div class="settings-blurb">Fraction of the full Kelly-optimal bet size used for every trade (bet = fraction &times; edge/(1&minus;price) &times; bankroll). <b>0.25</b> = quarter-Kelly (conservative), <b>1.0</b> = full Kelly (growth-optimal only if the model's probabilities are exact — aggressive otherwise). The arena picks up changes within seconds; no restart needed.</div>
-
+            <div class="settings-blurb">Fraction of full Kelly used for every trade. <b>0.25</b> = quarter-Kelly (default). Live within seconds — also one-click on Overview.</div>
+            <div class="chip-btn-row" style="margin-bottom:10px">
+                <button class="chip-btn" onclick="presetKelly(0.10)">0.10</button>
+                <button class="chip-btn primary" onclick="presetKelly(0.25)">0.25</button>
+                <button class="chip-btn" onclick="presetKelly(0.50)">0.50</button>
+                <button class="chip-btn" onclick="presetKelly(1.00)">1.00</button>
+            </div>
             <div class="cred-row">
                 <label>Fraction (0&ndash;1]<small>Current: <span id="kelly-current">&mdash;</span></small></label>
                 <input type="number" id="kelly-fraction-input" min="0.01" max="1" step="0.05" placeholder="0.25">
-                <button class="btn" onclick="saveKelly()">Save</button>
+                <button class="btn btn-primary" onclick="saveKelly()">Save</button>
             </div>
             <div class="test-result" id="kelly-result"></div>
+        </div>
+
+        <div class="settings-section">
+            <h3>Alerts (Telegram / Discord / Email)</h3>
+            <div class="settings-blurb">
+                Production notifications for drawdowns, risk pauses, kill switch, regime shifts,
+                evolution cycles, health degradation, and errors. Secrets go in the credential
+                fields below (encrypted store). Enable channels here after credentials are saved.
+            </div>
+            <div class="cred-row">
+                <label>Master switch<small>Off = silent</small></label>
+                <select id="alerts-enabled" style="background:#0d1117;color:#c9d1d9;border:1px solid #30363d;border-radius:6px;padding:8px 10px;font-family:inherit">
+                    <option value="0">Off</option>
+                    <option value="1">On</option>
+                </select>
+                <button class="btn" onclick="saveAlertsConfig()">Save</button>
+            </div>
+            <div class="cred-row">
+                <label>Min level<small>info / warn / critical</small></label>
+                <select id="alerts-min-level" style="background:#0d1117;color:#c9d1d9;border:1px solid #30363d;border-radius:6px;padding:8px 10px;font-family:inherit">
+                    <option value="info">info</option>
+                    <option value="warn">warn</option>
+                    <option value="critical">critical</option>
+                </select>
+                <span></span>
+            </div>
+            <div id="alerts-channels-status" style="font-size:12px;color:#8b949e;margin:8px 0"></div>
+            <div class="chip-btn-row" id="alerts-channel-toggles" style="margin-bottom:10px"></div>
+            <div class="actions-row">
+                <button class="btn btn-secondary" onclick="testAlert()">Send test alert</button>
+                <button class="btn btn-secondary" onclick="loadAlerts()">Reload</button>
+            </div>
+            <div class="test-result" id="alerts-result"></div>
+            <div style="margin-top:12px;font-weight:600;font-size:12px;color:#8b949e">Recent alerts</div>
+            <table id="alerts-log-table" style="margin-top:6px">
+                <thead><tr><th>Time</th><th>Type</th><th>Title</th><th>Sent</th></tr></thead>
+                <tbody id="alerts-log-tbody"><tr><td colspan="4" style="color:#8b949e">—</td></tr></tbody>
+            </table>
+
+            <div style="margin-top:16px;color:#8b949e;font-size:12px;margin-bottom:8px">Alert credentials (encrypted — leave blank to keep)</div>
+            <div class="cred-row">
+                <label>Telegram bot token<small>@BotFather</small></label>
+                <input type="password" id="creds-alert_telegram_bot_token" placeholder="Telegram bot token" autocomplete="off">
+                <span class="cred-status missing" id="status-alert_telegram_bot_token">Missing</span>
+            </div>
+            <div class="cred-row">
+                <label>Telegram chat id<small>Numeric chat id</small></label>
+                <input type="password" id="creds-alert_telegram_chat_id" placeholder="Chat id" autocomplete="off">
+                <span class="cred-status missing" id="status-alert_telegram_chat_id">Missing</span>
+            </div>
+            <div class="cred-row">
+                <label>Discord webhook<small>Integrations → Webhooks</small></label>
+                <input type="password" id="creds-alert_discord_webhook" placeholder="https://discord.com/api/webhooks/…" autocomplete="off">
+                <span class="cred-status missing" id="status-alert_discord_webhook">Missing</span>
+            </div>
+            <div class="cred-row">
+                <label>SMTP host<small>e.g. smtp.gmail.com</small></label>
+                <input type="password" id="creds-alert_smtp_host" placeholder="SMTP host" autocomplete="off">
+                <span class="cred-status missing" id="status-alert_smtp_host">Missing</span>
+            </div>
+            <div class="cred-row">
+                <label>SMTP port<small>587 or 465</small></label>
+                <input type="password" id="creds-alert_smtp_port" placeholder="587" autocomplete="off">
+                <span class="cred-status missing" id="status-alert_smtp_port">Missing</span>
+            </div>
+            <div class="cred-row">
+                <label>SMTP user<small>Login</small></label>
+                <input type="password" id="creds-alert_smtp_user" placeholder="user@…" autocomplete="off">
+                <span class="cred-status missing" id="status-alert_smtp_user">Missing</span>
+            </div>
+            <div class="cred-row">
+                <label>SMTP password<small>App password</small></label>
+                <input type="password" id="creds-alert_smtp_password" placeholder="SMTP password" autocomplete="off">
+                <span class="cred-status missing" id="status-alert_smtp_password">Missing</span>
+            </div>
+            <div class="cred-row">
+                <label>SMTP from<small>From address</small></label>
+                <input type="password" id="creds-alert_smtp_from" placeholder="from@…" autocomplete="off">
+                <span class="cred-status missing" id="status-alert_smtp_from">Missing</span>
+            </div>
+            <div class="cred-row">
+                <label>SMTP to<small>Recipients</small></label>
+                <input type="password" id="creds-alert_smtp_to" placeholder="you@…, ops@…" autocomplete="off">
+                <span class="cred-status missing" id="status-alert_smtp_to">Missing</span>
+            </div>
+        </div>
+
+        <div class="settings-section">
+            <h3>Portfolio Capital Allocation</h3>
+            <div class="settings-blurb">
+                Split the shared bankroll across active bots. When <b>enabled</b>, each bot Kelly-sizes against
+                <code>bankroll &times; weight</code> (weights sum to 1) instead of the full pool — so correlated
+                bots no longer each size as if they own the whole bankroll. Methods: <b>equal</b>, <b>sharpe</b>,
+                <b>expectancy</b>, or <b>kelly_portfolio</b> (expectancy/variance, correlation-shrunk).
+                Rebalances every 30&nbsp;min and on regime change. Pin a bot with a manual weight; free capital
+                is redistributed by the method. Arena picks up changes within seconds.
+            </div>
+            <div class="cred-row">
+                <label>Enabled<small>Off = legacy full-pool Kelly</small></label>
+                <select id="portfolio-enabled" style="background:#0d1117;color:#c9d1d9;border:1px solid #30363d;border-radius:6px;padding:8px 10px;font-family:inherit">
+                    <option value="0">Off</option>
+                    <option value="1">On</option>
+                </select>
+                <button class="btn" onclick="savePortfolioEnabled()">Save</button>
+            </div>
+            <div class="cred-row">
+                <label>Method<small>Score → weights</small></label>
+                <select id="portfolio-method" style="background:#0d1117;color:#c9d1d9;border:1px solid #30363d;border-radius:6px;padding:8px 10px;font-family:inherit">
+                    <option value="kelly_portfolio">Kelly portfolio</option>
+                    <option value="sharpe">Sharpe</option>
+                    <option value="expectancy">Expectancy</option>
+                    <option value="equal">Equal</option>
+                </select>
+                <button class="btn" onclick="savePortfolioMethod()">Save</button>
+            </div>
+            <div class="cred-row">
+                <label>Lookback (hours)<small>Metrics window</small></label>
+                <input type="number" id="portfolio-window" min="1" max="168" step="1" placeholder="24">
+                <button class="btn" onclick="savePortfolioWindow()">Save</button>
+            </div>
+            <div style="margin:10px 0 6px;color:#8b949e;font-size:12px">
+                Last rebalance: <span id="portfolio-last-rebal">&mdash;</span>
+                &nbsp;·&nbsp; reason: <span id="portfolio-reason">&mdash;</span>
+                &nbsp;·&nbsp; regime: <span id="portfolio-regime">&mdash;</span>
+            </div>
+            <div class="card" style="padding:10px;margin-bottom:8px;overflow-x:auto">
+                <table id="portfolio-table">
+                    <thead>
+                        <tr>
+                            <th>Bot</th>
+                            <th>Weight %</th>
+                            <th>Auto %</th>
+                            <th>Pin %</th>
+                            <th>Sharpe</th>
+                            <th>E[pnl]</th>
+                            <th>N</th>
+                            <th></th>
+                        </tr>
+                    </thead>
+                    <tbody id="portfolio-tbody">
+                        <tr><td colspan="8" style="color:#8b949e">Loading…</td></tr>
+                    </tbody>
+                </table>
+            </div>
+            <div style="margin-bottom:8px;color:#8b949e;font-size:11px" id="portfolio-corr"></div>
+            <div class="actions-row">
+                <button class="btn btn-primary" onclick="savePortfolioPins()">Save pins</button>
+                <button class="btn btn-secondary" onclick="clearPortfolioPins()">Clear pins</button>
+                <button class="btn btn-secondary" onclick="forcePortfolioRebalance()">Rebalance now</button>
+            </div>
+            <div class="test-result" id="portfolio-result"></div>
         </div>
 
         <div class="settings-section">
@@ -524,7 +872,7 @@ function switchTab(name) {
         if (b.textContent.trim().toLowerCase().replace(/\s+/g, '-') === name) b.classList.add('active');
     });
     if (name === 'settings') refreshSettings();
-    if (name === 'signal-lab') { loadSignalLab(); pollValidation(); }
+    if (name === 'signal-lab') { loadSignalLab(); loadHybridMeta(); pollValidation(); }
 }
 
 // ---------- Warning banner ----------
@@ -576,6 +924,482 @@ async function refreshSettings() {
     }
     loadBankroll();
     loadKelly();
+    loadPortfolio();
+    loadAlerts();
+}
+
+// ---------- Ops command center / health / quick capital ----------
+function _setOpsChip(id, cls, val, sub) {
+    const el = document.getElementById(id);
+    if (!el) return;
+    el.className = 'ops-chip ' + (cls || 'info');
+    const v = el.querySelector('.val');
+    const s = el.querySelector('.sub');
+    if (v) v.textContent = val;
+    if (s) s.textContent = sub || '';
+}
+
+function updateOps(ops) {
+    if (!ops || ops.error) {
+        _setOpsChip('ops-health', 'warn', 'n/a', ops && ops.error ? ops.error : 'unavailable');
+        return;
+    }
+    const h = ops.health || {};
+    const hSt = h.status || 'unknown';
+    _setOpsChip('ops-health',
+        hSt === 'healthy' ? 'ok' : (hSt === 'critical' ? 'crit' : 'warn'),
+        hSt.toUpperCase(),
+        (h.arena_log && h.arena_log.message) || '—');
+
+    const reg = ops.regime || {};
+    const conf = reg.confidence != null ? (Number(reg.confidence) * 100).toFixed(0) + '%' : '—';
+    _setOpsChip('ops-regime', 'info', reg.id || 'unknown',
+        `conf ${conf}` + (reg.meta_bucket ? ` · ${reg.meta_bucket}` : ''));
+
+    // overview regime card
+    const ovs = document.getElementById('ov-regime-summary');
+    if (ovs) {
+        ovs.innerHTML = `Now <b>${reg.id || '?'}</b>` +
+            (reg.legacy ? ` <span class="neutral">(${reg.legacy})</span>` : '') +
+            ` · conf <b>${conf}</b>` +
+            (reg.meta_bucket ? ` · meta <b>${reg.meta_bucket}</b>` : '');
+    }
+    const featBody = document.querySelector('#ov-regime-features tbody');
+    if (featBody) {
+        const feats = reg.features || {};
+        featBody.innerHTML = ['vol', 'trend', 'mom', 'flow'].map(k => {
+            const v = feats[k];
+            return `<tr><td>${k}</td><td>${v != null ? (Number(v) * 100).toFixed(0) + '%' : '—'}</td></tr>`;
+        }).join('');
+    }
+
+    const risk = ops.risk || {};
+    if (risk.killed) {
+        _setOpsChip('ops-risk', 'crit', 'KILL', risk.kill_reason || 'armed');
+    } else if (risk.portfolio_status === 'paused') {
+        _setOpsChip('ops-risk', 'crit', 'PAUSED',
+            `dd ${risk.portfolio_dd != null ? (risk.portfolio_dd * 100).toFixed(0) + '%' : '—'} · day ${Number(risk.portfolio_daily_pnl || 0).toFixed(1)}`);
+    } else if ((risk.paused_bots || []).length) {
+        _setOpsChip('ops-risk', 'warn', `${risk.paused_bots.length} bot(s)`,
+            risk.paused_bots.slice(0, 3).join(', '));
+    } else {
+        _setOpsChip('ops-risk', 'ok', (risk.portfolio_status || 'ok').toUpperCase(),
+            `dd ${risk.portfolio_dd != null ? (risk.portfolio_dd * 100).toFixed(0) + '%' : '—'} · VaR ${risk.portfolio_var != null ? '$' + Number(risk.portfolio_var).toFixed(1) : 'n/a'}`);
+    }
+
+    const al = ops.allocation || {};
+    _setOpsChip('ops-alloc', al.enabled ? 'ok' : 'info',
+        al.enabled ? (al.method || 'on') : 'OFF',
+        al.enabled
+            ? `${al.n_active || 0} bots · ${(al.top_weights || []).slice(0, 2).map(w => w.bot.split('-')[0] + ' ' + (w.weight * 100).toFixed(0) + '%').join(', ') || '—'}`
+            : 'full-pool Kelly');
+    const oas = document.getElementById('ov-alloc-summary');
+    if (oas) {
+        oas.innerHTML = al.enabled
+            ? `<b>${al.method}</b> · n=${al.n_active || 0}` +
+              (al.rebalance_reason ? ` · last: ${al.rebalance_reason}` : '')
+            : 'Disabled — each bot sizes against the full shared bankroll.';
+    }
+    const oat = document.querySelector('#ov-alloc-table tbody');
+    if (oat) {
+        const rows = al.top_weights || [];
+        oat.innerHTML = rows.length
+            ? rows.map(w => `<tr><td>${w.bot}</td><td><b>${(Number(w.weight) * 100).toFixed(1)}%</b></td></tr>`).join('')
+            : '<tr><td colspan="2" style="color:#8b949e">No weights yet</td></tr>';
+    }
+
+    const evo = ops.evolution || {};
+    const ago = evo.last_evolution_time
+        ? ((Date.now() / 1000 - Number(evo.last_evolution_time)) / 3600).toFixed(1) + 'h ago'
+        : 'never';
+    _setOpsChip('ops-evo', 'info', evo.cycle != null ? ('#' + evo.cycle) : '—',
+        `${ago}` + (evo.last_trigger ? ` · ${evo.last_trigger}` : ''));
+
+    const sz = ops.sizing || {};
+    _setOpsChip('ops-size', 'info',
+        sz.paper_available != null ? ('$' + Number(sz.paper_available).toFixed(0)) : '—',
+        sz.kelly_fraction != null ? ('Kelly ' + Number(sz.kelly_fraction).toFixed(2)) : '—');
+    const qba = document.getElementById('quick-bankroll-avail');
+    if (qba && sz.paper_available != null) qba.textContent = '$' + Number(sz.paper_available).toFixed(2);
+    const qkc = document.getElementById('quick-kelly-cur');
+    if (qkc && sz.kelly_fraction != null) qkc.textContent = Number(sz.kelly_fraction).toFixed(2);
+
+    // Signal contributions
+    const sig = ops.signals || {};
+    const body = document.getElementById('ov-signals-body');
+    if (body) {
+        const lanes = sig.lanes || [];
+        if (!lanes.length) {
+            body.textContent = sig.error || 'No blend attributions in recent trades yet.';
+        } else {
+            const maxAbs = Math.max(...lanes.map(l => l.mean_abs || 0), 1e-6);
+            body.innerHTML = lanes.slice(0, 8).map(l => {
+                const pct = Math.min(100, (l.mean_abs / maxAbs) * 100);
+                const neg = (l.mean || 0) < 0;
+                return `<div class="contrib-bar">
+                    <span style="width:52px">${l.lane}</span>
+                    <div class="bar-track"><div class="bar-fill${neg ? ' neg' : ''}" style="width:${pct}%"></div></div>
+                    <span style="width:70px;text-align:right;color:${neg ? '#f85149' : '#3fb950'}">${Number(l.mean).toFixed(3)}</span>
+                    <span style="color:#8b949e;width:36px;text-align:right">n=${l.n}</span>
+                </div>`;
+            }).join('') +
+            `<div style="margin-top:6px;color:#8b949e;font-size:11px">${sig.trades_with_blend || 0}/${sig.trades_scanned || 0} trades with blend (last ${sig.hours || 6}h)</div>`;
+        }
+    }
+}
+
+function updateHealth(h) {
+    if (!h || h.error) {
+        const s = document.getElementById('health-summary');
+        if (s) s.textContent = h && h.error ? h.error : 'Health unavailable';
+        return;
+    }
+    const sum = document.getElementById('health-summary');
+    if (sum) {
+        const col = h.status === 'healthy' ? '#3fb950' : (h.status === 'critical' ? '#f85149' : '#f0883e');
+        const c = h.counts || {};
+        sum.innerHTML = `Status <b style="color:${col}">${(h.status || '').toUpperCase()}</b> · ok ${c.ok || 0} · warn ${c.warn || 0} · critical ${c.critical || 0}`;
+    }
+    const card = document.getElementById('health-card');
+    if (card) {
+        card.style.borderLeftColor = h.status === 'healthy' ? '#3fb950' : (h.status === 'critical' ? '#f85149' : '#f0883e');
+    }
+    const recs = document.getElementById('health-recs');
+    if (recs) {
+        const list = h.recommendations || [];
+        recs.innerHTML = list.map(r =>
+            `<div class="health-rec${r.level === 'critical' ? ' crit' : ''}"><b>${r.from}</b> — ${r.text}</div>`
+        ).join('');
+    }
+    const rs = document.getElementById('health-restart');
+    if (rs) {
+        const r = h.restart || {};
+        if (r.needed) {
+            rs.innerHTML = `<span style="color:#f85149;font-weight:bold">Restart recommended</span> (${r.urgency}): <code>${r.command || ''}</code><div style="margin-top:4px">${r.reason || ''}</div>`;
+        } else {
+            rs.innerHTML = `<span style="color:#3fb950">No restart needed</span>`;
+        }
+    }
+    const tb = document.getElementById('health-checks-tbody');
+    if (tb) {
+        tb.innerHTML = (h.checks || []).map(c => {
+            const col = c.ok ? '#3fb950' : (c.level === 'critical' ? '#f85149' : '#f0883e');
+            return `<tr>
+                <td>${c.name}</td>
+                <td style="color:${col};font-weight:bold">${c.ok ? 'OK' : (c.level || 'FAIL').toUpperCase()}</td>
+                <td style="font-size:12px;color:#c9d1d9">${c.message || ''}</td>
+            </tr>`;
+        }).join('');
+    }
+}
+
+function _quickResult(msg, ok) {
+    const el = document.getElementById('quick-capital-result');
+    if (!el) return;
+    el.textContent = msg;
+    el.style.color = ok ? '#3fb950' : '#f85149';
+}
+
+async function quickTopup(amount) {
+    try {
+        const resp = await postJSON('/api/settings/bankroll', { amount });
+        if (resp && resp.error) return _quickResult(resp.error, false);
+        _quickResult(`Paper balance topped to $${Number(resp.available).toFixed(2)}.`, true);
+        const qba = document.getElementById('quick-bankroll-avail');
+        if (qba) qba.textContent = '$' + Number(resp.available).toFixed(2);
+        loadBankroll();
+    } catch (e) { _quickResult(String(e), false); }
+}
+
+async function quickTopupCustom() {
+    const v = parseFloat(document.getElementById('quick-bankroll-input').value);
+    if (isNaN(v) || v < 0) return _quickResult('Enter a non-negative amount.', false);
+    return quickTopup(v);
+}
+
+async function quickKelly(fraction) {
+    try {
+        const resp = await postJSON('/api/settings/kelly', { fraction });
+        if (resp && resp.error) return _quickResult(resp.error, false);
+        _quickResult(`Kelly set to ${Number(resp.kelly_fraction).toFixed(2)}.`, true);
+        const qkc = document.getElementById('quick-kelly-cur');
+        if (qkc) qkc.textContent = Number(resp.kelly_fraction).toFixed(2);
+        loadKelly();
+    } catch (e) { _quickResult(String(e), false); }
+}
+
+function presetBankroll(amount) {
+    const input = document.getElementById('paper-bankroll-input');
+    if (input) input.value = amount;
+    saveBankroll();
+}
+
+function presetKelly(fraction) {
+    const input = document.getElementById('kelly-fraction-input');
+    if (input) input.value = fraction;
+    saveKelly();
+}
+
+// ---------- Alerts settings ----------
+let _alertsState = null;
+
+async function loadAlerts() {
+    try {
+        const a = await fetchJSON('/api/alerts');
+        _alertsState = a;
+        const cfg = a.config || {};
+        const en = document.getElementById('alerts-enabled');
+        if (en) en.value = cfg.enabled ? '1' : '0';
+        const ml = document.getElementById('alerts-min-level');
+        if (ml) ml.value = cfg.min_level || 'info';
+        const ch = a.channels || {};
+        const statusEl = document.getElementById('alerts-channels-status');
+        if (statusEl) {
+            statusEl.innerHTML = ['telegram', 'discord', 'email'].map(c => {
+                const s = ch[c] || {};
+                const col = s.configured ? (s.enabled ? '#3fb950' : '#f0883e') : '#8b949e';
+                return `<span style="margin-right:12px;color:${col}"><b>${c}</b>: ${s.configured ? (s.enabled ? 'ready' : 'configured, off') : 'no credentials'}</span>`;
+            }).join('');
+        }
+        const toggles = document.getElementById('alerts-channel-toggles');
+        if (toggles) {
+            toggles.innerHTML = ['telegram', 'discord', 'email'].map(c => {
+                const on = (cfg.channels || {})[c];
+                return `<button class="chip-btn${on ? ' primary' : ''}" onclick="toggleAlertChannel('${c}')">${c}: ${on ? 'ON' : 'OFF'}</button>`;
+            }).join('');
+        }
+        const tb = document.getElementById('alerts-log-tbody');
+        if (tb) {
+            const log = a.log || [];
+            tb.innerHTML = log.length ? log.slice(0, 15).map(e => {
+                const when = e.ts ? new Date(e.ts * 1000).toLocaleString() : '—';
+                return `<tr>
+                    <td style="font-size:11px;color:#8b949e">${when}</td>
+                    <td>${e.event_type || ''}</td>
+                    <td>${e.title || ''}</td>
+                    <td style="color:${e.sent ? '#3fb950' : '#f0883e'}">${e.sent ? 'yes' : 'no'}</td>
+                </tr>`;
+            }).join('') : '<tr><td colspan="4" style="color:#8b949e">No alerts sent yet.</td></tr>';
+        }
+    } catch (e) {
+        console.error('loadAlerts', e);
+    }
+}
+
+async function saveAlertsConfig() {
+    const en = document.getElementById('alerts-enabled');
+    const ml = document.getElementById('alerts-min-level');
+    try {
+        const resp = await postJSON('/api/alerts', {
+            enabled: en && en.value === '1',
+            min_level: ml ? ml.value : 'info',
+        });
+        if (resp && resp.error) {
+            document.getElementById('alerts-result').textContent = resp.error;
+            document.getElementById('alerts-result').style.color = '#f85149';
+            return;
+        }
+        document.getElementById('alerts-result').textContent = 'Alert config saved.';
+        document.getElementById('alerts-result').style.color = '#3fb950';
+        await loadAlerts();
+    } catch (e) {
+        document.getElementById('alerts-result').textContent = String(e);
+        document.getElementById('alerts-result').style.color = '#f85149';
+    }
+}
+
+async function toggleAlertChannel(ch) {
+    const cfg = (_alertsState && _alertsState.config) || {};
+    const channels = Object.assign({}, cfg.channels || {});
+    channels[ch] = !channels[ch];
+    try {
+        await postJSON('/api/alerts', { channels });
+        await loadAlerts();
+    } catch (e) { console.error(e); }
+}
+
+async function testAlert() {
+    try {
+        const resp = await postJSON('/api/alerts', { test: true });
+        const el = document.getElementById('alerts-result');
+        if (resp && resp.error) {
+            el.textContent = resp.error;
+            el.style.color = '#f85149';
+            return;
+        }
+        const ch = (resp.test && resp.test.channels) || {};
+        const parts = Object.entries(ch).map(([k, v]) => `${k}:${v.ok ? 'ok' : v.detail}`);
+        el.textContent = 'Test: ' + (parts.join(' · ') || 'no channels enabled');
+        el.style.color = '#3fb950';
+        await loadAlerts();
+    } catch (e) {
+        document.getElementById('alerts-result').textContent = String(e);
+        document.getElementById('alerts-result').style.color = '#f85149';
+    }
+}
+
+// ---------- Portfolio capital allocation ----------
+let _portfolioState = null;
+
+function _pct(w) {
+    return (Number(w) * 100).toFixed(1);
+}
+
+async function loadPortfolio() {
+    try {
+        const p = await fetchJSON('/api/portfolio');
+        _portfolioState = p;
+        const en = document.getElementById('portfolio-enabled');
+        if (en && document.activeElement !== en) en.value = p.enabled ? '1' : '0';
+        const meth = document.getElementById('portfolio-method');
+        if (meth && document.activeElement !== meth) meth.value = p.method || 'kelly_portfolio';
+        const win = document.getElementById('portfolio-window');
+        if (win && document.activeElement !== win) win.value = Number(p.window_hours || 24);
+        const last = p.last_rebalance_at
+            ? new Date(Number(p.last_rebalance_at) * 1000).toLocaleString()
+            : 'never';
+        const lr = document.getElementById('portfolio-last-rebal');
+        if (lr) lr.textContent = last;
+        const rr = document.getElementById('portfolio-reason');
+        if (rr) rr.textContent = p.rebalance_reason || '—';
+        const rg = document.getElementById('portfolio-regime');
+        if (rg) rg.textContent = p.last_regime || '—';
+
+        const weights = p.weights || {};
+        const autoW = p.auto_weights || {};
+        const pins = p.manual_overrides || {};
+        const metrics = p.metrics || {};
+        // Union of known bots
+        const names = Array.from(new Set([
+            ...Object.keys(weights),
+            ...Object.keys(autoW),
+            ...Object.keys(pins),
+            ...Object.keys(metrics),
+        ])).sort();
+        const tbody = document.getElementById('portfolio-tbody');
+        if (!tbody) return;
+        if (names.length === 0) {
+            tbody.innerHTML = '<tr><td colspan="8" style="color:#8b949e">No active bots yet.</td></tr>';
+        } else {
+            tbody.innerHTML = names.map(name => {
+                const m = metrics[name] || {};
+                const w = weights[name] != null ? weights[name] : '';
+                const a = autoW[name] != null ? autoW[name] : '';
+                const pin = pins[name] != null ? (Number(pins[name]) * 100).toFixed(1) : '';
+                const sh = m.sharpe != null ? Number(m.sharpe).toFixed(2) : '—';
+                const ex = m.expectancy != null ? Number(m.expectancy).toFixed(3) : '—';
+                const n = m.n != null ? m.n : '—';
+                const ready = m.ready ? '' : ' style="opacity:0.55"';
+                return `<tr${ready}>
+                    <td>${name}</td>
+                    <td><b>${w === '' ? '—' : _pct(w)}</b></td>
+                    <td>${a === '' ? '—' : _pct(a)}</td>
+                    <td><input type="number" class="portfolio-pin" data-bot="${name}"
+                         min="0" max="100" step="1" value="${pin}"
+                         placeholder="auto"
+                         style="width:72px;background:#0d1117;color:#c9d1d9;border:1px solid #30363d;border-radius:4px;padding:4px 6px;font-family:inherit"></td>
+                    <td>${sh}</td>
+                    <td>${ex}</td>
+                    <td>${n}</td>
+                    <td style="color:#8b949e;font-size:10px">${m.ready ? '' : 'cold'}</td>
+                </tr>`;
+            }).join('');
+        }
+        const corr = p.correlations || {};
+        const pairs = Object.entries(corr)
+            .sort((a, b) => Math.abs(b[1]) - Math.abs(a[1]))
+            .slice(0, 8)
+            .map(([k, v]) => `${k.replace('|', ' ↔ ')}: ${Number(v).toFixed(2)}`)
+            .join(' · ');
+        const corrEl = document.getElementById('portfolio-corr');
+        if (corrEl) corrEl.textContent = pairs
+            ? ('Top correlations: ' + pairs)
+            : 'No material correlations estimated yet (need overlapping markets).';
+    } catch (e) {
+        console.error('loadPortfolio error:', e);
+        const tbody = document.getElementById('portfolio-tbody');
+        if (tbody) tbody.innerHTML = `<tr><td colspan="8" style="color:#f85149">Failed to load: ${e}</td></tr>`;
+    }
+}
+
+function _portfolioResult(msg, ok) {
+    const el = document.getElementById('portfolio-result');
+    if (!el) return;
+    el.textContent = msg;
+    el.style.color = ok ? '#3fb950' : '#f85149';
+}
+
+async function savePortfolioEnabled() {
+    const en = document.getElementById('portfolio-enabled');
+    try {
+        const resp = await postJSON('/api/portfolio', { enabled: en.value === '1' });
+        if (resp && resp.error) return _portfolioResult(resp.error, false);
+        _portfolioResult(resp.enabled ? 'Portfolio allocation ON — sizes use capital weights.' : 'Portfolio allocation OFF — full-pool Kelly restored.', true);
+        await loadPortfolio();
+    } catch (e) { _portfolioResult(String(e), false); }
+}
+
+async function savePortfolioMethod() {
+    const meth = document.getElementById('portfolio-method');
+    try {
+        const resp = await postJSON('/api/portfolio', { method: meth.value });
+        if (resp && resp.error) return _portfolioResult(resp.error, false);
+        _portfolioResult(`Method set to ${resp.method} and rebalanced.`, true);
+        await loadPortfolio();
+    } catch (e) { _portfolioResult(String(e), false); }
+}
+
+async function savePortfolioWindow() {
+    const win = document.getElementById('portfolio-window');
+    const hours = parseFloat(win.value);
+    if (isNaN(hours) || hours < 1 || hours > 168) {
+        return _portfolioResult('Lookback must be 1–168 hours.', false);
+    }
+    try {
+        const resp = await postJSON('/api/portfolio', { window_hours: hours });
+        if (resp && resp.error) return _portfolioResult(resp.error, false);
+        _portfolioResult(`Lookback set to ${hours}h and rebalanced.`, true);
+        await loadPortfolio();
+    } catch (e) { _portfolioResult(String(e), false); }
+}
+
+async function savePortfolioPins() {
+    const inputs = document.querySelectorAll('.portfolio-pin');
+    const overrides = {};
+    for (const inp of inputs) {
+        const bot = inp.dataset.bot;
+        const raw = inp.value.trim();
+        if (raw === '') continue;
+        const pct = parseFloat(raw);
+        if (isNaN(pct) || pct < 0 || pct > 100) {
+            return _portfolioResult(`Invalid pin for ${bot}: enter 0–100 or leave blank.`, false);
+        }
+        if (pct > 0) overrides[bot] = pct / 100;
+    }
+    try {
+        const resp = await postJSON('/api/portfolio', { manual_overrides: overrides });
+        if (resp && resp.error) return _portfolioResult(resp.error, false);
+        _portfolioResult(`Saved ${Object.keys(overrides).length} pin(s) and rebalanced.`, true);
+        await loadPortfolio();
+    } catch (e) { _portfolioResult(String(e), false); }
+}
+
+async function clearPortfolioPins() {
+    try {
+        const resp = await postJSON('/api/portfolio', { manual_overrides: {} });
+        if (resp && resp.error) return _portfolioResult(resp.error, false);
+        _portfolioResult('Cleared all pins — fully auto weights.', true);
+        await loadPortfolio();
+    } catch (e) { _portfolioResult(String(e), false); }
+}
+
+async function forcePortfolioRebalance() {
+    try {
+        const resp = await postJSON('/api/portfolio', { rebalance: true });
+        if (resp && resp.error) return _portfolioResult(resp.error, false);
+        _portfolioResult('Rebalanced now.', true);
+        await loadPortfolio();
+    } catch (e) { _portfolioResult(String(e), false); }
 }
 
 async function loadKelly() {
@@ -716,6 +1540,167 @@ async function testCredentials(which) {
     }
 }
 
+// ---------- Risk Engine ----------
+let _riskState = null;
+
+function _riskResult(msg, ok) {
+    const el = document.getElementById('risk-result');
+    if (!el) return;
+    el.textContent = msg;
+    el.style.color = ok ? '#3fb950' : '#f85149';
+}
+
+function _statusColor(st) {
+    if (st === 'paused') return '#f85149';
+    if (st === 'reduced') return '#f0883e';
+    return '#3fb950';
+}
+
+function updateRisk(r) {
+    if (!r || r.error) {
+        const sum = document.getElementById('risk-summary');
+        if (sum) sum.textContent = r && r.error ? ('Risk error: ' + r.error) : 'Risk unavailable';
+        return;
+    }
+    _riskState = r;
+    const killed = !!r.killed;
+    const en = r.enabled !== false;
+    const port = r.portfolio || {};
+    const sum = document.getElementById('risk-summary');
+    if (sum) {
+        sum.innerHTML = killed
+            ? `<span style="color:#f85149;font-weight:bold">KILL SWITCH ARMED</span> — ${r.kill_reason || 'halted'} <span style="color:#8b949e">(${r.kill_source || '?'}) · file: ${r.kill_file || '—'}</span>`
+            : `Engine <b style="color:${en ? '#3fb950' : '#8b949e'}">${en ? 'ON' : 'OFF'}</b> · portfolio <b style="color:${_statusColor(port.status)}">${port.status || '—'}</b>`
+              + (port.reason ? ` · ${port.reason}` : '')
+              + ` · file <code style="font-size:11px">${r.kill_file || '—'}</code>`;
+    }
+    const killBtn = document.getElementById('risk-kill-btn');
+    if (killBtn) {
+        killBtn.textContent = killed ? 'CLEAR KILL SWITCH' : 'KILL SWITCH';
+        killBtn.className = killed ? 'btn btn-primary' : 'btn btn-danger';
+    }
+    const ptb = document.getElementById('risk-portfolio-tbody');
+    if (ptb) {
+        const varS = port.var_1d != null ? ('$' + Number(port.var_1d).toFixed(2)) : 'n/a';
+        ptb.innerHTML = `<tr>
+            <td style="color:${_statusColor(port.status)};font-weight:bold">${port.status || '—'}</td>
+            <td class="${Number(port.daily_pnl) >= 0 ? 'positive' : 'negative'}">${Number(port.daily_pnl || 0).toFixed(2)}</td>
+            <td>${port.drawdown != null ? (Number(port.drawdown) * 100).toFixed(1) + '%' : '—'}</td>
+            <td>${varS}</td>
+            <td>${port.size_mult != null ? Number(port.size_mult).toFixed(2) + '×' : '—'}</td>
+        </tr>`;
+    }
+    const lim = r.limits || {};
+    const limEl = document.getElementById('risk-limits');
+    if (limEl) {
+        limEl.innerHTML = [
+            `Bot daily loss: <b>$${Number(lim.bot_daily_loss || 0).toFixed(0)}</b>`,
+            `Portfolio daily: <b>$${Number(lim.portfolio_daily_loss || 0).toFixed(0)}</b>`,
+            `Bot max DD: <b>${(Number(lim.bot_max_drawdown || 0) * 100).toFixed(0)}%</b>`,
+            `Portfolio max DD: <b>${(Number(lim.portfolio_max_drawdown || 0) * 100).toFixed(0)}%</b>`,
+            `VaR conf: <b>${(Number(lim.var_confidence || 0.95) * 100).toFixed(0)}%</b>`
+              + (lim.var_limit_usd != null ? ` · cap $${Number(lim.var_limit_usd).toFixed(0)}` : ''),
+        ].join('<br>');
+    }
+    const bots = r.bots || {};
+    const names = Object.keys(bots).sort();
+    const btb = document.getElementById('risk-bots-tbody');
+    if (btb) {
+        if (!names.length) {
+            btb.innerHTML = '<tr><td colspan="8" style="color:#8b949e">No bots evaluated yet.</td></tr>';
+        } else {
+            btb.innerHTML = names.map(name => {
+                const b = bots[name] || {};
+                const varS = b.var_1d != null ? ('$' + Number(b.var_1d).toFixed(2)) : 'n/a';
+                const act = b.status === 'paused'
+                    ? `<button class="btn btn-secondary" style="padding:2px 8px;font-size:11px" onclick="riskResumeBot('${name}')">Resume</button>`
+                    : `<button class="btn btn-secondary" style="padding:2px 8px;font-size:11px" onclick="riskPauseBot('${name}')">Pause</button>`;
+                return `<tr>
+                    <td>${name}</td>
+                    <td style="color:${_statusColor(b.status)};font-weight:bold">${b.status || '—'}</td>
+                    <td>${b.size_mult != null ? Number(b.size_mult).toFixed(2) + '×' : '—'}</td>
+                    <td class="${Number(b.daily_pnl) >= 0 ? 'positive' : 'negative'}">${Number(b.daily_pnl || 0).toFixed(2)}</td>
+                    <td>${b.drawdown != null ? (Number(b.drawdown) * 100).toFixed(1) + '%' : '—'}</td>
+                    <td>${varS}</td>
+                    <td style="font-size:11px;color:#8b949e;max-width:220px;overflow:hidden;text-overflow:ellipsis">${b.reason || ''}</td>
+                    <td>${act}</td>
+                </tr>`;
+            }).join('');
+        }
+    }
+    const ev = r.events || [];
+    const etb = document.getElementById('risk-events-tbody');
+    if (etb) {
+        if (!ev.length) {
+            etb.innerHTML = '<tr><td colspan="5" style="color:#8b949e">No risk decisions logged yet.</td></tr>';
+        } else {
+            etb.innerHTML = ev.slice(0, 25).map(e => {
+                const lvl = e.level || 'info';
+                const col = lvl === 'critical' ? '#f85149' : (lvl === 'warn' ? '#f0883e' : '#8b949e');
+                return `<tr>
+                    <td style="font-size:11px;color:#8b949e">${(e.created_at || '').replace('T', ' ').slice(0, 19)}</td>
+                    <td style="color:${col}">${lvl}</td>
+                    <td>${e.action || ''}</td>
+                    <td>${e.bot_name || '—'}</td>
+                    <td style="font-size:11px;color:#c9d1d9">${e.reason || ''}</td>
+                </tr>`;
+            }).join('');
+        }
+    }
+}
+
+async function loadRisk() {
+    try {
+        const r = await fetchJSON('/api/risk');
+        updateRisk(r);
+    } catch (e) {
+        console.error('loadRisk', e);
+    }
+}
+
+async function toggleKillSwitch() {
+    const killed = _riskState && _riskState.killed;
+    const arm = !killed;
+    const msg = arm
+        ? 'ARM kill switch? All bots stop trading until cleared.'
+        : 'Clear kill switch and resume risk-gated trading?';
+    if (!confirm(msg)) return;
+    try {
+        const resp = await postJSON('/api/risk/kill-switch', {
+            armed: arm,
+            reason: arm ? 'dashboard_arm' : 'dashboard_clear',
+        });
+        if (resp && resp.error) return _riskResult(resp.error, false);
+        _riskResult(arm ? 'Kill switch ARMED — trading halted.' : 'Kill switch cleared.', true);
+        await loadRisk();
+    } catch (e) { _riskResult(String(e), false); }
+}
+
+async function forceRiskEval() {
+    try {
+        const resp = await postJSON('/api/risk', { evaluate: true });
+        if (resp && resp.error) return _riskResult(resp.error, false);
+        _riskResult('Risk re-evaluated.', true);
+        await loadRisk();
+    } catch (e) { _riskResult(String(e), false); }
+}
+
+async function riskPauseBot(name) {
+    try {
+        await postJSON('/api/risk', { pause_bot: name, reason: 'manual_pause' });
+        _riskResult(`Paused ${name}.`, true);
+        await loadRisk();
+    } catch (e) { _riskResult(String(e), false); }
+}
+
+async function riskResumeBot(name) {
+    try {
+        await postJSON('/api/risk', { resume_bot: name });
+        _riskResult(`Resumed ${name} (subject to automatic limits).`, true);
+        await loadRisk();
+    } catch (e) { _riskResult(String(e), false); }
+}
+
 // ---------- Overview / Bots / Trades ----------
 function updateOverview(stats) {
     // Build the period rows, then sort ascending by (resolved) trade count so
@@ -797,15 +1782,131 @@ function updateEvolution(events) {
         const replaced = e.replaced || [];
         const killedInfo = replaced.map(name => {
             const r = rankings.find(x => x.name === name);
-            if (r) return `${name} <span class="neutral">(${(r.win_rate * 100).toFixed(0)}% ${fmtPnl(r.pnl)})</span>`;
+            if (r) {
+                const fit = r.fitness != null ? `fit=${Number(r.fitness).toFixed(2)} ` : '';
+                return `${name} <span class="neutral">(${fit}${(r.win_rate * 100).toFixed(0)}% ${fmtPnl(r.pnl)})</span>`;
+            }
             return name;
-        }).join(', ');
+        }).join(', ') || '—';
+        const elites = rankings.filter(r => r.elite).map(r => r.name);
+        const survivors = elites.length ? elites : (e.survivors || []);
+        const newBots = (e.new_bots || []).map(name => {
+            const r = rankings.find(x => x.name === name);
+            // lineage may only be on the spawn side; show name
+            return name;
+        }).join(', ') || '—';
         return `<tr>
             <td>#${e.cycle_number}</td>
-            <td>${(e.survivors || []).join(', ')}</td>
+            <td>${survivors.join(', ') || '—'}</td>
             <td>${killedInfo}</td>
-            <td>${(e.new_bots || []).join(', ')}</td>
+            <td>${newBots}</td>
             <td>${formatEtDateTime(e.created_at)}</td>
+        </tr>`;
+    }).join('');
+}
+
+function updateRegime(reg) {
+    const summary = document.getElementById('regime-summary');
+    const featBody = document.querySelector('#regime-features-table tbody');
+    const perfBody = document.querySelector('#regime-perf-table tbody');
+    const transBody = document.querySelector('#regime-trans-table tbody');
+    if (!summary) return;
+    if (!reg || reg.error) {
+        summary.textContent = reg && reg.error ? ('Regime error: ' + reg.error) : 'No regime data';
+        return;
+    }
+    const cur = reg.current || {};
+    const feats = cur.features || {};
+    const rid = cur.regime_id || cur.label || 'unknown';
+    const legacy = cur.legacy || cur.regime || '?';
+    summary.innerHTML = `Now <b>${rid}</b> <span class="neutral">(legacy ${legacy})</span> · conf <b>${(Number(cur.confidence || 0) * 100).toFixed(0)}%</b> · meta bucket <b>${cur.meta_bucket || '?'}</b>${cur.last_change_from ? ' · last switch from ' + cur.last_change_from : ''}`;
+    if (featBody) {
+        const rows = ['vol', 'trend', 'mom', 'flow'].map(k => {
+            const v = feats[k] != null ? feats[k] : cur[k + '_score'];
+            const pct = v != null ? (Number(v) * 100).toFixed(0) + '%' : '—';
+            return `<tr><td>${k}</td><td>${pct}</td></tr>`;
+        });
+        featBody.innerHTML = rows.join('');
+    }
+    if (perfBody) {
+        const perf = reg.performance || {};
+        const keys = Object.keys(perf).filter(k => (perf[k].n || 0) > 0);
+        if (!keys.length) {
+            perfBody.innerHTML = '<tr><td colspan="5" style="color:#8b949e">No resolved trades stamped with regime yet</td></tr>';
+        } else {
+            perfBody.innerHTML = keys.map(k => {
+                const p = perf[k];
+                const wr = p.win_rate != null ? (p.win_rate * 100).toFixed(0) + '%' : '—';
+                return `<tr><td>${k}</td><td>${p.n}</td><td>${wr}</td><td>${fmtPnl(p.pnl)}</td><td>${p.avg_pnl != null ? fmtPnl(p.avg_pnl) : '—'}</td></tr>`;
+            }).join('');
+        }
+    }
+    if (transBody) {
+        const trans = reg.db_events || reg.transitions || [];
+        if (!trans.length) {
+            transBody.innerHTML = '<tr><td colspan="4" style="color:#8b949e">No transitions yet</td></tr>';
+        } else {
+            transBody.innerHTML = trans.slice(0, 12).map(t => {
+                const when = t.created_at || (t.ts ? new Date(t.ts * 1000).toISOString() : '—');
+                return `<tr><td>${t.from_regime || t.from || '—'}</td><td>${t.to_regime || t.to || '—'}</td><td>${t.confidence != null ? (Number(t.confidence) * 100).toFixed(0) + '%' : '—'}</td><td>${typeof when === 'string' && when.includes('T') ? formatEtDateTime(when) : when}</td></tr>`;
+            }).join('');
+        }
+    }
+}
+
+function updateGA(ga) {
+    const summary = document.getElementById('ga-status-summary');
+    const fitBody = document.querySelector('#ga-fitness-table tbody');
+    if (!summary || !fitBody) return;
+    if (!ga) {
+        summary.textContent = 'No GA data';
+        fitBody.innerHTML = '';
+        return;
+    }
+    const st = ga.status || {};
+    const last = st.last_cycle;
+    const cfg = ga.config || {};
+    if (last) {
+        summary.innerHTML = `Cycle <b>#${last.cycle}</b> · best fit <b>${Number(last.best_fitness || 0).toFixed(3)}</b> · mean <b>${Number(last.mean_fitness || 0).toFixed(3)}</b> · elites: ${(last.elites || []).join(', ') || '—'} · replaced: ${(last.replaced || []).length}${last.skipped ? ' · <span class="neutral">(skipped: ' + (last.reason || '') + ')</span>' : ''} · interval ${cfg.interval_hours || '?'}h / window ${cfg.window_hours || '?'}h`;
+    } else {
+        summary.textContent = `No GA cycles yet · elite=${cfg.elite_count ?? 1} mut=${cfg.mutation_rate ?? '—'} σ=${cfg.mutation_sigma ?? '—'} · interval ${cfg.interval_hours || '?'}h`;
+    }
+    // Sparkline from fitness history
+    const hist = st.fitness_history || [];
+    const spark = document.getElementById('ga-fitness-spark');
+    if (spark && hist.length) {
+        const vals = hist.map(h => Number(h.best_fitness || 0));
+        const min = Math.min(...vals), max = Math.max(...vals);
+        const w = Math.max(200, vals.length * 8), h = 36;
+        const pts = vals.map((v, i) => {
+            const x = (i / Math.max(1, vals.length - 1)) * (w - 4) + 2;
+            const y = h - 4 - ((v - min) / (max - min || 1)) * (h - 8);
+            return `${x},${y}`;
+        }).join(' ');
+        spark.innerHTML = `<svg width="${w}" height="${h}" style="max-width:100%"><polyline fill="none" stroke="#3fb950" stroke-width="1.5" points="${pts}"/></svg><div style="font-size:11px;color:#8b949e">Best fitness over last ${hist.length} cycles</div>`;
+    } else if (spark) {
+        spark.innerHTML = '';
+    }
+    // Latest generation individual table
+    const gens = ga.generations || [];
+    const latest = gens[0];
+    const inds = (latest && latest.individuals) || [];
+    if (!inds.length) {
+        fitBody.innerHTML = '<tr><td colspan="7" style="color:#8b949e">No scored individuals yet</td></tr>';
+        return;
+    }
+    fitBody.innerHTML = inds.map(i => {
+        const c = i.components || {};
+        const status = i.elite ? 'ELITE' : (i.status || '').toUpperCase();
+        const statusCls = i.elite ? 'positive' : (i.status === 'replaceable' ? 'negative' : 'neutral');
+        return `<tr>
+            <td>${i.name}${i.lineage ? `<div style="font-size:10px;color:#8b949e">${i.lineage}</div>` : ''}</td>
+            <td>${i.fitness != null ? Number(i.fitness).toFixed(3) : '—'}</td>
+            <td>${fmtPnl(c.pnl != null ? c.pnl : i.pnl)}</td>
+            <td>${c.sharpe != null ? Number(c.sharpe).toFixed(2) : '—'}</td>
+            <td>${c.max_drawdown_pct != null ? (c.max_drawdown_pct * 100).toFixed(0) + '%' : '—'}</td>
+            <td>${c.consistency != null ? (c.consistency * 100).toFixed(0) + '%' : '—'}</td>
+            <td class="${statusCls}">${status}</td>
         </tr>`;
     }).join('');
 }
@@ -1080,16 +2181,20 @@ function updateCopyBots(wallets) {
 
 async function refresh() {
     try {
-        const [status, overview, bots, evolution, trades, earnings, copyBots, buckets, skips] = await Promise.all([
+        const [status, overview, bots, evolution, ga, regime, trades, earnings, copyBots, buckets, skips, ops, health] = await Promise.all([
             fetchJSON('/api/status'),
             fetchJSON('/api/overview'),
             fetchJSON('/api/bots'),
             fetchJSON('/api/evolution'),
+            fetchJSON('/api/ga'),
+            fetchJSON('/api/regime'),
             fetchJSON('/api/trades?limit=20'),
             fetchJSON('/api/earnings'),
             fetchJSON('/api/copytrading'),
             fetchJSON('/api/entry-buckets?mode=paper'),
             fetchJSON('/api/skips'),
+            fetchJSON('/api/ops'),
+            fetchJSON('/api/health'),
         ]);
         updateMode(status.mode);
         updateBanner(status.warnings || []);
@@ -1097,15 +2202,20 @@ async function refresh() {
         updateBots(bots.filter(b => b.config.strategy_type !== 'copy_trade'));
         updateCopyBots(copyBots);
         updateEvolution(evolution);
+        updateGA(ga);
+        updateRegime(regime);
         updateTrades(trades);
         updateEntryBuckets(buckets);
         updateSkips(skips);
         updateEarnings(earnings);
+        updateOps(ops);
+        updateHealth(health);
     } catch (e) {
         console.error('Refresh error:', e);
     }
     await fetchMarkets();
     updateMarketCards();
+    await loadRisk();
 }
 
 // --- Live market-card refresh (independent of the 10s heavy refresh) ---
@@ -1307,6 +2417,56 @@ async function loadSignalLab() {
     }
 }
 
+async function loadHybridMeta() {
+    const card = document.getElementById('hybrid-meta-card');
+    let data;
+    try { data = await fetchJSON('/api/hybrid-meta'); }
+    catch (e) { card.innerHTML = '<div style="color:#f85149">Failed to load hybrid meta state</div>'; return; }
+
+    const subs = data.subs || {};
+    const last = data.last || {};
+    if (Object.keys(subs).length === 0 && Object.keys(last).length === 0) {
+        card.innerHTML = '<div style="color:#8b949e">No meta-learner state yet &mdash; appears after the hybrid bot has made a decision and its first meta-tagged trades resolve.</div>';
+        return;
+    }
+
+    let html = '';
+    if (last.weights) {
+        const w = Object.entries(last.weights)
+            .map(([s, v]) => `<b>${s}</b> ${(v * 100).toFixed(0)}%`).join(' &middot; ');
+        html += `<div style="margin-bottom:8px;font-size:13px">Effective weights
+            <span style="color:#8b949e">(regime=${last.regime || '?'}, bucket=${last.bucket || '?'}, ${last.ts || ''} UTC)</span>:
+            <div style="margin-top:4px">${w}</div></div>`;
+    }
+
+    const fmtRec = (r) => r && r.n > 0
+        ? `${r.mult.toFixed(2)}&times; <span style="color:#8b949e">(${r.correct}/${r.n})</span>`
+        : '<span style="color:#8b949e">&ndash;</span>';
+    const rows = Object.entries(subs).map(([sub, rec]) => {
+        const ov = rec.overall || {};
+        const color = (ov.mult || 1) > 1.02 ? '#3fb950' : (ov.mult || 1) < 0.98 ? '#f85149' : '#c9d1d9';
+        return `<tr>
+            <td>${sub}</td>
+            <td style="text-align:right;color:${color}">${fmtRec(ov)}</td>
+            <td style="text-align:right">${fmtRec(rec.trending)}</td>
+            <td style="text-align:right">${fmtRec(rec.ranging)}</td>
+            <td style="text-align:right">${fmtRec(rec.mixed)}</td>
+        </tr>`;
+    }).join('');
+    if (rows) {
+        html += `<table style="width:100%;font-size:13px;border-collapse:collapse">
+            <thead><tr style="color:#8b949e;text-align:left">
+                <th>Sub-strategy</th><th style="text-align:right">Overall</th>
+                <th style="text-align:right">Trending</th>
+                <th style="text-align:right">Ranging</th>
+                <th style="text-align:right">Mixed</th>
+            </tr></thead><tbody>${rows}</tbody></table>`;
+    } else {
+        html += '<div style="color:#8b949e;font-size:12px">Online multipliers: collecting &mdash; no meta-tagged hybrid trades have resolved yet.</div>';
+    }
+    card.innerHTML = html;
+}
+
 async function decideLane(id, action) {
     if (action === 'approve' &&
         !confirm('Approve this lane? It will start carrying live decision weight within seconds.')) return;
@@ -1377,7 +2537,7 @@ refresh();
 setInterval(refresh, 10000);
 // Keep the Signal Lab fresh while it's the visible tab.
 setInterval(() => {
-    if (!document.getElementById('tab-signal-lab').classList.contains('hidden')) loadSignalLab();
+    if (!document.getElementById('tab-signal-lab').classList.contains('hidden')) { loadSignalLab(); loadHybridMeta(); }
 }, 15000);
 // Market list re-pull every 3s keeps current/next turnover snappy.
 setInterval(fetchMarkets, 3000);

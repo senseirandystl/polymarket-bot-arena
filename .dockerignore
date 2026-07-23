@@ -1,0 +1,53 @@
+# VCS / IDE
+.git
+.gitignore
+.github
+.claude
+.grok
+.idea
+.vscode
+*.swp
+
+# Local Python env & caches
+.venv
+venv
+__pycache__
+*.py[cod]
+*.egg-info
+.mypy_cache
+.pytest_cache
+.coverage
+htmlcov
+.ruff_cache
+
+# Runtime state (mounted as volumes at runtime instead)
+bot_arena.db
+bot_arena.db-*
+*.db
+*.db.bak.*
+logs/
+*.log
+dashboard.log
+.credentials.enc
+data/
+
+# Offline caches & generated reports
+tools/.signal_cache/
+backtest/.cache/
+backtest/reports/
+
+# Tests & local docs noise (image still includes unit-testable source)
+# Keep tests/ out of the image to shrink it; run tests on the host / CI.
+tests/
+docs/superpowers/
+
+# Launchd / host-only
+com.polymarket.*.plist
+*.plist
+
+# Docker context self-reference
+Dockerfile*
+docker-compose*.yml
+.env
+.env.*
+!/.env.example

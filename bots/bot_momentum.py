@@ -1,6 +1,8 @@
 """Bot 1: Momentum / Trend Following strategy."""
 
-from bots.base_bot import BaseBot
+import config
+from bots.base_bot import BaseBot, strategy_decision
+from signals.lab import SignalView
 
 DEFAULT_PARAMS = {
     "lookback_candles": 5,
@@ -14,6 +16,13 @@ DEFAULT_PARAMS = {
     "min_confidence": 0.55,
     "trend_strength_weight": 0.7,
     "volume_weight": 0.3,
+    # Regime conditioning: confidence scales by (1 + w * (2*trend_score - 1)).
+    # Trend-following earns MORE trust on trending tape and LESS in chop
+    # (2026-07-19 live: momentum-driven trades in chop ran 47.9% WR / -$74;
+    # the lab's quiet-regime mom-lane damp attacks the same leak — this
+    # conditions the strategy's own thesis the same way). Neutral (x1.0) when
+    # the regime feed has no reading.
+    "regime_conf_weight": 0.35,
 }
 
 
@@ -29,9 +38,10 @@ class MomentumBot(BaseBot):
 
     def analyze(self, market: dict, signals: dict) -> dict:
         """Trade in the direction of short-term price momentum."""
-        prices = signals.get("prices", [])
+        sv = SignalView.of(signals)
+        prices = sv.prices
         if len(prices) < self.strategy_params["lookback_candles"]:
-            return {"action": "hold", "side": "yes", "confidence": 0, "reasoning": "insufficient price data"}
+            return strategy_decision("hold", reasoning="insufficient price data")
 
         lookback = self.strategy_params["lookback_candles"]
         recent = prices[-lookback:]
@@ -39,7 +49,7 @@ class MomentumBot(BaseBot):
         newest = recent[-1]
 
         if oldest == 0:
-            return {"action": "hold", "side": "yes", "confidence": 0, "reasoning": "zero price"}
+            return strategy_decision("hold", reasoning="zero price")
 
         pct_change = (newest - oldest) / oldest
         threshold = self.strategy_params["momentum_threshold"]
@@ -55,7 +65,7 @@ class MomentumBot(BaseBot):
         trend_strength = consecutive / (len(recent) - 1) if len(recent) > 1 else 0
 
         # Volume signal (if available)
-        volumes = signals.get("volumes", [])
+        volumes = sv.volumes
         vol_signal = 0.5
         if len(volumes) >= lookback:
             recent_vol = sum(volumes[-lookback:])
@@ -67,18 +77,40 @@ class MomentumBot(BaseBot):
         vw = self.strategy_params["volume_weight"]
         confidence = (trend_strength * tw + vol_signal * vw)
 
+        # Regime conditioning: trend-following deserves more say on trending
+        # tape, less in chop. Smoothly scaled by trend_score; neutral when the
+        # regime feed is silent (regime_context sets trend_score=0.5 then).
+        regime = self.regime_context(signals)
+        rw = self.strategy_params.get("regime_conf_weight", 0.35)
+        regime_factor = 1.0 + rw * (2.0 * regime["trend_score"] - 1.0)
+        confidence *= regime_factor
+
+        contributing = {
+            "pct_change": pct_change,
+            "trend_strength": trend_strength,
+            "vol_signal": vol_signal,
+            "regime": regime["label"],
+            "regime_factor": regime_factor,
+        }
+
         if abs(pct_change) < threshold:
-            return {"action": "hold", "side": "yes", "confidence": confidence,
-                    "reasoning": f"momentum {pct_change:.4f} below threshold {threshold}"}
+            return strategy_decision(
+                "hold", confidence=confidence, signals=contributing,
+                reasoning=f"momentum {pct_change:.4f} below threshold {threshold}")
 
         side = "yes" if pct_change > 0 else "no"
-        import config
         amount = config.get_max_position() * self.strategy_params["position_size_pct"]
+        # Strategy edge estimate: how far the move clears the trigger, scaled
+        # by trend quality — a thesis-strength proxy in probability units.
+        edge = min(0.10, (abs(pct_change) - threshold) * 50.0 * max(trend_strength, 0.2))
 
-        return {
-            "action": "buy",
-            "side": side,
-            "confidence": min(confidence, 0.95),
-            "reasoning": f"Momentum {pct_change:.4f} ({lookback} candles), trend_str={trend_strength:.2f}, vol={vol_signal:.2f}",
-            "suggested_amount": amount,
-        }
+        return strategy_decision(
+            "buy", side,
+            edge=edge,
+            confidence=min(confidence, 0.95),
+            reasoning=(f"Momentum {pct_change:.4f} ({lookback} candles), "
+                       f"trend_str={trend_strength:.2f}, vol={vol_signal:.2f}, "
+                       f"regime={regime['label']}x{regime_factor:.2f}"),
+            signals=contributing,
+            suggested_amount=amount,
+        )

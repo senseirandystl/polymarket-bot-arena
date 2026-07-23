@@ -6,6 +6,10 @@ credentials.json
 # outside the repo at ~/.config/polymarket/arena_fernet.key, 0600 perms)
 .credentials.enc
 
+# Docker Compose local env + bind-mounted data volume
+.env
+data/
+
 # Database & state
 *.db
 *.sqlite
@@ -35,3 +39,7 @@ bot_arena.db.bak.*
 
 # Offline signal-validation harness cache (real market data; keep out of git + bounded)
 tools/.signal_cache/
+
+# Backtester cache + generated reports (backtest/ package)
+backtest/.cache/
+backtest/reports/

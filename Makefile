@@ -3,7 +3,8 @@
 
 PY := .venv/bin/python3
 
-.PHONY: test test-unit test-integration coverage typecheck
+.PHONY: test test-unit test-integration coverage typecheck \
+	docker-up docker-down docker-logs docker-ps docker-build
 
 test:            ## full suite (unit + integration)
 	$(PY) -m pytest
@@ -19,3 +20,21 @@ coverage:        ## full suite with line coverage report
 
 typecheck:       ## mypy baseline (see mypy.ini)
 	$(PY) -m mypy .
+
+# --- Docker (24/7 stack; see docs/docker.md) ---
+
+docker-build:    ## build arena+dashboard image
+	docker compose build
+
+docker-up:       ## build + start arena + dashboard detached
+	@test -f .env || (cp .env.example .env && echo "Created .env from .env.example — set DASHBOARD_PASS before public expose")
+	docker compose up -d --build
+
+docker-down:     ## stop containers (keeps ./data)
+	docker compose down
+
+docker-logs:     ## follow arena + dashboard logs
+	docker compose logs -f
+
+docker-ps:       ## status + health
+	docker compose ps

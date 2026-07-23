@@ -104,7 +104,9 @@ def build_combined_signals(
     # non-directional context and are consumed directly (hybrid weighting,
     # selectivity).
     btc_prices = price_signals.get("prices", []) or []
-    regime = volatility_regime.compute(btc_prices)
+    # Base vol/trend scores (pure, local) — still the continuous inputs
+    # HybridBot and others read for tilt; the regime detector builds on them.
+    vol_base = volatility_regime.compute(btc_prices)
     tech = technicals.compute(btc_prices)
     xasset = cross_asset.compute(price_feed)
     try:
@@ -116,6 +118,46 @@ def build_combined_signals(
         futures = {"funding": 0.0, "oi_delta": 0.0, "taker_delta": 0.0,
                    "stale": True}
 
+    # Robust multi-feature regime (online EMA + hysteresis + optional
+    # centroids). Continuous: updates every tick, not only at resolution.
+    market_regime: dict = {}
+    try:
+        from signals.regime_detector import get_detector
+        market_regime = get_detector().update(
+            btc_prices,
+            cvd=cvd,
+            obi=obi,
+            vol_score=vol_base.get("vol_score"),
+            trend_score=vol_base.get("trend_score"),
+            realized_vol=vol_base.get("realized_vol"),
+        )
+    except Exception as e:
+        logger.debug(f"regime detector update failed: {e}")
+        market_regime = {
+            "regime_id": "unknown", "label": "unknown",
+            "regime": vol_base.get("regime", "unknown"),
+            "legacy": vol_base.get("regime", "unknown"),
+            "confidence": 0.0, "features": {},
+            "vol_score": vol_base.get("vol_score", 0.0),
+            "trend_score": vol_base.get("trend_score", 0.0),
+            "known": False,
+        }
+
+    # Enrich vol_regime so existing consumers (SignalView.vol_regime,
+    # HybridBot, sniper quiet check) see both legacy + rich fields without
+    # a second lookup. Detector's legacy maps onto quiet/normal/trending/
+    # volatile; regime_id holds the rich label.
+    regime = {
+        **vol_base,
+        "regime": market_regime.get("legacy") or vol_base.get("regime", "unknown"),
+        "regime_id": market_regime.get("regime_id", "unknown"),
+        "confidence": market_regime.get("confidence", 0.0),
+        "features": market_regime.get("features") or {},
+        "meta_bucket": market_regime.get("meta_bucket", "mixed"),
+        "mom_score": market_regime.get("mom_score", 0.0),
+        "flow_score": market_regime.get("flow_score", 0.0),
+    }
+
     return {
         **price_signals,
         **sent_signals,
@@ -125,6 +167,7 @@ def build_combined_signals(
         "btc_drift": btc_drift,
         "btc_strike": btc_strike,
         "vol_regime": regime,
+        "market_regime": market_regime,
         "technicals": tech,
         "xasset": xasset.get("xasset_score", 0.0),
         "futures": futures,

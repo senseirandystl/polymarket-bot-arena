@@ -1,0 +1,37 @@
+# Polymarket Bot Arena — systemd unit (bare metal alternative to Docker / launchd)
+#
+# Install (edit paths/User first):
+#   sudo cp deploy/systemd/polymarket-botarena.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now polymarket-botarena
+#
+# Pair with polymarket-dashboard.service. Prefer docker-compose for VPS if you
+# already use Docker — do not run both stacks against the same DB.
+
+[Unit]
+Description=Polymarket Bot Arena (trading loop)
+Documentation=file:///opt/pba/docs/docker.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pba
+Group=pba
+WorkingDirectory=/opt/pba
+Environment=PYTHONUNBUFFERED=1
+Environment=ARENA_NO_DASHBOARD=1
+Environment=TZ=America/New_York
+# Optional: EnvironmentFile=/opt/pba/.env
+ExecStart=/opt/pba/.venv/bin/python3 /opt/pba/arena.py
+Restart=on-failure
+RestartSec=30
+# Hardening (tune if you need writes outside /opt/pba)
+NoNewPrivileges=true
+PrivateTmp=true
+
+StandardOutput=append:/var/log/polymarket-botarena.out.log
+StandardError=append:/var/log/polymarket-botarena.err.log
+
+[Install]
+WantedBy=multi-user.target

@@ -123,4 +123,18 @@ class TradeResolver(threading.Thread):
             features = None
         if features:
             record_outcome(trade["bot_name"], features, side, won)
+        # Online regime performance: attribute this P&L to the regime the
+        # trade was opened in (stamped in trade_features as regime:<id>).
+        try:
+            rid = None
+            if isinstance(features, list):
+                for f in features:
+                    if isinstance(f, str) and f.startswith("regime:") and not f.startswith("regime_legacy:"):
+                        rid = f.split(":", 1)[1]
+                        break
+            if rid:
+                from signals.regime_detector import get_detector
+                get_detector().record_outcome(rid, pnl, won=won)
+        except Exception:
+            pass
         return True

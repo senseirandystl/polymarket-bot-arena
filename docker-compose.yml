@@ -1,0 +1,109 @@
+# Polymarket Bot Arena — 24/7 stack (arena + dashboard)
+#
+# Quick start:
+#   cp .env.example .env          # edit DASHBOARD_PASS before any public expose
+#   docker compose up -d --build
+#   open http://localhost:8501
+#
+# Full guide: docs/docker.md
+# Alternatives: launchd plists (macOS) / deploy/systemd/*.service (Linux bare metal)
+
+services:
+  arena:
+    build: .
+    image: polymarket-bot-arena:latest
+    container_name: pba-arena
+    restart: unless-stopped
+    # Compose auto-loads .env for ${...} substitution (file optional on first run).
+    environment:
+      PYTHONUNBUFFERED: "1"
+      ARENA_NO_DASHBOARD: "1"
+      ARENA_DB_PATH: /data/bot_arena.db
+      ARENA_LOG_DIR: /data/logs
+      ARENA_CREDENTIALS_FILE: /data/secrets/credentials.enc
+      ARENA_CREDENTIALS_KEY_FILE: /data/secrets/arena_fernet.key
+      # Operational knobs (set in .env — see config.py / .env.example)
+      ARENA_PAPER_BANKROLL: ${ARENA_PAPER_BANKROLL:-}
+      ARENA_KELLY_FRACTION: ${ARENA_KELLY_FRACTION:-}
+      ARENA_TRADE_LOOP_INTERVAL_SEC: ${ARENA_TRADE_LOOP_INTERVAL_SEC:-}
+      ARENA_MARKET_DATA_INTERVAL_SEC: ${ARENA_MARKET_DATA_INTERVAL_SEC:-}
+      ARENA_HTTP_MAX_RETRIES: ${ARENA_HTTP_MAX_RETRIES:-}
+      ARENA_LOG_JSON: ${ARENA_LOG_JSON:-}
+      ARENA_LOG_STALE_SEC: ${ARENA_LOG_STALE_SEC:-300}
+      TZ: ${TZ:-America/New_York}
+    volumes:
+      # Persist SQLite DB, logs, encrypted credentials + Fernet key
+      - ${PBA_DATA_DIR:-./data}:/data
+    # No published ports — arena is headless (dashboard is the UI)
+    healthcheck:
+      # Log must exist and advance within ARENA_LOG_STALE_SEC (default 5m).
+      # start_period covers cold import + first discovery cycle.
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import os,time,pathlib; p=pathlib.Path(os.environ.get('ARENA_LOG_DIR','/data/logs'))/'arena.log'; stale=float(os.environ.get('ARENA_LOG_STALE_SEC','300')); assert p.is_file() and (time.time()-p.stat().st_mtime)<stale, f'stale or missing {p}'",
+        ]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 90s
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+    # Give websockets / HTTPS a clean network namespace; no host network required
+    networks:
+      - pba
+
+  dashboard:
+    image: polymarket-bot-arena:latest
+    container_name: pba-dashboard
+    restart: unless-stopped
+    depends_on:
+      arena:
+        condition: service_started
+    environment:
+      PYTHONUNBUFFERED: "1"
+      ARENA_DB_PATH: /data/bot_arena.db
+      ARENA_LOG_DIR: /data/logs
+      ARENA_CREDENTIALS_FILE: /data/secrets/credentials.enc
+      ARENA_CREDENTIALS_KEY_FILE: /data/secrets/arena_fernet.key
+      DASHBOARD_HOST: "0.0.0.0"
+      DASHBOARD_PORT: "8501"
+      DASHBOARD_USER: ${DASHBOARD_USER:-admin}
+      DASHBOARD_PASS: ${DASHBOARD_PASS:-Thor}
+      ARENA_LOG_STALE_SEC: ${ARENA_LOG_STALE_SEC:-300}
+      TZ: ${TZ:-America/New_York}
+    volumes:
+      # Same data volume as arena (shared SQLite + logs + secrets)
+      - ${PBA_DATA_DIR:-./data}:/data
+    ports:
+      - "${DASHBOARD_BIND:-127.0.0.1}:${DASHBOARD_PORT:-8501}:8501"
+    command: ["python", "dashboard/server.py"]
+    healthcheck:
+      # /healthz is unauthenticated (Basic-auth bypass for probes)
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8501/healthz', timeout=5)",
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 45s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    networks:
+      - pba
+
+networks:
+  pba:
+    driver: bridge

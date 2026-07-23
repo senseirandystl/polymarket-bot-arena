@@ -120,6 +120,43 @@ def init_db():
                 created_at TEXT DEFAULT (datetime('now'))
             );
 
+            -- GA generation detail (fitness, elitism, lineage, operators).
+            -- Complements evolution_events; one row per GA cycle.
+            CREATE TABLE IF NOT EXISTS ga_generations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                cycle_number INTEGER NOT NULL,
+                report TEXT NOT NULL,            -- JSON: full GA report
+                best_fitness REAL,
+                mean_fitness REAL,
+                n_elites INTEGER DEFAULT 0,
+                n_replaced INTEGER DEFAULT 0,
+                n_spawned INTEGER DEFAULT 0,
+                skipped INTEGER DEFAULT 0,
+                created_at TEXT DEFAULT (datetime('now'))
+            );
+
+            -- Regime detector transition log (online, continuous).
+            CREATE TABLE IF NOT EXISTS regime_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                from_regime TEXT,
+                to_regime TEXT NOT NULL,
+                confidence REAL,
+                features TEXT,                   -- JSON feature snapshot
+                perf_snapshot TEXT,              -- JSON per-regime perf at change
+                created_at TEXT DEFAULT (datetime('now'))
+            );
+
+            -- Risk engine decision log (pause / size-reduce / kill / block).
+            CREATE TABLE IF NOT EXISTS risk_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                action TEXT NOT NULL,
+                level TEXT NOT NULL DEFAULT 'info',
+                bot_name TEXT,
+                reason TEXT,
+                detail TEXT,                     -- JSON
+                created_at TEXT DEFAULT (datetime('now'))
+            );
+
             CREATE TABLE IF NOT EXISTS daily_stats (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 bot_name TEXT NOT NULL,
@@ -178,6 +215,16 @@ def init_db():
                 created_at TEXT DEFAULT (datetime('now'))
             );
 
+            CREATE TABLE IF NOT EXISTS backtest_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                label TEXT NOT NULL,
+                markets INTEGER NOT NULL,
+                trades INTEGER NOT NULL,
+                summary TEXT NOT NULL,           -- JSON: metrics.summarize()
+                report_path TEXT,                -- full JSON report on disk
+                created_at TEXT DEFAULT (datetime('now'))
+            );
+
             CREATE TABLE IF NOT EXISTS lane_proposals (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 lane TEXT NOT NULL,              -- 'fut' | 'tech' | 'xasset'
@@ -226,8 +273,17 @@ def init_db():
 
 @contextmanager
 def get_conn():
-    conn = sqlite3.connect(str(DB_PATH))
+    # timeout covers brief multi-writer contention (arena + dashboard share
+    # one SQLite file under docker-compose / dual launchd services).
+    conn = sqlite3.connect(str(DB_PATH), timeout=30.0)
     conn.row_factory = sqlite3.Row
+    # WAL lets the dashboard read while the arena writes without "database is
+    # locked" storms; safe on a single host / shared volume.
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=30000")
+    except sqlite3.Error:
+        pass
     try:
         yield conn
         conn.commit()
@@ -514,6 +570,166 @@ def get_evolution_history(limit=20):
         return [dict(r) for r in rows]
 
 
+def log_ga_generation(cycle_number: int, report: dict) -> None:
+    """Persist a full GA cycle report for dashboard / offline analysis."""
+    individuals = report.get("individuals") or []
+    best = max((i.get("fitness", 0.0) for i in individuals), default=0.0)
+    mean = (
+        sum(i.get("fitness", 0.0) for i in individuals) / len(individuals)
+        if individuals else 0.0
+    )
+    # Strip non-JSON-safe live bot refs if any leaked in
+    safe_report = {
+        k: v for k, v in report.items()
+        if k not in ("bots",)
+    }
+    with get_conn() as conn:
+        conn.execute(
+            """INSERT INTO ga_generations
+               (cycle_number, report, best_fitness, mean_fitness,
+                n_elites, n_replaced, n_spawned, skipped)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                cycle_number,
+                json.dumps(safe_report, default=str),
+                best,
+                mean,
+                len(report.get("elites") or []),
+                len(report.get("replaced") or []),
+                len(report.get("spawned") or []),
+                1 if report.get("skipped") else 0,
+            ),
+        )
+
+
+def get_ga_history(limit: int = 20) -> list:
+    """Recent GA generation rows with parsed report JSON."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            """SELECT * FROM ga_generations
+               ORDER BY created_at DESC LIMIT ?""",
+            (limit,),
+        ).fetchall()
+        out = []
+        for r in rows:
+            d = dict(r)
+            if isinstance(d.get("report"), str):
+                try:
+                    d["report"] = json.loads(d["report"])
+                except Exception:
+                    pass
+            out.append(d)
+        return out
+
+
+def get_ga_status() -> dict:
+    """Compact GA status for the dashboard (last cycle + fitness curve)."""
+    last_raw = get_arena_state("ga_last_cycle")
+    hist_raw = get_arena_state("ga_fitness_history")
+    last = None
+    hist = []
+    if last_raw:
+        try:
+            last = json.loads(last_raw)
+        except Exception:
+            last = None
+    if hist_raw:
+        try:
+            hist = json.loads(hist_raw)
+        except Exception:
+            hist = []
+    return {"last_cycle": last, "fitness_history": hist or []}
+
+
+def log_regime_event(from_regime, to_regime, confidence, features, perf_snapshot=None):
+    """Persist a regime transition for dashboard / offline analysis."""
+    with get_conn() as conn:
+        conn.execute(
+            """INSERT INTO regime_events
+               (from_regime, to_regime, confidence, features, perf_snapshot)
+               VALUES (?, ?, ?, ?, ?)""",
+            (
+                from_regime,
+                to_regime,
+                float(confidence) if confidence is not None else None,
+                json.dumps(features or {}, default=str),
+                json.dumps(perf_snapshot or {}, default=str),
+            ),
+        )
+
+
+def get_regime_events(limit: int = 30) -> list:
+    with get_conn() as conn:
+        rows = conn.execute(
+            """SELECT * FROM regime_events
+               ORDER BY created_at DESC LIMIT ?""",
+            (limit,),
+        ).fetchall()
+        out = []
+        for r in rows:
+            d = dict(r)
+            for k in ("features", "perf_snapshot"):
+                if isinstance(d.get(k), str):
+                    try:
+                        d[k] = json.loads(d[k])
+                    except Exception:
+                        pass
+            out.append(d)
+        return out
+
+
+def log_risk_event(action: str, level: str = "info", reason: str = "",
+                   bot_name: str = None, detail: dict = None) -> int:
+    """Append one risk-engine decision for dashboard / audit trail."""
+    with get_conn() as conn:
+        cur = conn.execute(
+            """INSERT INTO risk_events (action, level, bot_name, reason, detail)
+               VALUES (?, ?, ?, ?, ?)""",
+            (
+                str(action),
+                str(level or "info"),
+                bot_name,
+                (reason or "")[:1000],
+                json.dumps(detail or {}, default=str),
+            ),
+        )
+        # Cap table growth (keep newest N)
+        max_keep = int(getattr(config, "RISK_EVENT_LOG_MAX", 500))
+        conn.execute(
+            """DELETE FROM risk_events WHERE id NOT IN (
+                   SELECT id FROM risk_events ORDER BY id DESC LIMIT ?
+               )""",
+            (max_keep,),
+        )
+        return cur.lastrowid
+
+
+def get_risk_events(limit: int = 40, bot_name: str = None) -> list:
+    """Most recent risk decisions (newest first)."""
+    with get_conn() as conn:
+        if bot_name:
+            rows = conn.execute(
+                """SELECT * FROM risk_events WHERE bot_name=?
+                   ORDER BY id DESC LIMIT ?""",
+                (bot_name, int(limit)),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """SELECT * FROM risk_events ORDER BY id DESC LIMIT ?""",
+                (int(limit),),
+            ).fetchall()
+    out = []
+    for r in rows:
+        d = dict(r)
+        if isinstance(d.get("detail"), str):
+            try:
+                d["detail"] = json.loads(d["detail"])
+            except Exception:
+                pass
+        out.append(d)
+    return out
+
+
 def get_total_daily_loss(mode="paper"):
     with get_conn() as conn:
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -645,6 +861,39 @@ def set_kelly_fraction(fraction):
 # to weight the lane live — no config edit, no restart. Denying just closes
 # the proposal (the harness may re-file after a later run with fresh data).
 # ---------------------------------------------------------------------------
+
+def record_backtest_run(label: str, markets: int, trades: int,
+                        summary: dict, report_path=None) -> int:
+    """Store one offline backtest run's summary (backtest/ package).
+
+    Same pattern as lane_validation_runs: run records only, never trade
+    tables — the dashboard can list runs via get_backtest_runs.
+    """
+    with get_conn() as conn:
+        cur = conn.execute(
+            "INSERT INTO backtest_runs (label, markets, trades, summary, "
+            "report_path) VALUES (?, ?, ?, ?, ?)",
+            (str(label), int(markets), int(trades), json.dumps(summary),
+             report_path))
+        return cur.lastrowid
+
+
+def get_backtest_runs(limit: int = 20) -> list:
+    """Most recent backtest runs, summaries parsed."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM backtest_runs ORDER BY id DESC LIMIT ?",
+            (int(limit),)).fetchall()
+    out = []
+    for row in rows:
+        d = dict(row)
+        try:
+            d["summary"] = json.loads(d["summary"])
+        except (TypeError, ValueError):
+            d["summary"] = {}
+        out.append(d)
+    return out
+
 
 def record_lane_validation_run(markets, samples, results: dict) -> int:
     """Store one harness run's per-lane metrics. Returns the run id."""

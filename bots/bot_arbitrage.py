@@ -30,7 +30,7 @@ import time
 import config
 import db
 import polymarket_markets
-from bots.base_bot import BaseBot
+from bots.base_bot import BaseBot, strategy_decision
 from polymarket_fills import simulate_fill_shares
 from venues import get_engine
 
@@ -59,8 +59,8 @@ class ArbitrageBot(BaseBot):
     # ``analyze`` is abstract on BaseBot but unused here — arb overrides the
     # whole decision path. Return a neutral hold so nothing calls into it.
     def analyze(self, market: dict, signals: dict) -> dict:
-        return {"action": "hold", "side": "yes", "confidence": 0.0,
-                "reasoning": "arbitrage uses make_decision override"}
+        return strategy_decision(
+            "hold", reasoning="arbitrage uses make_decision override")
 
     def _book(self, token_id: str) -> dict:
         """Fetch a token's book with a sub-second micro-cache."""
@@ -75,9 +75,9 @@ class ArbitrageBot(BaseBot):
         return book
 
     @staticmethod
-    def _skip(reason: str) -> dict:
-        return {"action": "skip", "side": "yes", "confidence": 0.0,
-                "reasoning": reason, "suggested_amount": 0}
+    def _skip(reason: str, edge: float = 0.0, signals: dict | None = None) -> dict:
+        return strategy_decision("skip", edge=edge, reasoning=reason,
+                                 signals=signals or {})
 
     def make_decision(self, market: dict, signals: dict) -> dict:
         yes_tok = market.get("polymarket_token_id")
@@ -149,33 +149,46 @@ class ArbitrageBot(BaseBot):
         edge_total = shares - net_cost
         edge = edge_total / shares  # locked-in profit per matched pair
 
+        # Fee attribution: the edge above is already NET of both legs' taker
+        # fees (fees are inside net_cost) — the threshold below therefore
+        # compares fee-adjusted lock-in against the margin floor, never a
+        # gross yes+no<1 gap that fees would eat.
+        fee_per_pair = (fy["fee"] + fn["fee"]) / shares
+        arb_signals = {"yes_vwap": fy["avg_price"], "no_vwap": fn["avg_price"],
+                       "fee_per_pair": fee_per_pair, "shares": shares,
+                       "net_cost": net_cost}
+
         min_margin = self.strategy_params.get("min_margin", config.ARBITRAGE_MIN_MARGIN)
         if edge < min_margin:
             return self._skip(
                 f"arb: no edge (yes_vwap={fy['avg_price']:.3f}+"
                 f"no_vwap={fn['avg_price']:.3f}, edge={edge:+.4f}/pair"
-                f"<{min_margin:.3f}) @ {shares:.1f}sh"
+                f"<{min_margin:.3f}, fees={fee_per_pair:.4f}/pair) "
+                f"@ {shares:.1f}sh",
+                edge=edge, signals=arb_signals,
             )
 
         reasoning = (
             f"ARB edge={edge:+.4f}/pair x{shares:.1f}sh "
             f"(yes_vwap={fy['avg_price']:.3f} no_vwap={fn['avg_price']:.3f} "
-            f"net=${net_cost:.2f} lock=${edge_total:.2f})"
+            f"fees={fee_per_pair:.4f}/pair net=${net_cost:.2f} "
+            f"lock=${edge_total:.2f})"
         )
-        return {
-            "action": "buy",
-            "side": "yes",  # nominal — this is a two-legged trade (see 'legs')
-            "confidence": min(0.95, edge * 10),
-            "reasoning": reasoning,
-            "suggested_amount": fy["cost"] + fn["cost"],
-            "legs": [
+        return strategy_decision(
+            "buy", "yes",  # nominal side — this is a two-legged trade (see 'legs')
+            edge=edge,
+            confidence=min(0.95, edge * 10),
+            reasoning=reasoning,
+            signals=arb_signals,
+            suggested_amount=fy["cost"] + fn["cost"],
+            legs=[
                 {"side": "yes", "shares": shares, "amount": fy["cost"],
                  "vwap": fy["avg_price"]},
                 {"side": "no", "shares": shares, "amount": fn["cost"],
                  "vwap": fn["avg_price"]},
             ],
-            "features": None,
-        }
+            features=None,
+        )
 
     def execute(self, signal: dict, market: dict) -> dict:
         """Place BOTH legs. Both must fill for a genuine (neutral) arb.
@@ -192,6 +205,20 @@ class ArbitrageBot(BaseBot):
             return {"success": False, "reason": "bot_paused"}
         if signal.get("action") != "buy" or not signal.get("legs"):
             return {"success": False, "reason": "no_legs"}
+
+        # Risk engine gate (kill switch / portfolio pause / daily loss).
+        try:
+            from arena.risk_engine import pre_trade
+            mode_hint = db.get_bot_mode(self.name)
+            risk = pre_trade(self.name, mode=mode_hint,
+                             amount=float(signal.get("suggested_amount") or 0))
+            if not risk.allow:
+                if risk.action in ("pause", "kill"):
+                    self._paused = True
+                logger.warning(f"[{self.name}] ARB risk block: {risk.reason}")
+                return {"success": False, "reason": risk.reason}
+        except Exception as e:
+            logger.warning(f"[{self.name}] ARB risk check failed (continuing): {e}")
 
         yes_tok = market.get("polymarket_token_id")
         no_tok = market.get("polymarket_no_token_id")

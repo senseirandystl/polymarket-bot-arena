@@ -42,6 +42,22 @@ LIVE_LANE_KEYS = {
 CANDIDATE_KEYS = ["fut_taker", "fut_funding", "fut_oi",
                   "tech_mtf", "tech_macd", "tech_bb", "xasset"]
 
+# Expanded feature-suite keys (signals/multiscale.py, signals/regime.py,
+# signals/session_features.py — attached by attach_features). DIRECTIONAL
+# keys are side-pickers ranked by the harness scorecard; CONTEXT keys are
+# non-directional conditioners used for the regime-split analysis. Neither
+# set is part of the fut/tech/xasset promotion pipeline — a directional
+# feature that ranks well graduates by being wired as a lane and re-proposed,
+# never by skipping the pipeline.
+FEATURE_DIRECTIONAL_KEYS = ["ms_mom_1m", "ms_mom_3m", "ms_mom_5m",
+                            "ms_mom_15m"]
+FEATURE_CONTEXT_KEYS = ["ms_rvol_5m", "ms_rvol_15m", "ms_rvol_30m",
+                        "ms_atr_5m", "ms_vol_ratio",
+                        "regime_trend", "regime_trend_10", "regime_trend_30",
+                        "regime_chop",
+                        "sess_tod_sin", "sess_tod_cos", "sess_nyse_prox",
+                        "sess_weekend"]
+
 # Promotion thresholds: a lane must clear ALL of them on its LIVE definition.
 # Net edge is the bar that killed pm_mom (predictive, -0.80c/share); the WR
 # and sample floors keep one lucky regime from qualifying.
@@ -136,6 +152,43 @@ def attach_candidates(samples: list, open_ts: float, series: dict) -> None:
                 peers.append(soft_saturate((two[1] - two[0]) / two[0],
                                            XASSET_SCALE))
         s.signals["xasset"] = (sum(peers) / len(peers)) if peers else None
+
+
+def attach_features(samples: list, open_ts: float, series: dict) -> None:
+    """Compute the expanded feature suite into each sample's ``signals`` dict.
+
+    Same contract as :func:`attach_candidates` — one market's Samples plus
+    epoch-second series. Uses the PRODUCTION feature code
+    (signals/multiscale.py, signals/regime.py, signals/session_features.py)
+    so the harness validates exactly what would ship. Book/flow features
+    (signals/microstructure.py, signals/flow.py) need historical books/tape
+    the venue does not archive — those validate via live shadow attribution
+    instead and are not attached here.
+    """
+    from datetime import datetime, timezone
+
+    from signals import multiscale, regime as regime_mod, session_features
+
+    for s in samples:
+        elapsed = 300 - s.time_remaining
+        ts = open_ts + elapsed
+
+        closes = (series["btc_close"].closes_until(ts, 60)
+                  if "btc_close" in series else [])
+        if len(closes) >= 6:
+            feats = {**multiscale.compute(closes), **regime_mod.compute(closes)}
+        else:
+            feats = {k: None for k in (FEATURE_DIRECTIONAL_KEYS
+                                       + FEATURE_CONTEXT_KEYS)
+                     if not k.startswith("sess_")}
+
+        sess = session_features.compute(
+            datetime.fromtimestamp(ts, tz=timezone.utc))
+        for key in FEATURE_DIRECTIONAL_KEYS + FEATURE_CONTEXT_KEYS:
+            if key.startswith("sess_"):
+                s.signals[key] = sess.get(key)
+            else:
+                s.signals[key] = feats.get(key)
 
 
 def _lane_rule(key: str, deadband: float = DEADBAND):

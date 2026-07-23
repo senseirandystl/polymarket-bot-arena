@@ -67,18 +67,36 @@ async def _healthz(request: Request, call_next):
     normal authenticated routes untouched.
     """
     if request.url.path == "/healthz":
-        stale_after = int(os.environ.get("ARENA_LOG_STALE_SEC", "300"))
+        stale_after = int(os.environ.get(
+            "ARENA_LOG_STALE_SEC",
+            str(getattr(config, "ARENA_LOG_STALE_SEC", 300)),
+        ))
         log_path = config.LOG_DIR / "arena.log"
         age = None
         try:
             age = time.time() - log_path.stat().st_mtime
         except OSError:
             pass
+        # Lightweight kill-switch hint (no heavy imports if possible)
+        killed = False
+        try:
+            ks = db.get_arena_state("kill_switch")
+            killed = ks in ("1", "true", "on")
+            if not killed:
+                from pathlib import Path as _P
+                kf = _P(getattr(config, "RISK_KILL_SWITCH_FILE", "") or "")
+                killed = kf.is_file() and kf.read_text(errors="ignore").strip().lower() not in (
+                    "0", "false", "off", "no", "clear", "disarm",
+                )
+        except Exception:
+            pass
+        stale = age is not None and age > stale_after
         return JSONResponse({
-            "status": "ok",
+            "status": "degraded" if (stale or killed) else "ok",
             "ts": time.time(),
             "arena_log_age_sec": round(age, 1) if age is not None else None,
-            "arena_log_stale": (age is not None and age > stale_after),
+            "arena_log_stale": stale,
+            "kill_switch": killed,
         })
     return await call_next(request)
 
@@ -149,6 +167,80 @@ def get_bot_balance(trading_mode="paper"):
 def index():
     html_path = Path(__file__).parent / "index.html"
     return html_path.read_text()
+
+
+@app.get("/api/ops")
+def get_ops(_auth: str = Depends(verify_auth)):
+    """Command-center snapshot: regime, risk, allocation, signals, health."""
+    from arena.ops_snapshot import ops_snapshot
+    try:
+        return JSONResponse(ops_snapshot())
+    except Exception as e:
+        logger.exception("ops snapshot failed")
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.get("/api/health")
+def get_health(_auth: str = Depends(verify_auth)):
+    """Deep health checks + restart recommendations (authenticated)."""
+    from arena.health import run_health_checks
+    try:
+        return JSONResponse(run_health_checks())
+    except Exception as e:
+        logger.exception("health check failed")
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.get("/api/alerts")
+def get_alerts(_auth: str = Depends(verify_auth)):
+    """Alert channel config, credential presence, and recent alert log."""
+    from arena import alerts
+    try:
+        return JSONResponse({
+            "config": alerts.load_config(),
+            "channels": alerts.channel_status(),
+            "log": alerts.get_alert_log(40),
+            "event_types": list(alerts.EVENT_TYPES),
+        })
+    except Exception as e:
+        logger.exception("alerts get failed")
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.post("/api/alerts")
+async def update_alerts(request: Request, _auth: str = Depends(verify_auth)):
+    """Update alert config and/or send a test message.
+
+    Body: {enabled?, channels?, events?, min_level?, debounce_sec?, test?: bool|channel}
+    """
+    from arena import alerts
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        return JSONResponse({"error": "JSON object required"}, status_code=400)
+    try:
+        cfg = alerts.load_config()
+        patch = {k: body[k] for k in (
+            "enabled", "channels", "events", "min_level", "debounce_sec"
+        ) if k in body}
+        if patch:
+            cfg = alerts.save_config({**cfg, **patch})
+        test_result = None
+        if body.get("test"):
+            ch = body["test"] if isinstance(body["test"], str) else None
+            test_result = alerts.send_test(ch)
+        return JSONResponse({
+            "success": True,
+            "config": cfg,
+            "channels": alerts.channel_status(),
+            "test": test_result,
+            "log": alerts.get_alert_log(20),
+        })
+    except Exception as e:
+        logger.exception("alerts update failed")
+        return JSONResponse({"error": str(e)}, status_code=500)
 
 
 @app.get("/api/status")
@@ -424,6 +516,19 @@ def get_entry_buckets(mode: str = "paper", hours: int = None):
     return JSONResponse(db.get_entry_price_buckets(mode=mode, hours=hours))
 
 
+@app.get("/api/hybrid-meta")
+def get_hybrid_meta():
+    """Hybrid meta-learner state (arena_state 'hybrid_meta'): per-sub online
+    multipliers with per-regime-bucket records, and the last effective
+    sub-strategy weights the ensemble actually used. Empty until the hybrid
+    has run at least once on this DB."""
+    raw = db.get_arena_state("hybrid_meta")
+    try:
+        return JSONResponse(json.loads(raw) if raw else {})
+    except (json.JSONDecodeError, TypeError):
+        return JSONResponse({})
+
+
 @app.get("/api/skips")
 def get_skips():
     """Skip-reason tally the arena persists (why it sat flat, not just what it
@@ -492,6 +597,164 @@ async def set_kelly(request: Request, _auth: str = Depends(verify_auth)):
     return JSONResponse({"success": True, "kelly_fraction": db.get_kelly_fraction()})
 
 
+@app.get("/api/portfolio")
+def get_portfolio(_auth: str = Depends(verify_auth)):
+    """Portfolio capital allocation state (weights, metrics, method, toggles).
+
+    Weights sum to 1 across active bots when allocation is enabled; each bot
+    Kelly-sizes against bankroll × weight. See arena/portfolio.py.
+    """
+    from arena import portfolio
+    try:
+        snap = portfolio.dashboard_snapshot()
+    except Exception as e:
+        logger.exception("portfolio snapshot failed")
+        return JSONResponse({"error": str(e)}, status_code=500)
+    return JSONResponse(snap)
+
+
+@app.get("/api/risk")
+def get_risk(_auth: str = Depends(verify_auth)):
+    """Risk engine snapshot: limits, per-bot status, VaR, kill switch, events."""
+    from arena import risk_engine
+    try:
+        return JSONResponse(risk_engine.dashboard_snapshot())
+    except Exception as e:
+        logger.exception("risk snapshot failed")
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.post("/api/risk")
+async def update_risk(request: Request, _auth: str = Depends(verify_auth)):
+    """Update risk engine settings / evaluate / pause-resume bots.
+
+    Body fields (all optional):
+      enabled: bool
+      limits: {bot_daily_loss, portfolio_daily_loss, bot_max_drawdown, ...}
+      evaluate: bool  — force full recompute
+      pause_bot: str  — bot name to manually pause
+      resume_bot: str
+      reason: str     — reason for pause
+    """
+    from arena import risk_engine
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        return JSONResponse({"error": "JSON object required"}, status_code=400)
+    try:
+        state = risk_engine.load_state()
+        if "enabled" in body:
+            state = risk_engine.set_enabled(bool(body["enabled"]))
+        if isinstance(body.get("limits"), dict):
+            state = risk_engine.update_limits(body["limits"])
+        if body.get("pause_bot"):
+            risk_engine.pause_bot(
+                str(body["pause_bot"]),
+                reason=str(body.get("reason") or "manual_pause"),
+            )
+        if body.get("resume_bot"):
+            risk_engine.resume_bot(str(body["resume_bot"]))
+        if body.get("evaluate"):
+            state = risk_engine.evaluate()
+        else:
+            state = risk_engine.load_state()
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    except Exception as e:
+        logger.exception("risk update failed")
+        return JSONResponse({"error": str(e)}, status_code=500)
+    return JSONResponse({"success": True, **state})
+
+
+@app.post("/api/risk/kill-switch")
+async def risk_kill_switch(request: Request, _auth: str = Depends(verify_auth)):
+    """Arm or clear the global kill switch (halts all trading).
+
+    Body: {armed: bool, reason?: str}
+    Also mirrored to logs/KILL_SWITCH file for operator file-based control.
+    """
+    from arena import risk_engine
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    armed = bool(body.get("armed"))
+    reason = str(body.get("reason") or ("dashboard_arm" if armed else "dashboard_clear"))
+    try:
+        state = risk_engine.set_kill_switch(armed, reason=reason, source="dashboard")
+    except Exception as e:
+        logger.exception("kill switch failed")
+        return JSONResponse({"error": str(e)}, status_code=500)
+    return JSONResponse({
+        "success": True,
+        "kill_switch": state.get("kill_switch"),
+        "killed": bool(state.get("kill_switch")) or risk_engine._file_kill_armed(),
+        "kill_reason": state.get("kill_reason"),
+        "kill_file": str(risk_engine.kill_switch_file_path()),
+    })
+
+
+@app.post("/api/portfolio")
+async def update_portfolio(request: Request, _auth: str = Depends(verify_auth)):
+    """Update portfolio allocation settings and/or force a rebalance.
+
+    Body fields (all optional):
+      enabled: bool
+      method: equal | sharpe | expectancy | kelly_portfolio
+      window_hours: float
+      manual_overrides: {bot_name: weight}  (empty dict clears pins)
+      merge_overrides: bool (default false — replace overrides)
+      rebalance: bool (force rebalance now)
+    """
+    from arena import portfolio
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        return JSONResponse({"error": "JSON object required"}, status_code=400)
+
+    try:
+        state = portfolio.load_state()
+        if "enabled" in body:
+            state = portfolio.set_enabled(bool(body["enabled"]))
+        if "method" in body and body["method"] is not None:
+            state = portfolio.set_method(str(body["method"]))
+        if "window_hours" in body and body["window_hours"] is not None:
+            try:
+                wh = float(body["window_hours"])
+            except (TypeError, ValueError):
+                return JSONResponse(
+                    {"error": "window_hours must be a number"}, status_code=400)
+            if wh < 1 or wh > 168:
+                return JSONResponse(
+                    {"error": "window_hours must be in [1, 168]"}, status_code=400)
+            state = portfolio.load_state()
+            state["window_hours"] = wh
+            portfolio.save_state(state)
+            state = portfolio.rebalance(force=True, reason="window_change")
+        if "manual_overrides" in body:
+            ov = body["manual_overrides"]
+            if ov is None:
+                ov = {}
+            if not isinstance(ov, dict):
+                return JSONResponse(
+                    {"error": "manual_overrides must be an object"}, status_code=400)
+            state = portfolio.set_manual_overrides(
+                ov, merge=bool(body.get("merge_overrides")))
+        if body.get("rebalance"):
+            state = portfolio.rebalance(force=True, reason="manual")
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    except Exception as e:
+        logger.exception("portfolio update failed")
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+    return JSONResponse({"success": True, **state})
+
+
 @app.get("/api/lane-proposals")
 def get_lane_proposals(_auth: str = Depends(verify_auth)):
     """Signal Lab: candidate-lane proposals + approved overrides + last run.
@@ -521,6 +784,18 @@ def get_lane_proposals(_auth: str = Depends(verify_auth)):
         "core_tuner": core_tuner,
         "auto_approve": db.get_auto_approve_lanes(),
     })
+
+
+@app.get("/api/backtests")
+def get_backtests(limit: int = 20, _auth: str = Depends(verify_auth)):
+    """Signal Lab: recent offline backtest runs (backtest/ package).
+
+    Runs are recorded by ``python -m backtest --to-db`` (or the
+    backtest.run_backtest API); summaries carry expectancy/WR/PF/Sharpe/
+    drawdown, per-regime splits and per-signal contribution. Read-only —
+    the backtester never writes trade tables.
+    """
+    return JSONResponse({"runs": db.get_backtest_runs(limit=limit)})
 
 
 @app.post("/api/lane-auto-approve")
@@ -692,6 +967,88 @@ def get_evolution():
             if isinstance(h.get(key), str):
                 h[key] = json.loads(h[key])
     return JSONResponse(history)
+
+
+@app.get("/api/regime")
+def get_regime():
+    """Current market regime, transition log, and per-regime performance."""
+    try:
+        from signals.regime_detector import get_detector
+        status = get_detector().status()
+    except Exception as e:
+        status = {"error": str(e), "current": {}, "performance": {},
+                  "transitions": []}
+    # Prefer durable DB history when available
+    try:
+        events = db.get_regime_events(limit=25)
+    except Exception:
+        events = []
+    if events:
+        status["db_events"] = events
+    return JSONResponse(status)
+
+
+@app.get("/api/ga")
+def get_ga():
+    """Genetic Algorithm status: last cycle snapshot, fitness curve, recent gens."""
+    status = db.get_ga_status()
+    gens = db.get_ga_history(limit=15)
+    # Compact generation rows for the UI (full report available on demand)
+    compact = []
+    for g in gens:
+        report = g.get("report") or {}
+        compact.append({
+            "cycle_number": g.get("cycle_number"),
+            "best_fitness": g.get("best_fitness"),
+            "mean_fitness": g.get("mean_fitness"),
+            "n_elites": g.get("n_elites"),
+            "n_replaced": g.get("n_replaced"),
+            "n_spawned": g.get("n_spawned"),
+            "skipped": bool(g.get("skipped")),
+            "created_at": g.get("created_at"),
+            "elites": report.get("elites") or [],
+            "replaced": report.get("replaced") or [],
+            "spawned": [
+                {
+                    "name": s.get("name"),
+                    "parents": s.get("parents"),
+                    "operator": s.get("operator"),
+                    "lineage": s.get("lineage"),
+                    "strategy_type": s.get("strategy_type"),
+                }
+                for s in (report.get("spawned") or [])
+            ],
+            "individuals": [
+                {
+                    "name": i.get("name"),
+                    "fitness": i.get("fitness"),
+                    "components": i.get("components"),
+                    "status": i.get("status"),
+                    "elite": i.get("elite"),
+                    "pnl": i.get("pnl"),
+                    "win_rate": i.get("win_rate"),
+                    "trades": i.get("trades"),
+                    "strategy_type": i.get("strategy_type"),
+                    "lineage": i.get("lineage"),
+                }
+                for i in (report.get("individuals") or [])
+            ],
+        })
+    return JSONResponse({
+        "status": status,
+        "generations": compact,
+        "config": {
+            "elite_count": getattr(config, "GA_ELITE_COUNT", 1),
+            "mutation_rate": getattr(config, "GA_MUTATION_RATE", 0.2),
+            "mutation_sigma": getattr(config, "GA_MUTATION_SIGMA", 0.12),
+            "tournament_k": getattr(config, "GA_TOURNAMENT_K", 3),
+            "interval_hours": getattr(config, "EVOLUTION_INTERVAL_HOURS", 2),
+            "window_hours": getattr(config, "EVOLUTION_WINDOW_HOURS", 24),
+            "perf_trigger_enabled": getattr(config, "GA_PERF_TRIGGER_ENABLED", True),
+            "perf_trigger_pnl": getattr(config, "GA_PERF_TRIGGER_PNL", -25.0),
+            "fitness_weights": getattr(config, "GA_FITNESS_WEIGHTS", {}),
+        },
+    })
 
 
 @app.get("/api/trades")
