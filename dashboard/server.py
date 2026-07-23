@@ -54,6 +54,35 @@ def verify_auth(credentials: HTTPBasicCredentials = Depends(security)):
 
 app = FastAPI(title="Polymarket Bot Arena Dashboard", dependencies=[Depends(verify_auth)])
 
+
+@app.middleware("http")
+async def _healthz(request: Request, call_next):
+    """Unauthenticated liveness probe at ``/healthz`` for watchdogs/monitors.
+
+    Runs as middleware so it bypasses the app-wide Basic-auth dependency (an
+    external uptime check should not need credentials). Cheap: no DB, just the
+    age of ``arena.log`` so a monitor can tell a HUNG arena (log not advancing)
+    from a healthy one. ``stale`` flips true past ARENA_LOG_STALE_SEC; a watchdog
+    (arena_watchdog.sh) can restart on it. Every other path falls through to the
+    normal authenticated routes untouched.
+    """
+    if request.url.path == "/healthz":
+        stale_after = int(os.environ.get("ARENA_LOG_STALE_SEC", "300"))
+        log_path = config.LOG_DIR / "arena.log"
+        age = None
+        try:
+            age = time.time() - log_path.stat().st_mtime
+        except OSError:
+            pass
+        return JSONResponse({
+            "status": "ok",
+            "ts": time.time(),
+            "arena_log_age_sec": round(age, 1) if age is not None else None,
+            "arena_log_stale": (age is not None and age > stale_after),
+        })
+    return await call_next(request)
+
+
 # Balance cache: key -> {"balance": float, "fetched_at": float}
 _balance_cache = {}
 BALANCE_CACHE_TTL = 60  # seconds
