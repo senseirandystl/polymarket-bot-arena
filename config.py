@@ -31,6 +31,17 @@ POLYMARKET_HOST = "https://clob.polymarket.com"
 POLYMARKET_GAMMA_URL = "https://gamma-api.polymarket.com"  # discovery + resolution
 POLYMARKET_CHAIN_ID = 137  # Polygon
 
+# --- Shared HTTP retry policy (http_client.request_with_retry) ---
+# Bounded retries + exponential backoff for SLOW-cadence reads (discovery,
+# resolution, CVD, PM history, strike). NOT applied to the 1s hot-path book/
+# midpoint reads — a retry-sleep there would stall the trader tick, and those
+# calls are already best-effort with a warm-cache fallback. Worst-case added
+# latency per call ≈ backoff_base·(2^0 + 2^1) ≈ 1.2s at the defaults.
+HTTP_MAX_RETRIES = 2                       # attempts after the first = 3 total tries
+HTTP_BACKOFF_BASE = 0.4                    # seconds; grows 0.4, 0.8, ... (capped)
+HTTP_BACKOFF_CAP = 2.0                     # per-sleep ceiling
+HTTP_RETRY_STATUSES = (429, 500, 502, 503, 504)  # transient server/rate-limit codes
+
 # BTC 5-min up/down markets live under this recurring Gamma series ("BTC Up or
 # Down 5m"). Discovery lists this series' open events; the live 5-min window is
 # then selected by its real resolves_at timestamp (see arena/market_utils).

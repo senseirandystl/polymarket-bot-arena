@@ -21,7 +21,7 @@ import time
 import threading
 from typing import Optional
 
-import requests
+import http_client
 
 import config
 
@@ -44,7 +44,7 @@ class PolymarketPriceFeed:
     def _fetch_history(self, token_id: str) -> list[dict]:
         """Fetch recent price history from Polymarket CLOB."""
         try:
-            resp = requests.get(
+            resp = http_client.get(
                 PRICE_HISTORY_URL,
                 params={"market": token_id, "interval": "1m", "fidelity": 10},
                 timeout=8,

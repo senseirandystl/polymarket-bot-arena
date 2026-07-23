@@ -19,6 +19,7 @@ from datetime import datetime, timezone
 import requests
 
 import config
+import http_client
 from signals import clean_tick
 
 logger = logging.getLogger("polymarket.markets")
@@ -65,7 +66,7 @@ def discover_markets(limit: int = None) -> list:
         limit = getattr(config, "POLYMARKET_DISCOVERY_LIMIT", 6)
     now = datetime.now(timezone.utc).isoformat()
     try:
-        resp = requests.get(
+        resp = http_client.get(
             f"{GAMMA}/events",
             params={
                 "series_id": SERIES_ID,
@@ -355,7 +356,7 @@ def recent_resolutions(limit: int = 100) -> dict:
     it rather than doing per-market lookups.
     """
     try:
-        resp = requests.get(
+        resp = http_client.get(
             f"{GAMMA}/events",
             params={
                 "series_id": SERIES_ID,

@@ -25,7 +25,7 @@ import threading
 import time
 from typing import Optional
 
-import requests
+import http_client
 
 import config
 
@@ -108,7 +108,7 @@ class CvdFeed:
 
     def _fetch(self, condition_id: str) -> list:
         try:
-            resp = requests.get(
+            resp = http_client.get(
                 TRADES_URL,
                 params={"market": condition_id, "limit": CVD_TRADE_LIMIT},
                 timeout=8,
