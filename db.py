@@ -269,7 +269,7 @@ def resolve_trade(internal_id, outcome, pnl):
 def get_bot_trades(bot_name, hours=None, limit=50):
     with get_conn() as conn:
         if hours:
-            cutoff = (datetime.utcnow() - timedelta(hours=hours)).strftime("%Y-%m-%d %H:%M:%S")
+            cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).strftime("%Y-%m-%d %H:%M:%S")
             rows = conn.execute(
                 "SELECT * FROM trades WHERE bot_name=? AND created_at>=? ORDER BY created_at DESC LIMIT ?",
                 (bot_name, cutoff, limit)
@@ -288,7 +288,7 @@ def get_bot_performance(bot_name, hours=12, mode=None):
         conditions = ["bot_name=?", "outcome IN ('win', 'loss', 'exit_tp', 'exit_sl')"]
         params = [bot_name]
         if hours is not None:
-            cutoff = (datetime.utcnow() - timedelta(hours=hours)).strftime("%Y-%m-%d %H:%M:%S")
+            cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).strftime("%Y-%m-%d %H:%M:%S")
             conditions.append("created_at>=?")
             params.append(cutoff)
         if mode is not None:
@@ -345,7 +345,7 @@ def get_entry_price_buckets(mode=None, hours=None):
             conditions.append("mode=?")
             params.append(mode)
         if hours is not None:
-            cutoff = (datetime.utcnow() - timedelta(hours=hours)).strftime("%Y-%m-%d %H:%M:%S")
+            cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).strftime("%Y-%m-%d %H:%M:%S")
             conditions.append("created_at>=?")
             params.append(cutoff)
         where = " AND ".join(conditions)
@@ -392,7 +392,7 @@ def get_entry_price_buckets(mode=None, hours=None):
 
 def get_all_bots_performance(hours=12):
     with get_conn() as conn:
-        cutoff = (datetime.utcnow() - timedelta(hours=hours)).strftime("%Y-%m-%d %H:%M:%S")
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).strftime("%Y-%m-%d %H:%M:%S")
         rows = conn.execute("""
             SELECT
                 bot_name,
@@ -456,7 +456,7 @@ def wipe_all():
     return len(tables)
 
 
-def add_copy_wallet(address: str, label: str = None, mode: str = "paper"):
+def add_copy_wallet(address: str, label: str | None = None, mode: str = "paper"):
     """Add or reactivate a wallet to copy-trade. mode: 'paper' or 'live'."""
     with get_conn() as conn:
         conn.execute(
@@ -516,7 +516,7 @@ def get_evolution_history(limit=20):
 
 def get_total_daily_loss(mode="paper"):
     with get_conn() as conn:
-        today = datetime.utcnow().strftime("%Y-%m-%d")
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         row = conn.execute("""
             SELECT COALESCE(SUM(pnl), 0) as total_loss
             FROM trades
@@ -527,7 +527,7 @@ def get_total_daily_loss(mode="paper"):
 
 def get_bot_daily_loss(bot_name, mode="paper"):
     with get_conn() as conn:
-        today = datetime.utcnow().strftime("%Y-%m-%d")
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         row = conn.execute("""
             SELECT COALESCE(SUM(pnl), 0) as total_loss
             FROM trades
@@ -751,7 +751,7 @@ def decide_lane_proposal(proposal_id, action):
         overrides[row["lane"]] = {
             "enabled": True,
             "profile": prop.get("profile", {}),
-            "approved_at": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+            "approved_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
         }
         set_arena_state("lane_overrides", json.dumps(overrides))
     return status

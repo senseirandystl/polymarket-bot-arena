@@ -89,7 +89,7 @@ class BaseBot(ABC):
     # Exit strategy: None = hold to resolution (default)
     # "stop_loss" = exit when position is down stop_loss_pct
     # "take_profit" = exit when position is up take_profit_pct
-    exit_strategy: str = None
+    exit_strategy: str | None = None
     stop_loss_pct: float = 0.0
     take_profit_pct: float = 0.0
 
@@ -795,7 +795,7 @@ class BaseBot(ABC):
             logger.error(f"[{self.name}] Trade exception: {e}")
             return {"success": False, "reason": str(e)}
 
-    def _exposure_headroom(self, market_id, side, mode) -> float:
+    def _exposure_headroom(self, market_id, side, mode) -> float | None:
         """Remaining shared-pool budget for this (market, side), or None when
         it can't be computed (missing ids — fail open, other guards still
         apply). Cap base: gross paper pool in paper mode; a fixed
@@ -860,7 +860,7 @@ class BaseBot(ABC):
             "params": copy.deepcopy(self.strategy_params),
         }
 
-    def mutate(self, winning_params: dict, mutation_rate: float = None) -> dict:
+    def mutate(self, winning_params: dict, mutation_rate: float | None = None) -> dict:
         """Create mutated params from winning bot's params."""
         rate = mutation_rate or config.MUTATION_RATE
         new_params = copy.deepcopy(winning_params)

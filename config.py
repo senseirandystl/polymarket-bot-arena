@@ -5,6 +5,8 @@ Polymarket Bot Arena Configuration
 import os
 from pathlib import Path
 
+from pydantic import BaseModel, Field, model_validator
+
 # Re-export encrypted credentials helpers so callers can
 # `from config import get_credential` (consistent with the rest of the
 # codebase) rather than `import credentials_store`. The Simmer API key,
@@ -30,6 +32,17 @@ POLYMARKET_KEY_PATH = Path.home() / ".config/polymarket/credentials.json"
 POLYMARKET_HOST = "https://clob.polymarket.com"
 POLYMARKET_GAMMA_URL = "https://gamma-api.polymarket.com"  # discovery + resolution
 POLYMARKET_CHAIN_ID = 137  # Polygon
+
+# --- Shared HTTP retry policy (http_client.request_with_retry) ---
+# Bounded retries + exponential backoff for SLOW-cadence reads (discovery,
+# resolution, CVD, PM history, strike). NOT applied to the 1s hot-path book/
+# midpoint reads — a retry-sleep there would stall the trader tick, and those
+# calls are already best-effort with a warm-cache fallback. Worst-case added
+# latency per call ≈ backoff_base·(2^0 + 2^1) ≈ 1.2s at the defaults.
+HTTP_MAX_RETRIES = 2                       # attempts after the first = 3 total tries
+HTTP_BACKOFF_BASE = 0.4                    # seconds; grows 0.4, 0.8, ... (capped)
+HTTP_BACKOFF_CAP = 2.0                     # per-sleep ceiling
+HTTP_RETRY_STATUSES = (429, 500, 502, 503, 504)  # transient server/rate-limit codes
 
 # BTC 5-min up/down markets live under this recurring Gamma series ("BTC Up or
 # Down 5m"). Discovery lists this series' open events; the live 5-min window is
@@ -567,6 +580,108 @@ STALENESS_DISPLAY_MAX_SEC = 300  # Upper clamp on the staleness value shown
 # Logging
 LOG_DIR = Path(__file__).parent / "logs"
 LOG_DIR.mkdir(exist_ok=True)
+
+
+# ---------------------------------------------------------------------------
+# Environment overrides (opt-in) — operational knobs only
+# ---------------------------------------------------------------------------
+# A curated set of NON-safety knobs can be overridden from the environment so an
+# operator can tune them without editing source (matches the DASHBOARD_* pattern
+# from slice D). Deliberately EXCLUDED: TRADING_MODE (must start paper — flip it
+# via the dashboard, never an env var) and the live risk caps / guard thresholds
+# (those belong in reviewed code, not ambient environment). An unset var leaves
+# the literal default above untouched; a malformed value fails fast below.
+def _env_num(name: str, current, cast):
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return current
+    try:
+        return cast(raw)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(
+            f"Invalid environment override {name}={raw!r}: expected "
+            f"{cast.__name__}"
+        ) from exc
+
+
+PAPER_BANKROLL_DEFAULT = _env_num("ARENA_PAPER_BANKROLL", PAPER_BANKROLL_DEFAULT, float)
+KELLY_FRACTION = _env_num("ARENA_KELLY_FRACTION", KELLY_FRACTION, float)
+TRADE_LOOP_INTERVAL_SEC = _env_num("ARENA_TRADE_LOOP_INTERVAL_SEC", TRADE_LOOP_INTERVAL_SEC, float)
+MARKET_DATA_INTERVAL_SEC = _env_num("ARENA_MARKET_DATA_INTERVAL_SEC", MARKET_DATA_INTERVAL_SEC, float)
+HTTP_MAX_RETRIES = _env_num("ARENA_HTTP_MAX_RETRIES", HTTP_MAX_RETRIES, int)
+
+
+# ---------------------------------------------------------------------------
+# Fail-fast configuration validation (pydantic)
+# ---------------------------------------------------------------------------
+# Validate the safety-critical invariants and cross-field relationships at
+# IMPORT time so a bad edit or env override crashes the arena at startup with a
+# clear message — never mid-session against real (or simulated) money. This does
+# NOT change the config.X import surface: every constant above is still a plain
+# module global; this only asserts they are self-consistent.
+class _ConfigInvariants(BaseModel):
+    trading_mode: str
+    taker_fee_rate: float = Field(gt=0, lt=1)
+    kelly_fraction: float = Field(gt=0, le=1)
+    model_lean_min: float = Field(ge=0, le=0.5)
+    model_conviction_scale: float = Field(gt=0)
+    book_sum_tolerance: float = Field(ge=0, lt=0.5)
+    consensus_guard: float = Field(gt=0, lt=1)
+    high_price_guard: float = Field(gt=0, lt=1)
+    dead_zone_lo: float = Field(gt=0, lt=1)
+    dead_zone_hi: float = Field(gt=0, lt=1)
+    market_side_exposure_cap: float = Field(gt=0, le=1)
+    paper_bankroll: float = Field(gt=0)
+    live_max_position: float = Field(gt=0)
+    evolution_window_hours: float = Field(gt=0)
+    trade_loop_interval_sec: float = Field(gt=0)
+    market_data_interval_sec: float = Field(gt=0)
+    http_max_retries: int = Field(ge=0)
+
+    @model_validator(mode="after")
+    def _relationships(self):
+        if self.trading_mode not in ("paper", "live"):
+            raise ValueError(f"trading_mode must be 'paper' or 'live', got {self.trading_mode!r}")
+        if not (self.consensus_guard < self.high_price_guard):
+            raise ValueError(
+                f"consensus_guard ({self.consensus_guard}) must be below "
+                f"high_price_guard ({self.high_price_guard})"
+            )
+        if not (self.dead_zone_lo < self.dead_zone_hi):
+            raise ValueError(
+                f"dead_zone_lo ({self.dead_zone_lo}) must be below "
+                f"dead_zone_hi ({self.dead_zone_hi})"
+            )
+        return self
+
+
+def _validate_config() -> None:
+    """Raise RuntimeError with a clear message if the config is inconsistent."""
+    try:
+        _ConfigInvariants(
+            trading_mode=TRADING_MODE,
+            taker_fee_rate=POLYMARKET_TAKER_FEE_RATE,
+            kelly_fraction=KELLY_FRACTION,
+            model_lean_min=MODEL_LEAN_MIN,
+            model_conviction_scale=MODEL_CONVICTION_SCALE,
+            book_sum_tolerance=BOOK_SUM_TOLERANCE,
+            consensus_guard=CONSENSUS_GUARD,
+            high_price_guard=HIGH_PRICE_GUARD,
+            dead_zone_lo=DEAD_ZONE_PRICE_LO,
+            dead_zone_hi=DEAD_ZONE_PRICE_HI,
+            market_side_exposure_cap=MARKET_SIDE_EXPOSURE_CAP,
+            paper_bankroll=PAPER_BANKROLL_DEFAULT,
+            live_max_position=LIVE_MAX_POSITION,
+            evolution_window_hours=EVOLUTION_WINDOW_HOURS,
+            trade_loop_interval_sec=TRADE_LOOP_INTERVAL_SEC,
+            market_data_interval_sec=MARKET_DATA_INTERVAL_SEC,
+            http_max_retries=HTTP_MAX_RETRIES,
+        )
+    except Exception as exc:  # pydantic.ValidationError or ValueError
+        raise RuntimeError(f"Invalid arena configuration: {exc}") from exc
+
+
+_validate_config()
 
 
 def get_current_mode():

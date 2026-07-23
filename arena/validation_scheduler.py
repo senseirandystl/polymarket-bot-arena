@@ -51,7 +51,7 @@ class ValidationScheduler:
     def _running(self) -> bool:
         return self._proc is not None and self._proc.poll() is None
 
-    def due(self, now: float = None) -> bool:
+    def due(self, now: float | None = None) -> bool:
         if not getattr(config, "AUTO_VALIDATE_ENABLED", False):
             return False
         if self._running():

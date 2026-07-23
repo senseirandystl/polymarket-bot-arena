@@ -70,7 +70,7 @@ def clean_price(token_id: str, raw: Optional[float]) -> Optional[float]:
         return raw
 
 
-def reset(token_id: str = None) -> None:
+def reset(token_id: str | None = None) -> None:
     """Clear guard state (all tokens, or one). Used by tests and on rollover."""
     with _lock:
         if token_id:

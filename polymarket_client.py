@@ -38,7 +38,7 @@ def get_client() -> ClobClient:
     return _client
 
 
-def get_usdc_balance() -> float:
+def get_usdc_balance() -> float | None:
     """Get USDC balance from Polymarket CLOB (funder wallet collateral)."""
     try:
         from py_clob_client.clob_types import BalanceAllowanceParams, AssetType

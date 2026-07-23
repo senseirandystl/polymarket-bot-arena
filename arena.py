@@ -74,14 +74,11 @@ from arena.signals import build_combined_signals
 from arena.state import SharedArenaState
 from signals.orderflow_signals import get_cvd_feed
 
-logging.basicConfig(
-    format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
-    level=logging.INFO,
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler(config.LOG_DIR / "arena.log", encoding="utf-8"),
-    ],
-)
+from arena.log_setup import configure_logging, log_event
+
+# Structured logging: JSON when ARENA_LOG_JSON is set, else the same text
+# format as before (byte-identical console/file output). See arena/log_setup.py.
+configure_logging(config.LOG_DIR / "arena.log", level=logging.INFO)
 logger = logging.getLogger("arena")
 maker_logger = logging.getLogger("arena.maker")
 
@@ -350,9 +347,14 @@ def run_evolution(bots, cycle_number):
         )
 
         new_bots.append(evolved)
-        logger.info(
+        log_event(
+            logger, logging.INFO,
             f"  Created {evolved.name} (from {parent.name}): "
-            f"{json.dumps(evolved.strategy_params)[:200]}"
+            f"{json.dumps(evolved.strategy_params)[:200]}",
+            event_type="evolution", action="spawn", cycle=cycle_number,
+            bot=evolved.name, parent=parent.name,
+            strategy=evolved.strategy_type, generation=evolved.generation,
+            retired=dead_bot.name,
         )
 
     db.log_evolution(
@@ -635,7 +637,9 @@ def _evolution_check_loop(bots, state, pos_monitor, trader):
                 trader.set_bots(bots)
                 pos_monitor.update_bots(bots)
         except Exception as e:
-            logger.error(f"Evolution cycle error (caught): {e}")
+            log_event(logger, logging.ERROR, f"Evolution cycle error (caught): {e}",
+                      exc_info=True, event_type="error", where="evolution_cycle",
+                      cycle=cycle_number)
 
         try:
             if time.time() - last_lane_check >= lane_monitor_interval:
@@ -650,12 +654,14 @@ def _evolution_check_loop(bots, state, pos_monitor, trader):
                 core_lane_tuner.tune()
                 last_lane_check = time.time()
         except Exception as e:
-            logger.error(f"Lane monitor/promoter/tuner error (caught): {e}")
+            log_event(logger, logging.ERROR, f"Lane monitor/promoter/tuner error (caught): {e}",
+                      exc_info=True, event_type="error", where="lane_pipeline")
 
         try:
             validation_scheduler.check()
         except Exception as e:
-            logger.error(f"Auto-validation scheduler error (caught): {e}")
+            log_event(logger, logging.ERROR, f"Auto-validation scheduler error (caught): {e}",
+                      exc_info=True, event_type="error", where="validation_scheduler")
 
         time.sleep(30)
 
@@ -833,7 +839,7 @@ def main_loop(bots):
     # Stored in the same UTC "%Y-%m-%d %H:%M:%S" format as trades.created_at
     # so a plain string comparison (created_at >= session_start) works.
     db.set_arena_state(
-        "session_start", datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        "session_start", datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     )
 
     logger.info(

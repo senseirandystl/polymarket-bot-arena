@@ -78,7 +78,7 @@ def store() -> MarketDataStore:
 class MarketDataWarmer(threading.Thread):
     """Refresh the live market's book/price/orderflow data every ~1s."""
 
-    def __init__(self, discovery, cvd_feed, pm_feed, interval: float = None) -> None:
+    def __init__(self, discovery, cvd_feed, pm_feed, interval: float | None = None) -> None:
         super().__init__(daemon=True, name="market-data-warmer")
         self._stop_event = threading.Event()
         self._discovery = discovery

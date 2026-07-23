@@ -10,7 +10,7 @@ import math
 import logging
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 
 import config
 import db
@@ -116,7 +116,7 @@ def extract_features(market_price, price_momentum, hour_et=None, volume=None, ti
 
     # Hour bucket
     if hour_et is None:
-        hour_et = (datetime.utcnow().hour - 5) % 24  # UTC to ET approx
+        hour_et = (datetime.now(timezone.utc).hour - 5) % 24  # UTC to ET approx
     for name, start, end in HOUR_BUCKETS:
         if start < end:
             if start <= hour_et < end:

@@ -19,6 +19,7 @@ from datetime import datetime, timezone
 import requests
 
 import config
+import http_client
 from signals import clean_tick
 
 logger = logging.getLogger("polymarket.markets")
@@ -52,7 +53,7 @@ def _as_list(v):
 # ---------------------------------------------------------------------------
 # Discovery
 # ---------------------------------------------------------------------------
-def discover_markets(limit: int = None) -> list:
+def discover_markets(limit: int | None = None) -> list:
     """Return normalized BTC 5-min markets for the current + upcoming windows.
 
     Orders by ``endDate`` ascending and filters ``end_date_min=now`` so the
@@ -65,7 +66,7 @@ def discover_markets(limit: int = None) -> list:
         limit = getattr(config, "POLYMARKET_DISCOVERY_LIMIT", 6)
     now = datetime.now(timezone.utc).isoformat()
     try:
-        resp = requests.get(
+        resp = http_client.get(
             f"{GAMMA}/events",
             params={
                 "series_id": SERIES_ID,
@@ -119,7 +120,7 @@ def _normalize(m: dict):
 # ---------------------------------------------------------------------------
 # Order book + fresh prices
 # ---------------------------------------------------------------------------
-def get_order_book(token_id: str) -> dict:
+def get_order_book(token_id: str | None) -> dict:
     """Fetch and NORMALIZE a token's CLOB order book.
 
     Polymarket returns bids ascending and asks descending (both worst→best), so
@@ -127,6 +128,8 @@ def get_order_book(token_id: str) -> dict:
     into. Here we sort explicitly: ``asks`` ascending (best/lowest first),
     ``bids`` descending (best/highest first), and expose ``best_bid``/``best_ask``.
     """
+    if not token_id:
+        return {"valid": False}
     try:
         resp = requests.get(f"{CLOB}/book", params={"token_id": token_id}, timeout=15)
         if resp.status_code != 200:
@@ -196,7 +199,7 @@ def _token_ids(condition_id: str):
     return (up, down)
 
 
-def midpoint_price(token_id: str):
+def midpoint_price(token_id: str | None):
     """Live CLOB midpoint for a token, or ``None``.
 
     IMPORTANT: uses the ``/midpoint`` endpoint, which tracks the live order book.
@@ -355,7 +358,7 @@ def recent_resolutions(limit: int = 100) -> dict:
     it rather than doing per-market lookups.
     """
     try:
-        resp = requests.get(
+        resp = http_client.get(
             f"{GAMMA}/events",
             params={
                 "series_id": SERIES_ID,

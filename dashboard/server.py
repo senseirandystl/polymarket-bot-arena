@@ -2,6 +2,7 @@
 
 import json
 import logging
+import os
 import secrets
 import sys
 import time
@@ -21,10 +22,22 @@ from arena.market_utils import is_5min_market
 
 security = HTTPBasic()
 
-DASHBOARD_USER = "admin"
-DASHBOARD_PASS = "Thor"
-
 logger = logging.getLogger(__name__)
+
+# Dashboard Basic-auth credentials — read from the environment so the secret is
+# not hardcoded. Defaults preserve the historical local-dev values so nothing
+# breaks on a fresh clone (the dashboard binds to localhost). Set DASHBOARD_USER
+# / DASHBOARD_PASS in the environment (or the launchd plist) to override; the
+# bin/arena probe reads the SAME env vars so the two stay in sync.
+_DEFAULT_USER = "admin"
+_DEFAULT_PASS = "Thor"
+DASHBOARD_USER = os.environ.get("DASHBOARD_USER", _DEFAULT_USER)
+DASHBOARD_PASS = os.environ.get("DASHBOARD_PASS", _DEFAULT_PASS)
+if DASHBOARD_PASS == _DEFAULT_PASS:
+    logger.warning(
+        "Dashboard is using the DEFAULT password — set DASHBOARD_PASS in the "
+        "environment before exposing the dashboard beyond localhost."
+    )
 
 
 def verify_auth(credentials: HTTPBasicCredentials = Depends(security)):
@@ -40,6 +53,35 @@ def verify_auth(credentials: HTTPBasicCredentials = Depends(security)):
 
 
 app = FastAPI(title="Polymarket Bot Arena Dashboard", dependencies=[Depends(verify_auth)])
+
+
+@app.middleware("http")
+async def _healthz(request: Request, call_next):
+    """Unauthenticated liveness probe at ``/healthz`` for watchdogs/monitors.
+
+    Runs as middleware so it bypasses the app-wide Basic-auth dependency (an
+    external uptime check should not need credentials). Cheap: no DB, just the
+    age of ``arena.log`` so a monitor can tell a HUNG arena (log not advancing)
+    from a healthy one. ``stale`` flips true past ARENA_LOG_STALE_SEC; a watchdog
+    (arena_watchdog.sh) can restart on it. Every other path falls through to the
+    normal authenticated routes untouched.
+    """
+    if request.url.path == "/healthz":
+        stale_after = int(os.environ.get("ARENA_LOG_STALE_SEC", "300"))
+        log_path = config.LOG_DIR / "arena.log"
+        age = None
+        try:
+            age = time.time() - log_path.stat().st_mtime
+        except OSError:
+            pass
+        return JSONResponse({
+            "status": "ok",
+            "ts": time.time(),
+            "arena_log_age_sec": round(age, 1) if age is not None else None,
+            "arena_log_stale": (age is not None and age > stale_after),
+        })
+    return await call_next(request)
+
 
 # Balance cache: key -> {"balance": float, "fetched_at": float}
 _balance_cache = {}
@@ -539,7 +581,7 @@ async def run_lane_validation(request: Request, _auth: str = Depends(verify_auth
     """Launch `validate_signals.py --markets N --propose` in the background."""
     import subprocess
     import sys as _sys
-    from datetime import datetime
+    from datetime import datetime, timezone
 
     if _validation_running():
         return JSONResponse({"error": "a validation run is already in progress"},
@@ -562,7 +604,7 @@ async def run_lane_validation(request: Request, _auth: str = Depends(verify_auth
         cwd=str(repo_root), stdout=log, stderr=subprocess.STDOUT)
     _validation_run.update({
         "proc": proc,
-        "started_at": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+        "started_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
         "markets": markets,
     })
     return JSONResponse({"success": True, "markets": markets,

@@ -24,7 +24,7 @@ import time
 from datetime import datetime
 from typing import Callable, Optional
 
-import requests
+import http_client
 
 import config
 
@@ -36,7 +36,7 @@ def _fetch_open_at(event_start_iso: str) -> Optional[float]:
     try:
         ts = int(datetime.fromisoformat(
             event_start_iso.replace("Z", "+00:00")).timestamp() * 1000)
-        r = requests.get(BINANCE_KLINES, params={
+        r = http_client.get(BINANCE_KLINES, params={
             "symbol": "BTCUSDT", "interval": "1m", "startTime": ts, "limit": 1,
         }, timeout=6)
         if r.status_code == 200:

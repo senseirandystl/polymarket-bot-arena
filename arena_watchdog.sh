@@ -1,17 +1,26 @@
 #!/bin/bash
 # Watchdog for the arena process.
-# Restarts the arena if its log file hasn't been updated in 5 minutes.
+# Restarts the arena (via launchd) if its log file hasn't advanced in 5 minutes
+# — a proxy for "the process is hung / dead". Wire it to a cron or launchd
+# StartInterval job; it's a single-shot check, safe to run every minute.
+#
+# Paths resolve RELATIVE TO THIS SCRIPT (it lives at the repo root), so a fresh
+# clone works with no edits — the previous hardcoded /Users/ben/... paths were
+# dead on any other host (the exact bug class CLAUDE.md warns about). Or probe
+# the dashboard's unauthenticated liveness endpoint instead:
+#   curl -s localhost:8501/healthz | jq .arena_log_stale
 
-LOG="/Users/ben/clawd/trading_bot/logs/arena.log"
-WATCHDOG_LOG="/Users/ben/clawd/trading_bot/logs/arena_watchdog.log"
-STALE_SECONDS=300  # 5 minutes
+REPO_ROOT="$(cd -P "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+LOG="$REPO_ROOT/logs/arena.log"
+WATCHDOG_LOG="$REPO_ROOT/logs/arena_watchdog.log"
+STALE_SECONDS="${ARENA_LOG_STALE_SEC:-300}"  # 5 minutes; matches /healthz default
 
 log() {
     echo "$(date '+%Y-%m-%d %H:%M:%S') $1" >> "$WATCHDOG_LOG"
 }
 
 if [ ! -f "$LOG" ]; then
-    log "WARN: arena.log not found, skipping check"
+    log "WARN: $LOG not found, skipping check"
     exit 0
 fi
 

@@ -30,3 +30,10 @@ py-order-utils
 
 # --- Encrypted credential store (credentials_store.py; used by arena + dashboard) ---
 cryptography>=42.0
+
+# --- Config validation + env overrides (config.py fail-fast invariants) ---
+pydantic>=2.0
+
+# --- Testing (make test / make coverage; pytest.ini at the repo root) ---
+pytest>=8.0
+pytest-cov>=5.0

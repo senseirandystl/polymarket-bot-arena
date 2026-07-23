@@ -78,10 +78,12 @@ DASH_PORT="${DASHBOARD_PORT:-8501}"
 DASH_LOG="${DASHBOARD_LOG:-$REPO_ROOT/dashboard.log}"
 PIDFILE="$REPO_ROOT/.dashboard.pid"
 
-# Note: the HTTP-Basic auth used to probe the dashboard is hardcoded to
-# match DASHBOARD_USER / DASHBOARD_PASS at the top of dashboard/server.py.
-# If those constants change there, update this line. (Wrapping in env vars
-# adds churn for a single-call-site credential pair; a comment is cheaper.)
+# HTTP-Basic auth used to probe the dashboard. Read from the environment, with
+# the same defaults dashboard/server.py falls back to — so the probe and the
+# server always agree, and an operator can override the secret in ONE place
+# (export DASHBOARD_USER / DASHBOARD_PASS) instead of editing source.
+DASH_USER="${DASHBOARD_USER:-admin}"
+DASH_PASS="${DASHBOARD_PASS:-Thor}"
 
 # --- Orphan reaping at startup ---------------------------------------
 # If a previous `bin/arena` was SIGKILL'd (e.g. via the Activity Monitor
@@ -119,7 +121,7 @@ fi
 DASH_CHILD=""
 if [[ "${ARENA_NO_DASHBOARD:-0}" == "1" ]]; then
     echo "bin/arena: ARENA_NO_DASHBOARD=1 -- skipping dashboard auto-start" >&2
-elif curl -s -o /dev/null -m 1 -u admin:Thor \
+elif curl -s -o /dev/null -m 1 -u "$DASH_USER:$DASH_PASS" \
         "http://localhost:${DASH_PORT}/api/status" 2>/dev/null; then
     echo "bin/arena: dashboard already up on :${DASH_PORT}, leaving it alone" >&2
 else
@@ -151,7 +153,7 @@ else
     ready=0
     for _ in 1 2 3 4 5 6; do
         sleep 0.5
-        if curl -s -o /dev/null -m 1 -u admin:Thor \
+        if curl -s -o /dev/null -m 1 -u "$DASH_USER:$DASH_PASS" \
                 "http://localhost:${DASH_PORT}/api/status" 2>/dev/null; then
             ready=1
             echo "bin/arena: dashboard ready on http://localhost:${DASH_PORT}/" >&2

@@ -96,9 +96,10 @@ class FuturesMetaFeed:
             self._prev_oi = oi
 
         taker_ratio = 1.0
+        taker_params: dict[str, str | int] = {"symbol": SYMBOL, "period": "5m",
+                                              "limit": 1}
         resp = requests.get(f"{FAPI_BASE}/futures/data/takerlongshortRatio",
-                            params={"symbol": SYMBOL, "period": "5m",
-                                    "limit": 1}, timeout=10)
+                            params=taker_params, timeout=10)
         resp.raise_for_status()
         rows = resp.json() or []
         if rows:

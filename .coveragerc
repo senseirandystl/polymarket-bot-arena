@@ -1,0 +1,11 @@
+[run]
+omit =
+    .venv/*
+    tests/*
+    tools/*
+    copytrading/*
+    bot.py
+
+[report]
+skip_empty = True
+precision = 1

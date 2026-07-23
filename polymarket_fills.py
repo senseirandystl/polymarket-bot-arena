@@ -9,7 +9,7 @@ import config
 
 
 def taker_fee(shares: float, price: float,
-              rate: float = None) -> float:
+              rate: float | None = None) -> float:
     """Polymarket taker fee in USDC (makers are never charged).
 
     Documented formula, symmetric around 50c so a 30c and 70c trade cost the
