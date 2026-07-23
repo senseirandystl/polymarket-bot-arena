@@ -34,20 +34,20 @@ import time
 from datetime import datetime, timezone
 from typing import Callable, Dict, List, Optional
 
-import requests
-
 import config
+import polymarket_markets
+from signals import orderflow_signals
 from arena.market_utils import (
     compute_time_remaining_seconds,
-    is_btc_updown,
-    window_contains_now,
+    is_5min_market,
+    select_current_market,
 )
 
 logger = logging.getLogger("arena.discovery")
 
 
 class MarketDiscovery(threading.Thread):
-    """Background scanner for Simmer BTC 5-min markets."""
+    """Background scanner for Polymarket BTC 5-min up/down markets."""
 
     def __init__(
         self,
@@ -83,7 +83,7 @@ class MarketDiscovery(threading.Thread):
             f"Market discovery started (interval={config.DISCOVERY_INTERVAL_SEC}s)"
         )
         # First tick fires immediately on start so the trader sees a
-        # current_market on its first iteration rather than waiting 60s.
+        # current_market on its first iteration rather than waiting 20s.
         while not self._stop_event.is_set():
             try:
                 self._do_scan()
@@ -163,12 +163,7 @@ class MarketDiscovery(threading.Thread):
     # ----------------------------------------------------------------------
 
     def _do_scan(self) -> None:
-        api_key = config.get_credential("simmer_api_key")
-        if not api_key:
-            logger.debug("Skipping discovery: no Simmer API key")
-            return
-
-        markets = self._fetch_markets(api_key)
+        markets = polymarket_markets.discover_markets()
         if not markets:
             return
 
@@ -180,25 +175,24 @@ class MarketDiscovery(threading.Thread):
             m["time_remaining_seconds"] = tr
             m["window_age_seconds"] = max(0, 300 - tr)
 
+        # Bots trade ONLY 5-minute windows -- drop any 15-min (or other
+        # non-5-min) BTC up/down markets before anything downstream can
+        # see them.  This gates the trader, the maker fallback AND the
+        # all_markets snapshot, so a 15-min window can never surface.
+        five_min = [
+            m for m in markets if is_5min_market(m.get("question", "") or "")
+        ]
         non_expired = [
-            m for m in markets if m.get("time_remaining_seconds", 0) > 0
+            m for m in five_min if m.get("time_remaining_seconds", 0) > 0
         ]
 
-        # Pick the live market.  Prefer window_contains_now; fall back
-        # to the soonest-resolving market whose remaining lifetime is
-        # in (0, 300].  We deliberately stop here -- per the user's
-        # policy we do NOT pre-pick a speculative next_market so
-        # nothing can leak across the rollover until the next scan
-        # sees the new window for real.
-        candidates = sorted(
-            [
-                m for m in non_expired
-                if m.get("time_remaining_seconds", 999) <= 300
-                or window_contains_now(m.get("question", ""), now_utc)
-            ],
-            key=lambda m: m.get("time_remaining_seconds", 999),
-        )
-        current = candidates[0] if candidates else None
+        # Pick the live market by its REAL resolves_at timestamp
+        # (0 < time_remaining <= 300), never by ET time-of-day -- so a
+        # future-dated window whose clock time straddles "now" is never
+        # chosen.  Per the user's policy we do NOT pre-pick a speculative
+        # next_market; nothing leaks across the rollover until the next
+        # scan sees the new window for real.
+        current = select_current_market(non_expired, now_utc)
 
         # Maker fallback target: if no market currently contains the
         # wall clock, the maker section quotes the soonest non-expired
@@ -221,119 +215,56 @@ class MarketDiscovery(threading.Thread):
         # Refresh orderflow for the current market AND for the maker
         # fallback (when present).  When both exist they are guaranteed
         # distinct markets so we issue two calls.  Total cost: 1-2
-        # HTTPS calls per 60s cycle -- the fallback call only fires
+        # HTTPS calls per 20s cycle -- the fallback call only fires
         # in the no-current-market gap, so the hot path stays at one.
         #
         # NOTE: keep these calls LOCK-FREE; _fetch_orderflow_for_market
         # re-acquires self._lock for its cache writes.  Wrapping this
         # block in `with self._lock:` would deadlock.
         if current is not None:
-            self._fetch_orderflow_for_market(api_key, current, time.time())
+            self._refresh_market_data(current)
         if maker_fallback is not None and maker_fallback is not current:
-            self._fetch_orderflow_for_market(
-                api_key, maker_fallback, time.time()
-            )
+            self._refresh_market_data(maker_fallback)
 
+        prev_id = (self._current_market or {}).get("id")
         with self._lock:
             self._markets_cache = non_expired
             self._current_market = current
             self._maker_fallback_market = maker_fallback
             self._last_scan_ts = time.time()
 
-        logger.info(
-            f"Discovery: {len(markets)} BTC candidates, "
-            f"{len(non_expired)} unexpired, "
-            f"current={'yes' if current else 'no'}, "
-            f"maker_fallback={'yes' if maker_fallback else 'no'}"
+        # Only announce (INFO) when the live window actually rolls over;
+        # otherwise stay at DEBUG so the log isn't flooded every cycle.
+        cur_id = (current or {}).get("id")
+        msg = (
+            f"Discovery: {len(non_expired)} unexpired windows, "
+            f"current={current.get('question', '')[:38] if current else 'none'}"
         )
+        if cur_id != prev_id:
+            logger.info(msg)
+        else:
+            logger.debug(msg)
 
-    def _fetch_markets(self, api_key: str) -> List[dict]:
-        """Scan both Simmer SDK + public endpoints, dedupe by id."""
-        seen: Dict[str, dict] = {}
+    def _refresh_market_data(self, m: dict) -> None:
+        """Set fresh price + orderflow on a selected market from the CLOB book.
 
-        def _scan_page(page, source: str):
-            for m in page:
-                mid = m.get("id") or m.get("market_id", "unknown")
-                if mid in seen:
-                    continue
-                if is_btc_updown(m):
-                    if logger.isEnabledFor(logging.INFO):
-                        logger.info(
-                            f"  CANDIDATE [{source}]: {mid[:12]}... | "
-                            f"{m.get('question')} | resolves_at={m.get('resolves_at')}"
-                        )
-                    seen[mid] = m
-
-        # --- Source 1: SDK upcoming markets ---
-        try:
-            resp = requests.get(
-                f"{config.SIMMER_BASE_URL}/api/sdk/markets",
-                headers={"Authorization": f"Bearer {api_key}"},
-                params={"limit": 50, "tags": "fast-5m"},
-                timeout=20,
-            )
-            if resp.status_code == 200:
-                data = resp.json()
-                page = data if isinstance(data, list) else data.get("markets", [])
-                _scan_page(page, "upcoming")
-        except Exception as e:
-            logger.warning(f"SDK /api/sdk/markets call failed: {e}")
-
-        # --- Source 2: public endpoint for currently-live markets ---
-        try:
-            resp = requests.get(
-                f"{config.SIMMER_BASE_URL}/api/markets",
-                headers={"Authorization": f"Bearer {api_key}"},
-                params={"limit": 20},
-                timeout=10,
-            )
-            if resp.status_code == 200:
-                data = resp.json()
-                page = data if isinstance(data, list) else data.get("markets", [])
-                _scan_page(page, "live")
-        except Exception as e:
-            logger.warning(f"Public /api/markets call failed: {e}")
-
-        return list(seen.values())
-
-    def _fetch_orderflow_for_market(self, api_key: str, m: dict, now: float) -> None:
-        """Fetch (or reuse cached) ``/api/sdk/context/{id}`` data for one market.
-
-        Cached values stay valid for ``config.ORDERFLOW_CACHE_SECONDS`` so
-        the trader (which runs at 1Hz) can read the same snapshot without
-        triggering a network call per tick.
+        ``current_price`` becomes the live Up-token mid, and ``orderflow`` is
+        populated so the signal stack (which reads ``current_probability`` and
+        ``volume_24h``) has data. Best-effort — leaves the fields untouched if
+        the book is unavailable.
         """
-        mid = m.get("id") or m.get("market_id", "")
-        if not mid:
-            return
-
-        ts = self._orderflow_cache_ts.get(mid, 0.0)
-        if now - ts < config.ORDERFLOW_CACHE_SECONDS:
-            with self._lock:
-                cached = self._orderflow_cache.get(mid)
-            if cached is not None:
-                m["orderflow"] = cached
-            return
-
-        try:
-            resp = requests.get(
-                f"{config.SIMMER_BASE_URL}/api/sdk/context/{mid}",
-                headers={"Authorization": f"Bearer {api_key}"},
-                timeout=10,
-            )
-            if resp.status_code == 200:
-                ctx = resp.json()
-                of = {
-                    "current_probability": ctx.get("current_probability", 0.5),
-                    "volume_24h": ctx.get("volume_24h", 0),
-                    "time_to_resolution": ctx.get("time_to_resolution_seconds", 0),
-                    "warnings": ctx.get("warnings", []),
-                }
-                with self._lock:
-                    self._orderflow_cache[mid] = of
-                    self._orderflow_cache_ts[mid] = now
-                m["orderflow"] = of
-            else:
-                logger.debug(f"orderflow HTTP {resp.status_code} for {mid[:12]}...")
-        except Exception as e:
-            logger.debug(f"orderflow fetch error for {mid[:12]}...: {e}")
+        polymarket_markets.refresh_price(m)  # sets m["current_price"] from CLOB
+        # Order-book imbalance on the Up/YES token — one extra book call per
+        # discovery cycle (~20s), off the trader hot path. obi > 0 = bid-heavy
+        # (upward/YES pressure). Best-effort: 0.0 when the book is unavailable.
+        obi = 0.0
+        up_tok = m.get("polymarket_token_id")
+        if up_tok:
+            book = polymarket_markets.get_order_book(up_tok)
+            obi = orderflow_signals.order_book_imbalance(book)
+        m["orderflow"] = {
+            "current_probability": m.get("current_price") or 0.5,
+            "volume_24h": m.get("volume_24h", 0) or 0,
+            "obi": obi,
+            "warnings": [],
+        }

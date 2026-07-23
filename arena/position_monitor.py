@@ -1,11 +1,10 @@
 """Position monitor thread — 0.5s SL/TP exit engine for bots that carry
 an ``exit_strategy``.
 
-Extracted verbatim from the old monolithic ``arena.py``.  Behaviour is
-unchanged: poll Simmer for active-market prices every 0.5s, look at each
-bot's open positions, exit at the configured stop-loss / take-profit
-threshold, write outcome=exit_sl / exit_tp on the trade row, and feed
-the outcome back into the learning system.
+Polls the Polymarket CLOB for the prices of markets where bots hold open
+positions (throttled), looks at each bot's open positions, exits at the
+configured stop-loss / take-profit threshold, writes outcome=exit_sl / exit_tp
+on the trade row, and feeds the outcome back into the learning system.
 
 Kept separate from the ``Trader`` (1s) and ``TradeResolver`` (60s)
 threads so the SL/TP engine can stay hard-realtime without slowing
@@ -16,28 +15,33 @@ without forcing every other worker to share its interval.
 import json
 import logging
 import threading
-
-import requests
+import time
 
 import config
 import db
+import polymarket_markets
 from learning import extract_features_from_reasoning, record_outcome
 
 
-# Hard-realtime SL/TP poll rate. NOT a config-tunable knob because it sits
-# at the edge of what the Simmer API comfortably serves at one Logged-in
-# account; slowing it down to "save API calls" defeats the point.
+# SL/TP poll rate. The loop ticks this fast, but the (Polymarket) price fetch is
+# throttled separately (see PositionMonitorThread._PRICE_TTL) so we don't hammer
+# the CLOB — prices for 5-min windows don't move meaningfully sub-second anyway.
 FAST_POLL_INTERVAL = 0.5
 
 logger = logging.getLogger("arena.position_monitor")
 
 
 class PositionMonitorThread(threading.Thread):
+    # Refresh open-position prices from the CLOB at most this often (seconds).
+    _PRICE_TTL = 3.0
+
     def __init__(self) -> None:
         super().__init__(daemon=True, name="position-monitor")
         self._bots: dict = {}
         self._stop_event = threading.Event()
         self._lock = threading.Lock()
+        self._price_cache: dict = {}
+        self._price_ts: float = 0.0
 
     def update_bots(self, bots) -> None:
         """Called by the coordinator after each evolution cycle."""
@@ -50,29 +54,32 @@ class PositionMonitorThread(threading.Thread):
         self._stop_event.set()
 
     def _fetch_market_prices(self) -> dict:
-        """Fetch a {market_id: current_yes_price} map from Simmer."""
-        api_key = config.get_credential("simmer_api_key")
-        if not api_key:
-            return {}
+        """{market_id: current_yes_price} for markets with OPEN positions.
+
+        Polymarket-native: prices come from the CLOB (Up-token mid) per distinct
+        open-position market, throttled to ``_PRICE_TTL`` seconds so the 2Hz
+        monitor loop doesn't hammer the API. Markets with no open position are
+        never fetched.
+        """
+        now = time.time()
+        if now - self._price_ts < self._PRICE_TTL and self._price_cache:
+            return self._price_cache
         try:
-            headers = {"Authorization": f"Bearer {api_key}"}
-            resp = requests.get(
-                f"{config.SIMMER_BASE_URL}/api/sdk/markets",
-                headers=headers,
-                params={"status": "active", "limit": 100},
-                timeout=5,
-            )
-            if resp.status_code != 200:
-                return {}
-            data = resp.json()
-            markets_list = data if isinstance(data, list) else data.get("markets", [])
-            return {
-                (m.get("id") or m.get("market_id")): m.get("current_price")
-                for m in markets_list
-                if m.get("current_price") is not None
-            }
+            with db.get_conn() as conn:
+                rows = conn.execute(
+                    "SELECT DISTINCT market_id FROM trades WHERE outcome IS NULL"
+                ).fetchall()
         except Exception:
-            return {}
+            return self._price_cache
+        prices = {}
+        for r in rows:
+            mid = r["market_id"]
+            p = polymarket_markets.current_up_price(mid)
+            if p is not None:
+                prices[mid] = p
+        self._price_cache = prices
+        self._price_ts = now
+        return prices
 
     def _check_positions(self, price_map: dict) -> None:
         with self._lock:

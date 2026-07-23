@@ -1,4 +1,17 @@
-"""Real-time BTC/SOL price data from Binance WebSocket."""
+"""Real-time BTC/ETH/SOL price data from Binance WebSocket.
+
+One socket, three 1m-kline streams. ``get_signals`` keeps its original keys
+(``prices``/``volumes``/``latest``/``stale``) for backward compatibility and
+adds smooth derived metrics:
+
+- ``momentum``: last-candle return, tanh-scaled to (-1, 1),
+- ``acceleration``: change in candle-over-candle return (is the move
+  speeding up or fading), tanh-scaled,
+- ``mtf``: dict of raw 1m/3m/5m returns for multi-timeframe consumers.
+
+ETH exists here for the cross-asset lane (signals/cross_asset.py) — it rides
+the same socket, so the extra symbol costs no additional connection.
+"""
 
 import json
 import time
@@ -6,10 +19,14 @@ import threading
 import logging
 from collections import deque
 
+from signals.curves import soft_saturate
+
 logger = logging.getLogger(__name__)
 
 BINANCE_WS = "wss://stream.binance.com:9443/ws"
-SYMBOLS = {"btc": "btcusdt", "sol": "solusdt"}
+SYMBOLS = {"btc": "btcusdt", "eth": "ethusdt", "sol": "solusdt"}
+MOMENTUM_SCALE = 0.002   # 0.2% one-candle move reads ~0.76 (~p97, see BUG #25)
+ACCEL_SCALE = 0.001
 
 
 class PriceFeed:
@@ -37,6 +54,7 @@ class PriceFeed:
 
         streams = "/".join(f"{s}@kline_1m" for s in SYMBOLS.values())
         url = f"{BINANCE_WS}/{streams}"
+        backoff = 2.0
 
         while self._running:
             try:
@@ -44,6 +62,7 @@ class PriceFeed:
                 ws.settimeout(10)
                 ws.connect(url)
                 logger.info(f"Connected to Binance WS: {url}")
+                backoff = 2.0  # healthy connection resets the backoff
 
                 while self._running:
                     try:
@@ -73,21 +92,42 @@ class PriceFeed:
 
                 ws.close()
             except Exception as e:
-                logger.error(f"Price feed error: {e}")
-                time.sleep(5)
+                logger.error(f"Price feed error: {e} (retry in {backoff:.0f}s)")
+                time.sleep(backoff)
+                backoff = min(60.0, backoff * 2)  # exponential, capped
 
     def get_signals(self, symbol: str) -> dict:
-        """Get current price signals for a symbol."""
+        """Current price signals for a symbol (back-compat keys + derived)."""
         sym = symbol.lower()
         if sym not in self.prices:
             return {"prices": [], "volumes": [], "latest": 0}
 
+        prices = list(self.prices[sym])
         stale = (time.time() - self._last_update.get(sym, 0)) > 60
+
+        momentum = 0.0
+        acceleration = 0.0
+        if len(prices) >= 2 and prices[-2] > 0:
+            r1 = (prices[-1] - prices[-2]) / prices[-2]
+            momentum = soft_saturate(r1, MOMENTUM_SCALE)
+            if len(prices) >= 3 and prices[-3] > 0:
+                r0 = (prices[-2] - prices[-3]) / prices[-3]
+                acceleration = soft_saturate(r1 - r0, ACCEL_SCALE)
+
+        mtf = {}
+        for horizon in (1, 3, 5):
+            if len(prices) > horizon and prices[-1 - horizon] > 0:
+                mtf[f"{horizon}m"] = (
+                    (prices[-1] - prices[-1 - horizon]) / prices[-1 - horizon])
+
         return {
-            "prices": list(self.prices[sym]),
+            "prices": prices,
             "volumes": list(self.volumes[sym]),
             "latest": self.latest.get(sym, 0),
             "stale": stale,
+            "momentum": momentum,
+            "acceleration": acceleration,
+            "mtf": mtf,
         }
 
 

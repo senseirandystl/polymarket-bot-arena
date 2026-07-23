@@ -7,12 +7,22 @@ import math
 import config
 from bots.base_bot import BaseBot
 
+# Retune (2026-07-16): the old EMA 20/50 + 20-candle breakout needed 70 one-min
+# candles (~70 minutes) before analyze() could fire at all — the price feed
+# fills at 1 candle/min from a cold start, so phantom was a silent base-stack
+# clone for the first hour of EVERY restart. EMA 9/26 + 10-candle breakout
+# (36-candle warmup) keeps the identity (trend filter + breakout + vol sanity)
+# on horizons that fit 5-min markets and halves the warmup.
 DEFAULT_PARAMS = {
-    "ema_fast": 20,
-    "ema_slow": 50,
-    "atr_period": 14,
-    "breakout_lookback": 20,
-    "min_atr_pct": 0.0005,    # 0.05%
+    "ema_fast": 9,
+    "ema_slow": 26,
+    "atr_period": 10,
+    "breakout_lookback": 10,
+    # Real BTC 1-min |move| distribution (2,740 samples from the harness kline
+    # cache): p50 0.022%, p75 0.042%, avg 0.032%. The old 0.05% floor sat at
+    # ~p75+ — phantom idled through most normal tape. 0.02% skips only truly
+    # dead tape; the 1% ceiling still rejects chaos.
+    "min_atr_pct": 0.0002,    # 0.02% (~median 1-min move)
     "max_atr_pct": 0.01,      # 1.0%
     "position_size_pct": 0.06,
     "min_confidence": 0.20,
@@ -21,14 +31,18 @@ DEFAULT_PARAMS = {
 
 class PhantomBot(BaseBot):
     def __init__(self, name="phantom-v1", params=None, generation=0, lineage=None):
+        # "phantom" is a first-class strategy_type in base_bot's signal tables
+        # (STRATEGY_PRIORS / STRATEGY_SIGNAL_PROFILE / MIN_EDGE), so
+        # pass it straight through. The old code passed "hybrid" then reassigned
+        # to "phantom" afterwards — fragile, and wrong if the base ever reads
+        # strategy_type during __init__.
         super().__init__(
             name=name,
-            strategy_type="hybrid", # Using hybrid type for similar signal weight
+            strategy_type="phantom",
             params=params or DEFAULT_PARAMS.copy(),
             generation=generation,
             lineage=lineage,
         )
-        self.strategy_type = "phantom"
 
     def _calc_ema(self, prices, period):
         if len(prices) < period:

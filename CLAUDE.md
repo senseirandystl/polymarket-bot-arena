@@ -2,7 +2,10 @@
 
 ## What This Is
 
-An automated trading bot arena that runs 4 competing bots on Polymarket's BTC 5-minute up/down markets via the Simmer paper trading platform. Bots evolve every 4 hours — the bottom 2 are replaced by mutated copies of the top 2. Each bot has its own Simmer account for independent trading and real performance comparison.
+An automated trading bot arena that runs competing bots on **Polymarket's** BTC 5-minute up/down markets. The **default slate is 8 bots** (five directional defaults incl. the sniper + the market-neutral **arbitrage** bot + two **maker** bots — late-window and fee-zone; roster updated 2026-07-18); a terminal launch can instead select any subset of strategies (see **Startup flow** below). The maker bots are first-class members of the slate but run on the discovery-cycle (maker) cadence, not the 1s trader tick. Directional bots are judged for evolution every `EVOLUTION_INTERVAL_HOURS` (2h) on a rolling `EVOLUTION_WINDOW_HOURS` (24h) window — survive if window P&L > 0 or break-even gap (WR − avg entry) ≥ `EVOLUTION_BE_GAP_MIN` (0.03); losers are replaced by mutated copies of the winners (BUG #29: the old 2h-window + flat-65%-WR bar made every bot permanently immune). The arbitrage bot is **evolution-exempt** (`arena.EVOLUTION_EXEMPT_TYPES`) and the maker bots are excluded from evolution too (they are partitioned out of the trader/evolution list in `main_loop`). **Paper mode simulates against real Polymarket order books** (discovery, prices, depth-based fills, fees, resolution — everything except order submission); **live mode** submits real CLOB orders. Simmer has been fully removed (its 5-min market feed was inconsistent and its free tier capped at 50 buys/day). See [BUG_HISTORY.md](./BUG_HISTORY.md) #10.
+
+### Startup flow (terminal launches only — `arena.py` / `bin/arena`)
+On an interactive tty, `arena/startup.py` runs before the threads boot. If the DB holds a previous run it asks **Continue** (resume the exact prior slate) or **Start fresh** (wipe DB rows via `db.wipe_all()` + truncate `logs/*.log`, then choose bots). Bot choice is **Default** (Enter → the 8-bot slate incl. sniper + both makers) or **Manual** (numbered strategy menu — now includes the two maker bots as selectable entries; accepts `1,3,5`, `1-6`, or a mix → launches exactly those). Under launchd / any non-tty parent there is no prompt — it silently resumes the existing DB config, so the service never blocks.
 
 ## Current State (v4 — Feb 15, 2026)
 
@@ -16,8 +19,14 @@ Absolute numbers from the Feb 2026 v4 baseline (276 resolved trades, total P&L `
 - **Contrarian/mean-reversion strategies lose money** in 5-min markets
 - **Confidence 0.30-0.50 is the sweet spot** — 67.9% WR, +$48 total
 - **Confidence >0.50 LOSES money** — 48.6% WR but large bet sizes = big losses
-- **NO bets have 44.9% WR vs YES at 49.2%** — slight YES bias is profitable
+- **NO bets had 44.9% WR vs YES at 49.2%** in the Simmer-era data — this was the
+  basis for the old blanket NO ban, now **removed** (BUG_HISTORY #20). That stat
+  came from Simmer's inconsistent 5-min feed and a YES-centric decision path, so
+  it did not measure a fair NO decision. NO is now traded on a cost-adjusted
+  per-side net edge; re-evaluate NO vs YES WR once Polymarket-native trades
+  accumulate (Priority 3 query).
 - **Buying cheap YES (<40c) against market consensus = 0-10% WR** (catastrophic)
+  — now enforced symmetrically for both sides via the consensus guard (0.35).
 
 ### What's Running
 - **Arena process:** launchd service `com.polymarket.botarena` (loadable via `launchctl load -w ~/Library/LaunchAgents/com.polymarket.botarena.plist`; auto-restarts on crash via `KeepAlive`). Check status with `launchctl list | grep polymarket`.
@@ -27,35 +36,399 @@ Absolute numbers from the Feb 2026 v4 baseline (276 resolved trades, total P&L `
 
 > **Deployment note:** The two plists in `~/Library/LaunchAgents/` are symlinks back to the project tree (see [launchd Services](#launchd-services) below), so the repo is the single source of truth — `git pull` automatically propagates plist edits. Logs live in `~/Library/Logs/`, not in the repo.
 
-### Simmer API Keys (4 accounts, slot-based)
-Stored at `~/.config/simmer/bot_keys.json` — keys mapped to slot_0 through slot_3. When evolution kills a bot, the replacement inherits the dead bot's slot (and API key). Default key at `~/.config/simmer/simmer_api_key.json`.
+### Credentials
+Paper mode needs **no keys** — all market data (discovery, books, resolutions) is public. Live mode needs Polymarket credentials, added via the dashboard Settings tab (encrypted store, `credentials_store.py`). The old Simmer key files (`~/.config/simmer/*`) are obsolete — Simmer is fully removed (BUG #10).
 
 ## Architecture
 
-### Signal Hierarchy (make_decision in base_bot.py)
+### Signal Hierarchy (make_decision in base_bot.py) — MODEL-BLEND fair value (BUG #24)
 ```
-combined = (
-    market_price_edge * 0.50    # Strongest: follow the market price
-    + btc_momentum * 0.20       # BTC price movement direction
-    + strategy_signal * 0.15    # Per-bot strategy differentiation
-    + learning_bias * variable  # Grows from 10% to 60% weight with data
-)
+P_model   = 0.5 + 0.5 · Σ w_lane · lane          # lanes normalized to [-1,1], YES-frame
+|P_model − 0.5| < MODEL_LEAN_MIN (0.10) → SKIP   # hard lean floor, BUG #27
+trust_eff = trust · min(1, |P_model − 0.5| / MODEL_CONVICTION_SCALE)   # BUG #26
+edge_side = trust_eff · (P_model_side − side_price) − taker_fee        # BUG #27:
+            # each side anchored on its OWN book price — a cross-book gap is
+            # never directional edge (it's the arb bot's two-legged trade)
+  lanes: drift (anchor, harness +7.6¢/share net), mom (BTC 1-candle,
+         harness +10.2¢/share net),
+         pm (× SIGNAL_WEIGHT_PM=0 kill-switch — BUG #26: net edge NEGATIVE),
+         cvd (× SIGNAL_WEIGHT_CVD=0 kill-switch — BUG #27: thin-tape
+         saturation → sign(tape), live flat; feed now volume-floored at
+         CVD_VOLUME_FLOOR=200sh pending offline re-validation),
+         obi (× SIGNAL_WEIGHT_OBI=0 kill-switch),
+         fut/tech/xasset (2026-07-18 CANDIDATE lanes — Binance perp
+         funding/OI/taker delta, MACD/Bollinger/multi-TF composite, ETH+SOL
+         cross-asset confirmation; × SIGNAL_WEIGHT_FUT/TECH/XASSET=0
+         kill-switches, raw reads logged in trade reasoning for offline
+         validation — never weight before the harness shows positive NET edge),
+         strat (analyze() thesis — PER-STRATEGY profile weight since BUG #27),
+         learn (× 0 while LEARNING_ENABLED=False)
+  w_lane: per-strategy — BaseBot.STRATEGY_SIGNAL_PROFILE (differentiation by
+          EMPHASIS, all weights ≥0, no baked-in direction)
+  trust:  BaseBot.STRATEGY_MODEL_TRUST (0.5–0.6)
 ```
+**Signal-stack expansion (2026-07-18).** New modules in `signals/`: `curves.py`
+(smooth scoring: tanh soft-saturation, logistic, Gaussian zones, smoothstep —
+used for lane values/confidence; validated hard SAFETY gates stay hard),
+`futures_meta.py` (background-thread Binance perp funding/OI/taker-delta feed,
+auto-started idempotently by `arena/signals.build_combined_signals`), `volatility_regime.py` + `technicals.py` +
+`cross_asset.py` (pure local compute off the candle stream — the price feed now
+also carries ETH and exposes momentum/acceleration/multi-TF), and
+`macro_calendar.py` (time-based 08:30/14:00-ET release caution; ≥
+`config.MACRO_CAUTION_SKIP` (0.75) directional takers stand down in
+`make_decision` — non-directional context, like the session filter). All
+DIRECTIONAL candidate lanes are kill-switched at 0 pending harness validation;
+`vol_regime` context drives **HybridBot's regime-switching meta-learner**
+(dynamic sub-strategy weights: smooth trend-regime tilt × recent-live-WR
+logistic tilt, sub-analyzers now incl. phantom). The sentiment feed is **DISABLED**
+(`config.SENTIMENT_FEED_ENABLED = False` — `SentimentFeed.start()` no-ops, no
+polling thread, `get_signals()` returns `{}`); the LLM scorer scaffolding
+(Ollama-shaped, keyword fallback) stays in `signals/sentiment.py` for a future
+hosted-LLM (Claude/Grok) hookup. The momentum lane and the late-window boosts
+(base + sniper) are smooth curves now (same calibration points, no cliffs).
+Default paper bankroll is **$200** (`PAPER_BANKROLL_DEFAULT`).
+
+**Lane-promotion pipeline (2026-07-18).** Candidate lanes graduate from
+kill-switched to live through a measured, human-approved path:
+1. **Backfill + measure** — `tools/validate_signals.py --candidates`
+   reconstructs fut/tech/xasset readings for every harness decision point
+   (`tools/lane_candidates.py`: batch Binance klines + funding/OI/taker
+   series; production `technicals.compute`/`soft_saturate` code paths, so the
+   harness validates exactly what ships; the `/futures/data/*` endpoints
+   retain only ~30 days) and reports follow-WR + **net edge** per lane.
+2. **Auto-proposal** — `--propose` records the run (`lane_validation_runs`)
+   and files a PENDING `lane_proposals` row for any lane clearing the
+   conjunctive bar (`lane_candidates.MIN_SAMPLES/MIN_FOLLOW_WR/MIN_NET_EDGE`
+   = n≥200, WR≥55%, net ≥ +0.5¢/share on the lane's LIVE key — the WR-only
+   bar is exactly what pm_mom would have passed while losing money). This is
+   the only harness mode that writes to bot_arena.db (never trade tables).
+3. **Human approve/deny** — dashboard **Signal Lab** tab
+   (`/api/lane-proposals`, `/api/lane-proposals/{id}/decide`). Approving
+   writes the lane into the `lane_overrides` arena_state JSON
+   (`db.decide_lane_proposal`) with the proposal's per-strategy profile
+   weights (conservative 0.10 starters, `lane_candidates.PROFILE_SUGGESTIONS`).
+4. **Live effect, no restart** — `base_bot._lane_overrides()` (hot-path
+   cached, `HOTPATH_CACHE_TTL_SEC`) flips the lane's kill-switch multiplier
+   to 1.0 and `_model_prob_yes` takes the lane's weight from the approved
+   profile (strategies not named stay 0). The Signal Lab **Disable** button
+   (`/api/lane-overrides/{lane}/disable`) reverts a lane to weight 0 within
+   seconds — the safety hatch if live performance diverges from the harness.
+5. **Live monitor auto-demotes (2026-07-19)** — `arena/lane_monitor.py`
+   (called from the evolution loop every `LANE_MONITOR_INTERVAL_SEC`) parses
+   the raw `cand(...)` reads out of resolved trades placed since a lane's
+   approval, scores the lane's SIGN against the actual market direction, and
+   auto-calls `db.disable_lane_override` when accuracy < `LANE_MONITOR_MIN_ACCURACY`
+   (0.53) after ≥ `LANE_MONITOR_MIN_TRADES` (50) readings. The report lands in
+   arena_state `lane_monitor` and shows in Signal Lab next to each override.
+   Why: the 24h v5 run approved tech at a harness-read 74–80% follow-WR; live
+   it scored 51.7% over 209 trades (harness numbers carry adverse-selection +
+   stale-mid optimism — an approved lane must keep re-earning its weight; fut
+   was likewise auto-demoted at 52.6%, xasset stayed healthy at 57.2%).
+6. **Closed-loop auto-approve (BUG #31, 2026-07-21)** — `arena/lane_promoter.py`
+   (evolution-loop host, right after the monitor) flips the pipeline's JUDGE
+   from the optimistic offline harness to **live shadow attribution**. The
+   harness only NOMINATES (files a pending proposal); the promoter scores each
+   pending lane's own `cand(...)` reads across resolved trades — measured at
+   ZERO live weight, so it is the lane's live predictiveness before it can move
+   a trade — and, when the dashboard toggle `auto_approve_lanes` is ON (default
+   `config.AUTO_APPROVE_LANES_ENABLED`, stored in arena_state), auto-approves
+   lanes that clear a LIVE bar (`AUTO_APPROVE_MIN_ACCURACY` 0.55 over
+   `AUTO_APPROVE_MIN_TRADES` 60 — deliberately stricter than the monitor's 0.53
+   demotion floor, hysteresis so a borderline lane can't flap). Bounded: one
+   promotion per cycle, and never past `AUTO_APPROVE_MAX_ACTIVE` (3) live
+   candidate lanes. OFF → it still annotates every proposal with the live
+   evidence (shown in Signal Lab next to the harness metrics) and waits for a
+   human click; demotion stays automatic either way. Why: the harness approved
+   tech at 74–80% that scored 51.7% live — a lane must clear LIVE ground truth,
+   not the harness number, before (and to keep) carrying weight.
+7. **Core-lane auto-tuner (BUG #31)** — `arena/core_lane_tuner.py` (same
+   evolution-loop host, after the promoter) is the CORE half of the loop: it
+   tunes the lanes that drive **every** directional trade — drift/mom/strat —
+   **per strategy**, on that strategy's own live attribution (the drift=/mom=/
+   strat= readings logged in its trades' reasoning, joined to strategy_type via
+   bot_configs). A lane predictive for a strategy (sign accuracy ≥
+   `CORE_TUNE_HIGH_ACC` 0.56 over ≥ `CORE_TUNE_MIN_TRADES` 40) earns a small
+   `CORE_TUNE_STEP` (0.05) weight nudge UP; anti-predictive (≤ `CORE_TUNE_LOW_ACC`
+   0.48) nudges DOWN; the dead band between holds. Heavily bounded because these
+   lanes decide 100% of a decision: one step/lane/strategy/cycle, and a per-lane
+   `CORE_TUNE_BAND` (±0.20) around the hand-set class default so no lane can run
+   away or collapse (drift can never be tuned to zero). It writes a COMPLETE
+   per-strategy profile per tuned lane (marked `core:true` in `lane_overrides`)
+   — a core-lane override zeroes any strategy it omits, unlike a candidate lane.
+   Gated by the SAME toggle: OFF → computes and persists suggested weights to
+   arena_state `core_lane_tuner` (dashboard Core-Lane Tuning card) but never
+   applies. This is the mechanism that "fine-tunes all active bot strategies on
+   real data" — the candidate-lane loop only touches fut/tech/xasset.
+8. **Directed evolution (BUG #31)** — evolution now spawns replacements from the
+   **best-ranked survivor** (not `random.choice`) and mutates at the tighter
+   `MUTATION_RATE_DIRECTED` (0.07 vs 0.15), so a mutant stays near a proven
+   config instead of re-rolling params. Lane weights are no longer evolution's
+   job at all — the core-lane tuner owns them per strategy_type, which mutants
+   inherit automatically. Evolution manages the ROSTER; the tuner manages the
+   SIGNAL BLEND; they no longer fight over the same surface.
+The measurement is now **self-scheduling**: `arena/validation_scheduler.py`
+(same evolution-loop host) spawns `validate_signals.py --markets
+AUTO_VALIDATE_WINDOW_MARKETS --propose` every `AUTO_VALIDATE_EVERY_MARKETS`
+5-min windows (defaults: 300-market window, every 100 markets ≈ 8.3h —
+frequency gives regime freshness, the window keeps the n≥200 sample bar fed;
+timer persists in arena_state, output shares `logs/lane_validation.log` with
+the dashboard's Run Validation button). The loop is now **fully hands-off** end
+to end (harness nominate → live-verify → auto-approve → auto-demote) with the
+Signal Lab toggle the single human override.
+
+**Hard model-lean floor (BUG #27):** conviction scaling damped weak models but
+their residual edge still scaled with MARKET displacement, so trust_eff=0.03
+trades still cleared MIN_EDGE. Now lean < `config.MODEL_LEAN_MIN` skips
+outright — no opinion, no trade. Harness ignorance-fade probe (underdog when
+|drift|<0.15): 31.6% WR, −4.44¢/share over 247 samples. **Recalibrated 0.10 →
+0.05 (2026-07-18):** 0.10 was measured against the old cvd/pm-inflated lean
+distribution; on the fidelity profiles it demanded |drift| ≥ 0.286 from the
+drift-pure meanrev. 0.05 maps drift-pure onto exactly the harness's |drift| ≈
+0.15 ignorance boundary; the 0.05–0.10 band trades under damped trust.
+**Ask-priced decisions (2026-07-18):** edge, guards, `entry_price` and Kelly
+sizing all use the side's **executable best ask** (laid onto the market dict
+from the warm books by the trader; mid fallback until the warmer primes).
+Decisions used to price the mid while the fill engines walk the asks — on
+wide books (3–8¢ spreads) the fill landed > `MAX_FILL_SLIPPAGE` above the
+decision price and the slippage guard rejected 5 of 7 attempted trades in an
+hour. The slippage guard now only catches book *movement* between decision
+and fill. (The book-sum gate still judges the MIDS — asks sum > 1 on any
+normal spread.)
+**Mid = information, ask = cost (BUG #28):** the consensus/high-price guards
+are keyed on the chosen side's **MID** (what the crowd believes) while edge,
+`entry_price` and sizing use the ask — judging guards on the ask let a wide
+0.41 ask sneak past the consensus guard when the mid said 0.26. The venue
+slippage guard is a symmetric **band**: |fill − expected| ≤
+`MAX_FILL_SLIPPAGE` in either direction (a fill far *below* expectation
+means the book moved and the decision inputs are stale — that class ran 22%
+WR live).
+**Book-consistency gate (BUG #27):** |yes + no − 1| > `config.BOOK_SUM_TOLERANCE`
+(0.04) → directional skip. The old `edge_no = (1 − fair_yes) − no_price` mixed
+the two books, so stale/gapped books (sums 0.84–0.94 live) minted phantom
+edges that Kelly max-sized (−$29.15 in two trades).
+**Model-lean eligibility:** a bot may only buy a side its model *actively leans
+toward* (`P_model > 0.5` for YES, `< 0.5` for NO) — model ignorance (P=0.5) is
+not disagreement with the market, so it never fades the favorite on nothing.
+**Conviction-scaled trust (BUG #26):** eligibility alone was too weak — `edge =
+trust·(P_model − mid)` takes its magnitude from the *market's* displacement, so
+a model at 0.52 could book a 3–7¢ "edge" against any real market move and
+systematically fade it (chop run: underdog buys 38.5% WR, YES side 10% WR).
+`trust_eff` scales the model's say by its own information content
+(`config.MODEL_CONVICTION_SCALE` = 0.10 — full trust at lean ≥ 0.10, e.g. the
+validated market-lags-drift trade; near-zero at lean ≈ 0.01–0.03). Replay of the
+126-trade day under the new math: keeps 31 (65% WR, +$48.65), suppresses 95
+(54% WR, −$27.97 net).
+**Drift veto (BUG #25):** a directional bot never buys the side that
+*contradicts* a drift reading ≥ `config.DRIFT_VETO_MIN` (0.05) — live,
+drift-contradicting trades ran 26% WR vs 52% agreeing. Flow-only trades at
+drift≈0 stay allowed. Lane normalizations are calibrated to the real input
+distribution (momentum saturates at a 0.2% one-candle move ≈ p97; the first
+cut saturated below the *median* move and let one candle of noise outvote the
+time-damped drift — the #25 loss).
+**Why the old additive form died (BUG #24, 2026-07-16):** `fair = mid + tilt +
+alpha` counted its own bonus lanes as edge *by construction* — the flat +6¢
+favorite tilt alone cleared MIN_EDGE at window open, so all four directional
+bots bought the 58–65¢ favorite in the first minute of every window (107
+early-window trades, 49% WR, −$79.53; the 60–70¢ bucket alone −$64.55 at 47%
+WR — no favorite premium exists at taker prices). The net-edge harness
+(PM-price-aware, see below) confirmed: "buy the favorite" is the worst rule
+(negative EV above ~0.67); "follow drift only when the market lags" is the
+best. The tilt (`K_TILT`/`FAVORITE_EDGE_CAP`) and `MARKET_PRICE_AGGRESSION`
+are gone; drift's time-damping now naturally keeps bots flat in the noisy
+first minute instead of a hard time ban.
+**`btc_drift` (`signals/strike.py`) is the validated fundamental.** Each window
+resolves UP iff BTC closes ≥ its price at the window OPEN. The **strike** ("price
+to beat") is fetched accurately as the **Binance BTCUSDT 1m open at the market's
+`eventStartTime`** (Polymarket does not expose the strike directly; `eventStartTime`
++ the BTC feed reconstruct it, Chainlink basis ~0.005%) — once per market, off
+the hot path in the warmer, cached in `StrikeRegistry`. `drift = tanh(z)`,
+`z = (btc_now − strike)/(DRIFT_VOL_SCALE·√frac-remaining)` — bounded, regime-agnostic
+(YES above strike, NO below), time-scaled (more decisive near expiry). **It was
+first shipped with a MISCALCULATED strike (mid-window "first sighting") and blew
+up the account (BUG #23); with the accurate strike the offline harness measures
+it ~76% predictive.** Side selection is explicit **per-side** — each side scored
+on its own book price + fee (own edge, own confidence), same `MIN_EDGE` bar, no
+hardcoded bias.
+
+**Signal-validation harness (`tools/validate_signals.py`).** Offline check of any
+candidate signal on REAL data (resolved Gamma markets + Binance 1m klines + the
+market's own **Polymarket price history** via CLOB `prices-history`), writing
+nothing to `bot_arena.db` (gitignored, size-capped kline+PM cache). It reports
+two things: raw predictiveness (follow-the-signal WR) **and NET EDGE** — the
+per-share EV of a decision rule *after paying the actual PM price + taker fee*.
+**A signal can be predictive yet worthless once the market has priced it in**
+(that gap is exactly BUG #24), so a live weight requires positive NET edge, not
+just follow-WR ≫ 50%. Caveat: PM history mids are somewhat stale, so net-EV
+numbers are optimistic upper bounds — use them for *ordering/sign*, and the live
+DB for ground truth. Run: `.venv/bin/python3 tools/validate_signals.py --markets 300`.
+Empirical (2026-07-16, 300 markets, 50% UP base): drift 74.5% follow-WR (83%
+near expiry, 64% early); "follow drift only when the side ≤58¢ (market lags)"
+is the top net-EV rule; "buy the favorite" is the worst (negative above ~0.67).
+Prior run (2026-07-15): CVD 66.9/52.4 (real edge); OBI inverted (→ kill-switch
+0); learning bias inverted (→ disabled live). 2026-07-17 run (300 markets):
+`pm_mom` (PM in-market momentum) 69.7% follow-WR but **net edge −0.80¢/share**
+— predictive yet priced in (→ `SIGNAL_WEIGHT_PM = 0` kill-switch, BUG #26);
+the harness now also reports `magnitude_distribution` percentiles for honest
+lane-saturation calibration (pm p50 0.126/min vs the live 0.0019 clamp) and an
+ignorance-fade probe rule (its +9.7¢ reading is stale-mid inflation — the live
+DB ground truth for the same trade class was 41.7% WR / −2.8¢ gap). Coin-flip (45–55¢) trades are
+suppressed by the `MIN_EDGE` gate on a now-real edge, **not** a price-bucket ban.
+OBI + CVD (`signals/orderflow_signals.py`) are the two order-flow reads the
+profitable-bot research favors over price-history indicators — they describe
+pressure that hasn't hit the price yet. OBI is computed once per discovery cycle
+from the Up-token CLOB book; CVD is fetched per market from the data-api trade
+tape (`data-api.polymarket.com/trades`), cached ~20s. Both are in `[-1, 1]`
+(positive = upward/YES). Per-strategy lane weights live in
+`BaseBot.STRATEGY_SIGNAL_PROFILE`; `config.SIGNAL_WEIGHT_OBI` is a global OBI
+kill-switch.
+
+**Two-sided (YES/NO) net-edge selection.** From the blended `fair_yes` above,
+the bot computes a **cost-adjusted net edge on BOTH sides**
+— `edge = prob − side_price − taker_fee(1, side_price)` for YES and NO, each
+using that side's own book mid (`market["no_price"]` for NO) and the canonical
+`polymarket_fills.taker_fee` — and **buys whichever side has the larger positive
+edge** above a per-strategy `BaseBot.MIN_EDGE` floor (skips if neither clears it).
+YES and NO are evaluated on their own prices/fees, so NO is a first-class
+decision, not a mirror of YES — subject to the **model-lean eligibility** rule
+above (only the side the model actively leans toward is tradable). A directional bot takes at most one
+side per market (argmax) — arbitrage is the only two-legged bot. Sizing,
+`entry_price`, and the slippage limit all key off the chosen side's price. The
+old blanket **NO ban is gone** (see BUG_HISTORY #20).
 
 ### Safeguards
-- **Market consensus guard:** Never bet against prices >65c or <35c
+- **Model-lean floor + book-consistency gate (BUG #27):** see Signal
+  Hierarchy above — lean < `MODEL_LEAN_MIN` (0.10) or books summing outside
+  1±`BOOK_SUM_TOLERANCE` (0.04) skip before any edge is computed.
+- **Dead-zone gate (BUG #31):** a directional bot sits flat when the chosen
+  side's MID is in `[DEAD_ZONE_PRICE_LO, DEAD_ZONE_PRICE_HI]` (0.42–0.58) AND
+  `|drift| < DEAD_ZONE_DRIFT_MIN` (0.10) — fires in `make_decision` *before*
+  the edge gate. This was the single biggest live leak (0.42–0.58 & flat drift:
+  59 trades, 39% WR, −$77.83 — a model opinion against a coin-flip market). It
+  is drift-CONDITIONAL: `|drift| ≥ 0.10` in the same band is the profitable
+  "market lags drift" trade (+$30.10, 65.7% WR) and passes through. Zone bots
+  (sniper/makers) override `make_decision` and carry their own drift gates.
+- **Shared-pool concentration cap (BUG #27):** total OPEN cost per (market,
+  side) across ALL bots is capped at `config.MARKET_SIDE_EXPOSURE_CAP` (0.10)
+  × the gross paper pool (`db.get_open_exposure` / `db.get_paper_pool_gross`;
+  live: 2×`LIVE_MAX_POSITION`). Directional bots clamp to the remaining
+  headroom or skip (`reason='exposure_cap'`) — per-bot Kelly can't see the
+  correlated positions tandem bots just opened (hour-22 pile-ins were ~4×
+  leverage on one BTC candle). Arbitrage (hedged, own `execute()`) is exempt.
+- **Symmetric side guards:** A bot never buys a *chosen* side priced above
+  `config.HIGH_PRICE_GUARD` (0.72 — bad risk/reward) or below
+  `config.CONSENSUS_GUARD` (0.35 — fighting strong consensus). Both key off the
+  side actually being bought, so YES and NO are protected identically (replaces
+  the old YES-only NO-ban + one-sided consensus guard).
+- **Session-timing skip:** Sit flat during high-flip session handovers (NYSE
+  open/close, ET) — the trader gates all taker bots once per tick
+  (`arena/session_filter.py`, `config.SESSION_SKIP_*`). "Build the skip, default
+  flat." Skip reasons are tallied in shared state and flushed to `arena_state`
+  every 30s (dashboard `/api/skips`).
+- **Clean-tick guard:** Reject implausible single-tick price jumps (>15¢)
+  (`signals/clean_tick.py`, `config.CLEAN_TICK_*`); applied to both YES and NO
+  prices in the market-data warmer (and the fallback `refresh_price`).
+  Drop-first-tick is OFF (`CLEAN_TICK_DROP_FIRST=False`) — REST/warmer reads are
+  already current, so dropping the first would blank a new market for a cycle.
+- **Pure fractional-Kelly sizing (2026-07-17):** binary-market Kelly `f* =
+  edge/(1−price)` (edge already fee-adjusted), bet at the **Kelly fraction ×
+  f* × live bankroll** (paper pool via cached `db.get_paper_available`,
+  `SIZING_BANKROLL_CACHE_SEC`). The Kelly fraction lives in the DB
+  (`db.get_kelly_fraction`, default `config.KELLY_FRACTION` = 0.25) and is
+  **editable in the dashboard Settings tab** — the arena picks up changes
+  within seconds. Paper bets are **uncapped** (no per-trade / %-of-balance
+  limits; the venue's shared-pool gate is the only spend limit); live mode
+  keeps the hard `LIVE_MAX_POSITION` cap. Replaces the flat
+  confidence-scaled %-of-max-position formula (win avg $3.83 vs loss avg
+  $3.76 over 453 trades — size ignored edge, odds, and bankroll). Still
+  **shares-first**: exact share count derived before USD (`amount =
+  target_shares × price`) — never USD → shares, which rounds away PnL at low
+  prices. **Kelly edge cap (2026-07-19):** the edge fed into SIZING is
+  clamped at `KELLY_EDGE_CAP` (0.10; trade/skip still uses the raw edge) —
+  outsized edges mean maximal model-vs-market disagreement, which live
+  correlates with stale inputs (the 24h run's 15 biggest bets went 8/15 for
+  −$34). **Flow-only edge tax made CONTINUOUS (BUG #30, 2026-07-20):** the
+  old step (raised 0.05 → 0.10 on 2026-07-19) only penalized |drift| < 0.10;
+  the next 24h/279-trade run showed the 0.10–0.30 band it released to full
+  trust was the single biggest dollar loss (135 trades, 49.6% WR, −$76.32),
+  while only |drift| ≥ 0.30 was genuinely predictive (79.3% WR). `min_edge`
+  now tapers linearly — `1 + (FLOW_ONLY_EDGE_MULT_MAX − 1) × max(0, 1 −
+  |drift|/FLOW_ONLY_DRIFT_FULL_TRUST)` (max 2.0×, full trust at 0.30) —
+  instead of stepping to full trust at 0.10; a claim resting purely on noisy
+  flow lanes now pays a graduated tax that only fully lifts near the
+  harness's genuinely-predictive drift range. The BTC mom lane is also damped
+  ×`MOM_QUIET_REGIME_DAMP` (0.5) when the volatility regime reads "quiet"
+  (one candle of chop-tape noise is not a trend).
+- **Price-justified-by-drift gate (zone bots):** the late-window maker,
+  fee-zone maker, and sniper require `0.5 + 0.5·|drift|` (the calibrated
+  drift-implied probability) `≥ side_price + taker_fee + min_edge` — a 71%-WR
+  maker still lost −$41.66 buying 79¢ entries whose price already contained
+  the conviction (overnight 2026-07-17, 69 trades).
+- **Entry-price-bucket ROI:** `db.get_entry_price_buckets()` + dashboard
+  `/api/entry-buckets` report count/WR/ROI and the **break-even gap** (WR − avg
+  entry) per bucket — a high WR bought at high prices still loses; the gap must
+  be ≥5¢ to break even, ≥10¢ to profit.
 - **Bet sizing cap:** Confidence capped at 0.45 for sizing (prevents overconfident large bets)
-- **Stale trade expiry:** Trades pending >1h auto-expire (5-min markets resolve in ~10min)
+- **No stale expiry:** Pending trades stay pending until the market actually resolves. The old 1h auto-expire was removed — it threw away real outcomes. See BUG_HISTORY #10.
 - **Daily loss limits:** Uncapped for paper trading (was $10/bot, $25 total)
 - **Dedup:** Loads recent (bot, market) pairs from DB to prevent duplicates across restarts
 
+### Market-data warmer (`arena/market_data.py`) — the hot-path fast lane
+One background thread (`MarketDataWarmer`, `config.MARKET_DATA_INTERVAL_SEC`, default **1s**) is the **single owner of all per-market network reads**: YES+NO books, YES+NO prices, OBI, CVD, PM in-market momentum → written into a shared `MarketDataStore` (`market_data.store()`). The Trader's 1s tick and the arbitrage bot read this **warm cache** (zero network on the hot path); `build_combined_signals(..., warm=...)` takes the warm values directly. So every trading-decision input stays **≤1s fresh**. The per-signal feed caches (CVD tape, PM history) are now just coalescing guards — TTL `config.SIGNAL_CACHE_TTL_SEC` (≈0.8s) so the warmer refreshes them every cycle. Cost: ~4 CLOB/data-api calls/sec for the live market; dial `MARKET_DATA_INTERVAL_SEC` up to back off. The maker section (20s hook) still uses the cold path (`warm=None`).
+
+**Hot-path DB caches:** `make_decision` used to run two SQLite queries per bot per second (resolved-trade count for the learning weight; the `bot_learning` table for the learned bias). Both now cache for `config.HOTPATH_CACHE_TTL_SEC` (30s — they only change on resolution); `learning.record_outcome` busts the bias cache. `db.get_bot_mode` caches for `config.BOT_MODE_CACHE_TTL_SEC` (3s) and is invalidated on `set_bot_mode`/`retire_bot`.
+
+### Market data (Polymarket-native)
+`polymarket_markets.py` owns all market data (public, no auth):
+- **Discovery:** Gamma `/events?series_id=10684` ("BTC Up or Down 5m") → normalized market dicts; the live window is picked by real `resolves_at` (`market_utils.select_current_market`).
+- **Fresh prices / depth:** CLOB `/book` — normalized so `best_bid`/`best_ask` are correct (the raw feed is worst→best ordered, a trap). Consumed on the hot path via the warmer above, not fetched per bot.
+- **Resolution:** `recent_resolutions()` builds a `condition_id → outcome` map from the series' closed events' `outcomePrices` (`["1","0"]`=Up). The CLOB `tokens[].winner` flag is unreliable — do not use it.
+
+### Execution venues (paper vs live)
+Order placement is split by venue so the two never intermix — `base_bot.execute()` picks an engine via `venues.get_engine(mode)`. Both use identical pricing/fill/fee math (`polymarket_fills.py`):
+- **Paper** (`venues/paper.py`, `fill_source='paper_sim'`): **simulates against the real CLOB order book** — walks the asks for depth/slippage, applies the Polymarket taker fee, and never submits. All paper bots share ONE virtual USDC pool. `available = bankroll + realized_paper_pnl − reserved_open_cost` (`db.get_paper_available`); a bot can't spend cash the pool lacks. The dashboard Settings "Balance" field **tops the pool up to the entered figure** via `db.topup_paper_bankroll` — it back-solves the underlying `bankroll` so `available` equals what you type, *preserving* trade history and open positions (entering $200 when the pool is at $45 sets available to exactly $200). The Settings "Kelly Fraction" field edits the live sizing multiplier the same way (`db.get_kelly_fraction`, picked up within seconds). Resolves against the real market outcome.
+- **Live** (`venues/live.py` → `polymarket_client.py`): real CLOB `create_market_order`/`MarketOrderArgs` (auto tick-size / neg-risk / fee). Uses the real wallet USDC balance. Fully wired but only used when a bot's `trading_mode` is `live` (arena starts in paper).
+- **Fees:** `polymarket_fills.taker_fee()` is the **single source of truth** for fee math — makers free, takers pay `feeRate × shares × p × (1−p)` per the [official Polymarket docs](https://docs.polymarket.com/trading/fees) (symmetric around 50¢; crypto tier `config.POLYMARKET_TAKER_FEE_RATE = 0.07`, peaking at $1.75/100 shares at 50¢). Any bot needing a fee estimate must call this, never re-derive it (see BUG_HISTORY #17). Factored into resolved P&L (`payout − amount − fee`). Trade columns `fill_source`/`entry_price`/`fee` record each fill.
+
 ### Per-Strategy Differentiation
-| Strategy | Aggression | Prior | Min Confidence |
-|----------|-----------|-------|----------------|
-| momentum | 1.2 (follows price strongly) | 0.52 (slight YES) | 0.01 (trades almost everything) |
-| mean_reversion | 0.95 (nearly follows, was 0.6) | 0.48 (slight NO) | 0.06 |
-| sentiment | 1.0 (neutral) | 0.50 | 0.03 |
-| hybrid | 1.0 (neutral, was 0.9) | 0.50 | 0.05 |
+Differentiation is by **model emphasis** (`BaseBot.STRATEGY_SIGNAL_PROFILE` lane
+weights + `STRATEGY_MODEL_TRUST`), never by a hardcoded direction — all weights
+are ≥0 and all lanes regime-agnostic. Under the old shared additive stack the
+four directional bots placed the *identical* trade in the same second (4× the
+same mistake); now different inputs trade different bots:
+
+Fidelity redesign (BUG #27): with pm/obi/cvd killed pending validation, the
+LIVE lanes are drift, mom and strat — and the strat lane now carries a
+**per-strategy profile weight** (the flat global 0.15 differentiated nobody).
+Both live signal lanes are harness-validated for net edge (drift +7.6¢, mom
++10.2¢/share); the **strat** lane (`analyze()` thesis) is NOT yet
+harness-validated the same way — BUG #30/#31 found live WR falling as its own
+confidence rose (|strat| ≥ 0.6: 36.1–46% WR; the only profitable band was
+|strat| < 0.3 at +$41.23), so `config.STRAT_LANE_CONF_CAP` (**0.30**, lowered
+from 0.60 in BUG #31) clamps its magnitude to that band before the blend
+pending a proper offline validation of the lane. **momentum and hybrid
+profiles rebalanced toward drift (BUG #30)** — see below; both had been the
+worst live performers and the most exposed to the mom/strat lanes just shown
+harmful at high magnitude:
+
+| Strategy | Live profile (drift/mom/strat) | Trust | Character |
+|----------|-------------------------------|-------|-----------|
+| momentum | .35/.40/.25 | 0.50 | trades the BTC short-term trend (mom lane + its trend analyze()) |
+| phantom  | .20/.30/.50 | 0.50 | EMA-crossover/breakout swing — analyze()-thesis-dominant |
+| mean_reversion (meanrev-v1, +tp) | .70/0/.30 | 0.60 | drift anchor + z-score fade, **drift-gated** (BUG #28: the fade only fires toward the side signed drift ≥ `min_drift` 0.10 already favors — drift picks the side, the z-score times the pullback; ungated it went 0/11) + max side mid 0.58 (`STRATEGY_MAX_SIDE_PRICE`, the harness's "market lags" rule) |
+| sentiment | .30/0/.70 | 0.50 | in-market flow reader (raw pm+cvd via analyze(); its lanes stay killed until validated) — not in the default slate |
+| hybrid | .50/.20/.30 | 0.50 | balanced ensemble of the sub-strategies |
+| arbitrage | n/a — **overrides** `make_decision`/`execute` (market-neutral, two-legged) | n/a | n/a |
+
+(pm/cvd/obi profile weights are all 0 while their kill-switches are 0. The
+old `meanrev-sl25-v1` is renamed **`meanrev-v1`** / `mean_reversion` — the
+stop-loss was removed long ago (spec R3) and the separate menu entry was a
+byte-identical duplicate; `db.init_db` migrates old rows idempotently.)
+
+**Every bot trades both sides now (BUG_HISTORY #20).** The four directional bots (+SL/TP variants) pick YES or NO via the two-sided net-edge comparison above. The **sniper** overrides `make_decision` but applies its cheap/strong price zones symmetrically to the NO token. Both **makers** quote whichever side's price is in their band. A directional/sniper/maker bot takes **at most one side per market**; only arbitrage is two-legged.
+
+**Drift-confirmation gates on the zone/band bots (2026-07-16, harness net-edge data).** The sniper and both makers pick a side from a *price* pattern — which the net-edge harness showed is not edge by itself (the in-zone favorite measured +0.8¢/share; the sniper cheap zone −8.8¢ at 37.5% WR). All three now additionally require the **signed `btc_drift` toward the chosen side** (`min_drift` param: sniper/fee-zone 0.15; late-window 0.25, where drift *picks* the side and momentum is demoted to a non-contradiction check + confidence booster). With the gate the same rules measured +9.4¢ (fee-zone, 82.6% WR) and +16.3¢ (sniper cheap zone, 62.9%). The sniper's early-window confidence/size boosts are **removed** (early entries were the arena's entire loss — BUG #24). Maker `entry_price` now reports the side's real price, not the quoted ask (+6¢/+2¢), so the slippage guard is honest — the `maker_*` fields are logged metrics only, and **maker quotes execute as TAKER fills** in both venues (the zero-fee maker advantage is aspirational until real limit-order posting exists). **Phantom** retuned EMA 20/50→9/26, breakout 20→10 (warmup 70→36 candles — it was a silent clone for the first ~70 min of every restart) and its min-ATR vol gate lowered 0.05%→0.02% (the old floor sat at ~p75 of real BTC 1-min moves; it idled through normal tape).
+
+**Arbitrage bot** (`bots/bot_arbitrage.py`): buys **both** YES and NO on one market when the market-neutral edge clears `config.ARBITRAGE_MIN_MARGIN` per matched share pair, locking in `1 − cost` regardless of outcome. **Two things make the edge real (see BUG_HISTORY #11):** (1) the edge is measured from the **depth-walked VWAP** of filling the intended size on each book — *not* the thin top-of-book `best_ask`, which lies about cost once you size past one share; (2) both legs are **share-matched** — sized to the *same* share count (the smaller of the two books' fillable depth, capped by `max_pos` and the shared bankroll), and filled by an exact-share path (`polymarket_fills.simulate_fill_shares` → `engine.place(..., target_shares=...)`) so the position is genuinely neutral. It bypasses the directional signal stack/guards, places both legs in one `execute()` (success only if **both** fill — a one-legged fill is logged as naked risk), reads warm books from the market-data store, and is evolution-exempt.
 
 ### Learning System
 - Features extracted at TRADE TIME (not resolution time — this was a critical bug fix)
@@ -67,14 +440,23 @@ combined = (
 ## Key Files
 
 ```
-arena.py              # Main loop: discover markets, run bots, resolve trades, evolve
-bots/base_bot.py      # BaseBot with make_decision() signal hierarchy + execute()
+arena.py              # Coordinator: interactive startup, boot threads, evolution cycle
+arena/market_data.py  # MarketDataWarmer (1s) — sole owner of per-market network reads → warm store
+arena/startup.py      # Interactive continue/fresh + default/manual bot selection (tty only)
+bots/base_bot.py      # BaseBot with make_decision() signal hierarchy + execute() → venue engine
 bots/bot_momentum.py  # MomentumBot (follows trends)
 bots/bot_mean_rev.py  # MeanRevBot (was contrarian, now nearly neutral)
 bots/bot_sentiment.py # SentimentBot
 bots/bot_hybrid.py    # HybridBot
-config.py             # All config: paths, limits, evolution interval, API URLs
-db.py                 # SQLite: trades, bot_configs, evolution_events, bot_learning
+bots/bot_arbitrage.py # ArbitrageBot: market-neutral YES+NO cross-book arb (evolution-exempt)
+venues/__init__.py    # get_engine(mode) + TradeResult — paper vs live split
+venues/paper.py       # PaperEngine: simulate fills vs real CLOB book + shared bankroll
+venues/live.py        # LiveEngine: Polymarket CLOB order placement
+polymarket_markets.py # Market data: discovery (Gamma), book/prices, resolution
+polymarket_fills.py   # Order-book fill simulation + taker fee formula
+polymarket_client.py  # CLOB client: market/limit orders, balances, order book
+config.py             # All config: paths, limits, evolution interval, API URLs, SIMMER_MIRROR_ENABLED
+db.py                 # SQLite: trades (+ fill_source/entry_price), bot_configs, evolution, bot_learning
 learning.py           # Feature extraction, bias calculation, outcome recording
 signals/price_feed.py # Binance WS for BTC candles (staleness detection)
 signals/sentiment.py  # Sentiment signals
@@ -160,7 +542,7 @@ The HTTP-Basic credentials used by the probe (`admin` / `Thor`) are hardcoded to
 
 ### Fresh-clone Setup
 
-> ⚠️ This starts the bot trading on completion. Make sure the Simmer keys exist at `~/.config/simmer/simmer_api_key.json` and at `~/.config/simmer/bot_keys.json` (all four `slot_0…slot_3` entries populated) first. Otherwise the loaded program will fail to start and `KeepAlive` will keep relaunching it — the throttle is 30s for the arena and 10s for the dashboard, so the stderr logs (`~/Library/Logs/com.polymarket.botarena.err.log`, `~/Library/Logs/com.polymarket.dashboard.err.log`) fill quickly with `FileNotFoundError` lines.
+> ⚠️ This starts the bot trading (paper mode) on completion. No API keys are required for paper trading. If a service fails to start, `KeepAlive` relaunches it on a throttle (30s arena / 10s dashboard), so the stderr logs (`~/Library/Logs/com.polymarket.botarena.err.log`, `~/Library/Logs/com.polymarket.dashboard.err.log`) fill quickly with the traceback — check there first.
 
 `WorkingDirectory` is intentionally unset in both plists — `config.py` (`DB_PATH`, `LOG_DIR`) and `dashboard/server.py` (`Path(__file__).parent / "index.html"`) anchor every path on `__file__`, so launchd's default cwd of `/` is harmless. If you specifically want the courtesy-chdir before exec, add `<key>WorkingDirectory</key><string>/your/absolute/repo/path</string>` to both plists manually before `launchctl load -w`.
 
@@ -189,21 +571,7 @@ SQLite at `<repo>/bot_arena.db` (= `config.DB_PATH`) — tables: trades, bot_con
 
 ## Bug History (avoid re-introducing)
 
-1. **Circular learning (v3 bug, CRITICAL):** `resolve_trades()` used `market.get("current_price")` at resolution time. Resolved markets have price ~1.0 or ~0.0, so learning was: "high price = YES wins" (tautology). **Fix:** Store features at trade time in `trade_features` column.
-
-2. **P&L always $0 (v3 bug):** Old `resolve_trades()` SELECT didn't include `shares_bought`, so the try/except defaulted to shares=0, making pnl=0 for all trades. **Fix:** Include shares_bought in SELECT, formula: `pnl = (shares - amount) if won else -amount`.
-
-3. **P&L formula wrong (v3 bug):** Used `pnl = amount` for wins instead of `shares_bought - amount`. In prediction markets, profit = shares * $1 - cost, not 2x the bet.
-
-4. **Stale trades clogging queue:** 5-min market trades that fell off Simmer's resolved API (limit=200) stayed pending forever (425 trades). **Fix:** Auto-expire trades pending >1h.
-
-5. **Duplicate trades on restart:** In-memory `traded` set reset every restart. **Fix:** Load recent (bot, market) pairs from DB on startup.
-
-6. **sqlite3.Row has no .get():** Use `try: val = row["col"] except: val = default` instead of `row.get("col", default)`.
-
-7. **Paper P&L always $0 — resolver scanned a list that excludes fast-5m markets (CRITICAL):** `TradeResolver._resolve_pending()` fetched `/api/sdk/markets?status=resolved&limit=200` and matched pending trades against that list. BTC 5-min markets are tagged `fast-5m` and are **absent from the general market list** (the same reason `discovery.py` must pass `tags=fast-5m`), so the list never contained our markets → `resolved_map` was always empty → every trade sat pending until the 1h stale-sweep expired it at `pnl=0`. The resolver logged only `Expired N`, never `Resolved N`. **Fix:** resolve each distinct pending `market_id` by direct lookup `GET /api/sdk/markets/{id}` (`arena/resolver.py::_fetch_market_outcome`). Note: Simmer leaves `resolved_at` **null even after resolution** on these markets, so the authoritative signal is `status == "resolved"` **and** a non-null boolean `outcome` (JSON `true`/`false` = Up/Down) — do *not* rely on `resolved_at != null` here despite what the Simmer docs suggest.
-
-8. **Paper P&L always $0 — wrong share-count field from Simmer trade response:** `_execute_paper()` logged `shares_bought=result.get("shares_bought")`, but Simmer's `/api/sdk/trade` response reports the fill under `shares` / `shares_filled` (+ `fill_price`/`cost`), *not* `shares_bought`. Missing/zero shares means `pnl = shares - amount` can only ever be $0 (same class as Bug #2). **Fix:** `BaseBot._extract_shares()` reads `shares_bought`/`shares`/`shares_filled`, and if still zero derives shares from the fill price (`amount / fill_price`, or `amount / (1-yes_price)` for NO bets) so a share count is always recorded. Trades already logged with `shares_bought=0` can't be backfilled (entry price is lost) and stay at $0.
+Moved to **[BUG_HISTORY.md](./BUG_HISTORY.md)** to keep this guide lean. Read it before touching the resolver, discovery, learning, or P&L code — it records nine already-fixed bugs (circular learning, the various `$0` P&L causes, stale-trade clogging, and the next-day/15-min market selection bug) and the reasoning behind each fix.
 
 ## Next Steps for Iteration
 

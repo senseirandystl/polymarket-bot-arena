@@ -68,7 +68,7 @@ class BtcMakerBot(BaseBot):
         """
         p = self.strategy_params
         prices = signals.get("prices", [])
-        market_price = market.get("current_price", 0.5)
+        market_price = market.get("current_price") or 0.5  # None if book down
 
         # --- Directional lean from recent BTC candles ---
         momentum = 0.0
@@ -176,7 +176,8 @@ class BtcMakerBot(BaseBot):
             if mode == "live":
                 return self._execute_maker_live(signal, market, amount)
             else:
-                return self._execute_paper(signal, market, amount, "simmer", mode)
+                # Paper fills route through the shared local-sim venue engine.
+                return self._place_via_engine(signal, market, amount, mode)
         except Exception as e:
             log.error(f"[{self.name}] Trade exception: {e}")
             return {"success": False, "reason": str(e)}

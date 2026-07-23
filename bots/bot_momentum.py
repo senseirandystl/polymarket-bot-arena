@@ -4,7 +4,12 @@ from bots.base_bot import BaseBot
 
 DEFAULT_PARAMS = {
     "lookback_candles": 5,
-    "momentum_threshold": 0.002,  # 0.2% move to trigger
+    # 0.03% move to trigger (was 0.2% — fired in ~6% of ticks, so the strategy
+    # lane was silent and all bots were clones). BTC 1-min candles routinely move
+    # >0.03%, so momentum now emits a directional lean whenever there is a real
+    # trend; the strategy lane is capped at +/-0.043 of fair value, so a frequent
+    # lean nudges rather than dominates.
+    "momentum_threshold": 0.0003,
     "position_size_pct": 0.05,    # 5% of max position
     "min_confidence": 0.55,
     "trend_strength_weight": 0.7,

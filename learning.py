@@ -8,11 +8,46 @@ decisions, the bot queries its learned win rates to bias yes/no.
 
 import math
 import logging
+import threading
+import time
 from datetime import datetime
 
+import config
 import db
 
 logger = logging.getLogger(__name__)
+
+# Per-bot cache of the bot_learning feature table. get_learned_bias runs on the
+# 1s trader hot path for every bot, but the underlying win/loss counts only
+# change when a trade RESOLVES (~60s). Cache the rows for HOTPATH_CACHE_TTL_SEC
+# to avoid a SQLite round-trip per bot per tick. record_outcome invalidates the
+# affected bot so freshly-learned data isn't masked by a stale cache.
+_learn_cache: dict = {}   # bot_name -> (ts, {feature_key: (wins, losses)})
+_learn_cache_lock = threading.Lock()
+
+
+def _learned_table(bot_name):
+    """Return ``{feature_key: (wins, losses)}`` for a bot, cached briefly."""
+    now = time.time()
+    ttl = getattr(config, "HOTPATH_CACHE_TTL_SEC", 30)
+    with _learn_cache_lock:
+        hit = _learn_cache.get(bot_name)
+        if hit and (now - hit[0]) < ttl:
+            return hit[1]
+    with db.get_conn() as conn:
+        rows = conn.execute(
+            "SELECT feature_key, wins, losses FROM bot_learning WHERE bot_name=?",
+            (bot_name,)
+        ).fetchall()
+    learned = {r["feature_key"]: (r["wins"], r["losses"]) for r in rows}
+    with _learn_cache_lock:
+        _learn_cache[bot_name] = (now, learned)
+    return learned
+
+
+def _invalidate_learned(bot_name):
+    with _learn_cache_lock:
+        _learn_cache.pop(bot_name, None)
 
 # Feature buckets
 PRICE_BUCKETS = [
@@ -123,13 +158,7 @@ def get_learned_bias(bot_name, features, prior_yes=0.5):
     Returns:
         float 0.0-1.0 representing how much to lean yes
     """
-    with db.get_conn() as conn:
-        rows = conn.execute(
-            "SELECT feature_key, wins, losses FROM bot_learning WHERE bot_name=?",
-            (bot_name,)
-        ).fetchall()
-
-    learned = {r["feature_key"]: (r["wins"], r["losses"]) for r in rows}
+    learned = _learned_table(bot_name)
 
     # Start with prior
     log_odds = math.log(prior_yes / (1 - prior_yes)) if 0 < prior_yes < 1 else 0
@@ -199,6 +228,9 @@ def record_outcome(bot_name, features, side, won):
                         ON CONFLICT(bot_name, feature_key)
                         DO UPDATE SET wins=wins+1, updated_at=datetime('now')
                     """, (bot_name, feat))
+
+    # Bust the hot-path cache so the freshly-learned counts are visible now.
+    _invalidate_learned(bot_name)
 
 
 def extract_features_from_reasoning(reasoning):

@@ -17,6 +17,7 @@ import config
 import credentials_store
 import db
 import learning
+from arena.market_utils import is_5min_market
 
 security = HTTPBasic()
 
@@ -45,33 +46,22 @@ _balance_cache = {}
 BALANCE_CACHE_TTL = 60  # seconds
 
 
-def _fetch_slot_balance(api_key):
-    """Fetch balance for a Simmer account."""
-    import requests
-    try:
-        headers = {"Authorization": f"Bearer {api_key}"}
-        resp = requests.get(
-            f"{config.SIMMER_BASE_URL}/api/sdk/agents/me",
-            headers=headers, timeout=10,
-        )
-        if resp.status_code == 200:
-            data = resp.json()
-            return data.get("balance")
-    except Exception:
-        pass
-    return None
+def get_bot_balance(trading_mode="paper"):
+    """Balance for a bot. Paper bots share the virtual bankroll; live bots show
+    real Polymarket USDC. Returns ``(balance, is_live)``."""
+    # Paper: all bots draw from ONE shared virtual USDC bankroll (set in the
+    # dashboard Settings tab). Show the currently-available pool cash.
+    if trading_mode != "live":
+        return db.get_paper_available(), False
 
-
-def get_bot_balance(slot_name, bot_keys, trading_mode="paper"):
-    """Get cached or fresh balance for a bot slot. Live bots show Polymarket USDC balance."""
-    cache_key = "polymarket_live" if trading_mode == "live" else slot_name
+    cache_key = "polymarket_live"
     now = time.time()
     cached = _balance_cache.get(cache_key)
     if cached and (now - cached["fetched_at"]) < BALANCE_CACHE_TTL:
-        return cached["balance"], trading_mode == "live"
+        return cached["balance"], True
 
-    if trading_mode == "live":
-        # Read Polymarket L2 credentials from the encrypted store.
+    # Live: query the real Polymarket wallet USDC (paper already returned above).
+    if True:  # noqa: SIM103 - kept for a clear indent level; paper returned early
         api_key = credentials_store.get_credential("polymarket_api_key")
         api_secret = credentials_store.get_credential("polymarket_api_secret")
         api_passphrase = credentials_store.get_credential("polymarket_api_passphrase")
@@ -112,37 +102,18 @@ def get_bot_balance(slot_name, bot_keys, trading_mode="paper"):
         _balance_cache[cache_key] = {"balance": balance, "fetched_at": now}
         return balance, True
 
-    api_key = bot_keys.get(slot_name)
-    if not api_key:
-        return None, False
-    balance = _fetch_slot_balance(api_key)
-    _balance_cache[cache_key] = {"balance": balance, "fetched_at": now}
-    return balance, False
-
 
 @app.get("/", response_class=HTMLResponse)
-async def index():
+def index():
     html_path = Path(__file__).parent / "index.html"
     return html_path.read_text()
 
 
 @app.get("/api/status")
-async def get_status():
+def get_status():
     warnings: list = []
-    if not config.is_credential_configured("simmer_api_key"):
-        warnings.append({
-            "level": "error",
-            "category": "credentials",
-            "message": (
-                "No Simmer API key configured. The arena is running but bots cannot "
-                "trade. Open the Settings tab to enter your Simmer API key."
-            ),
-        })
-    elif not config.is_credential_configured("simmer_bot_keys"):
-        # Single-account mode is fine \u2014 only flag if zero per-bot keys AND no
-        # default key. Actually we already checked the default key above, so
-        # this branch is informational only (multi-account mode is optional).
-        pass
+    # Paper mode needs no credentials \u2014 it simulates against public Polymarket
+    # order books. Only live mode requires Polymarket CLOB credentials.
     if config.get_current_mode() == "live":
         pm_missing = [
             name for name in (
@@ -206,213 +177,103 @@ def _to_et(dt_utc):
         return dt_utc + timedelta(hours=-4 if dst_start <= dt_utc < dst_end else -5)
 
 
-def _window_contains_now(question: str, now_utc) -> bool:
-    """Return True if the question's ET time range contains the current ET time."""
-    import re
-    q = question.lower()
-    match = re.search(r'(\d{1,2}):(\d{2})\s*(am|pm)\s*[-–]\s*(\d{1,2}):(\d{2})\s*(am|pm)', q)
-    if not match:
-        return False
-    h1, m1, ap1 = int(match.group(1)), int(match.group(2)), match.group(3)
-    h2, m2, ap2 = int(match.group(4)), int(match.group(5)), match.group(6)
-    if ap1 == 'pm' and h1 != 12: h1 += 12
-    if ap1 == 'am' and h1 == 12: h1 = 0
-    if ap2 == 'pm' and h2 != 12: h2 += 12
-    if ap2 == 'am' and h2 == 12: h2 = 0
-    start_min, end_min = h1 * 60 + m1, h2 * 60 + m2
-    now_et = _to_et(now_utc)
-    now_min = now_et.hour * 60 + now_et.minute
-    if end_min > start_min:
-        return start_min <= now_min < end_min
-    else:  # crosses midnight ET
-        return now_min >= start_min or now_min < end_min
-
-
 @app.get("/api/markets")
-async def get_markets():
-    """Get active BTC fast markets as {current, upcoming_count, upcoming}.
+def get_markets():
+    """Current + upcoming BTC 5-min markets, from Polymarket (Gamma + CLOB).
 
-    Queries two sources: SDK (upcoming tagged markets) + public API (live markets).
-    The SDK endpoint drops live markets from its results once they enter their window.
-
-    Failure modes (network timeout, JSON decode, malformed market entries) are
-    caught per-source so a single Simmer-side hiccup can never blank the BTC
-    5-Min Markets card. Worst case (both sources unreachable) returns HTTP 200
-    with empty-shape payload + ``warnings`` field; the frontend degrades to a
-    "Simmer unavailable" hint rather than a 500 stack trace in the browser.
+    The dashboard runs as its own process, so it can't read the arena's
+    in-memory discovery snapshot — it does its own Polymarket discovery here,
+    using the same helpers (``select_current_market`` keyed off the real
+    ``resolves_at`` timestamp). No credentials needed; market data is public.
     """
-    import requests as req
     from datetime import datetime, timezone
-
-    api_key = credentials_store.get_credential("simmer_api_key")
-    if not api_key:
-        return JSONResponse({"current": None, "upcoming_count": 0, "upcoming": [],
-                             "error": "No Simmer API key configured"})
-    headers = {"Authorization": f"Bearer {api_key}"}
-
-    markets_list: list = []
-    warnings: list = []
-
-    # Source 1: SDK upcoming markets.
-    # Per-source try/except: if this side fails, source 2 can still populate
-    # the card. Narrow ``requests.RequestException`` instead of bare
-    # ``Exception`` so genuine programming bugs (AttributeError, etc.) still
-    # escalate instead of being silently suppressed.
-    try:
-        r1 = req.get(
-            f"{config.SIMMER_BASE_URL}/api/sdk/markets",
-            headers=headers,
-            params={"limit": 50, "tags": "fast-5m"},
-            timeout=10,
-        )
-        if r1.status_code == 200:
-            d = r1.json()
-            # Three-shape dispatch. Simmer has shipped ``null`` bodies during
-            # outages; we still return 200 with an empty card (the user's
-            # accept criterion), but we now log "shape not recognized" so the
-            # empty card is distinguishable from a real "no markets" case in
-            # the launchd dashboard log.
-            if isinstance(d, dict):
-                for m in d.get("markets") or []:
-                    # Defensive: any non-dict entry (str/None/number) is skipped.
-                    if isinstance(m, dict) and m.get("id"):
-                        markets_list.append(m)
-            elif isinstance(d, list):
-                for m in d:
-                    if isinstance(m, dict) and m.get("id"):
-                        markets_list.append(m)
-            else:
-                warnings.append("sdk_markets: response shape not recognized")
-        else:
-            warnings.append(f"sdk_markets: HTTP {r1.status_code}")
-    except req.RequestException as e:
-        warnings.append(f"sdk_markets: {type(e).__name__}")
-        logger.warning("markets: SDK source1 unreachable: %s", e)
-    except (ValueError, TypeError) as e:
-        # JSONDecodeError is a subclass of ValueError; covers non-JSON bodies.
-        warnings.append(f"sdk_markets: JSON decode error: {e}")
-        logger.warning("markets: SDK source1 bad JSON: %s", e)
-
-    # Source 2: public endpoint for currently-live markets.
-    try:
-        r2 = req.get(
-            f"{config.SIMMER_BASE_URL}/api/markets",
-            headers=headers,
-            params={"limit": 20},
-            timeout=10,
-        )
-        if r2.status_code == 200:
-            d = r2.json()
-            seen_ids = {m.get("id") for m in markets_list if isinstance(m, dict)}
-            # Same three-shape dispatch as Source 1 -- a parsed-null body
-            # (no exception) is logged so operators can tell empty-card from
-            # truly-no-markets.
-            if isinstance(d, dict):
-                for m in d.get("markets") or []:
-                    mid = m.get("id") if isinstance(m, dict) else None
-                    if mid and mid not in seen_ids:
-                        markets_list.append(m)
-                        seen_ids.add(mid)
-            elif isinstance(d, list):
-                for m in d:
-                    mid = m.get("id") if isinstance(m, dict) else None
-                    if mid and mid not in seen_ids:
-                        markets_list.append(m)
-                        seen_ids.add(mid)
-            else:
-                warnings.append("public_markets: response shape not recognized")
-        else:
-            warnings.append(f"public_markets: HTTP {r2.status_code}")
-    except req.RequestException as e:
-        warnings.append(f"public_markets: {type(e).__name__}")
-        logger.warning("markets: SDK source2 unreachable: %s", e)
-    except (ValueError, TypeError) as e:
-        warnings.append(f"public_markets: JSON decode error: {e}")
-        logger.warning("markets: SDK source2 bad JSON: %s", e)
+    import polymarket_markets
+    from arena.market_utils import (
+        compute_time_remaining_seconds, is_5min_market, select_current_market,
+    )
 
     now_utc = datetime.now(timezone.utc)
-    btc_markets: list = []
-    for m in markets_list:
-        try:
-            q = (m.get("question") or "").lower()
-            tags = m.get("tags") or []
-            is_btc_updown = (
-                ("bitcoin" in q or "btc" in q)
-                and ("up or down" in q or "up/down" in q)
-            ) or ("fast-5m" in tags and ("bitcoin" in q or "btc" in q))
-            if not is_btc_updown:
-                continue
-
-            resolves_at_str = m.get("resolves_at")
-            time_remaining = None
-            if resolves_at_str:
-                try:
-                    rs = resolves_at_str.replace("Z", "+00:00").replace(" ", "T")
-                    resolves_at = datetime.fromisoformat(rs)
-                    if resolves_at.tzinfo is None:
-                        resolves_at = resolves_at.replace(tzinfo=timezone.utc)
-                    time_remaining = (resolves_at - now_utc).total_seconds()
-                except (ValueError, TypeError, AttributeError):
-                    # Malformed timestamp -- leave time_remaining=None so the
-                    # market still shows up in the upcoming list rather than
-                    # being silently dropped, and the soonest-fallback filter
-                    # is robust to None entries (it coalesces to 999999).
-                    time_remaining = None
-
-            if time_remaining is not None and time_remaining < 0:
-                continue
-
-            try:
-                in_window = _window_contains_now(m.get("question", ""), now_utc)
-            except (ValueError, TypeError, AttributeError):
-                # Regex helper hiccup (unlikely but possible if zoneinfo is
-                # unavailable). Fall back to time-only check rather than
-                # raising out of the loop and skipping the rest of the card.
-                in_window = False
-
-            btc_markets.append({
-                "id": m.get("id"),
-                "question": m.get("question"),
-                "current_price": m.get("current_price"),
-                "resolves_at": m.get("resolves_at"),
-                "time_remaining_seconds": time_remaining,
-                "is_current_window": (
-                    (time_remaining is not None and 0 < time_remaining <= 300)
-                    or in_window
-                ),
-                "url": m.get("url"),
-            })
-        except (TypeError, AttributeError, KeyError) as e:
-            # Malformed market dict from Simmer -- skip the one entry, don't
-            # blank the card. Logged at debug so it's traceable without
-            # spamming normal-operation logs.
-            logger.debug("markets: skipping malformed market id=%s: %s",
-                         m.get("id") if isinstance(m, dict) else None, e)
+    btc_markets = []
+    for m in polymarket_markets.discover_markets():
+        if not is_5min_market(m.get("question", "") or ""):
             continue
-
+        tr = compute_time_remaining_seconds(m, now_utc)
+        if tr is not None and tr < 0:
+            continue
+        m["time_remaining_seconds"] = tr
+        btc_markets.append(m)
     btc_markets.sort(key=lambda x: x.get("time_remaining_seconds") or 999999)
 
-    # Priority 1: market whose question window contains now.
-    current = next((m for m in btc_markets if m["is_current_window"]), None)
-    # Priority 2: soonest market closing within 20 min.
-    if not current:
+    # Current = the market whose real window contains now (0 < remaining <= 300).
+    current = select_current_market(btc_markets, now_utc)
+    if current is None:
         soon = [m for m in btc_markets
-                if (m.get("time_remaining_seconds") or 999999) <= 1200]
+                if 0 < (m.get("time_remaining_seconds") or 999999) <= 1200]
         current = soon[0] if soon else None
-
     upcoming = [m for m in btc_markets if m is not current]
-    payload = {
-        "current": current,
-        "upcoming_count": len(upcoming),
-        "upcoming": upcoming,
-    }
-    if warnings:
-        payload["warnings"] = warnings
-    return JSONResponse(payload)
+
+    # Fresh CLOB prices for the visible markets in ONE batch call (POST
+    # /midpoints) — atomic snapshot, one round trip instead of a /midpoint GET
+    # per market. Prices current + the next card; both YES and NO are set.
+    polymarket_markets.price_markets([current, upcoming[0] if upcoming else None])
+
+    def _shape(m):
+        if not m:
+            return None
+        tr = m.get("time_remaining_seconds")
+        yes = m.get("current_price")
+        no = m.get("no_price")
+        if no is None and yes is not None:
+            no = round(1.0 - yes, 4)
+        shaped = {
+            "id": m.get("id"),
+            "question": m.get("question"),
+            "current_price": yes,                     # YES/Up (0-1)
+            "no_price": no,                           # NO/Down (0-1), real mid
+            "resolves_at": m.get("resolves_at"),
+            "time_remaining_seconds": tr,
+            "is_current_window": tr is not None and 0 < tr <= 300,
+            "url": None,
+        }
+        with db.get_conn() as conn:
+            rows = conn.execute(
+                "SELECT bot_name, side, amount, shares_bought, entry_price, "
+                "outcome, pnl, created_at "
+                "FROM trades WHERE market_id=? ORDER BY created_at ASC",
+                (shaped["id"],),
+            ).fetchall()
+        shaped["trades"] = [dict(r) for r in rows]
+        return shaped
+
+    cur_s = _shape(current)
+    upcoming_s = [_shape(m) for m in upcoming]
+    return JSONResponse({
+        "current": cur_s,
+        "next": upcoming_s[0] if upcoming_s else None,
+        "upcoming_count": len(upcoming_s),
+        "upcoming": upcoming_s,
+    })
+
+
+@app.get("/api/price/{condition_id}")
+def get_price(condition_id: str):
+    """Fresh YES/NO prices for one market (fast poll for the market cards)."""
+    import polymarket_markets
+    prices = polymarket_markets.current_prices(condition_id)
+    if not prices:
+        return JSONResponse({"yes": None, "no": None})
+    # Fall back to complement if one side's book is momentarily empty.
+    yes = prices.get("yes")
+    no = prices.get("no")
+    if yes is not None and no is None:
+        no = round(1.0 - yes, 4)
+    if no is not None and yes is None:
+        yes = round(1.0 - no, 4)
+    return JSONResponse({"yes": yes, "no": no})
 
 
 @app.get("/api/maker-status")
-async def get_maker_status():
+def get_maker_status():
     """Return the latest snapshot the arena's secondary-bot tick published.
 
     Powers the Maker Section card on the Overview tab.  Always returns
@@ -501,30 +362,237 @@ async def get_maker_status():
 
 
 @app.get("/api/overview")
-async def get_overview():
+def get_overview():
     stats = db.get_dashboard_stats()
     active_bots = db.get_active_bots()
     return JSONResponse({
         "stats": stats,
         "active_bots": active_bots,
         "mode": config.get_current_mode(),
+        "paper_bankroll": db.get_paper_bankroll(),
+        "paper_available": db.get_paper_available(),
+    })
+
+
+@app.get("/api/entry-buckets")
+def get_entry_buckets(mode: str = "paper", hours: int = None):
+    """ROI by entry-price bucket — reveals whether a high WR is bought at bad
+    prices. ``breakeven_gap`` = win_rate − avg_entry (cents of edge over the
+    break-even line; <0 is losing, ≥0.05 is healthy)."""
+    return JSONResponse(db.get_entry_price_buckets(mode=mode, hours=hours))
+
+
+@app.get("/api/skips")
+def get_skips():
+    """Skip-reason tally the arena persists (why it sat flat, not just what it
+    traded). Empty until the arena process has flushed at least once."""
+    raw = db.get_arena_state("skip_counts")
+    try:
+        return JSONResponse(json.loads(raw) if raw else {})
+    except (json.JSONDecodeError, TypeError):
+        return JSONResponse({})
+
+
+@app.get("/api/settings/bankroll")
+def get_bankroll(_auth: str = Depends(verify_auth)):
+    return JSONResponse({
+        "bankroll": db.get_paper_bankroll(),
+        "available": db.get_paper_available(),
+    })
+
+
+@app.post("/api/settings/bankroll")
+async def set_bankroll(request: Request, _auth: str = Depends(verify_auth)):
+    """Top the shared paper pool up to the entered balance.
+
+    The number the user enters becomes the new *available* shared balance: it
+    tops the pool up to that figure while preserving trade history and open
+    positions (see ``db.topup_paper_bankroll``). Entering $200 when the pool is
+    at $45 sets available to $200.
+    """
+    body = await request.json()
+    try:
+        amount = float(body.get("amount"))
+    except (TypeError, ValueError):
+        return JSONResponse({"error": "amount must be a number"}, status_code=400)
+    if amount < 0:
+        return JSONResponse({"error": "amount must be non-negative"}, status_code=400)
+    db.topup_paper_bankroll(amount)
+    return JSONResponse({
+        "success": True,
+        "bankroll": db.get_paper_bankroll(),
+        "available": db.get_paper_available(),
+    })
+
+
+@app.get("/api/settings/kelly")
+def get_kelly(_auth: str = Depends(verify_auth)):
+    return JSONResponse({"kelly_fraction": db.get_kelly_fraction()})
+
+
+@app.post("/api/settings/kelly")
+async def set_kelly(request: Request, _auth: str = Depends(verify_auth)):
+    """Set the Kelly fraction used for bet sizing (0 < f <= 1).
+
+    The arena reads it from the DB on a short cache, so edits take effect
+    within seconds without a restart. 0.25 = quarter-Kelly (conservative);
+    1.0 = full Kelly (growth-optimal only if model probabilities are exact).
+    """
+    body = await request.json()
+    try:
+        fraction = float(body.get("fraction"))
+    except (TypeError, ValueError):
+        return JSONResponse({"error": "fraction must be a number"}, status_code=400)
+    try:
+        db.set_kelly_fraction(fraction)
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    return JSONResponse({"success": True, "kelly_fraction": db.get_kelly_fraction()})
+
+
+@app.get("/api/lane-proposals")
+def get_lane_proposals(_auth: str = Depends(verify_auth)):
+    """Signal Lab: candidate-lane proposals + approved overrides + last run.
+
+    Proposals are filed by the offline harness (validate_signals --propose)
+    when a kill-switched lane clears the promotion thresholds; approving one
+    here activates the lane live via the DB override (no restart).
+    """
+    # Live lane monitor report (arena/lane_monitor.py): per-lane live
+    # direction-accuracy for enabled overrides — the demotion half of the
+    # pipeline. Written by the arena every LANE_MONITOR_INTERVAL_SEC.
+    try:
+        monitor = json.loads(db.get_arena_state("lane_monitor") or "{}")
+    except (json.JSONDecodeError, TypeError):
+        monitor = {}
+    # Core-lane tuner report (arena/core_lane_tuner.py): per-(strategy, lane)
+    # live accuracy + current/suggested drift/mom/strat weights.
+    try:
+        core_tuner = json.loads(db.get_arena_state("core_lane_tuner") or "{}")
+    except (json.JSONDecodeError, TypeError):
+        core_tuner = {}
+    return JSONResponse({
+        "proposals": db.get_lane_proposals(),
+        "overrides": db.get_lane_overrides(),
+        "last_run": db.get_latest_lane_run(),
+        "monitor": monitor,
+        "core_tuner": core_tuner,
+        "auto_approve": db.get_auto_approve_lanes(),
+    })
+
+
+@app.post("/api/lane-auto-approve")
+async def set_lane_auto_approve(request: Request,
+                                _auth: str = Depends(verify_auth)):
+    """Flip the closed-loop auto-approve toggle (body: {"enabled": true}).
+
+    ON: the promoter auto-approves candidate lanes that clear the LIVE bar.
+    OFF: it only annotates proposals with live evidence for a human decision.
+    """
+    body = await request.json()
+    enabled = bool(body.get("enabled"))
+    db.set_auto_approve_lanes(enabled)
+    return JSONResponse({"success": True, "auto_approve": enabled})
+
+
+@app.post("/api/lane-proposals/{proposal_id}/decide")
+async def decide_lane_proposal(proposal_id: int, request: Request,
+                               _auth: str = Depends(verify_auth)):
+    """Approve or deny a pending lane proposal (body: {"action": "approve"})."""
+    body = await request.json()
+    action = (body.get("action") or "").strip().lower()
+    try:
+        status_out = db.decide_lane_proposal(proposal_id, action)
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    return JSONResponse({
+        "success": True,
+        "status": status_out,
+        "overrides": db.get_lane_overrides(),
+    })
+
+
+@app.post("/api/lane-overrides/{lane}/disable")
+async def disable_lane(lane: str, _auth: str = Depends(verify_auth)):
+    """Safety hatch: switch an approved lane back off without a restart."""
+    if db.disable_lane_override(lane):
+        return JSONResponse({"success": True, "overrides": db.get_lane_overrides()})
+    return JSONResponse({"error": f"no override for lane '{lane}'"}, status_code=404)
+
+
+# --- Signal Lab: run the validation harness from the dashboard -------------
+# The harness is network-heavy (minutes for 300 markets), so it runs as a
+# detached subprocess; the UI polls /status until it exits, then reloads the
+# proposals (the run itself lands in the DB via --propose). One run at a
+# time — a second click while running is a 409.
+_validation_run = {"proc": None, "started_at": None, "markets": None}
+_VALIDATION_LOG = config.LOG_DIR / "lane_validation.log"
+
+
+def _validation_running() -> bool:
+    proc = _validation_run["proc"]
+    return proc is not None and proc.poll() is None
+
+
+@app.post("/api/lane-validation/run")
+async def run_lane_validation(request: Request, _auth: str = Depends(verify_auth)):
+    """Launch `validate_signals.py --markets N --propose` in the background."""
+    import subprocess
+    import sys as _sys
+    from datetime import datetime
+
+    if _validation_running():
+        return JSONResponse({"error": "a validation run is already in progress"},
+                            status_code=409)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    try:
+        markets = int(body.get("markets") or 300)
+    except (TypeError, ValueError):
+        return JSONResponse({"error": "markets must be a number"}, status_code=400)
+    markets = max(50, min(1000, markets))
+
+    repo_root = Path(__file__).resolve().parent.parent
+    script = repo_root / "tools" / "validate_signals.py"
+    log = open(_VALIDATION_LOG, "w")          # truncate: one run per log
+    proc = subprocess.Popen(
+        [_sys.executable, str(script), "--markets", str(markets), "--propose"],
+        cwd=str(repo_root), stdout=log, stderr=subprocess.STDOUT)
+    _validation_run.update({
+        "proc": proc,
+        "started_at": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+        "markets": markets,
+    })
+    return JSONResponse({"success": True, "markets": markets,
+                         "started_at": _validation_run["started_at"]})
+
+
+@app.get("/api/lane-validation/status")
+def lane_validation_status(_auth: str = Depends(verify_auth)):
+    """Poll target for the Signal Lab: running state + log tail + exit code."""
+    proc = _validation_run["proc"]
+    tail = ""
+    try:
+        if _VALIDATION_LOG.exists():
+            tail = _VALIDATION_LOG.read_text()[-2000:]
+    except OSError:
+        pass
+    return JSONResponse({
+        "running": _validation_running(),
+        "started_at": _validation_run["started_at"],
+        "markets": _validation_run["markets"],
+        "returncode": (None if proc is None else proc.poll()),
+        "log_tail": tail,
     })
 
 
 @app.get("/api/bots")
-async def get_bots():
+def get_bots():
     active = db.get_active_bots()
-
-    # Load bot keys for balance fetching
-    bot_keys = {}
-    try:
-        with open(config.SIMMER_BOT_KEYS_PATH) as f:
-            bot_keys = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        pass
-
     result = []
-    for i, bot_cfg in enumerate(active):
+    for bot_cfg in active:
         # Parse params JSON string if needed
         cfg = dict(bot_cfg)
         if isinstance(cfg.get("params"), str):
@@ -552,9 +620,8 @@ async def get_bots():
             ).fetchone()
             pending_count = dict(row)["c"]
 
-        # Balance: Polymarket USDC for live bots, Simmer SIM for paper bots
-        slot_name = f"slot_{i}"
-        balance, balance_is_live = get_bot_balance(slot_name, bot_keys, trading_mode)
+        # Balance: real wallet USDC for live bots, shared virtual bankroll for paper.
+        balance, balance_is_live = get_bot_balance(trading_mode)
 
         # For live bots, include the trading key address so dashboard can show where to deposit
         trading_key_address = None
@@ -576,7 +643,7 @@ async def get_bots():
 
 
 @app.get("/api/evolution")
-async def get_evolution():
+def get_evolution():
     history = db.get_evolution_history(limit=20)
     for h in history:
         for key in ("survivors", "replaced", "new_bots", "rankings"):
@@ -586,28 +653,31 @@ async def get_evolution():
 
 
 @app.get("/api/trades")
-async def get_trades(bot: str = None, limit: int = 50):
+def get_trades(bot: str = None, limit: int = 50):
     if bot:
         return JSONResponse(db.get_bot_trades(bot, limit=limit))
     with db.get_conn() as conn:
-        # Sort resolved trades first (by resolution time), then pending. Show
-        # every trade, including 1h-stale-expired (outcome='expired', pnl=0)
-        # rows, so the Recent Trades table matches the bot cards in the Bots
-        # tab and the Overview stats. A "phantom pnl=0" filter no longer
-        # applies — vote-era false positives were cleared and the filter was
-        # silently hiding legitimate expired paper trades.
+        # Sort PENDING trades first (newest activity), then resolved by
+        # recency. Previously resolved sorted first and pending last, so with
+        # hundreds of resolved trades the handful of pending rows were pushed
+        # past the LIMIT and never appeared in Recent Trades — even though the
+        # Active Bots cards counted them. Surfacing pending at the top keeps
+        # the two views reconciled. COALESCE(resolved_at, created_at) orders
+        # pending by placement time and resolved by settlement time.
+        # Show every trade, including 1h-stale-expired (outcome='expired',
+        # pnl=0) rows; the "phantom pnl=0" filter no longer applies.
         rows = conn.execute(
             """SELECT * FROM trades
                ORDER BY
-                   CASE WHEN outcome IS NOT NULL THEN 0 ELSE 1 END,
-                   resolved_at DESC, created_at DESC
+                   CASE WHEN outcome IS NULL THEN 0 ELSE 1 END,
+                   COALESCE(resolved_at, created_at) DESC
                LIMIT ?""", (limit,)
         ).fetchall()
         return JSONResponse([dict(r) for r in rows])
 
 
 @app.get("/api/copytrading")
-async def get_copytrading():
+def get_copytrading():
     wallets = db.list_copy_wallets()
     result = []
     for w in wallets:
@@ -642,15 +712,27 @@ async def get_copytrading():
 
 
 @app.get("/api/earnings")
-async def get_earnings():
+def get_earnings():
     with db.get_conn() as conn:
-        daily = conn.execute("""
-            SELECT date(created_at) as day, COALESCE(SUM(pnl), 0) as pnl,
-                   COUNT(*) as trades,
-                   SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) as wins
-            FROM trades WHERE outcome IN ('win', 'loss')
-            GROUP BY date(created_at) ORDER BY day DESC LIMIT 30
-        """).fetchall()
+        # Bucket by ET calendar date (created_at is stored UTC). Grouping in
+        # Python keeps the day boundary DST-correct and consistent with the
+        # ET-anchored "Today" stats on the Overview tab.
+        resolved = conn.execute(
+            "SELECT created_at, pnl FROM trades WHERE outcome IN ('win', 'loss')"
+        ).fetchall()
+        buckets: dict = {}
+        for r in resolved:
+            day = db.utc_to_et_date(r["created_at"])
+            b = buckets.setdefault(day, {"pnl": 0.0, "trades": 0, "wins": 0})
+            pnl = r["pnl"] or 0
+            b["pnl"] += pnl
+            b["trades"] += 1
+            if pnl > 0:
+                b["wins"] += 1
+        daily = [
+            {"day": day, "pnl": round(v["pnl"], 2), "trades": v["trades"], "wins": v["wins"]}
+            for day, v in sorted(buckets.items(), reverse=True)[:30]
+        ]
 
         best = conn.execute(
             "SELECT * FROM trades WHERE pnl IS NOT NULL ORDER BY pnl DESC LIMIT 5"
@@ -668,7 +750,7 @@ async def get_earnings():
 
 
 @app.get("/api/learning")
-async def get_learning():
+def get_learning():
     active = db.get_active_bots()
     result = {}
     for bot_cfg in active:
@@ -683,7 +765,7 @@ async def get_learning():
 
 
 @app.get("/api/credentials/status")
-async def credentials_status_endpoint():
+def credentials_status_endpoint():
     """Return the list of credential fields and which ones are currently set.
 
     Powers both the Settings tab form and the dashboard warning banner.
@@ -736,7 +818,7 @@ async def credentials_save(request: Request):
 async def credentials_test(request: Request):
     """Test connectivity with currently-configured credentials.
 
-    Body: {"which": "simmer" | "polymarket" | "all"} (default "all").
+    Body: {"which": "polymarket" | "all"} (default "all").
     Returns key-by-key results without persisting anything.
     """
     try:
@@ -745,34 +827,6 @@ async def credentials_test(request: Request):
         body = {}
     which = (body or {}).get("which", "all")
     results = {}
-
-    if which in ("simmer", "all"):
-        api_key = credentials_store.get_credential("simmer_api_key")
-        if not api_key:
-            results["simmer"] = {"ok": False, "error": "Simmer API key not configured"}
-        else:
-            try:
-                import requests as _req
-                resp = _req.get(
-                    f"{config.SIMMER_BASE_URL}/api/sdk/agents/me",
-                    headers={"Authorization": f"Bearer {api_key}"},
-                    timeout=10,
-                )
-                if resp.status_code == 200:
-                    data = resp.json()
-                    results["simmer"] = {
-                        "ok": True,
-                        "agent_name": data.get("name"),
-                        "agent_id": data.get("agent_id"),
-                        "balance": data.get("balance"),
-                    }
-                else:
-                    results["simmer"] = {
-                        "ok": False,
-                        "error": f"HTTP {resp.status_code}: {resp.text[:200]}",
-                    }
-            except Exception as e:
-                results["simmer"] = {"ok": False, "error": str(e)}
 
     if which in ("polymarket", "all"):
         pm_creds = {
