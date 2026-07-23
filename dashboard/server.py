@@ -523,6 +523,18 @@ def get_lane_proposals(_auth: str = Depends(verify_auth)):
     })
 
 
+@app.get("/api/backtests")
+def get_backtests(limit: int = 20, _auth: str = Depends(verify_auth)):
+    """Signal Lab: recent offline backtest runs (backtest/ package).
+
+    Runs are recorded by ``python -m backtest --to-db`` (or the
+    backtest.run_backtest API); summaries carry expectancy/WR/PF/Sharpe/
+    drawdown, per-regime splits and per-signal contribution. Read-only —
+    the backtester never writes trade tables.
+    """
+    return JSONResponse({"runs": db.get_backtest_runs(limit=limit)})
+
+
 @app.post("/api/lane-auto-approve")
 async def set_lane_auto_approve(request: Request,
                                 _auth: str = Depends(verify_auth)):

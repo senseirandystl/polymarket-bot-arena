@@ -178,6 +178,16 @@ def init_db():
                 created_at TEXT DEFAULT (datetime('now'))
             );
 
+            CREATE TABLE IF NOT EXISTS backtest_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                label TEXT NOT NULL,
+                markets INTEGER NOT NULL,
+                trades INTEGER NOT NULL,
+                summary TEXT NOT NULL,           -- JSON: metrics.summarize()
+                report_path TEXT,                -- full JSON report on disk
+                created_at TEXT DEFAULT (datetime('now'))
+            );
+
             CREATE TABLE IF NOT EXISTS lane_proposals (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 lane TEXT NOT NULL,              -- 'fut' | 'tech' | 'xasset'
@@ -645,6 +655,39 @@ def set_kelly_fraction(fraction):
 # to weight the lane live — no config edit, no restart. Denying just closes
 # the proposal (the harness may re-file after a later run with fresh data).
 # ---------------------------------------------------------------------------
+
+def record_backtest_run(label: str, markets: int, trades: int,
+                        summary: dict, report_path=None) -> int:
+    """Store one offline backtest run's summary (backtest/ package).
+
+    Same pattern as lane_validation_runs: run records only, never trade
+    tables — the dashboard can list runs via get_backtest_runs.
+    """
+    with get_conn() as conn:
+        cur = conn.execute(
+            "INSERT INTO backtest_runs (label, markets, trades, summary, "
+            "report_path) VALUES (?, ?, ?, ?, ?)",
+            (str(label), int(markets), int(trades), json.dumps(summary),
+             report_path))
+        return cur.lastrowid
+
+
+def get_backtest_runs(limit: int = 20) -> list:
+    """Most recent backtest runs, summaries parsed."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM backtest_runs ORDER BY id DESC LIMIT ?",
+            (int(limit),)).fetchall()
+    out = []
+    for row in rows:
+        d = dict(row)
+        try:
+            d["summary"] = json.loads(d["summary"])
+        except (TypeError, ValueError):
+            d["summary"] = {}
+        out.append(d)
+    return out
+
 
 def record_lane_validation_run(markets, samples, results: dict) -> int:
     """Store one harness run's per-lane metrics. Returns the run id."""

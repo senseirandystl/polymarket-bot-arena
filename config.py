@@ -555,6 +555,17 @@ SIGNAL_CACHE_TTL_SEC = 0.8
 # spend so a trade always clears this (5 shares × price × buffer) — otherwise
 # small-edge bets get rejected 'below_min_size' and never fill.
 POLYMARKET_MIN_SHARES = 5
+
+# --- Backtesting (backtest/ package — offline replay only) ---
+# Historical order-book DEPTH is not archived by Polymarket, so backtest fills
+# walk a SYNTHETIC ask ladder anchored on the recorded PM mid: best ask =
+# mid + BACKTEST_HALF_SPREAD, then (offset, shares) tiers below. Tune these to
+# stress liquidity assumptions; results are an optimistic upper bound either
+# way (same caveat as the Signal Lab harness's stale-mid net-EV numbers).
+BACKTEST_HALF_SPREAD = 0.01
+BACKTEST_BOOK_DEPTH = [(0.00, 400.0), (0.01, 600.0), (0.02, 1000.0)]
+BACKTEST_BANKROLL = PAPER_BANKROLL_DEFAULT   # starting virtual pool per run
+BACKTEST_TICK_SEC = 60      # decision-tick spacing inside each 5-min window
 # How many BTC 5-min markets to pull per discovery cycle (current + next few).
 POLYMARKET_DISCOVERY_LIMIT = 6
 MAKER_UPCOMING_WINDOW_SEC = 1200  # ≤N seconds in the future the maker section is
