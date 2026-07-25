@@ -43,3 +43,6 @@ tools/.signal_cache/
 # Backtester cache + generated reports (backtest/ package)
 backtest/.cache/
 backtest/reports/
+
+# Isolated build worktrees (subagent-driven development)
+.claude/worktrees/
