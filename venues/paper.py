@@ -33,7 +33,7 @@ class PaperEngine:
     def place(self, *, bot_name, side, amount, market, mode,
               confidence=None, reasoning=None, features=None,
               target_shares=None, limit_price=None, expected_price=None,
-              book=None) -> TradeResult:
+              book=None, context=None) -> TradeResult:
         market_id = market.get("id") or market.get("market_id")
         token = (
             market.get("polymarket_token_id") if side == "yes"
@@ -131,6 +131,7 @@ class PaperEngine:
             fill_source="paper_sim",
             entry_price=fill["avg_price"],
             fee=fill["fee"],
+            context=context,
         )
         logger.info(
             f"[{bot_name}] Paper fill: {side} ${fill['cost']:.2f} @ "

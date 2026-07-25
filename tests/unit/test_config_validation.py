@@ -30,6 +30,8 @@ def _valid_kwargs(**over):
         trade_loop_interval_sec=1.0,
         market_data_interval_sec=1.0,
         http_max_retries=2,
+        regime_alloc_min_weight=0.05,
+        regime_alloc_max_tilt=0.25,
     )
     base.update(over)
     return base

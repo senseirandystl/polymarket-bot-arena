@@ -812,6 +812,34 @@ async def set_lane_auto_approve(request: Request,
     return JSONResponse({"success": True, "auto_approve": enabled})
 
 
+@app.get("/api/regime-map")
+def get_regime_map():
+    """Regime-discovery map: discovered/OOS-validated regimes, per-bot shrunk
+    edges, the current cell, and whether Layer-3 conditioning is enabled.
+
+    Read-only. Behind the app-wide Basic-auth dependency like every route
+    except /healthz.
+    """
+    payload = db.get_regime_map()
+    payload["conditioning_enabled"] = db.get_regime_conditioning()
+    return JSONResponse(payload)
+
+
+@app.post("/api/regime-conditioning")
+async def set_regime_conditioning_toggle(request: Request,
+                                         _auth: str = Depends(verify_auth)):
+    """Flip regime-conditioning (body: {"enabled": true}).
+
+    ON: the portfolio allocator + core-lane tuner tilt toward what works in the
+    current validated regime. OFF: the map is still built/shown, but no
+    controller acts on it.
+    """
+    body = await request.json()
+    enabled = bool(body.get("enabled"))
+    db.set_regime_conditioning(enabled)
+    return JSONResponse({"success": True, "conditioning_enabled": enabled})
+
+
 @app.post("/api/lane-proposals/{proposal_id}/decide")
 async def decide_lane_proposal(proposal_id: int, request: Request,
                                _auth: str = Depends(verify_auth)):

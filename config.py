@@ -340,6 +340,21 @@ CORE_TUNE_BAND = 0.20          # max |deviation| of a tuned weight from its clas
 CORE_TUNE_WEIGHT_MAX = 0.90    # absolute ceiling on any single lane weight
 CORE_TUNE_WEIGHT_MIN = 0.0     # absolute floor (the band around the default binds first)
 
+# --- Regime discovery & conditioning (Layer 3 — arena/regime_map.py) ---
+# The toggle is stored in arena_state ('regime_conditioning', dashboard-
+# editable via db.get/set_regime_conditioning); this constant is only the
+# boot default. Same pattern as AUTO_APPROVE_LANES_ENABLED / CORE_TUNE_ENABLED
+# above — OFF means the map is still built and reported, but no downstream
+# controller is allowed to act on it.
+REGIME_CONDITIONING_ENABLED = True   # dashboard-editable; ON in paper mode
+REGIME_MAP_INTERVAL_SEC = 900        # attribution/discovery cadence
+REGIME_MIN_SAMPLES = 60              # promote a cell to a named regime
+REGIME_SHRINKAGE_K = 40              # empirical-Bayes prior strength
+REGIME_RECENCY_HALFLIFE_DAYS = 14    # decay for non-stationarity
+REGIME_ALLOC_MIN_WEIGHT = 0.05       # explore floor per active bot
+REGIME_ALLOC_MAX_TILT = 0.25         # max deviation from baseline weight
+REGIME_HOUR_BLOCK_HOURS = 3          # ET time-of-day granularity
+
 # Sentiment feed master switch (2026-07-18): OFF — no local LLM will be run
 # and the keyword/CryptoPanic pipeline isn't worth its noise on 5-min BTC
 # markets. When False, SentimentFeed.start() is a no-op: no polling thread,
@@ -745,11 +760,18 @@ class _ConfigInvariants(BaseModel):
     trade_loop_interval_sec: float = Field(gt=0)
     market_data_interval_sec: float = Field(gt=0)
     http_max_retries: int = Field(ge=0)
+    regime_alloc_min_weight: float = Field(gt=0, lt=1)
+    regime_alloc_max_tilt: float = Field(gt=0, lt=1)
 
     @model_validator(mode="after")
     def _relationships(self):
         if self.trading_mode not in ("paper", "live"):
             raise ValueError(f"trading_mode must be 'paper' or 'live', got {self.trading_mode!r}")
+        if not (self.regime_alloc_min_weight < self.regime_alloc_max_tilt):
+            raise ValueError(
+                f"regime_alloc_min_weight ({self.regime_alloc_min_weight}) must be "
+                f"below regime_alloc_max_tilt ({self.regime_alloc_max_tilt})"
+            )
         if not (self.consensus_guard < self.high_price_guard):
             raise ValueError(
                 f"consensus_guard ({self.consensus_guard}) must be below "
@@ -784,6 +806,8 @@ def _validate_config() -> None:
             trade_loop_interval_sec=TRADE_LOOP_INTERVAL_SEC,
             market_data_interval_sec=MARKET_DATA_INTERVAL_SEC,
             http_max_retries=HTTP_MAX_RETRIES,
+            regime_alloc_min_weight=REGIME_ALLOC_MIN_WEIGHT,
+            regime_alloc_max_tilt=REGIME_ALLOC_MAX_TILT,
         )
     except Exception as exc:  # pydantic.ValidationError or ValueError
         raise RuntimeError(f"Invalid arena configuration: {exc}") from exc
