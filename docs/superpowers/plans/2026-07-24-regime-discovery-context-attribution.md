@@ -235,13 +235,11 @@ Add a `context` JSON column, thread it through the venue engines to `db.log_trad
 
 ```python
 # tests/unit/test_context_persistence.py
-import importlib
 import db
 
 
 def test_log_trade_stores_and_reads_context(tmp_path, monkeypatch):
-    monkeypatch.setenv("ARENA_DB_PATH", str(tmp_path / "t.db"))
-    importlib.reload(db)
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "t.db")
     db.init_db()
     ctx = {"vol": 0.2, "trend": 0.1, "weekday": 2, "hour_block": 3,
            "session": "us", "macro_prox": 0, "vol_trend_regime": "low_vol_range",
@@ -257,8 +255,7 @@ def test_log_trade_stores_and_reads_context(tmp_path, monkeypatch):
 
 
 def test_context_column_migration_idempotent(tmp_path, monkeypatch):
-    monkeypatch.setenv("ARENA_DB_PATH", str(tmp_path / "t2.db"))
-    importlib.reload(db)
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "t2.db")
     db.init_db()
     db.init_db()  # second call must not raise
     rid = db.log_trade("m", "mkt", "NO", 1.0, "paper", "paper", context=None)
@@ -552,7 +549,6 @@ Promote cells to named regimes only when sample-count and out-of-sample stabilit
 
 ```python
 # tests/unit/test_regime_map_discovery.py
-import importlib
 import db
 from arena import regime_map
 
@@ -562,8 +558,7 @@ def _mk(bot, pnl, cell, ts):
 
 
 def test_under_sampled_cell_not_promoted(tmp_path, monkeypatch):
-    monkeypatch.setenv("ARENA_DB_PATH", str(tmp_path / "r.db"))
-    importlib.reload(db)
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "r.db")
     db.init_db()
     cell = ("r", 2, 3, "us", 0, 0)
     trades = [_mk("a", 1.0, cell, "2026-07-20 10:00:00") for _ in range(5)]
@@ -575,8 +570,7 @@ def test_under_sampled_cell_not_promoted(tmp_path, monkeypatch):
 
 
 def test_well_sampled_consistent_cell_promoted(tmp_path, monkeypatch):
-    monkeypatch.setenv("ARENA_DB_PATH", str(tmp_path / "r2.db"))
-    importlib.reload(db)
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "r2.db")
     db.init_db()
     cell = ("r", 2, 3, "us", 0, 0)
     # 'a' consistently wins, 'b' consistently loses, 100 each
@@ -718,7 +712,6 @@ git commit -m "feat: regime discovery + OOS validation + persistence (layer 2b)"
 
 ```python
 # tests/unit/test_regime_toggle.py
-import importlib
 import config
 import db
 
@@ -731,8 +724,7 @@ def test_config_defaults_present():
 
 
 def test_toggle_roundtrip(tmp_path, monkeypatch):
-    monkeypatch.setenv("ARENA_DB_PATH", str(tmp_path / "tg.db"))
-    importlib.reload(db)
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "tg.db")
     db.init_db()
     assert db.get_regime_conditioning() is True   # default from config
     db.set_regime_conditioning(False)
@@ -1016,14 +1008,12 @@ Wire `rebuild()` into the evolution loop and record the live context cell so Lay
 
 ```python
 # tests/unit/test_regime_map_scheduling.py
-import importlib
 import db
 from arena import regime_map
 
 
 def test_rebuild_records_current_cell(tmp_path, monkeypatch):
-    monkeypatch.setenv("ARENA_DB_PATH", str(tmp_path / "sc.db"))
-    importlib.reload(db)
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "sc.db")
     db.init_db()
     cell = ("low_vol_range", 2, 3, "us", 0, 0)
     trades = [{"bot_name": "a", "pnl": 1.0, "cell": cell,
@@ -1118,13 +1108,12 @@ git commit -m "feat: schedule regime_map rebuild on the evolution loop"
 ```python
 # tests/unit/test_regime_map_endpoint.py
 from fastapi.testclient import TestClient
-import importlib, db
+import db
 from dashboard import server
 
 
 def test_regime_map_endpoint(tmp_path, monkeypatch):
-    monkeypatch.setenv("ARENA_DB_PATH", str(tmp_path / "e.db"))
-    importlib.reload(db)
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "e.db")
     db.init_db()
     db.set_regime_map({"regimes": [{"cell": ["r", 2, 3, "us", 0, 0], "n": 80,
                                     "validated": True, "bot_edges": {}}],
