@@ -8,6 +8,7 @@ in the entire bot lifecycle and copy-trade setup machinery that
 ``arena.py`` collects on its import.
 """
 
+import time
 import threading
 
 
@@ -31,6 +32,9 @@ class SharedArenaState:
         # more than they trade). Tally skip reasons so runs are explainable —
         # why the arena sat flat, not just what it traded.
         self.skip_counts: dict = {}
+        # (bot, market_id) -> unix time until which execute is suppressed after
+        # a slippage reject (config.SLIPPAGE_RETRY_COOLDOWN_SEC).
+        self._slippage_until: dict = {}
 
     def is_traded(self, key: tuple) -> bool:
         with self._lock:
@@ -39,6 +43,29 @@ class SharedArenaState:
     def mark_traded(self, key: tuple) -> None:
         with self._lock:
             self.traded.add(key)
+            # A real fill ends any pending slippage cooldown for this pair.
+            self._slippage_until.pop(key, None)
+
+    def is_slippage_cooling(self, key: tuple, now: float | None = None) -> bool:
+        """True while this (bot, market) is in post-slippage backoff."""
+        now = time.time() if now is None else now
+        with self._lock:
+            until = self._slippage_until.get(key)
+            if until is None:
+                return False
+            if now >= until:
+                del self._slippage_until[key]
+                return False
+            return True
+
+    def mark_slippage_reject(
+        self, key: tuple, cooldown_sec: float, now: float | None = None
+    ) -> None:
+        """Start/refresh the slippage backoff for this (bot, market)."""
+        now = time.time() if now is None else now
+        cooldown_sec = max(0.0, float(cooldown_sec))
+        with self._lock:
+            self._slippage_until[key] = now + cooldown_sec
 
     def note_skip(self, reason: str) -> None:
         """Record a skip by coarse reason (e.g. 'session', 'no_edge', 'no_book')."""
@@ -72,3 +99,4 @@ class SharedArenaState:
         immediately."""
         with self._lock:
             self.traded.clear()
+            self._slippage_until.clear()

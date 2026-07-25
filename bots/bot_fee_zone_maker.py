@@ -117,37 +117,41 @@ class FeeZoneMakerBot(BaseBot):
                 maker_side="both",
             )
 
-        # ── Fee-zone gate: quote whichever SIDE's price is in the fee zone ────
+        # ── Fee-zone gate: quote whichever SIDE's MID is in the fee zone ─────
         # The fee zone [56¢,86¢] never contains both yes and no (yes+no ~= 1),
         # so at most one side qualifies. NO is a first-class mirror: quote the NO
         # token when its price sits in the same fee-friction band. Fee is
         # symmetric (fee(p) == fee(1-p)), so the advantage is identical per side.
+        # Zone membership keys off MID; executable cost + slippage expected price
+        # key off warm best ASK when present.
         min_zone = p["min_price_zone"]
         max_zone = p["max_price_zone"]
         no_price = market.get("no_price")
         if no_price is None:
             no_price = round(1.0 - market_price, 4)
         if min_zone <= market_price <= max_zone:
-            side, side_price = "yes", market_price
+            side, side_mid = "yes", market_price
+            side_exec = market.get("yes_ask") or side_mid
         elif min_zone <= no_price <= max_zone:
-            side, side_price = "no", no_price
+            side, side_mid = "no", no_price
+            side_exec = market.get("no_ask") or side_mid
         else:
             return _hold(
                 f"fzm: neither side in fee zone [{min_zone},{max_zone}] "
                 f"(yes={market_price:.2f} no={no_price:.2f})"
             )
 
-        # Recompute the maker quote around the CHOSEN side's price.
-        maker_bid = round(max(0.01, side_price - half_spread), 2)
-        maker_ask = round(min(0.99, side_price + half_spread), 2)
-        maker_mid = side_price
+        # Recompute the maker quote around the CHOSEN side's mid.
+        maker_bid = round(max(0.01, side_mid - half_spread), 2)
+        maker_ask = round(min(0.99, side_mid + half_spread), 2)
+        maker_mid = side_mid
 
-        # Verify taker fee is large enough to justify quoting
-        fee = taker_fee(side_price)
+        # Verify taker fee is large enough to justify quoting (at executable).
+        fee = taker_fee(side_exec)
         fee_bps = fee * 10000
         min_fee = p["min_fee_bps"]
         if fee_bps < min_fee:
-            return _hold(f"fzm: fee {fee_bps:.0f}bps < {min_fee}bps at price={side_price:.2f}")
+            return _hold(f"fzm: fee {fee_bps:.0f}bps < {min_fee}bps at price={side_exec:.2f}")
 
         # ── Drift confirmation: the in-zone favorite must be BACKED by BTC ───
         # Paper/live fills cross the book as takers (we pay the very fee that
@@ -167,11 +171,11 @@ class FeeZoneMakerBot(BaseBot):
         # is not enough if the book already charges more than the fundamental
         # supports (the late-window maker lost -$41.66 exactly this way).
         implied_p = 0.5 + 0.5 * signed_drift
-        fzm_edge = implied_p - side_price - taker_fee(side_price)
+        fzm_edge = implied_p - side_exec - taker_fee(side_exec)
         min_edge = p.get("min_edge", 0.02)
         if fzm_edge < min_edge:
             return _hold(
-                f"fzm: price {side_price:.2f} not justified by drift "
+                f"fzm: price {side_exec:.2f} not justified by drift "
                 f"(implied_P={implied_p:.2f}, edge={fzm_edge:+.3f} < {min_edge})")
 
         # ── Inventory discipline: never quote into a loaded side ─────────────
@@ -198,8 +202,8 @@ class FeeZoneMakerBot(BaseBot):
             return _hold(f"fzm: BTC momentum contradicts {side} zone (mom={momentum:+.5f})")
 
         # ── Confidence ────────────────────────────────────────────────────────
-        # Price signal: how far into the fee zone is the chosen side?
-        price_signal = (side_price - min_zone) / (max_zone - min_zone)
+        # Price signal: how far into the fee zone is the chosen side (mid)?
+        price_signal = (side_mid - min_zone) / (max_zone - min_zone)
 
         # Momentum signal: momentum confirming the side boosts confidence
         mw = p["momentum_weight"]
@@ -228,20 +232,19 @@ class FeeZoneMakerBot(BaseBot):
             edge=fzm_edge,
             confidence=confidence,
             reasoning=(
-                f"fzm: {side} price={side_price:.2f} fee={fee_bps:.0f}bps "
+                f"fzm: {side} mid={side_mid:.2f} exec={float(side_exec):.2f} "
+                f"fee={fee_bps:.0f}bps "
                 f"mom={momentum:+.5f} psig={price_signal:.2f} conf={confidence:.3f} "
-                f"bid={maker_bid:.2f} ask={maker_ask:.2f} inv=${inventory:.2f}"
+                f"quote_bid={maker_bid:.2f} quote_ask={maker_ask:.2f} "
+                f"inv=${inventory:.2f}"
             ),
             signals={"drift": drift, "signed_drift": signed_drift,
                      "momentum": momentum, "fee_bps": fee_bps,
                      "price_signal": price_signal, "implied_p": implied_p,
                      "inventory_usd": inventory},
             suggested_amount=amount,
-            # Expected taker price: the fill walks the real book from the best
-            # ask, so expect ~the side's current price (not our quoted ask, a
-            # logged maker metric — using it widened the slippage guard by the
-            # half-spread). Feeds the execute() guard (config.MAX_FILL_SLIPPAGE).
-            entry_price=round(side_price, 4),
+            # Expected taker price = warm best ask (matches paper fill book).
+            entry_price=round(float(side_exec), 4),
             features=features,
             maker_bid=maker_bid,
             maker_ask=maker_ask,

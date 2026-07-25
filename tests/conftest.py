@@ -82,10 +82,14 @@ def cheap_market():
 # ---------------------------------------------------------------------------
 
 def make_book(asks=None, bids=None, min_size=5.0):
+    asks = asks if asks is not None else [(0.56, 50), (0.57, 100), (0.60, 200)]
+    bids = bids if bids is not None else [(0.54, 50), (0.53, 100), (0.50, 200)]
     return {
         "valid": True,
-        "asks": asks if asks is not None else [(0.56, 50), (0.57, 100), (0.60, 200)],
-        "bids": bids if bids is not None else [(0.54, 50), (0.53, 100), (0.50, 200)],
+        "asks": asks,
+        "bids": bids,
+        "best_ask": asks[0][0] if asks else None,
+        "best_bid": bids[0][0] if bids else None,
         "min_order_size": min_size,
     }
 

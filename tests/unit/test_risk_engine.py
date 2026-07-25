@@ -13,10 +13,19 @@ from arena import risk_engine
 # ---------------------------------------------------------------------------
 
 def test_max_drawdown_pct():
-    # Run-up then 50% retrace of peak
+    # Run-up then 50% retrace of peak (zero-based, still valid when start=0)
     pnls = [10, 10, 10, -15]  # equity 30 peak, then 15 → dd 0.5
     assert risk_engine.max_drawdown_pct(pnls) == pytest.approx(0.5)
     assert risk_engine.max_drawdown_pct([]) == 0.0
+
+
+def test_max_drawdown_pct_bankroll_anchored():
+    # Pure losses on $1000 base → ~1.45% DD, not 100%
+    pnls = [-5.0, -5.0, -4.53]
+    dd = risk_engine.max_drawdown_pct(pnls, starting_equity=1000.0)
+    assert dd == pytest.approx(14.53 / 1000.0, rel=1e-6)
+    # Without capital base, pure losses no longer invent a false 100%
+    assert risk_engine.max_drawdown_pct(pnls, starting_equity=0.0) == 0.0
 
 
 def test_equity_stats():
@@ -25,6 +34,34 @@ def test_equity_stats():
     assert s["peak"] == pytest.approx(5.0)
     assert s["drawdown"] == pytest.approx(0.2)
     assert s["n"] == 3
+
+
+def test_equity_stats_bankroll_anchored_pure_loss():
+    """Regression: -$14.53 on $1000 bankroll must not report 100% DD."""
+    pnls = [-2.0, -3.5, -4.0, -5.03]
+    s = risk_engine.equity_stats(pnls, starting_equity=1000.0)
+    assert s["starting_equity"] == pytest.approx(1000.0)
+    assert s["peak"] == pytest.approx(1000.0)
+    assert s["equity"] == pytest.approx(985.47)
+    # equity_stats rounds drawdown to 4 dp
+    assert s["drawdown"] == pytest.approx(round(14.53 / 1000.0, 4))
+    assert s["drawdown"] < 0.40  # under portfolio max DD
+    assert s["drawdown"] != pytest.approx(1.0)
+
+
+def test_equity_stats_bankroll_anchored_runup_then_drawdown():
+    # Start 1000, +50 peak 1050, then -80 → equity 970, dd = 80/1050
+    s = risk_engine.equity_stats([50.0, -80.0], starting_equity=1000.0)
+    assert s["peak"] == pytest.approx(1050.0)
+    assert s["equity"] == pytest.approx(970.0)
+    assert s["drawdown"] == pytest.approx(round(80.0 / 1050.0, 4))
+
+
+def test_window_start_equity_reconstruction():
+    capital_now = 985.47
+    pnls = [-5.0, -5.0, -4.53]
+    start = risk_engine._window_start_equity(pnls, capital_now)
+    assert start == pytest.approx(1000.0)
 
 
 def test_historical_var_needs_samples():
@@ -112,6 +149,8 @@ def test_evaluate_pauses_on_daily_loss(monkeypatch):
                         lambda: [{"bot_name": "loser"}])
     monkeypatch.setattr(config, "RISK_PAPER_BOT_DAILY_LOSS", 20.0)
     monkeypatch.setattr(config, "RISK_BOT_DAILY_LOSS", 20.0)
+    monkeypatch.setattr(risk_engine, "_capital_now", lambda: 1000.0)
+    monkeypatch.setattr(risk_engine, "_bot_capital_weight", lambda _n: 1.0)
 
     # Daily P&L = -30 → over limit
     monkeypatch.setattr(
@@ -155,9 +194,11 @@ def test_evaluate_size_reduction_on_drawdown(monkeypatch):
     monkeypatch.setattr(config, "RISK_PORTFOLIO_MAX_DRAWDOWN", 0.99)
     monkeypatch.setattr(config, "RISK_UNDERPERFORM_PAUSE_PNL", -9999.0)
 
-    # Equity path: climb to 20 then drop to 12 → dd = 8/20 = 0.40
-    # start taper at 0.4*0.5=0.20, so at 0.40 we're mid-taper
-    series = [5, 5, 5, 5, -8]
+    # Bankroll-anchored: capital_now=60, series sum=-40 → window start=100.
+    # Path 100→92→…→60, peak=100, dd=0.40. Taper starts at 0.5*0.50=0.25.
+    series = [-8.0, -8.0, -8.0, -8.0, -8.0]
+    monkeypatch.setattr(risk_engine, "_capital_now", lambda: 60.0)
+    monkeypatch.setattr(risk_engine, "_bot_capital_weight", lambda _n: 1.0)
     monkeypatch.setattr(
         risk_engine, "_pnls_for_bots",
         lambda names, hours=None, today_only=False, mode=None: {
@@ -176,6 +217,97 @@ def test_evaluate_size_reduction_on_drawdown(monkeypatch):
     assert bot["drawdown"] == pytest.approx(0.4, abs=0.05)
     if bot["status"] == "reduced":
         assert 0.0 < bot["size_mult"] < 1.0
+
+
+def test_evaluate_does_not_pause_on_small_pure_loss(monkeypatch):
+    """User bug: -$14.53 on $1000 bankroll must not trip portfolio_max_drawdown."""
+    saved = {}
+    monkeypatch.setattr(risk_engine.db, "set_arena_state",
+                        lambda k, v: saved.__setitem__(k, v))
+    monkeypatch.setattr(risk_engine.db, "get_arena_state",
+                        lambda k, d=None: saved.get(k, d))
+    monkeypatch.setattr(risk_engine.db, "log_risk_event", lambda **kw: 1)
+    monkeypatch.setattr(risk_engine.db, "get_active_bots",
+                        lambda: [{"bot_name": "a"}, {"bot_name": "b"}])
+    monkeypatch.setattr(config, "RISK_BOT_DAILY_LOSS", 9999.0)
+    monkeypatch.setattr(config, "RISK_PAPER_BOT_DAILY_LOSS", 9999.0)
+    monkeypatch.setattr(config, "RISK_PAPER_PORTFOLIO_DAILY_LOSS", 9999.0)
+    monkeypatch.setattr(config, "RISK_PORTFOLIO_DAILY_LOSS", 9999.0)
+    monkeypatch.setattr(config, "RISK_PORTFOLIO_MAX_DRAWDOWN", 0.40)
+    monkeypatch.setattr(config, "RISK_BOT_MAX_DRAWDOWN", 0.35)
+    monkeypatch.setattr(config, "RISK_UNDERPERFORM_PAUSE_PNL", -9999.0)
+
+    # 12 small losses totaling -14.53 (n>=10 so portfolio DD gate is eligible)
+    losses = [-1.21] * 11 + [-1.22]  # sum ≈ -14.53
+    assert abs(sum(losses) + 14.53) < 0.01
+    # capital_now after losses; window start reconstructs to ~1000
+    monkeypatch.setattr(risk_engine, "_capital_now",
+                        lambda: 1000.0 + sum(losses))
+    monkeypatch.setattr(risk_engine, "_bot_capital_weight", lambda _n: 1.0)
+    monkeypatch.setattr(
+        risk_engine, "_pnls_for_bots",
+        lambda names, hours=None, today_only=False, mode=None: {
+            n: (list(losses) if not today_only else list(losses))
+            for n in names
+        },
+    )
+    # Portfolio series = chronological pool P&Ls (same losses once)
+    monkeypatch.setattr(
+        risk_engine, "_portfolio_pnls",
+        lambda hours=None, today_only=False, mode=None: list(losses),
+    )
+    monkeypatch.setattr(risk_engine, "_file_kill_armed", lambda: False)
+
+    state = risk_engine.evaluate(bot_names=["a", "b"], mode="paper")
+    port = state["portfolio"]
+    assert port["drawdown"] == pytest.approx(round(abs(sum(losses)) / 1000.0, 4),
+                                             abs=1e-4)
+    assert port["drawdown"] < 0.05  # ~1.5%, nowhere near 40%
+    assert port["status"] == "active"
+    assert port["size_mult"] == pytest.approx(1.0)
+    assert port.get("reason") is None
+
+
+def test_evaluate_pauses_portfolio_on_real_drawdown(monkeypatch):
+    """Large loss vs bankroll still trips portfolio_max_drawdown."""
+    saved = {}
+    monkeypatch.setattr(risk_engine.db, "set_arena_state",
+                        lambda k, v: saved.__setitem__(k, v))
+    monkeypatch.setattr(risk_engine.db, "get_arena_state",
+                        lambda k, d=None: saved.get(k, d))
+    monkeypatch.setattr(risk_engine.db, "log_risk_event", lambda **kw: 1)
+    monkeypatch.setattr(risk_engine.db, "get_active_bots",
+                        lambda: [{"bot_name": "deep"}])
+    monkeypatch.setattr(config, "RISK_BOT_DAILY_LOSS", 9999.0)
+    monkeypatch.setattr(config, "RISK_PAPER_BOT_DAILY_LOSS", 9999.0)
+    monkeypatch.setattr(config, "RISK_PAPER_PORTFOLIO_DAILY_LOSS", 9999.0)
+    monkeypatch.setattr(config, "RISK_PORTFOLIO_DAILY_LOSS", 9999.0)
+    monkeypatch.setattr(config, "RISK_PORTFOLIO_MAX_DRAWDOWN", 0.40)
+    monkeypatch.setattr(config, "RISK_BOT_MAX_DRAWDOWN", 0.99)
+    monkeypatch.setattr(config, "RISK_UNDERPERFORM_PAUSE_PNL", -9999.0)
+
+    # 10 equal losses of $50 on $1000 → 50% DD ≥ 40%
+    series = [-50.0] * 10
+    monkeypatch.setattr(risk_engine, "_capital_now", lambda: 500.0)
+    monkeypatch.setattr(risk_engine, "_bot_capital_weight", lambda _n: 1.0)
+    monkeypatch.setattr(
+        risk_engine, "_pnls_for_bots",
+        lambda names, hours=None, today_only=False, mode=None: {
+            "deep": [] if today_only else list(series),
+        },
+    )
+    monkeypatch.setattr(
+        risk_engine, "_portfolio_pnls",
+        lambda hours=None, today_only=False, mode=None: (
+            [] if today_only else list(series)),
+    )
+    monkeypatch.setattr(risk_engine, "_file_kill_armed", lambda: False)
+
+    state = risk_engine.evaluate(bot_names=["deep"], mode="paper")
+    port = state["portfolio"]
+    assert port["drawdown"] == pytest.approx(0.5, abs=0.01)
+    assert port["status"] == "paused"
+    assert "portfolio_max_drawdown" in (port.get("reason") or "")
 
 
 def test_pre_trade_allow_when_healthy(monkeypatch):

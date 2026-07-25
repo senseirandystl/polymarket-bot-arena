@@ -179,6 +179,11 @@ ARBITRAGE_BOOK_CACHE_SEC = 1.0  # micro-cache on the per-leg book reads (hot pat
 # re-validates the *combined* edge and fills both legs against the exact snapshot
 # it validated (passed to the engine), so its two legs stay atomic.
 MAX_FILL_SLIPPAGE = 0.03
+# After a slippage_band / slippage_exceeded reject, sit out this (bot, market)
+# for N seconds so the 1s trader does not spam re-attempts into a whipping
+# late-window book (overnight: 5–10 rejects/bot/window). Maker section (~20s)
+# also honors the same cooldown.
+SLIPPAGE_RETRY_COOLDOWN_SEC = 10.0
 
 # --- Order-flow signal weights (base_bot.make_decision) ---
 # Re-weighted from the 2026-07-15 overnight run (460 directional trades):

@@ -266,6 +266,10 @@ class RegimeDetector:
         }
         self._loaded = False
         self._last_persist = 0.0
+        # True once this process drives the detector (update/record_outcome).
+        # Read-only consumers (the dashboard process) leave it False and so
+        # refresh from the DB on every read instead of trusting stale memory.
+        self._live = False
 
     # ------------------------------------------------------------------
     # Persistence
@@ -275,6 +279,18 @@ class RegimeDetector:
         if self._loaded:
             return
         self._loaded = True
+        self._load_from_db()
+
+    def _load_from_db(self) -> None:
+        """Hydrate in-memory state from arena_state.
+
+        Runs once at startup for the arena's live detector, and on every
+        read for detached read-only consumers (the dashboard process, which
+        never calls :meth:`update`). The detector is a per-process singleton;
+        without this refresh a reader would freeze at whatever state existed
+        the first time it was touched — e.g. the ``unknown`` default if the
+        reader started before the arena committed its first regime.
+        """
         try:
             import db
             raw = db.get_arena_state(STATE_KEY)
@@ -283,6 +299,14 @@ class RegimeDetector:
                 self._regime = data.get("regime", self._regime)
                 self._confidence = float(data.get("confidence") or 0.0)
                 self._ema = dict(data.get("ema") or {})
+                # Restore the smoothed feature vector so `known`/features are
+                # populated for readers (drives the dashboard features table).
+                self._last_features = dict(
+                    data.get("last_features") or self._last_features
+                )
+                self._last_change_from = data.get(
+                    "last_change_from", self._last_change_from
+                )
                 cents = data.get("centroids") or {}
                 for rid, c in cents.items():
                     if rid in self._centroids and isinstance(c, dict):
@@ -315,6 +339,8 @@ class RegimeDetector:
                 "regime": self._regime,
                 "confidence": self._confidence,
                 "ema": dict(self._ema),
+                "last_features": dict(self._last_features),
+                "last_change_from": self._last_change_from,
                 "centroids": {
                     rid: {"n": c["n"], "mean": list(c["mean"])}
                     for rid, c in self._centroids.items()
@@ -346,6 +372,7 @@ class RegimeDetector:
         Continuous / online — safe to call every second from the warm path.
         """
         self._ensure_loaded()
+        self._live = True
         raw = compute_features(
             prices, cvd=cvd, obi=obi,
             vol_score=vol_score, trend_score=trend_score,
@@ -524,6 +551,7 @@ class RegimeDetector:
     ) -> None:
         """Update per-regime P&L stats when a trade resolves (online)."""
         self._ensure_loaded()
+        self._live = True
         rid = regime_id if regime_id in self._perf else "unknown"
         with self._lock:
             p = self._perf[rid]
@@ -540,6 +568,10 @@ class RegimeDetector:
     def performance_snapshot(self) -> dict[str, dict]:
         self._ensure_loaded()
         with self._lock:
+            if not self._live:
+                # Read-only consumer (dashboard): reflect the arena's latest
+                # persisted perf, not this process's stale first load.
+                self._load_from_db()
             out = {}
             for rid, p in self._perf.items():
                 n = int(p["n"])
@@ -586,6 +618,10 @@ class RegimeDetector:
     def snapshot(self) -> dict[str, Any]:
         self._ensure_loaded()
         with self._lock:
+            if not self._live:
+                # Read-only consumer (dashboard): reflect the arena's latest
+                # persisted regime, not this process's stale first load.
+                self._load_from_db()
             return self._snapshot_unlocked()
 
     def transitions(self, limit: int = 20) -> list[dict]:

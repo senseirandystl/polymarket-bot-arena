@@ -916,7 +916,13 @@ class BaseBot(ABC):
         Paper → local simulated fill (``venues.paper``); live → Polymarket CLOB
         (``venues.live``). Adapts the engine's ``TradeResult`` to the legacy
         dict shape callers (trader.py, maker bots) expect.
+
+        When the market carries a warm side book (``yes_book`` / ``no_book``
+        from the market-data warmer), that snapshot is passed to the engine
+        so the fill walks the SAME book the decision priced — not a fresh
+        CLOB fetch that can move several cents in under a second.
         """
+        from arena.market_data import side_book
         from venues import get_engine
 
         # Slippage band: reject a fill that deviates more than
@@ -925,6 +931,7 @@ class BaseBot(ABC):
         # a bargain). Only applied when the signal carries an expected
         # ``entry_price`` (all buy signals now do).
         expected = signal.get("entry_price")
+        book = side_book(market, signal.get("side"))
 
         res = get_engine(mode).place(
             bot_name=self.name,
@@ -936,6 +943,7 @@ class BaseBot(ABC):
             reasoning=signal.get("reasoning"),
             features=signal.get("features"),
             expected_price=expected,
+            book=book,
         )
         return {
             "success": res.success,
