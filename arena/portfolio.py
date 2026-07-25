@@ -279,6 +279,45 @@ def _raw_scores(
     return scores
 
 
+def apply_regime_tilt(
+    scores: dict[str, float],
+    regime_edges: dict[str, float] | None,
+    *,
+    max_tilt: float,
+    min_weight: float,
+) -> dict[str, float]:
+    """Multiplicatively tilt allocation scores by per-bot regime edge.
+
+    Each bot's edge is mapped to a bounded multiplier in
+    ``[1 - max_tilt, 1 + max_tilt]`` via the sign-scaled position of its edge
+    within the current regime's edge range. Bots absent from ``regime_edges``
+    are left neutral. The explore floor then keeps every score at least
+    ``min_weight * max(score)`` so no bot is starved out of generating the
+    future trades the attribution needs.
+
+    Pure: returns a new dict; never mutates ``scores``. Identity (a copy) when
+    ``regime_edges`` is falsy — the no-conditioning / no-validated-regime path.
+    """
+    if not regime_edges:
+        return dict(scores)
+    vals = list(regime_edges.values())
+    hi = max(vals)
+    lo = min(vals)
+    span = (hi - lo) or 1.0
+    out: dict[str, float] = {}
+    for bot, s in scores.items():
+        e = regime_edges.get(bot)
+        if e is None:
+            out[bot] = s  # neutral: not attributed in this regime
+            continue
+        norm = 2.0 * (e - lo) / span - 1.0  # -1 (worst) .. +1 (best)
+        out[bot] = s * (1.0 + max_tilt * norm)
+    if out:
+        floor = min_weight * max(out.values())
+        out = {b: max(v, floor) for b, v in out.items()}
+    return out
+
+
 def _normalize(
     scores: dict[str, float],
     *,
@@ -368,6 +407,7 @@ def allocate(
     *,
     manual_overrides: Optional[dict[str, float]] = None,
     hours: float | None = None,
+    regime_edges: dict[str, float] | None = None,
 ) -> dict[str, Any]:
     """Compute portfolio weights for ``bot_names``.
 
@@ -407,6 +447,14 @@ def allocate(
 
     if free_names and free_mass > 0:
         scores = _raw_scores(method, {n: metrics[n] for n in free_names}, corr)
+        # Regime-conditioning (Layer 3): bounded, floored tilt by each bot's
+        # validated shrunk edge for the CURRENT regime. No-op (identity) when
+        # regime_edges is None — the conditioning-off / no-validated-regime path.
+        scores = apply_regime_tilt(
+            scores, regime_edges,
+            max_tilt=float(getattr(config, "REGIME_ALLOC_MAX_TILT", 0.25)),
+            min_weight=float(getattr(config, "REGIME_ALLOC_MIN_WEIGHT", 0.05)),
+        )
         # Normalize free bots onto a unit simplex with min/max scaled so that
         # after multiplying by free_mass the absolute floors/caps still hold.
         n_free = len(free_names)
@@ -570,11 +618,28 @@ def rebalance(
                   getattr(config, "PORTFOLIO_WINDOW_HOURS", 24))
     overrides = state.get("manual_overrides") or {}
 
+    # Regime-conditioning (Layer 3): when the toggle is on and the CURRENT
+    # regime has been discovered + OOS-validated, fetch its per-bot shrunk
+    # edges so allocate() can tilt weights toward what works in this regime.
+    # Best-effort: any gap (toggle off, no current_cell yet, unvalidated
+    # regime) leaves regime_edges None and the tilt is a no-op.
+    regime_edges = None
+    try:
+        if db.get_regime_conditioning():
+            from arena.regime_map import edges_for_cell
+            cur_cell = db.get_regime_map().get("current_cell")
+            edges = edges_for_cell(tuple(cur_cell)) if cur_cell else None
+            if edges:
+                regime_edges = {b: e["shrunk_pnl"] for b, e in edges.items()}
+    except Exception:
+        regime_edges = None
+
     result = allocate(
         names,
         method=method,
         manual_overrides=overrides,
         hours=hours,
+        regime_edges=regime_edges,
     )
 
     state.update({
