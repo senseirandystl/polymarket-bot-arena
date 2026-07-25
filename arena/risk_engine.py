@@ -3,7 +3,8 @@
 Single authority for pre-trade risk gates and continuous risk evaluation:
 
 * Per-bot and portfolio **daily loss** limits (net P&L)
-* Per-bot and portfolio **max drawdown** (peak-to-trough on equity curves)
+* Per-bot and portfolio **max drawdown** (peak-to-trough on bankroll-anchored
+  equity curves — capital base + cumulative trade P&L, not zero-based P&L)
 * Automatic **size reduction** as drawdown approaches the limit, then **pause**
 * Underperformance pause (window P&L floor)
 * **Historical VaR** (percentile of recent trade P&Ls) when enough data
@@ -60,44 +61,104 @@ class TradeDecision:
 # Metrics helpers
 # ---------------------------------------------------------------------------
 
-def max_drawdown_pct(pnls: Sequence[float]) -> float:
-    """Peak-to-trough drawdown as a fraction of peak equity (0..inf)."""
+def max_drawdown_pct(
+    pnls: Sequence[float],
+    *,
+    starting_equity: float = 0.0,
+) -> float:
+    """Peak-to-trough drawdown as a fraction of peak equity (0..inf).
+
+    ``starting_equity`` is the capital base *before* the first P&L (e.g.
+    bankroll at window open). Without it, pure-loss series start at peak=0
+    and cannot form a meaningful ratio — callers should pass bankroll.
+    """
+    start = max(0.0, float(starting_equity or 0.0))
     if not pnls:
         return 0.0
-    equity = 0.0
-    peak = 0.0
+    equity = start
+    peak = start
     max_dd = 0.0
     for p in pnls:
         equity += float(p)
         peak = max(peak, equity)
-        dd = peak - equity
-        if peak > 0:
-            max_dd = max(max_dd, dd / peak)
-        elif dd > 0 and peak == 0:
-            max_dd = max(max_dd, 1.0)
+        if peak > 1e-12:
+            max_dd = max(max_dd, (peak - equity) / peak)
     return max_dd
 
 
-def equity_stats(pnls: Sequence[float]) -> dict[str, float]:
-    """Return equity, peak, drawdown_pct for a P&L series (oldest→newest)."""
+def equity_stats(
+    pnls: Sequence[float],
+    *,
+    starting_equity: float = 0.0,
+) -> dict[str, float]:
+    """Return equity, peak, drawdown_pct for a P&L series (oldest→newest).
+
+    Equity is bankroll-anchored: curve starts at ``starting_equity`` (capital
+    before the first trade in ``pnls``), then accumulates trade P&Ls.
+    Drawdown is ``(peak − equity) / peak``. A pure-loss window on a $1000
+    book is ~1–2% DD, not 100% (the old zero-based curve forced 100% whenever
+    cumulative P&L never went positive).
+    """
+    start = max(0.0, float(starting_equity or 0.0))
     if not pnls:
-        return {"equity": 0.0, "peak": 0.0, "drawdown": 0.0, "n": 0}
-    equity = 0.0
-    peak = 0.0
+        return {
+            "equity": round(start, 4),
+            "peak": round(start, 4),
+            "drawdown": 0.0,
+            "n": 0,
+            "starting_equity": round(start, 4),
+        }
+    equity = start
+    peak = start
     for p in pnls:
         equity += float(p)
         peak = max(peak, equity)
     dd = 0.0
-    if peak > 0:
+    if peak > 1e-12:
         dd = max(0.0, (peak - equity) / peak)
-    elif equity < 0:
-        dd = 1.0
     return {
         "equity": round(equity, 4),
         "peak": round(peak, 4),
         "drawdown": round(dd, 4),
         "n": len(pnls),
+        "starting_equity": round(start, 4),
     }
+
+
+def _capital_now() -> float:
+    """Current risk capital base (paper gross equity = bankroll + realized)."""
+    try:
+        gross = float(db.get_paper_pool_gross())
+        if gross > 0:
+            return gross
+    except Exception:
+        pass
+    try:
+        bankroll = float(db.get_paper_bankroll())
+        if bankroll > 0:
+            return bankroll
+    except Exception:
+        pass
+    return float(getattr(config, "PAPER_BANKROLL_DEFAULT", 200.0))
+
+
+def _window_start_equity(pnls: Sequence[float], capital_now: float) -> float:
+    """Reconstruct equity immediately before the first trade in ``pnls``.
+
+    ``capital_now − sum(pnls)`` is the equity at window open when
+    ``capital_now`` is bankroll + all realized P&L and ``pnls`` is the
+    window's chronological trade series.
+    """
+    return max(0.0, float(capital_now) - sum(float(p) for p in pnls))
+
+
+def _bot_capital_weight(bot_name: str) -> float:
+    """Fraction of pool capital this bot is sized against (1.0 if allocation off)."""
+    try:
+        from arena.portfolio import get_weight
+        return max(0.0, float(get_weight(bot_name)))
+    except Exception:
+        return 1.0
 
 
 def historical_var(pnls: Sequence[float], confidence: float = 0.95) -> Optional[float]:
@@ -516,6 +577,12 @@ def evaluate(bot_names: Optional[Sequence[str]] = None,
     window_pnls = _pnls_for_bots(names, hours=dd_hours, mode=None)
     under_pnls = _pnls_for_bots(names, hours=under_hours, mode=None)
 
+    # Bankroll-anchored equity: reconstruct window-start capital so pure-loss
+    # runs report ~loss/capital DD, not a false 100% from a zero-based curve.
+    capital_now = _capital_now()
+    port_window_for_base = _portfolio_pnls(hours=dd_hours)
+    port_start = _window_start_equity(port_window_for_base, capital_now)
+
     prev_bots = state.get("bots") or {}
     new_bots: dict[str, dict] = {}
 
@@ -524,7 +591,9 @@ def evaluate(bot_names: Optional[Sequence[str]] = None,
         w_series = window_pnls.get(name) or []
         u_series = under_pnls.get(name) or []
         daily_pnl = sum(d_series)
-        stats = equity_stats(w_series)
+        # Bot capital = pool start × portfolio weight (1.0 when allocation off).
+        bot_start = max(0.0, port_start * _bot_capital_weight(name))
+        stats = equity_stats(w_series, starting_equity=bot_start)
         dd = float(stats["drawdown"])
         var = historical_var(w_series, var_conf)
         under_total = sum(u_series)
@@ -570,6 +639,7 @@ def evaluate(bot_names: Optional[Sequence[str]] = None,
             "drawdown": round(dd, 4),
             "peak": stats["peak"],
             "equity": stats["equity"],
+            "starting_equity": stats.get("starting_equity", bot_start),
             "var_1d": var,
             "n_window": stats["n"],
             "reason": reason,
@@ -591,9 +661,9 @@ def evaluate(bot_names: Optional[Sequence[str]] = None,
 
     # Portfolio
     port_daily_series = _portfolio_pnls(today_only=True)
-    port_window = _portfolio_pnls(hours=dd_hours)
+    port_window = port_window_for_base
     port_daily = sum(port_daily_series)
-    port_stats = equity_stats(port_window)
+    port_stats = equity_stats(port_window, starting_equity=port_start)
     port_dd = float(port_stats["drawdown"])
     port_var = historical_var(port_window, var_conf)
     port_status = "active"
@@ -646,6 +716,7 @@ def evaluate(bot_names: Optional[Sequence[str]] = None,
         "drawdown": round(port_dd, 4),
         "peak": port_stats["peak"],
         "equity": port_stats["equity"],
+        "starting_equity": port_stats.get("starting_equity", port_start),
         "var_1d": port_var,
         "n_window": port_stats["n"],
         "size_mult": round(port_mult, 4),

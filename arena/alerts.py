@@ -227,7 +227,7 @@ def _send_telegram(title: str, body: str, level: str) -> tuple[bool, str]:
         return False, "telegram credentials missing"
     icon = {"critical": "🔴", "warn": "🟠", "warning": "🟠", "info": "🟢"}.get(
         level, "⚪")
-    text = f"{icon} *{title}*\n{body}"
+    text = f"{icon} *{title}*" + (f"\n{body}" if body else "")
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     return _http_json(url, {
         "chat_id": chat,
@@ -314,12 +314,11 @@ def notify(
             result["reason"] = "filtered_or_debounced"
             return result
         result["skipped"] = False
+        # The human-facing message is title + body only. The structured
+        # ``detail`` dict is kept in the arena_state log for the dashboard /
+        # debugging, but is NOT dumped as raw JSON into the notification —
+        # that produced messages like `{"from": "normal", "confidence": 0.82...}`.
         full_body = body
-        if detail:
-            try:
-                full_body = (body + "\n" + json.dumps(detail, default=str)[:500]).strip()
-            except Exception:
-                pass
         channels_cfg = cfg.get("channels") or {}
         any_ok = False
         for ch, sender in (
@@ -341,6 +340,7 @@ def notify(
             "level": level,
             "title": title,
             "body": body[:300],
+            "detail": detail or None,
             "sent": any_ok,
             "channels": result["channels"],
         })
@@ -378,11 +378,29 @@ def send_test(channel: Optional[str] = None) -> dict[str, Any]:
 # Convenience emitters used by arena / risk / regime
 # ---------------------------------------------------------------------------
 
+# Human-readable regime names for notifications (raw ids stay in `detail`).
+_REGIME_LABELS = {
+    "high_vol_trend": "High-vol trend",
+    "low_vol_range": "Low-vol range",
+    "high_vol_chop": "High-vol chop",
+    "low_vol_trend": "Low-vol trend",
+    "normal": "Normal",
+    "unknown": "Unknown",
+}
+
+
+def _regime_label(regime: str) -> str:
+    if not regime:
+        return "Unknown"
+    return _REGIME_LABELS.get(regime, regime.replace("_", " ").title())
+
+
 def alert_regime_shift(from_regime: str, to_regime: str, confidence: float = 0.0):
     notify(
         "regime_shift",
-        f"Regime: {from_regime or '?'} → {to_regime}",
-        f"Confidence {(confidence or 0) * 100:.0f}%",
+        f"Regime shift Detected: {_regime_label(from_regime)} → "
+        f"{_regime_label(to_regime)} · {(confidence or 0) * 100:.0f}% confidence",
+        "",
         level="info",
         key=f"{from_regime}->{to_regime}",
         detail={"from": from_regime, "to": to_regime, "confidence": confidence},

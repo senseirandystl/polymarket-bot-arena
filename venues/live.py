@@ -29,7 +29,7 @@ class LiveEngine:
     def place(self, *, bot_name, side, amount, market, mode,
               confidence=None, reasoning=None, features=None,
               target_shares=None, limit_price=None, expected_price=None,
-              book=None) -> TradeResult:
+              book=None, context=None) -> TradeResult:
         # ``target_shares`` (share-matched arb sizing) is accepted for a uniform
         # engine signature. The CLOB market-order path is USD-denominated, so we
         # convert to a USD budget when a share target is supplied and no explicit
@@ -127,6 +127,7 @@ class LiveEngine:
             fill_source="polymarket",
             entry_price=price,
             fee=fee,
+            context=context,
         )
         logger.info(
             f"[{bot_name}] LIVE fill: {side} ${amount:.2f} @ {price} "

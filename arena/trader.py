@@ -131,28 +131,13 @@ class Trader(threading.Thread):
 
         # FRESH data every tick with ZERO network on the hot path: the
         # market-data warmer refreshes YES+NO prices, both books, OBI, CVD and
-        # PM momentum every ~1s into a shared warm cache. Read it here and lay
-        # the warm values onto the market snapshot + signals. Fall back to a
-        # direct price fetch only until the warmer has primed this market.
+        # PM momentum every ~1s into a shared warm cache. Lay mids, asks AND
+        # full books onto the market so make_decision and paper fill share one
+        # snapshot (slippage path A). Fall back to a direct price fetch only
+        # until the warmer has primed this market.
         warm = market_data.store().get(market_id)
         if warm is not None:
-            if warm.get("yes_price") is not None:
-                market["current_price"] = warm["yes_price"]
-            if warm.get("no_price") is not None:
-                market["no_price"] = warm["no_price"]
-            # Executable (taker) prices: make_decision measures edge against
-            # the best ASK, not the mid — the fill engines walk the asks, so
-            # a mid-priced edge on a wide book just dies at the slippage
-            # guard (5 of 7 attempted trades in the first post-restart hour).
-            for ask_key, book_key in (("yes_ask", "yes_book"),
-                                      ("no_ask", "no_book")):
-                book = warm.get(book_key) or {}
-                if book.get("valid") and book.get("best_ask"):
-                    market[ask_key] = book["best_ask"]
-            market["orderflow"] = {
-                **(market.get("orderflow") or {}),
-                "obi": warm.get("obi", 0.0),
-            }
+            market_data.lay_warm_onto_market(market, warm)
         else:
             polymarket_markets.refresh_price(market)
 
@@ -167,6 +152,10 @@ class Trader(threading.Thread):
             warm=warm,
         )
 
+        import config as _cfg
+        slip_cd = float(getattr(_cfg, "SLIPPAGE_RETRY_COOLDOWN_SEC", 10.0))
+        slip_reasons = frozenset({"slippage_band", "slippage_exceeded"})
+
         new_trades = 0
         for bot in bots:
             key = (bot.name, market_id)
@@ -174,6 +163,10 @@ class Trader(threading.Thread):
             # window; otherwise it RE-EVALUATES every tick (a skip is not sticky)
             # so it enters the moment its edge appears mid-window.
             if self._state.is_traded(key):
+                continue
+            # Post-slippage backoff: don't re-hammer a whipping book every 1s.
+            if self._state.is_slippage_cooling(key):
+                self._state.note_skip("slippage_cooldown")
                 continue
             try:
                 signal = bot.make_decision(market, combined_signals)
@@ -213,16 +206,20 @@ class Trader(threading.Thread):
                         mode=bot.trading_mode,
                     )
                 else:
-                    # Transient (no book / bankroll dry) — don't mark, retry
-                    # next tick. Debug-level so a dry pool doesn't spam warnings.
+                    reason = result.get("reason")
+                    if reason in slip_reasons:
+                        self._state.mark_slippage_reject(key, slip_cd)
+                        self._state.note_skip("slippage")
+                    # Transient (no book / bankroll dry / cooldown) — don't mark
+                    # traded; retry next eligible tick.
                     log_event(
                         logger, logging.DEBUG,
                         f"[{bot.name}] trade not placed on {market_id[:12]}…: "
-                        f"{result.get('reason')}",
+                        f"{reason}",
                         event_type="trade", outcome="not_placed",
                         bot=bot.name, strategy=bot.strategy_type,
                         market_id=market_id, side=signal.get("side"),
-                        reason=result.get("reason"),
+                        reason=reason,
                     )
             except Exception as e:
                 log_event(

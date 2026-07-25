@@ -347,6 +347,7 @@ def _run_secondary_bots(discovery, maker_bots, copy_bots, signal_feeds, state):
     # Deliberately separate from the Trader's "swap only on actual
     # rollover" policy -- see arena/trader.py for that strict rule.
     if maker_bots and maker_targets:
+        from arena import market_data as _mdata
         for target in maker_targets:
             is_live = (
                 live_market_id is not None
@@ -354,7 +355,13 @@ def _run_secondary_bots(discovery, maker_bots, copy_bots, signal_feeds, state):
             )
             mode = "LIVE" if is_live else "PRE-WINDOW"
             tr = target.get("time_remaining_seconds", 0)
-            signals = build_combined_signals(*signal_feeds, market=target)
+            # Lay warm mids/asks/books so maker decisions + paper fills share
+            # one snapshot (same atomic-book path as the 1s trader).
+            mid = target.get("id") or target.get("market_id")
+            warm = _mdata.store().get(mid) if mid else None
+            _mdata.lay_warm_onto_market(target, warm)
+            signals = build_combined_signals(
+                *signal_feeds, market=target, warm=warm)
             maker_trades = 0
             for mb in maker_bots:
                 try:
@@ -382,6 +389,9 @@ def _run_maker_section(maker_bot, market: dict, signals: dict, state) -> bool:
     key = (maker_bot.name, market_id)
     if state.is_traded(key):
         return False
+    if state.is_slippage_cooling(key):
+        state.note_skip("slippage_cooldown")
+        return False
 
     try:
         signal = maker_bot.analyze(market, signals)
@@ -396,7 +406,7 @@ def _run_maker_section(maker_bot, market: dict, signals: dict, state) -> bool:
         )
 
         maker_logger.info(
-            f"[{maker_bot.name}] market={market_id[:12]}... "
+            f"[{maker_bot.name}] market={str(market_id)[:12]}... "
             f"price={market_price:.3f} "
             f"bid={maker_bid:.3f} ask={maker_ask:.3f} mid={maker_mid:.3f} "
             f"edge={edge_bps:.1f}bps lean={maker_side} "
@@ -415,20 +425,26 @@ def _run_maker_section(maker_bot, market: dict, signals: dict, state) -> bool:
             return False
 
         result = maker_bot.execute(signal, market)
-        state.mark_traded(key)
         if result.get("success"):
+            state.mark_traded(key)
             maker_logger.info(
                 f"[{maker_bot.name}] PAPER {signal['side'].upper()} "
                 f"${signal.get('suggested_amount', 0):.2f} "
                 f"on {market.get('question', '')[:50]}"
             )
             return True
-        else:
-            maker_logger.debug(
-                f"[{maker_bot.name}] paper execute skipped: "
-                f"{result.get('reason')}"
-            )
-            return False
+        reason = result.get("reason")
+        if reason in ("slippage_band", "slippage_exceeded"):
+            cd = float(getattr(config, "SLIPPAGE_RETRY_COOLDOWN_SEC", 10.0))
+            state.mark_slippage_reject(key, cd)
+            state.note_skip("slippage")
+        # Failed execute is NOT marked traded — allow retry after cooldown /
+        # next discovery cycle (was permanent lockout, which killed makers on
+        # one slippage miss).
+        maker_logger.debug(
+            f"[{maker_bot.name}] paper execute skipped: {reason}"
+        )
+        return False
 
     except Exception as e:
         maker_logger.error(f"[{maker_bot.name}] Maker section error: {e}")
@@ -458,6 +474,7 @@ def _evolution_check_loop(bots, state, pos_monitor, trader):
     without any manual run).
     """
     from arena import lane_monitor, lane_promoter, core_lane_tuner, portfolio
+    from arena import regime_map
     from arena import risk_engine
     from arena.validation_scheduler import ValidationScheduler
 
@@ -467,8 +484,10 @@ def _evolution_check_loop(bots, state, pos_monitor, trader):
     lane_monitor_interval = getattr(config, "LANE_MONITOR_INTERVAL_SEC", 1800)
     portfolio_interval = float(
         getattr(config, "PORTFOLIO_REBALANCE_INTERVAL_SEC", 1800))
+    regime_map_interval = float(getattr(config, "REGIME_MAP_INTERVAL_SEC", 900))
     last_lane_check = 0.0
     last_portfolio_check = 0.0
+    last_regime_map_check = 0.0
     last_pool_pnl = None  # for performance-trigger drop detection
 
     saved_cycle = db.get_arena_state("evolution_cycle", "0")
@@ -566,6 +585,18 @@ def _evolution_check_loop(bots, state, pos_monitor, trader):
         except Exception as e:
             log_event(logger, logging.ERROR, f"Lane monitor/promoter/tuner error (caught): {e}",
                       exc_info=True, event_type="error", where="lane_pipeline")
+
+        try:
+            # Regime discovery (Layer 2): recompute the per-bot context
+            # attribution map + validated regimes, and publish the current
+            # cell. Best-effort — never raises into the arena loop. The
+            # portfolio allocator and core-lane tuner read this map.
+            if time.time() - last_regime_map_check >= regime_map_interval:
+                regime_map.rebuild()
+                last_regime_map_check = time.time()
+        except Exception as e:
+            log_event(logger, logging.ERROR, f"Regime map rebuild error (caught): {e}",
+                      exc_info=True, event_type="error", where="regime_map")
 
         try:
             validation_scheduler.check()

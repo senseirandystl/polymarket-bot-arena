@@ -61,11 +61,17 @@ def _strategy_map(conn) -> dict:
                 "SELECT bot_name, strategy_type FROM bot_configs")}
 
 
-def compute_core_attribution(conn, deadband: float) -> dict:
-    """{strategy_type: {lane: {n, accuracy}}} from resolved directional trades."""
+def compute_core_attribution(conn, deadband: float, *,
+                             cell_filter: tuple | None = None) -> dict:
+    """{strategy_type: {lane: {n, accuracy}}} from resolved directional trades.
+
+    When ``cell_filter`` is a context cell (6-tuple), only trades taken in that
+    regime are counted (regime-conditioned tuning). When None, behavior is the
+    global default — every resolved directional trade is counted, unchanged.
+    """
     smap = _strategy_map(conn)
     rows = conn.execute(
-        """SELECT bot_name, side, outcome, reasoning FROM trades
+        """SELECT bot_name, side, outcome, reasoning, context FROM trades
            WHERE outcome IN ('win', 'loss') AND reasoning LIKE 'fair=%'"""
     ).fetchall()
     agg: dict = {}
@@ -73,6 +79,17 @@ def compute_core_attribution(conn, deadband: float) -> dict:
         strat = smap.get(r["bot_name"])
         if strat is None:
             continue
+        if cell_filter is not None:
+            # Regime-conditioned: skip trades not taken in the current regime.
+            ctx_raw = r["context"]
+            if not ctx_raw:
+                continue
+            try:
+                from signals.context import context_cell
+                if context_cell(json.loads(ctx_raw)) != cell_filter:
+                    continue
+            except (json.JSONDecodeError, TypeError, KeyError):
+                continue
         market_up = (r["side"] == "yes") == (r["outcome"] == "win")
         text = r["reasoning"] or ""
         for lane, rx in _LANE_RE.items():
@@ -128,11 +145,24 @@ def tune() -> dict:
     profiles = BaseBot.STRATEGY_SIGNAL_PROFILE
     strategies = list(profiles.keys())
 
+    # Regime-conditioning (Layer 3): when the toggle is on and the current
+    # regime is known, tune each lane on ITS attribution within that regime.
+    # Off / no current_cell -> None -> global attribution, byte-for-byte as before.
+    cell_filter = None
+    try:
+        if db.get_regime_conditioning():
+            cur = db.get_regime_map().get("current_cell")
+            cell_filter = tuple(cur) if cur else None
+    except Exception:
+        cell_filter = None
+
     with db.get_conn() as conn:
-        attribution = compute_core_attribution(conn, deadband)
+        attribution = compute_core_attribution(conn, deadband, cell_filter=cell_filter)
 
     overrides = db.get_lane_overrides()
-    report: dict = {"applied": apply, "lanes": {}}
+    report: dict = {"applied": apply,
+                    "cell_filter": list(cell_filter) if cell_filter else None,
+                    "lanes": {}}
     new_overrides = dict(overrides)
     dirty = False
     stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")

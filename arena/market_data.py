@@ -75,6 +75,53 @@ def store() -> MarketDataStore:
     return _store
 
 
+def lay_warm_onto_market(market: dict, warm: Optional[dict]) -> None:
+    """Lay warm prices/books onto a market snapshot (mutates ``market``).
+
+    Used by the trader and maker section so decisions and paper fills share
+    the same book snapshot: ``yes_ask``/``no_ask`` for edge + expected price,
+    and ``yes_book``/``no_book`` passed into ``venues.paper.place(book=...)``
+    so the fill does not re-fetch a drifted CLOB book (slippage path A).
+    """
+    if not warm:
+        return
+    if warm.get("yes_price") is not None:
+        market["current_price"] = warm["yes_price"]
+    if warm.get("no_price") is not None:
+        market["no_price"] = warm["no_price"]
+    # Full books first so asks and side-book fields stay consistent.
+    yes_book = warm.get("yes_book")
+    no_book = warm.get("no_book")
+    if yes_book is not None:
+        market["yes_book"] = yes_book
+    if no_book is not None:
+        market["no_book"] = no_book
+    for ask_key, book in (("yes_ask", yes_book or {}),
+                          ("no_ask", no_book or {})):
+        if book.get("valid") and book.get("best_ask") is not None:
+            market[ask_key] = book["best_ask"]
+        elif book.get("valid") and book.get("asks"):
+            # Tests / partial books may omit best_ask; derive from top ask.
+            market[ask_key] = book["asks"][0][0]
+    market["orderflow"] = {
+        **(market.get("orderflow") or {}),
+        "obi": warm.get("obi", 0.0),
+    }
+
+
+def side_book(market: dict, side: str) -> Optional[dict]:
+    """Return the warm side book if present and valid, else ``None``."""
+    if side == "yes":
+        book = market.get("yes_book")
+    elif side == "no":
+        book = market.get("no_book")
+    else:
+        return None
+    if isinstance(book, dict) and book.get("valid"):
+        return book
+    return None
+
+
 class MarketDataWarmer(threading.Thread):
     """Refresh the live market's book/price/orderflow data every ~1s."""
 

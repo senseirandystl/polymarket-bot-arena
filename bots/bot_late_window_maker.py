@@ -125,37 +125,39 @@ class LateWindowMakerBot(BaseBot):
                 f"(drift={drift:+.3f} mom={momentum:+.5f})")
 
         # ── Side selection: quote the DRIFT side on its own token price ──────
-        # The band check confirms the book agrees with the direction (yes+no
-        # ~= 1, so only one side's price sits in the band). NO is a first-class
-        # mirror of the YES entry, not a banned side.
+        # Band / edge gates key off the side MID (crowd view); the taker fill
+        # and slippage expected price key off the warm best ASK when present.
         min_price = p["min_price_yes"]
         max_price = p["max_price_yes"]
+        no_price = market.get("no_price")
+        if no_price is None:
+            no_price = round(1.0 - market_price, 4)
         if drift > 0:
-            side, side_price = "yes", market_price
+            side, side_mid = "yes", market_price
+            side_exec = market.get("yes_ask") or side_mid
         else:
-            no_price = market.get("no_price")
-            if no_price is None:
-                no_price = round(1.0 - market_price, 4)
-            side, side_price = "no", no_price
+            side, side_mid = "no", no_price
+            side_exec = market.get("no_ask") or side_mid
 
-        if side_price < min_price:
+        if side_mid < min_price:
             return _hold(
-                f"lwm: {side} price {side_price:.2f} < {min_price} (no confirmation)")
-        if side_price > max_price:
+                f"lwm: {side} price {side_mid:.2f} < {min_price} (no confirmation)")
+        if side_mid > max_price:
             return _hold(
-                f"lwm: {side} price {side_price:.2f} > {max_price} (margin too thin)")
+                f"lwm: {side} price {side_mid:.2f} > {max_price} (margin too thin)")
 
         # ── Edge gate: the price must be justified by drift's implied P ──────
         # implied_P = 0.5 + 0.5*|drift| is calibrated against resolved markets.
         # Buying above it is paying for conviction the fundamental doesn't
         # have — exactly how a 71%-WR bot lost money at 79c entries.
+        # Cost is the executable ask (what the taker actually pays).
         implied_p = 0.5 + 0.5 * abs(drift)
-        fee = polymarket_fills.taker_fee(1.0, side_price)
+        fee = polymarket_fills.taker_fee(1.0, side_exec)
         min_edge = p.get("min_edge", 0.03)
-        lwm_edge = implied_p - side_price - fee
+        lwm_edge = implied_p - side_exec - fee
         if lwm_edge < min_edge:
             return _hold(
-                f"lwm: price {side_price:.2f} not justified by drift "
+                f"lwm: price {side_exec:.2f} not justified by drift "
                 f"(implied_P={implied_p:.2f}, edge={lwm_edge:+.3f} < {min_edge})")
 
         # ── Inventory management: don't quote into a side the pool already
@@ -168,10 +170,10 @@ class LateWindowMakerBot(BaseBot):
                 f"lwm: inventory cap — ${inventory:.2f} open on {side} "
                 f"≥ ${max_inv:.2f}")
 
-        # ── Maker quote computation (on the chosen side's price) ──────────────
+        # ── Maker quote computation (on the chosen side's mid) ────────────────
         # What we'd post as a limit order: slightly ahead of market to capture spread
-        maker_ask = round(min(max_price, side_price + p["maker_offset_pct"]), 2)
-        maker_bid = round(max(0.01, side_price - 0.02), 2)
+        maker_ask = round(min(max_price, side_mid + p["maker_offset_pct"]), 2)
+        maker_bid = round(max(0.01, side_mid - 0.02), 2)
         maker_mid = round((maker_bid + maker_ask) / 2, 3)
         edge_bps = p["maker_offset_pct"] * 10000  # spread captured if filled
 
@@ -199,7 +201,8 @@ class LateWindowMakerBot(BaseBot):
             confidence=confidence,
             reasoning=(
                 f"lwm: time={time_rem:.0f}s mom={momentum:+.5f} "
-                f"{side} price={side_price:.2f} limit={maker_ask:.2f} "
+                f"{side} mid={side_mid:.2f} ask={float(side_exec):.2f} "
+                f"limit={maker_ask:.2f} "
                 f"edge={edge_bps:.0f}bps tw={time_weight:.2f} "
                 f"inv=${inventory:.2f}"
             ),
@@ -207,12 +210,10 @@ class LateWindowMakerBot(BaseBot):
                      "implied_p": implied_p, "time_weight": time_weight,
                      "inventory_usd": inventory},
             suggested_amount=amount,
-            # Expected taker price: the fill walks the real book from the best
-            # ask, so expect ~the side's current price. Feeds the execute()
-            # slippage guard (config.MAX_FILL_SLIPPAGE). Using maker_ask here
-            # (side_price + 6c) silently widened the guard to ~9c over mid —
-            # the maker_* fields below are logged metrics, not fill targets.
-            entry_price=round(side_price, 4),
+            # Expected taker price = warm best ask (same snapshot the paper
+            # engine walks when yes_book/no_book are laid on the market).
+            # Mid was a structural under-estimate of fill cost (half-spread).
+            entry_price=round(float(side_exec), 4),
             features=features,
             maker_bid=maker_bid,
             maker_ask=maker_ask,

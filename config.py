@@ -179,6 +179,11 @@ ARBITRAGE_BOOK_CACHE_SEC = 1.0  # micro-cache on the per-leg book reads (hot pat
 # re-validates the *combined* edge and fills both legs against the exact snapshot
 # it validated (passed to the engine), so its two legs stay atomic.
 MAX_FILL_SLIPPAGE = 0.03
+# After a slippage_band / slippage_exceeded reject, sit out this (bot, market)
+# for N seconds so the 1s trader does not spam re-attempts into a whipping
+# late-window book (overnight: 5–10 rejects/bot/window). Maker section (~20s)
+# also honors the same cooldown.
+SLIPPAGE_RETRY_COOLDOWN_SEC = 10.0
 
 # --- Order-flow signal weights (base_bot.make_decision) ---
 # Re-weighted from the 2026-07-15 overnight run (460 directional trades):
@@ -334,6 +339,21 @@ CORE_TUNE_STEP = 0.05          # per-cycle weight nudge (bounded, one step/lane/
 CORE_TUNE_BAND = 0.20          # max |deviation| of a tuned weight from its class default
 CORE_TUNE_WEIGHT_MAX = 0.90    # absolute ceiling on any single lane weight
 CORE_TUNE_WEIGHT_MIN = 0.0     # absolute floor (the band around the default binds first)
+
+# --- Regime discovery & conditioning (Layer 3 — arena/regime_map.py) ---
+# The toggle is stored in arena_state ('regime_conditioning', dashboard-
+# editable via db.get/set_regime_conditioning); this constant is only the
+# boot default. Same pattern as AUTO_APPROVE_LANES_ENABLED / CORE_TUNE_ENABLED
+# above — OFF means the map is still built and reported, but no downstream
+# controller is allowed to act on it.
+REGIME_CONDITIONING_ENABLED = True   # dashboard-editable; ON in paper mode
+REGIME_MAP_INTERVAL_SEC = 900        # attribution/discovery cadence
+REGIME_MIN_SAMPLES = 60              # promote a cell to a named regime
+REGIME_SHRINKAGE_K = 40              # empirical-Bayes prior strength
+REGIME_RECENCY_HALFLIFE_DAYS = 14    # decay for non-stationarity
+REGIME_ALLOC_MIN_WEIGHT = 0.05       # explore floor per active bot
+REGIME_ALLOC_MAX_TILT = 0.25         # max deviation from baseline weight
+REGIME_HOUR_BLOCK_HOURS = 3          # ET time-of-day granularity
 
 # Sentiment feed master switch (2026-07-18): OFF — no local LLM will be run
 # and the keyword/CryptoPanic pipeline isn't worth its noise on 5-min BTC
@@ -740,11 +760,18 @@ class _ConfigInvariants(BaseModel):
     trade_loop_interval_sec: float = Field(gt=0)
     market_data_interval_sec: float = Field(gt=0)
     http_max_retries: int = Field(ge=0)
+    regime_alloc_min_weight: float = Field(gt=0, lt=1)
+    regime_alloc_max_tilt: float = Field(gt=0, lt=1)
 
     @model_validator(mode="after")
     def _relationships(self):
         if self.trading_mode not in ("paper", "live"):
             raise ValueError(f"trading_mode must be 'paper' or 'live', got {self.trading_mode!r}")
+        if not (self.regime_alloc_min_weight < self.regime_alloc_max_tilt):
+            raise ValueError(
+                f"regime_alloc_min_weight ({self.regime_alloc_min_weight}) must be "
+                f"below regime_alloc_max_tilt ({self.regime_alloc_max_tilt})"
+            )
         if not (self.consensus_guard < self.high_price_guard):
             raise ValueError(
                 f"consensus_guard ({self.consensus_guard}) must be below "
@@ -779,6 +806,8 @@ def _validate_config() -> None:
             trade_loop_interval_sec=TRADE_LOOP_INTERVAL_SEC,
             market_data_interval_sec=MARKET_DATA_INTERVAL_SEC,
             http_max_retries=HTTP_MAX_RETRIES,
+            regime_alloc_min_weight=REGIME_ALLOC_MIN_WEIGHT,
+            regime_alloc_max_tilt=REGIME_ALLOC_MAX_TILT,
         )
     except Exception as exc:  # pydantic.ValidationError or ValueError
         raise RuntimeError(f"Invalid arena configuration: {exc}") from exc
