@@ -303,14 +303,17 @@ def apply_regime_tilt(
     vals = list(regime_edges.values())
     hi = max(vals)
     lo = min(vals)
-    span = (hi - lo) or 1.0
+    span = hi - lo
     out: dict[str, float] = {}
     for bot, s in scores.items():
         e = regime_edges.get(bot)
         if e is None:
             out[bot] = s  # neutral: not attributed in this regime
             continue
-        norm = 2.0 * (e - lo) / span - 1.0  # -1 (worst) .. +1 (best)
+        # No spread among attributed bots (e.g. a single one, or a genuine tie)
+        # means there is no basis to rank them -> leave them neutral rather than
+        # down-tilting every attributed bot toward the -1 end.
+        norm = 0.0 if span <= 0 else 2.0 * (e - lo) / span - 1.0  # -1..+1
         out[bot] = s * (1.0 + max_tilt * norm)
     if out:
         floor = min_weight * max(out.values())
@@ -627,8 +630,9 @@ def rebalance(
     try:
         if db.get_regime_conditioning():
             from arena.regime_map import edges_for_cell
-            cur_cell = db.get_regime_map().get("current_cell")
-            edges = edges_for_cell(tuple(cur_cell)) if cur_cell else None
+            rmap = db.get_regime_map()
+            cur_cell = rmap.get("current_cell")
+            edges = edges_for_cell(tuple(cur_cell), rmap) if cur_cell else None
             if edges:
                 regime_edges = {b: e["shrunk_pnl"] for b, e in edges.items()}
     except Exception:

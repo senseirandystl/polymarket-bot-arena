@@ -755,11 +755,18 @@ class _ConfigInvariants(BaseModel):
     trade_loop_interval_sec: float = Field(gt=0)
     market_data_interval_sec: float = Field(gt=0)
     http_max_retries: int = Field(ge=0)
+    regime_alloc_min_weight: float = Field(gt=0, lt=1)
+    regime_alloc_max_tilt: float = Field(gt=0, lt=1)
 
     @model_validator(mode="after")
     def _relationships(self):
         if self.trading_mode not in ("paper", "live"):
             raise ValueError(f"trading_mode must be 'paper' or 'live', got {self.trading_mode!r}")
+        if not (self.regime_alloc_min_weight < self.regime_alloc_max_tilt):
+            raise ValueError(
+                f"regime_alloc_min_weight ({self.regime_alloc_min_weight}) must be "
+                f"below regime_alloc_max_tilt ({self.regime_alloc_max_tilt})"
+            )
         if not (self.consensus_guard < self.high_price_guard):
             raise ValueError(
                 f"consensus_guard ({self.consensus_guard}) must be below "
@@ -794,6 +801,8 @@ def _validate_config() -> None:
             trade_loop_interval_sec=TRADE_LOOP_INTERVAL_SEC,
             market_data_interval_sec=MARKET_DATA_INTERVAL_SEC,
             http_max_retries=HTTP_MAX_RETRIES,
+            regime_alloc_min_weight=REGIME_ALLOC_MIN_WEIGHT,
+            regime_alloc_max_tilt=REGIME_ALLOC_MAX_TILT,
         )
     except Exception as exc:  # pydantic.ValidationError or ValueError
         raise RuntimeError(f"Invalid arena configuration: {exc}") from exc

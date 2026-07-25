@@ -167,9 +167,14 @@ def rebuild() -> dict:
     return payload
 
 
-def edges_for_cell(cell: tuple) -> dict | None:
-    """Validated per-bot shrunk edges for a cell, or None if not validated."""
-    payload = db.get_regime_map()
+def edges_for_cell(cell: tuple, payload: dict | None = None) -> dict | None:
+    """Validated per-bot shrunk edges for a cell, or None if not validated.
+
+    Pass an already-loaded ``payload`` (from ``db.get_regime_map()``) to avoid
+    a second arena_state read when the caller already has the map.
+    """
+    if payload is None:
+        payload = db.get_regime_map()
     for r in payload.get("regimes", []):
         if tuple(r.get("cell") or []) == tuple(cell) and r.get("validated"):
             return r.get("bot_edges") or {}
