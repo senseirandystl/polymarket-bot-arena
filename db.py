@@ -1082,6 +1082,23 @@ def set_auto_approve_lanes(enabled: bool):
     set_arena_state("auto_approve_lanes", "1" if enabled else "0")
 
 
+def get_regime_conditioning() -> bool:
+    """Whether Layer-3 controllers may act on the regime map (dashboard toggle).
+
+    Stored in arena_state; falls back to config.REGIME_CONDITIONING_ENABLED as
+    the boot default when the operator has never touched the switch.
+    """
+    raw = get_arena_state("regime_conditioning")
+    if raw is None:
+        return bool(getattr(config, "REGIME_CONDITIONING_ENABLED", True))
+    return str(raw) == "1"
+
+
+def set_regime_conditioning(enabled: bool):
+    """Flip the regime-conditioning toggle (dashboard)."""
+    set_arena_state("regime_conditioning", "1" if enabled else "0")
+
+
 def get_regime_map() -> dict:
     """The persisted regime-discovery map (arena/regime_map.py:rebuild)."""
     raw = get_arena_state("regime_map")
