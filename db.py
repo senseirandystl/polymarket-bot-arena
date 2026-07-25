@@ -1082,6 +1082,22 @@ def set_auto_approve_lanes(enabled: bool):
     set_arena_state("auto_approve_lanes", "1" if enabled else "0")
 
 
+def get_regime_map() -> dict:
+    """The persisted regime-discovery map (arena/regime_map.py:rebuild)."""
+    raw = get_arena_state("regime_map")
+    if not raw:
+        return {"regimes": []}
+    try:
+        return json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return {"regimes": []}
+
+
+def set_regime_map(payload: dict):
+    """Persist the regime map (called from arena/regime_map.py:rebuild)."""
+    set_arena_state("regime_map", json.dumps(payload, default=str))
+
+
 def annotate_lane_proposal(proposal_id, live: dict):
     """Attach live-attribution evidence to a proposal's metrics under 'live'.
 
