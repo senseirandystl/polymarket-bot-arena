@@ -458,6 +458,7 @@ def _evolution_check_loop(bots, state, pos_monitor, trader):
     without any manual run).
     """
     from arena import lane_monitor, lane_promoter, core_lane_tuner, portfolio
+    from arena import regime_map
     from arena import risk_engine
     from arena.validation_scheduler import ValidationScheduler
 
@@ -467,8 +468,10 @@ def _evolution_check_loop(bots, state, pos_monitor, trader):
     lane_monitor_interval = getattr(config, "LANE_MONITOR_INTERVAL_SEC", 1800)
     portfolio_interval = float(
         getattr(config, "PORTFOLIO_REBALANCE_INTERVAL_SEC", 1800))
+    regime_map_interval = float(getattr(config, "REGIME_MAP_INTERVAL_SEC", 900))
     last_lane_check = 0.0
     last_portfolio_check = 0.0
+    last_regime_map_check = 0.0
     last_pool_pnl = None  # for performance-trigger drop detection
 
     saved_cycle = db.get_arena_state("evolution_cycle", "0")
@@ -566,6 +569,18 @@ def _evolution_check_loop(bots, state, pos_monitor, trader):
         except Exception as e:
             log_event(logger, logging.ERROR, f"Lane monitor/promoter/tuner error (caught): {e}",
                       exc_info=True, event_type="error", where="lane_pipeline")
+
+        try:
+            # Regime discovery (Layer 2): recompute the per-bot context
+            # attribution map + validated regimes, and publish the current
+            # cell. Best-effort — never raises into the arena loop. The
+            # portfolio allocator and core-lane tuner read this map.
+            if time.time() - last_regime_map_check >= regime_map_interval:
+                regime_map.rebuild()
+                last_regime_map_check = time.time()
+        except Exception as e:
+            log_event(logger, logging.ERROR, f"Regime map rebuild error (caught): {e}",
+                      exc_info=True, event_type="error", where="regime_map")
 
         try:
             validation_scheduler.check()

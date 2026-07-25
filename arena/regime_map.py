@@ -148,7 +148,21 @@ def rebuild() -> dict:
         })
 
     regimes.sort(key=lambda r: r["n"], reverse=True)
-    payload = {"regimes": regimes, "updated_at": time.time()}
+
+    # Current regime cell for Layer-3 conditioning (portfolio allocator +
+    # core-lane tuner read this). Best available proxy: the cell of the most
+    # recently stamped resolved trade (trades are ordered DESC by created_at,
+    # so trades[0] is newest). This lags by up to a resolution cycle; a
+    # warm-path-published cell would be fresher, but capital/lane tuning
+    # rebalance on a slower cadence, so the lag is acceptable. It only takes
+    # effect once that cell is itself a validated regime (edges_for_cell gates
+    # on `validated`), so a lagged/rare cell simply produces a no-op tilt.
+    current_cell = None
+    if trades and trades[0].get("cell"):
+        current_cell = list(trades[0]["cell"])
+
+    payload = {"regimes": regimes, "current_cell": current_cell,
+               "updated_at": time.time()}
     db.set_regime_map(payload)
     return payload
 
