@@ -452,6 +452,19 @@ td { padding: 6px 4px; border-bottom: 1px solid #21262d; }
             </table>
         </div>
 
+        <div class="section-title">Regime Discovery Map</div>
+        <div class="card" id="regime-map-card" style="margin-bottom:14px">
+            <div id="regime-map-summary" style="color:#8b949e;font-size:13px;margin-bottom:10px">
+                Discovered regimes over market context (vol/trend × time-of-day × weekday × BTC trend),
+                with per-bot edge. A regime drives capital + signal weights only once it clears the
+                sample &amp; out-of-sample bar (Validated).
+            </div>
+            <table id="regime-map-table">
+                <thead><tr><th>Regime cell</th><th>N</th><th>Validated</th><th>Best bot (shrunk edge)</th></tr></thead>
+                <tbody><tr><td colspan="4" style="color:#8b949e">No regimes discovered yet</td></tr></tbody>
+            </table>
+        </div>
+
         <div class="section-title">Genetic Algorithm</div>
         <div class="card" id="ga-status-card" style="margin-bottom:14px">
             <div id="ga-status-summary" style="color:#8b949e;font-size:13px;margin-bottom:10px">No GA cycles yet</div>
@@ -500,6 +513,22 @@ td { padding: 6px 4px; border-bottom: 1px solid #21262d; }
             <label style="display:flex;align-items:center;gap:8px;cursor:pointer;white-space:nowrap">
                 <input type="checkbox" id="auto-approve-toggle" onchange="setAutoApprove(this.checked)" style="width:18px;height:18px;cursor:pointer">
                 <span id="auto-approve-label" style="font-weight:600;color:#8b949e">&hellip;</span>
+            </label>
+        </div>
+        <div class="card" id="regime-conditioning-card" style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px;margin-bottom:14px">
+            <div>
+                <div style="font-weight:600">Regime conditioning</div>
+                <div style="color:#8b949e;font-size:12px;max-width:640px">
+                    When ON, the portfolio allocator (capital) and core-lane tuner (signal weights)
+                    tilt toward the bots/lanes that work in the CURRENT market regime &mdash; but only
+                    for a regime that has cleared the sample &amp; out-of-sample bar (see the Regime
+                    Discovery Map on Overview). When OFF, the map is still built and shown, but no
+                    controller acts on it. Bounded tilt with an explore floor, so no bot is starved.
+                </div>
+            </div>
+            <label style="display:flex;align-items:center;gap:8px;cursor:pointer;white-space:nowrap">
+                <input type="checkbox" id="regime-conditioning-toggle" onchange="setRegimeConditioning(this.checked)" style="width:18px;height:18px;cursor:pointer">
+                <span id="regime-conditioning-label" style="font-weight:600;color:#8b949e">&hellip;</span>
             </label>
         </div>
         <div class="section-title">Pending Lane Proposals <span style="color:#8b949e;font-size:11px;text-transform:none;letter-spacing:0;">&mdash; filed by the offline harness when a kill-switched signal lane clears the promotion bar (n&ge;200, follow-WR&ge;55%, net edge &ge;+0.5&cent;/share after price+fee). Live shadow accuracy (judged on real fills) is shown per proposal; approving activates the lane live within seconds.</span></div>
@@ -1854,6 +1883,43 @@ function updateRegime(reg) {
     }
 }
 
+function updateRegimeMap(map) {
+    // Sync the Signal Lab conditioning toggle from server truth every refresh.
+    const on = !!(map && map.conditioning_enabled);
+    const cb = document.getElementById('regime-conditioning-toggle');
+    if (cb) cb.checked = on;
+    const clbl = document.getElementById('regime-conditioning-label');
+    if (clbl) { clbl.textContent = on ? 'ON' : 'OFF'; clbl.style.color = on ? '#3fb950' : '#8b949e'; }
+
+    const body = document.querySelector('#regime-map-table tbody');
+    if (!body) return;
+    const regimes = (map && map.regimes) || [];
+    const curCell = (map && map.current_cell) ? JSON.stringify(map.current_cell) : null;
+    if (!regimes.length) {
+        body.innerHTML = '<tr><td colspan="4" style="color:#8b949e">No regimes discovered yet — accumulating stamped trades</td></tr>';
+        return;
+    }
+    // Most-sampled first; highlight the current regime cell.
+    body.innerHTML = regimes.slice(0, 20).map(r => {
+        const cellStr = Array.isArray(r.cell) ? r.cell.join(' · ') : String(r.cell);
+        const isCur = curCell && JSON.stringify(r.cell) === curCell;
+        const edges = r.bot_edges || {};
+        let best = '—';
+        const names = Object.keys(edges);
+        if (names.length) {
+            const top = names.reduce((a, b) =>
+                (edges[b].shrunk_pnl || 0) > (edges[a].shrunk_pnl || 0) ? b : a);
+            best = `${top} (${fmtPnl(edges[top].shrunk_pnl)})`;
+        }
+        const val = r.validated
+            ? '<span style="color:#3fb950">Validated</span>'
+            : '<span style="color:#8b949e">pending</span>';
+        return `<tr${isCur ? ' style="background:rgba(163,113,247,0.12)"' : ''}>` +
+            `<td>${cellStr}${isCur ? ' <b>(current)</b>' : ''}</td>` +
+            `<td>${r.n}</td><td>${val}</td><td>${best}</td></tr>`;
+    }).join('');
+}
+
 function updateGA(ga) {
     const summary = document.getElementById('ga-status-summary');
     const fitBody = document.querySelector('#ga-fitness-table tbody');
@@ -2181,7 +2247,7 @@ function updateCopyBots(wallets) {
 
 async function refresh() {
     try {
-        const [status, overview, bots, evolution, ga, regime, trades, earnings, copyBots, buckets, skips, ops, health] = await Promise.all([
+        const [status, overview, bots, evolution, ga, regime, trades, earnings, copyBots, buckets, skips, ops, health, regimeMap] = await Promise.all([
             fetchJSON('/api/status'),
             fetchJSON('/api/overview'),
             fetchJSON('/api/bots'),
@@ -2195,6 +2261,7 @@ async function refresh() {
             fetchJSON('/api/skips'),
             fetchJSON('/api/ops'),
             fetchJSON('/api/health'),
+            fetchJSON('/api/regime-map'),
         ]);
         updateMode(status.mode);
         updateBanner(status.warnings || []);
@@ -2204,6 +2271,7 @@ async function refresh() {
         updateEvolution(evolution);
         updateGA(ga);
         updateRegime(regime);
+        updateRegimeMap(regimeMap);
         updateTrades(trades);
         updateEntryBuckets(buckets);
         updateSkips(skips);
@@ -2280,6 +2348,14 @@ async function setAutoApprove(enabled) {
         await postJSON('/api/lane-auto-approve', { enabled });
     } catch (e) { /* label refresh below reflects server truth */ }
     loadSignalLab();
+}
+
+async function setRegimeConditioning(enabled) {
+    try {
+        await postJSON('/api/regime-conditioning', { enabled });
+    } catch (e) { /* next refresh reflects server truth via updateRegimeMap */ }
+    const lbl = document.getElementById('regime-conditioning-label');
+    if (lbl) { lbl.textContent = enabled ? 'ON' : 'OFF'; lbl.style.color = enabled ? '#3fb950' : '#8b949e'; }
 }
 
 async function loadSignalLab() {
