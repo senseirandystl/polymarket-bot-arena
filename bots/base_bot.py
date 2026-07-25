@@ -5,7 +5,7 @@ import copy
 import logging
 import time
 from abc import ABC, abstractmethod
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 import sys
 
@@ -14,6 +14,7 @@ import config
 import db
 import learning
 import polymarket_fills
+from signals.context import build_context
 from signals.curves import smooth_ramp
 from signals.lab import SignalView, get_lab
 
@@ -504,6 +505,16 @@ class BaseBot(ABC):
                     features.append(f"regime_legacy:{rctx['legacy']}")
         except Exception:
             pass
+
+        # Stamp the structured market-context vector at decision time (Layer 1
+        # of the regime-discovery design — signals/context.py). Behavior-
+        # neutral: it is carried through to the trade row for later
+        # attribution and never feeds back into this decision. Never let a
+        # failure here block a trade.
+        try:
+            ctx_vec = build_context(sv.prices, signals, datetime.now(tz=timezone.utc))
+        except Exception:
+            ctx_vec = None
         prior = self.STRATEGY_PRIORS.get(self.strategy_type, 0.5)
         learned_yes_bias = learning.get_learned_bias(self.name, features, prior)
         # Convert from 0-1 to -0.5 to +0.5
@@ -809,6 +820,7 @@ class BaseBot(ABC):
             # rejects the trade instead of filling worse (config.MAX_FILL_SLIPPAGE).
             "entry_price": round(price, 4),
             "features": features,
+            "context": ctx_vec,
             # Per-lane weight x value attribution for this decision (also in
             # the persisted reasoning via blend.log_str()).
             "lane_contributions": dict(blend.contributions),
@@ -936,6 +948,7 @@ class BaseBot(ABC):
             reasoning=signal.get("reasoning"),
             features=signal.get("features"),
             expected_price=expected,
+            context=signal.get("context"),
         )
         return {
             "success": res.success,

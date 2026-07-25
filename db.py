@@ -253,6 +253,10 @@ def init_db():
             # Polymarket taker fee (USDC) charged on the fill — applied to both
             # simulated (paper) and live trades; factored into resolved P&L.
             "ALTER TABLE trades ADD COLUMN fee REAL DEFAULT 0",
+            # Structured market-context vector stamped at decision time
+            # (signals/context.py). JSON; NULL on legacy rows. Layer 1 of the
+            # regime-discovery design — attribution groups on context_cell(...).
+            "ALTER TABLE trades ADD COLUMN context TEXT",
         ]:
             try:
                 conn.execute(migration)
@@ -293,23 +297,28 @@ def get_conn():
 
 def log_trade(bot_name, market_id, side, amount, venue, mode, confidence=None,
               reasoning=None, market_question=None, trade_id=None, shares_bought=None,
-              trade_features=None, fill_source=None, entry_price=None, fee=0.0):
+              trade_features=None, fill_source=None, entry_price=None, fee=0.0,
+              context=None):
     """Insert a filled trade and return its internal row id.
 
     ``amount`` is the USDC cost actually spent on shares (after order-book
     walk); ``fee`` is the Polymarket taker fee; ``entry_price`` is the avg fill
-    price; ``fill_source`` records HOW it filled ('paper_sim' | 'polymarket').
+    price; ``fill_source`` records HOW it filled ('paper_sim' | 'polymarket');
+    ``context`` is the structured market-context vector stamped at decision
+    time (``signals/context.py``), stored as JSON — Layer 1 of the
+    regime-discovery design.
     """
     with get_conn() as conn:
         cur = conn.execute(
             """INSERT INTO trades (bot_name, market_id, market_question, side, amount,
                confidence, reasoning, trade_features, venue, mode, trade_id,
-               shares_bought, fill_source, entry_price, fee)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               shares_bought, fill_source, entry_price, fee, context)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (bot_name, market_id, market_question, side, amount,
              confidence, reasoning,
              json.dumps(trade_features) if trade_features else None,
-             venue, mode, trade_id, shares_bought, fill_source, entry_price, fee)
+             venue, mode, trade_id, shares_bought, fill_source, entry_price, fee,
+             json.dumps(context) if context else None)
         )
         return cur.lastrowid
 
@@ -336,6 +345,34 @@ def get_bot_trades(bot_name, hours=None, limit=50):
                 (bot_name, limit)
             ).fetchall()
         return [dict(r) for r in rows]
+
+
+def get_resolved_trades_with_context(hours=None):
+    """Resolved trades that carry a stamped context vector (Layer 2 input)."""
+    from signals.context import context_cell
+    with get_conn() as conn:
+        conds = ["outcome IN ('win','loss','exit_tp','exit_sl')", "context IS NOT NULL"]
+        params = []
+        if hours is not None:
+            cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).strftime("%Y-%m-%d %H:%M:%S")
+            conds.append("created_at>=?")
+            params.append(cutoff)
+        where = " AND ".join(conds)
+        rows = conn.execute(
+            f"SELECT bot_name, side, pnl, outcome, entry_price, context, created_at "
+            f"FROM trades WHERE {where} ORDER BY created_at DESC", params
+        ).fetchall()
+    out = []
+    for r in rows:
+        d = dict(r)
+        try:
+            d["context"] = json.loads(d["context"]) if d["context"] else None
+        except (json.JSONDecodeError, TypeError):
+            d["context"] = None
+        d["cell"] = context_cell(d["context"]) if d["context"] else None
+        if d["context"]:
+            out.append(d)
+    return out
 
 
 def get_bot_performance(bot_name, hours=12, mode=None):
