@@ -113,11 +113,32 @@ def rebuild() -> dict:
         cell_trades = sorted(raw.get(cell, []), key=lambda t: t.get("created_at") or "")
         validated = False
         if agg["n"] >= min_n:
-            # Interleave (odd/even) rather than split into head/tail halves —
-            # a chronological head/tail split can isolate an entire bot's
-            # trades into just one half whenever bots trade in separate time
-            # blocks, starving the other half of that bot's OOS evidence.
-            validated = validate_cell(cell_trades[0::2], cell_trades[1::2], k)
+            # Per-bot chronological split: within EACH bot's own trade
+            # stream, earlier half -> train, later half -> val. A single
+            # interleaved (odd/even) split is a RANDOM split, not an
+            # out-of-TIME holdout — it defeats the point of the validation,
+            # since a bot whose edge decayed over the window would still
+            # have both halves contain a 50/50 mix of its good and bad
+            # periods. Splitting per-bot preserves true time-order within
+            # each bot's stream (a real recency-aware holdout) while still
+            # guaranteeing every bot with >=2 trades appears in both halves,
+            # regardless of which time blocks different bots traded in.
+            by_bot: dict = {}
+            for t in cell_trades:
+                by_bot.setdefault(t.get("bot_name"), []).append(t)
+            train_trades: list = []
+            val_trades: list = []
+            for bot_trades in by_bot.values():
+                bot_trades = sorted(bot_trades, key=lambda t: t.get("created_at") or "")
+                mid = len(bot_trades) // 2
+                if mid == 0:
+                    # Single-trade bot: no split possible, contributes only
+                    # to train (can't be evidenced OOS from one trade).
+                    train_trades.extend(bot_trades)
+                else:
+                    train_trades.extend(bot_trades[:mid])
+                    val_trades.extend(bot_trades[mid:])
+            validated = validate_cell(train_trades, val_trades, k)
         regimes.append({
             "cell": cell,                # tuple; json.dumps encodes as an array,
                                           # matched back via tuple() after reload
