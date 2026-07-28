@@ -199,6 +199,12 @@ def run_evolution(bots, cycle_number):
     Multi-objective fitness (P&L + Sharpe + low drawdown + consistency),
     tournament selection, crossover, Gaussian mutation, and elitism.
     Evolution-exempt bots (arbitrage + pure makers) pass through untouched.
+
+    Returns
+    -------
+    (new_bots, report)
+        ``report`` is the structured GA summary (elites / replaced / spawned)
+        used for evolution notifications and diagnostics.
     """
     from evolution.ga import run_ga_cycle
 
@@ -228,7 +234,7 @@ def run_evolution(bots, cycle_number):
             f"params_keys={list(bot.strategy_params.keys())} "
             f"lineage={getattr(bot, 'lineage', None)}"
         )
-    return new_bots
+    return new_bots, report
 
 
 # ----------------------------------------------------------------------
@@ -526,7 +532,7 @@ def _evolution_check_loop(bots, state, pos_monitor, trader):
                     "GA cycle %s trigger=%s (elapsed=%.1fh)",
                     cycle_number, trigger, elapsed / 3600,
                 )
-                bots = run_evolution(bots, cycle_number)
+                bots, evo_report = run_evolution(bots, cycle_number)
                 last_evolution = time.time()
                 db.set_arena_state("evolution_cycle", str(cycle_number))
                 db.set_arena_state("last_evolution_time", str(last_evolution))
@@ -549,10 +555,8 @@ def _evolution_check_loop(bots, state, pos_monitor, trader):
 
                 try:
                     from arena.alerts import alert_evolution
-                    names = ", ".join(b.name for b in bots[:8])
                     alert_evolution(
-                        cycle_number, trigger,
-                        summary=f"roster={names} pool_pnl={last_pool_pnl}",
+                        cycle_number, trigger, report=evo_report,
                     )
                 except Exception:
                     pass
@@ -581,6 +585,14 @@ def _evolution_check_loop(bots, state, pos_monitor, trader):
                 lane_monitor.check_lanes()
                 lane_promoter.check_proposals()
                 core_lane_tuner.tune()
+                # Offline rollup of decision_events (skips + buys) for
+                # counterfactual lane/strategy fine-tuning.
+                try:
+                    from arena.decision_log import maybe_rollup, flush
+                    flush()
+                    maybe_rollup()
+                except Exception as e:
+                    logger.debug("decision rollup: %s", e)
                 last_lane_check = time.time()
         except Exception as e:
             log_event(logger, logging.ERROR, f"Lane monitor/promoter/tuner error (caught): {e}",
@@ -651,6 +663,15 @@ def _evolution_check_loop(bots, state, pos_monitor, trader):
         except Exception as e:
             log_event(logger, logging.ERROR, f"Health check error (caught): {e}",
                       exc_info=True, event_type="error", where="health")
+
+        try:
+            # Periodic digests + ops threshold alerts (hourly/daily/bankroll/
+            # feed/skips/resolver). Event-driven alerts fire at their sources.
+            from arena.alerts import run_periodic_alerts
+            run_periodic_alerts()
+        except Exception as e:
+            log_event(logger, logging.ERROR, f"Periodic alert error (caught): {e}",
+                      exc_info=True, event_type="error", where="periodic_alerts")
 
         time.sleep(30)
 
@@ -812,6 +833,12 @@ def main_loop(bots):
 
     resolver = TradeResolver()
     resolver.start()
+
+    try:
+        from arena.alerts import alert_startup
+        alert_startup(trader_bots + maker_bots)
+    except Exception as e:
+        logger.debug("startup alert failed: %s", e)
 
     trader = Trader(
         discovery=discovery,

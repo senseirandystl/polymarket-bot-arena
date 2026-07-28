@@ -64,6 +64,14 @@ class PaperEngine:
         #    fill in full — a partial share fill would unbalance the arb — and it
         #    must be affordable from the shared pool.
         #  * USD-budget (default): spend up to ``amount`` (capped by the pool).
+        #
+        # Order style (config.ORDER_STYLE): limit-first path uses
+        # simulate_limit_buy (maker fee 0 when resting; taker when marketable).
+        # Arb share-matched legs force marketable walk so both legs fill now.
+        use_limit = (
+            getattr(config, "ORDER_STYLE", "limit") == "limit"
+            and target_shares is None  # arb stays aggressive/matched
+        )
         if target_shares is not None:
             fill = polymarket_fills.simulate_fill_shares(book, target_shares)
             if not fill["filled"] or not fill["full"]:
@@ -77,6 +85,23 @@ class PaperEngine:
                     f"[{bot_name}] Paper bankroll ${available:.2f} < arb leg cost "
                     f"${fill['cost'] + fill['fee']:.2f} — skip"
                 )
+                return TradeResult(success=False, reason="insufficient_bankroll")
+        elif use_limit:
+            spend = min(amount or 0.0, available)
+            mid = None
+            if side == "yes":
+                mid = market.get("current_price") or market.get("yes_price")
+            else:
+                mid = market.get("no_price")
+            lim = limit_price
+            if lim is None:
+                lim = polymarket_fills.limit_buy_price(book, mid=mid)
+            if lim is None:
+                return TradeResult(success=False, reason="no_limit_price")
+            fill = polymarket_fills.simulate_limit_buy(book, spend, lim)
+            if not fill.get("filled"):
+                return TradeResult(success=False, reason="limit_unfilled")
+            if fill["cost"] + fill["fee"] > available + 1e-9:
                 return TradeResult(success=False, reason="insufficient_bankroll")
         else:
             spend = min(amount, available)
@@ -133,8 +158,9 @@ class PaperEngine:
             fee=fill["fee"],
             context=context,
         )
+        role = "maker" if fill.get("is_maker") else "taker"
         logger.info(
-            f"[{bot_name}] Paper fill: {side} ${fill['cost']:.2f} @ "
+            f"[{bot_name}] Paper fill ({role}): {side} ${fill['cost']:.2f} @ "
             f"{fill['avg_price']:.3f} ({fill['shares']:.2f} sh, fee ${fill['fee']:.3f}"
             f"{'' if fill['full'] else ', PARTIAL'}) on "
             f"{str(market.get('question', ''))[:40]}"

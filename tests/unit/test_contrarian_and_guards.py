@@ -44,7 +44,8 @@ def _market(yes=0.52, no=None, tr=180, **extra):
 
 def _sig(**over):
     base = {"prices": [100.0, 100.0], "latest": 100.0, "orderflow": {},
-            "pm_momentum": 0.0, "obi": 0.0, "cvd": 0.0, "btc_drift": 0.0}
+            "pm_momentum": 0.0, "obi": 0.0, "cvd": 0.0, "btc_drift": 0.0,
+            "btc_strike": 100.0}
     base.update(over)
     return base
 
@@ -61,7 +62,8 @@ def _dip_prices(direction="down", n=12):
 def test_fade_without_drift_holds():
     # Overextended down -> fade wants YES; drift ~0 -> NO trade thesis.
     bot = _mr()
-    sig = _sig(prices=_dip_prices("down"), latest=99.6, btc_drift=0.0)
+    sig = _sig(prices=_dip_prices("down"), latest=99.6, btc_drift=0.0,
+               btc_strike=99.5)
     out = bot.analyze(_market(), sig)
     assert out["action"] == "hold"
 
@@ -69,24 +71,40 @@ def test_fade_without_drift_holds():
 def test_fade_against_drift_holds():
     # Overextended down -> fade wants YES, but drift says DOWN: hold.
     bot = _mr()
-    sig = _sig(prices=_dip_prices("down"), latest=99.6, btc_drift=-0.3)
+    sig = _sig(prices=_dip_prices("down"), latest=99.6, btc_drift=-0.3,
+               btc_strike=99.5)
     out = bot.analyze(_market(), sig)
     assert out["action"] == "hold"
 
 
 def test_fade_with_drift_fires():
     # BTC above strike (drift +0.3) with a short-term dip: buy-the-dip YES.
+    # P0: mean ≥ strike so reversion target still supports UP.
     bot = _mr()
-    sig = _sig(prices=_dip_prices("down"), latest=99.6, btc_drift=0.3)
+    sig = _sig(prices=_dip_prices("down"), latest=99.6, btc_drift=0.3,
+               btc_strike=99.5)
     out = bot.analyze(_market(), sig)
     assert out["action"] == "buy" and out["side"] == "yes"
+    assert "strike=" in out["reasoning"] and "mean=" in out["reasoning"]
 
 
 def test_fade_with_drift_fires_symmetric_no():
+    # P0: mean ≤ strike so reversion target still supports DOWN.
     bot = _mr()
-    sig = _sig(prices=_dip_prices("up"), latest=100.4, btc_drift=-0.3)
+    sig = _sig(prices=_dip_prices("up"), latest=100.4, btc_drift=-0.3,
+               btc_strike=100.5)
     out = bot.analyze(_market(), sig)
     assert out["action"] == "buy" and out["side"] == "no"
+
+
+def test_fade_mean_above_ptb_blocks_no():
+    # Drift would allow NO, but mean sits above Price-to-Beat → hold.
+    bot = _mr()
+    sig = _sig(prices=_dip_prices("up"), latest=100.4, btc_drift=-0.3,
+               btc_strike=99.0)
+    out = bot.analyze(_market(), sig)
+    assert out["action"] == "hold"
+    assert "PTB" in out["reasoning"]
 
 
 def test_meanrev_max_side_price():

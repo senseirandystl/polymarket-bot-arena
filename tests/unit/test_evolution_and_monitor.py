@@ -141,7 +141,7 @@ def _run(bots, monkeypatch):
                             validate_fn=lambda b: True,
                             rng=random.Random(0),
                         ))
-    result = arena.run_evolution(bots, cycle_number=1)
+    result, _report = arena.run_evolution(bots, cycle_number=1)
     return result, replaced
 
 

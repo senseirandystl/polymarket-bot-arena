@@ -459,6 +459,7 @@ def test_arena_run_evolution_delegates_to_ga(monkeypatch):
     monkeypatch.setattr(ga_mod, "run_ga_cycle", fake_cycle)
 
     bots = [FakeBot("x", "momentum", {"pnl": 1, "wr": 0.5, "trades": 40, "gap": 0.05})]
-    out = arena.run_evolution(bots, 5)
+    out, report = arena.run_evolution(bots, 5)
     assert called.get("cycle") == 5
     assert out is bots or [b.name for b in out] == ["x"]
+    assert isinstance(report, dict)

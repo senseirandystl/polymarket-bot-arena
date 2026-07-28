@@ -270,6 +270,9 @@ class RegimeDetector:
         # Read-only consumers (the dashboard process) leave it False and so
         # refresh from the DB on every read instead of trusting stale memory.
         self._live = False
+        # Soft market-id stamp for rollover notes (no state reset — regime is
+        # continuous BTC tape context, not per-window moneyness).
+        self._last_market_id: Optional[str] = None
 
     # ------------------------------------------------------------------
     # Persistence
@@ -354,6 +357,37 @@ class RegimeDetector:
             logger.debug("regime_detector persist failed: %s", e)
 
     # ------------------------------------------------------------------
+    # Market identity (soft note only — no EMA/centroid reset)
+    # ------------------------------------------------------------------
+
+    def note_market(self, market_id: Optional[str]) -> None:
+        """Soft-annotate a Polymarket window rollover.
+
+        Logs once when ``market_id`` changes so soaks can align the regime
+        timeline to market boundaries. Does **not** reset EMA, hysteresis,
+        centroids, or confidence — regime describes continuous BTC tape, not
+        a single 5-min window's moneyness.
+        """
+        if not market_id:
+            return
+        with self._lock:
+            prev = self._last_market_id
+            if prev is None:
+                self._last_market_id = str(market_id)
+                return
+            if str(market_id) == prev:
+                return
+            self._last_market_id = str(market_id)
+            rid = self._regime
+            conf = float(self._confidence)
+            ticks = self._ticks
+        logger.info(
+            "REGIME MARKET ROLLOVER %s -> %s "
+            "(soft note; state retained: regime=%s conf=%.2f ticks=%d)",
+            prev, market_id, rid, conf, ticks,
+        )
+
+    # ------------------------------------------------------------------
     # Online update
     # ------------------------------------------------------------------
 
@@ -366,13 +400,18 @@ class RegimeDetector:
         vol_score: Optional[float] = None,
         trend_score: Optional[float] = None,
         realized_vol: Optional[float] = None,
+        market_id: Optional[str] = None,
     ) -> dict[str, Any]:
         """Ingest one market tick; return current regime snapshot.
 
         Continuous / online — safe to call every second from the warm path.
+        When ``market_id`` is provided, a soft rollover note is emitted if
+        the live window changed (no detector state is cleared).
         """
         self._ensure_loaded()
         self._live = True
+        if market_id is not None:
+            self.note_market(market_id)
         raw = compute_features(
             prices, cvd=cvd, obi=obi,
             vol_score=vol_score, trend_score=trend_score,
@@ -613,6 +652,8 @@ class RegimeDetector:
             "last_change_from": self._last_change_from,
             "candidate": self._candidate,
             "candidate_ticks": self._candidate_ticks,
+            # Soft stamp only — does not imply per-window regime state.
+            "market_id": self._last_market_id,
         }
 
     def snapshot(self) -> dict[str, Any]:

@@ -200,7 +200,8 @@ def get_alerts(_auth: str = Depends(verify_auth)):
             "config": alerts.load_config(),
             "channels": alerts.channel_status(),
             "log": alerts.get_alert_log(40),
-            "event_types": list(alerts.EVENT_TYPES),
+            "event_types": [e for e in alerts.EVENT_TYPES if e != "test"],
+            "event_labels": dict(getattr(alerts, "EVENT_LABELS", {})),
         })
     except Exception as e:
         logger.exception("alerts get failed")
@@ -351,7 +352,7 @@ def get_markets():
     # per market. Prices current + the next card; both YES and NO are set.
     polymarket_markets.price_markets([current, upcoming[0] if upcoming else None])
 
-    def _shape(m):
+    def _shape(m, *, with_strike: bool = False):
         if not m:
             return None
         tr = m.get("time_remaining_seconds")
@@ -359,16 +360,27 @@ def get_markets():
         no = m.get("no_price")
         if no is None and yes is not None:
             no = round(1.0 - yes, 4)
+        event_start = m.get("event_start_time") or m.get("eventStartTime")
         shaped = {
             "id": m.get("id"),
             "question": m.get("question"),
             "current_price": yes,                     # YES/Up (0-1)
             "no_price": no,                           # NO/Down (0-1), real mid
             "resolves_at": m.get("resolves_at"),
+            "event_start_time": event_start,
             "time_remaining_seconds": tr,
             "is_current_window": tr is not None and 0 < tr <= 300,
             "url": None,
+            "strike": None,                           # price-to-beat (Binance open)
         }
+        if with_strike and event_start and shaped["id"]:
+            try:
+                from signals.strike import get_strike_registry
+                shaped["strike"] = get_strike_registry().get_strike(
+                    shaped["id"], event_start,
+                )
+            except Exception:
+                shaped["strike"] = None
         with db.get_conn() as conn:
             rows = conn.execute(
                 "SELECT bot_name, side, amount, shares_bought, entry_price, "
@@ -379,13 +391,28 @@ def get_markets():
         shaped["trades"] = [dict(r) for r in rows]
         return shaped
 
-    cur_s = _shape(current)
+    # Live BTC from arena price_feed_status (shared SQLite); fallback None.
+    btc_price = None
+    btc_stale = True
+    try:
+        import json as _json
+        raw = db.get_arena_state("price_feed_status")
+        pf = _json.loads(raw) if raw else {}
+        btc = ((pf or {}).get("symbols") or {}).get("btc") or {}
+        btc_price = btc.get("latest")
+        btc_stale = bool(btc.get("stale") or (pf or {}).get("stale"))
+    except Exception:
+        pass
+
+    cur_s = _shape(current, with_strike=True)
     upcoming_s = [_shape(m) for m in upcoming]
     return JSONResponse({
         "current": cur_s,
         "next": upcoming_s[0] if upcoming_s else None,
         "upcoming_count": len(upcoming_s),
         "upcoming": upcoming_s,
+        "btc_price": btc_price,
+        "btc_stale": btc_stale,
     })
 
 
@@ -933,6 +960,31 @@ def lane_validation_status(_auth: str = Depends(verify_auth)):
     })
 
 
+@app.post("/api/settings/soak-report")
+async def run_soak_report(request: Request, _auth: str = Depends(verify_auth)):
+    """Build a soak report and push it to configured notification channels.
+
+    Body optional: ``{"notify": true}`` (default true). Returns the text body
+    and notify result so the Settings UI can show a status line.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    notify = body.get("notify", True)
+    try:
+        from tools.soak_report import build_report, format_text, notify as soak_notify
+        report = build_report()
+        text = format_text(report)
+        result = {"success": True, "report_text": text,
+                  "overall": report.get("overall")}
+        if notify:
+            result["notify"] = soak_notify(report)
+        return JSONResponse(result)
+    except Exception as e:
+        return JSONResponse({"success": False, "error": str(e)}, status_code=500)
+
+
 @app.get("/api/bots")
 def get_bots():
     active = db.get_active_bots()
@@ -989,12 +1041,93 @@ def get_bots():
 
 @app.get("/api/evolution")
 def get_evolution():
-    history = db.get_evolution_history(limit=20)
+    """Evolution event log (survivors / replaced / new bots) + GA spawn lineage.
+
+    ``evolution_events`` only rows when a bot is actually replaced; skipped GA
+    cycles (everyone survived) live only in ``ga_generations``. We merge both
+    so the Bots page shows a complete cycle timeline.
+    """
+    history = db.get_evolution_history(limit=40)
+    by_cycle: dict = {}
     for h in history:
         for key in ("survivors", "replaced", "new_bots", "rankings"):
             if isinstance(h.get(key), str):
-                h[key] = json.loads(h[key])
-    return JSONResponse(history)
+                try:
+                    h[key] = json.loads(h[key])
+                except Exception:
+                    pass
+        h.setdefault("spawned", [])
+        h.setdefault("elites", [])
+        h["ga_skipped"] = False
+        by_cycle[h.get("cycle_number")] = h
+
+    try:
+        for g in db.get_ga_history(limit=50):
+            cyc = g.get("cycle_number")
+            report = g.get("report") or {}
+            if not isinstance(report, dict):
+                report = {}
+            inds = report.get("individuals") or []
+            rankings = [
+                {
+                    "name": i.get("name"),
+                    "strategy_type": i.get("strategy_type"),
+                    "generation": i.get("generation"),
+                    "pnl": i.get("pnl"),
+                    "win_rate": i.get("win_rate"),
+                    "trades": i.get("trades"),
+                    "be_gap": i.get("be_gap"),
+                    "fitness": i.get("fitness"),
+                    "components": i.get("components"),
+                    "ranks": i.get("ranks"),
+                    "status": i.get("status"),
+                    "elite": i.get("elite"),
+                    "lineage": i.get("lineage"),
+                }
+                for i in inds
+            ]
+            if cyc in by_cycle:
+                h = by_cycle[cyc]
+                h["spawned"] = report.get("spawned") or h.get("spawned") or []
+                h["elites"] = report.get("elites") or h.get("elites") or []
+                h["ga_skipped"] = bool(g.get("skipped") or report.get("skipped"))
+                h["ga_reason"] = report.get("reason")
+                h["best_fitness"] = g.get("best_fitness")
+                if not h.get("rankings") and rankings:
+                    h["rankings"] = rankings
+                if not h.get("survivors"):
+                    h["survivors"] = [
+                        i.get("name") for i in inds
+                        if i.get("status") in ("survivor", "immune", "elite_protected")
+                        or i.get("elite")
+                    ]
+            else:
+                by_cycle[cyc] = {
+                    "id": None,
+                    "cycle_number": cyc,
+                    "survivors": [
+                        i.get("name") for i in inds
+                        if i.get("status") in ("survivor", "immune", "elite_protected")
+                        or i.get("elite")
+                    ],
+                    "replaced": report.get("replaced") or [],
+                    "new_bots": [s.get("name") for s in (report.get("spawned") or [])],
+                    "rankings": rankings,
+                    "spawned": report.get("spawned") or [],
+                    "elites": report.get("elites") or [],
+                    "ga_skipped": bool(g.get("skipped") or report.get("skipped")),
+                    "ga_reason": report.get("reason"),
+                    "best_fitness": g.get("best_fitness"),
+                    "created_at": g.get("created_at"),
+                }
+    except Exception:
+        pass
+
+    merged = sorted(
+        by_cycle.values(),
+        key=lambda r: (r.get("cycle_number") is None, -(r.get("cycle_number") or 0)),
+    )
+    return JSONResponse(merged[:30])
 
 
 @app.get("/api/regime")

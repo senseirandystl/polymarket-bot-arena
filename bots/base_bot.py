@@ -424,22 +424,27 @@ class BaseBot(ABC):
         fair = yes_mid + trust * (model_prob - yes_mid)
         return max(0.02, min(0.98, fair))
 
+    def _assumed_maker(self) -> bool:
+        """Whether edge math should use maker fee (0) under limit-first style."""
+        if getattr(config, "ORDER_STYLE", "limit") != "limit":
+            return False
+        mode = getattr(config, "LIMIT_PRICE_MODE", "passive_mid")
+        return mode in ("passive_mid", "join_bid")
+
     def _side_net_edges(self, model_prob: float, trust_eff: float,
                         yes_price: float, no_price: float) -> tuple:
         """Cost-adjusted edge per side, each anchored on its OWN book price.
 
-        edge_side = trust_eff * (P_model_side - side_price) - taker_fee. The
-        old form anchored fair on the YES mid but paid the NO book, so any
-        cross-book gap (stale/inconsistent books, yes+no != 1) landed in the
-        NO edge as phantom directional signal with zero model input — and
-        Kelly max-sized exactly those trades (BUG #27). Per-side anchoring
-        makes edge purely model-vs-that-side's-price; real cross-book gaps
-        belong to the arbitrage bot's two-legged trade.
+        edge_side = trust_eff * (P_model_side - side_price) - fee. Fee is
+        maker (0) when ORDER_STYLE=limit and LIMIT_PRICE_MODE is passive, else
+        the crypto taker fee. Per-side anchoring makes edge purely
+        model-vs-that-side's-price (BUG #27).
         """
+        is_maker = self._assumed_maker()
         edge_yes = (trust_eff * (model_prob - yes_price)
-                    - polymarket_fills.taker_fee(1.0, yes_price))
+                    - polymarket_fills.fee_per_share(yes_price, is_maker=is_maker))
         edge_no = (trust_eff * ((1.0 - model_prob) - no_price)
-                   - polymarket_fills.taker_fee(1.0, no_price))
+                   - polymarket_fills.fee_per_share(no_price, is_maker=is_maker))
         return edge_yes, edge_no
 
     def make_decision(self, market: dict, signals: dict) -> dict:
@@ -565,12 +570,21 @@ class BaseBot(ABC):
         # philosophy as the session filter — build the skip, default flat.
         # Structured skip: same contract as buys (edge 0, contributing
         # signals attached) so downstream consumers never branch on shape.
-        def _skip(reason: str, side: str = "yes", confidence: float = 0.0):
+        def _skip(reason: str, side: str = "yes", confidence: float = 0.0,
+                  edge: float = 0.0, entry_price: float | None = None):
+            # Always attach lane reads so decision_events can score skips
+            # counterfactually (same raw cand() values as buys).
             return strategy_decision(
-                "skip", side, confidence=confidence, reasoning=reason,
-                signals={"drift": drift_signal_val, "mom": momentum_signal,
-                         "strat": strategy_signal},
-                features=features)
+                "skip", side, edge=edge, confidence=confidence, reasoning=reason,
+                signals={
+                    "drift": drift_signal_val, "mom": momentum_signal,
+                    "strat": strategy_signal, "model_prob": model_prob,
+                    "fut": raw.get("fut_taker"), "tech": raw.get("tech_mtf"),
+                    "xasset": raw.get("xasset"),
+                    "regime": self.regime_context(signals).get("label"),
+                },
+                features=features,
+                entry_price=entry_price)
 
         macro = sv.macro_caution
         if macro >= getattr(config, "MACRO_CAUTION_SKIP", 0.75):
@@ -692,6 +706,19 @@ class BaseBot(ABC):
                 f"<{dz_drift:.2f} (coin-flip, no conviction)",
                 side=side, confidence=confidence)
 
+        # --- Extreme-drift market-lag gate ---
+        # |drift| ≥ DRIFT_EXTREME is only tradable when the market still LAGS
+        # (side mid ≤ DRIFT_EXTREME_MAX_SIDE_MID). Extreme drift with price
+        # already at 0.70+ is "priced in" — soak: |drift|≥0.50 → 41% WR.
+        ext_abs = getattr(config, "DRIFT_EXTREME_ABS", 0.50)
+        ext_max_mid = getattr(config, "DRIFT_EXTREME_MAX_SIDE_MID", 0.58)
+        if abs(drift_signal_val) >= ext_abs and side_mid_dz > ext_max_mid:
+            return _skip(
+                f"Extreme-drift lag gate: |drift|={abs(drift_signal_val):.3f}"
+                f">={ext_abs:.2f} but {side} mid={side_mid_dz:.2f}"
+                f">{ext_max_mid:.2f} (priced in)",
+                side=side, confidence=confidence)
+
         # --- Minimum-edge gate (no edge = no bet) — SAME bar on both sides ---
         # Information-scaled: with drift flat the model's disagreement with the
         # market rests entirely on the noisy flow/momentum lanes, so a
@@ -760,9 +787,18 @@ class BaseBot(ABC):
         # Portfolio capital slice: when allocation is on, this bot sizes
         # against bankroll × weight (weights sum to 1 across the roster).
         # Risk engine may further taper (drawdown / stress) via size_mult.
+        # Regime-adaptive size: live regime_performance → mult (bad regimes
+        # like low_vol_trend auto-shrink without a hardcoded skip list).
+        try:
+            from arena.regime_adapt import size_multiplier as _regime_size_mult
+            _reg_mult = _regime_size_mult(
+                self.regime_context(signals).get("label"))
+        except Exception:
+            _reg_mult = 1.0
         bankroll = (_sizing_bankroll(self.trading_mode)
                     * _portfolio_weight(self.name)
-                    * _risk_size_mult(self.name))
+                    * _risk_size_mult(self.name)
+                    * _reg_mult)
         # Edge is CLAMPED for sizing only (the trade/skip gate above used the
         # raw edge): outsized edges mean maximal model-vs-market disagreement,
         # which live correlates with stale inputs, not extra information (the
@@ -810,9 +846,15 @@ class BaseBot(ABC):
             "reasoning": reasoning,
             # Contributing signal readings (structured contract) — the model
             # blend's own lane attribution is in lane_contributions below.
-            "signals": {"drift": drift_signal_val, "mom": momentum_signal,
-                        "strat": strategy_signal, "model_prob": model_prob,
-                        "trust_eff": trust_eff},
+            "signals": {
+                "drift": drift_signal_val, "mom": momentum_signal,
+                "strat": strategy_signal, "model_prob": model_prob,
+                "trust_eff": trust_eff,
+                # Raw candidate reads (pre kill-switch) for decision_events.
+                "fut": raw.get("fut_taker"), "tech": raw.get("tech_mtf"),
+                "xasset": raw.get("xasset"),
+                "regime": self.regime_context(signals).get("label"),
+            },
             "suggested_amount": amount,
             "target_shares": target_shares,
             # Price the decision expects to pay. execute() turns this into a
@@ -909,18 +951,102 @@ class BaseBot(ABC):
             logger.error(f"[{self.name}] Trade exception: {e}")
             return {"success": False, "reason": str(e)}
 
+    def _peer_corr(self, other_bot: str) -> float | None:
+        """Pairwise correlation with another bot, or None if unknown.
+
+        Unknown peers count at full weight in exposure (conservative). Measured
+        ρ is floored at EXPOSURE_CORR_FLOOR so weakly related bots still share
+        some budget.
+        """
+        if other_bot == self.name:
+            return 1.0
+        try:
+            from arena.portfolio import load_state
+            st = load_state() or {}
+            pairs = st.get("correlations") or {}
+            a, b = sorted([self.name, other_bot])
+            key = f"{a}|{b}"
+            if key in pairs:
+                return max(0.0, min(1.0, float(pairs[key])))
+        except Exception:
+            pass
+        return None
+
+    def _effective_open_exposure(self, market_id, side, mode) -> tuple[float, int]:
+        """Correlation-weighted open cost on (market, side) + bot count.
+
+        Peers with ρ≈1 (momentum/phantom/hybrid) nearly fully share the
+        concentration budget so tandem fills cannot 4× one candle. Returns
+        (effective_usd, n_bots_open).
+        """
+        with db.get_conn() as conn:
+            rows = conn.execute(
+                """SELECT bot_name, SUM(amount) cost FROM trades
+                   WHERE market_id=? AND side=? AND mode=? AND outcome IS NULL
+                   GROUP BY bot_name""",
+                (market_id, side, mode),
+            ).fetchall()
+        if not rows:
+            # Fall back to unweighted total if query shape differs
+            return float(db.get_open_exposure(market_id, side, mode) or 0.0), 0
+        floor = float(getattr(config, "EXPOSURE_CORR_FLOOR", 0.35))
+        aware = bool(getattr(config, "EXPOSURE_CORR_AWARE", True))
+        eff = 0.0
+        n_bots = 0
+        for r in rows:
+            name = r["bot_name"]
+            cost = float(r["cost"] or 0.0)
+            if cost <= 0:
+                continue
+            n_bots += 1
+            if not aware or name == self.name:
+                eff += cost
+            else:
+                rho = self._peer_corr(name)
+                # Unknown corr → full weight (safe). Known → max(floor, ρ).
+                weight = 1.0 if rho is None else max(floor, rho)
+                eff += cost * weight
+        return eff, n_bots
+
     def _exposure_headroom(self, market_id, side, mode) -> float | None:
         """Remaining shared-pool budget for this (market, side), or None when
         it can't be computed (missing ids — fail open, other guards still
         apply). Cap base: gross paper pool in paper mode; a fixed
-        2x LIVE_MAX_POSITION per market-side in live mode."""
+        2x LIVE_MAX_POSITION per market-side in live mode.
+
+        Long-term concentration control: correlation-weighted open exposure
+        + hard max bots per (market, side) (MARKET_SIDE_MAX_BOTS).
+        """
         if not market_id or side not in ("yes", "no"):
             return None
         if mode == "live":
             cap_usd = 2.0 * config.LIVE_MAX_POSITION
         else:
             cap_usd = config.MARKET_SIDE_EXPOSURE_CAP * db.get_paper_pool_gross()
-        return cap_usd - db.get_open_exposure(market_id, side, mode)
+        try:
+            used, n_bots = self._effective_open_exposure(market_id, side, mode)
+        except Exception:
+            used = float(db.get_open_exposure(market_id, side, mode) or 0.0)
+            n_bots = 0
+        max_bots = int(getattr(config, "MARKET_SIDE_MAX_BOTS", 3) or 0)
+        if max_bots > 0 and n_bots >= max_bots:
+            # Already at thesis-cluster limit — no headroom for another bot
+            # unless this bot already has a position (adding size).
+            try:
+                mine = 0.0
+                with db.get_conn() as conn:
+                    r = conn.execute(
+                        """SELECT SUM(amount) c FROM trades
+                           WHERE market_id=? AND side=? AND mode=? AND bot_name=?
+                             AND outcome IS NULL""",
+                        (market_id, side, mode, self.name),
+                    ).fetchone()
+                    mine = float((r["c"] if r else 0) or 0)
+                if mine <= 0:
+                    return 0.0
+            except Exception:
+                return 0.0
+        return cap_usd - used
 
     def _place_via_engine(self, signal, market, amount, mode) -> dict:
         """Delegate order placement to the paper or live venue engine.
@@ -944,7 +1070,24 @@ class BaseBot(ABC):
         # ``entry_price`` (all buy signals now do).
         expected = signal.get("entry_price")
         book = side_book(market, signal.get("side"))
+        # Limit-first: price the resting/marketable buy from the book mode,
+        # falling back to the decision entry when book is missing.
+        lim = signal.get("limit_price")
+        if lim is None and getattr(config, "ORDER_STYLE", "limit") == "limit":
+            try:
+                import polymarket_fills
+                mid = (market.get("current_price") if signal.get("side") == "yes"
+                       else market.get("no_price"))
+                if book:
+                    lim = polymarket_fills.limit_buy_price(book, mid=mid)
+                if lim is None:
+                    lim = expected
+            except Exception:
+                lim = expected
 
+        # Note: do NOT pass Kelly ``target_shares`` here — that flag means
+        # share-matched arb legs in the venue engines. Directional bots size
+        # via USD amount (derived shares-first above) and use the limit path.
         res = get_engine(mode).place(
             bot_name=self.name,
             side=signal["side"],
@@ -955,6 +1098,7 @@ class BaseBot(ABC):
             reasoning=signal.get("reasoning"),
             features=signal.get("features"),
             expected_price=expected,
+            limit_price=lim,
             book=book,
             context=signal.get("context"),
         )

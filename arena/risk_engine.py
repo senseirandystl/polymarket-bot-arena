@@ -4,7 +4,8 @@ Single authority for pre-trade risk gates and continuous risk evaluation:
 
 * Per-bot and portfolio **daily loss** limits (net P&L)
 * Per-bot and portfolio **max drawdown** (peak-to-trough on bankroll-anchored
-  equity curves — capital base + cumulative trade P&L, not zero-based P&L)
+  equity curves — full pool capital base + cumulative trade P&L, not
+  zero-based P&L and not portfolio-weight micro-books)
 * Automatic **size reduction** as drawdown approaches the limit, then **pause**
 * Underperformance pause (window P&L floor)
 * **Historical VaR** (percentile of recent trade P&Ls) when enough data
@@ -591,12 +592,18 @@ def evaluate(bot_names: Optional[Sequence[str]] = None,
         w_series = window_pnls.get(name) or []
         u_series = under_pnls.get(name) or []
         daily_pnl = sum(d_series)
-        # Bot capital = pool start × portfolio weight (1.0 when allocation off).
-        bot_start = max(0.0, port_start * _bot_capital_weight(name))
+        # Per-bot DD uses the FULL pool capital base, not portfolio weight ×
+        # pool. Weights only control Kelly sizing; measuring DD against a 5%
+        # micro-book ($10 on a $200 pool) made a −$0.50 day look like 35% DD
+        # after a small run-up (sniper/momentum false pauses). Portfolio DD
+        # still protects shared capital; daily-loss / underperform gates still
+        # catch bot-level bleeding.
+        bot_start = max(0.0, port_start)
         stats = equity_stats(w_series, starting_equity=bot_start)
         dd = float(stats["drawdown"])
         var = historical_var(w_series, var_conf)
         under_total = sum(u_series)
+        auto_reason = None  # reason before manual overrides
 
         status = "active"
         reason = None
@@ -623,13 +630,27 @@ def evaluate(bot_names: Optional[Sequence[str]] = None,
             status = "reduced"
             reason = f"drawdown_taper:dd={dd:.2%}/max={bot_max_dd:.0%}"
 
-        # Manual pause sticky: if previously manually paused, keep unless
-        # clear_manual was set (handled via resume_bot API).
+        auto_reason = reason
         prev = prev_bots.get(name) or {}
-        if prev.get("manual_pause"):
+        manual_pause = bool(prev.get("manual_pause"))
+        # Sticky operator resume: stays until metrics would naturally be active
+        # again (so Resume isn't immediately undone by the same auto-pause).
+        manual_resume = bool(prev.get("manual_resume")) and not manual_pause
+
+        if manual_pause:
             status = "paused"
             reason = prev.get("reason") or "manual_pause"
             size_mult = 0.0
+            manual_resume = False
+        elif manual_resume and status == "paused":
+            # Force trading at the DD taper floor while override is held.
+            size_mult = max(min_mult, _dd_size_mult(dd, bot_max_dd, dd_start, min_mult))
+            status = "reduced" if size_mult < 0.999 else "active"
+            reason = f"manual_resume_override:{auto_reason or 'paused'}"
+        elif manual_resume and status in ("active", "reduced"):
+            # Metrics no longer require a hard pause — drop the sticky flag.
+            if status == "active":
+                manual_resume = False
 
         bot_state = {
             "status": status,
@@ -643,7 +664,9 @@ def evaluate(bot_names: Optional[Sequence[str]] = None,
             "var_1d": var,
             "n_window": stats["n"],
             "reason": reason,
-            "manual_pause": bool(prev.get("manual_pause")),
+            "manual_pause": manual_pause,
+            "manual_resume": bool(manual_resume),
+            "capital_weight": round(_bot_capital_weight(name), 4),
         }
         new_bots[name] = bot_state
 
@@ -890,6 +913,7 @@ def pause_bot(bot_name: str, reason: str = "manual_pause") -> dict:
         "status": "paused",
         "size_mult": 0.0,
         "manual_pause": True,
+        "manual_resume": False,
         "reason": reason,
     })
     bots[bot_name] = entry
@@ -900,13 +924,25 @@ def pause_bot(bot_name: str, reason: str = "manual_pause") -> dict:
 
 
 def resume_bot(bot_name: str) -> dict:
+    """Clear manual pause and force-allow trading until risk metrics recover.
+
+    Without ``manual_resume``, the next ``evaluate()`` immediately re-pauses
+    any bot still over an automatic limit (e.g. max DD) — which made the
+    dashboard Resume button appear broken.
+    """
     state = load_state()
     bots = state.setdefault("bots", {})
     entry = dict(bots.get(bot_name) or {})
     entry["manual_pause"] = False
-    # Re-evaluate to pick correct automatic status
+    entry["manual_resume"] = True
+    # Optimistic UI state until evaluate recomputes size_mult / reason
+    entry["status"] = "active"
+    entry["size_mult"] = float(entry.get("size_mult") or 0.0) or 1.0
+    entry["reason"] = "manual_resume"
+    bots[bot_name] = entry
     save_state(state)
-    log_event(action="resume", level="info", reason="manual_resume", bot=bot_name)
+    log_event(action="resume", level="info", reason="manual_resume", bot=bot_name,
+              detail={"manual_resume": True})
     evaluate()
     return (load_state().get("bots") or {}).get(bot_name) or entry
 

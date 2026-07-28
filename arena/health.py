@@ -181,7 +181,7 @@ def check_session() -> dict:
 
 
 def check_price_feed() -> dict:
-    """Best-effort: arena_state may hold feed heartbeat if present."""
+    """Best-effort: arena_state heartbeat written by arena.alerts.publish_price_feed_status."""
     try:
         raw = db.get_arena_state("price_feed_status")
         if not raw:
@@ -190,15 +190,22 @@ def check_price_feed() -> dict:
                 message="No feed heartbeat stored (check arena.log for Binance WS)",
             )
         data = json.loads(raw) if isinstance(raw, str) else raw
-        stale = bool((data or {}).get("stale"))
+        if not isinstance(data, dict):
+            return _check("price_feed", True, message="Feed status unreadable")
+        # Ignore very old heartbeats as stale (arena not publishing)
+        ts = float(data.get("ts") or 0)
+        age = time.time() - ts if ts else None
+        stale = bool(data.get("stale"))
+        if age is not None and age > float(getattr(config, "ALERT_FEED_STALE_SEC", 90)) * 2:
+            stale = True
         if stale:
             return _check(
                 "price_feed", False, level="warn",
-                message="Price feed marked stale",
+                message="Price feed marked stale / unavailable",
                 recommend="Restart arena to reconnect Binance WebSocket",
-                detail=data if isinstance(data, dict) else {},
+                detail=data,
             )
-        return _check("price_feed", True, message="Feed OK", detail=data or {})
+        return _check("price_feed", True, message="Feed OK", detail=data)
     except Exception as e:
         return _check("price_feed", True, message=f"feed status n/a ({e})")
 

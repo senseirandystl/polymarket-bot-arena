@@ -136,10 +136,11 @@ def _meanrev_sig(vol_regime):
     bot = MeanRevBot(name="rev-t", generation=0)
     lookback = bot.strategy_params["lookback_candles"]
     # Sharp up-spike on flat tape → overextended UP → fade NO, backed by a
-    # DOWN drift (BUG #28 gate).
+    # DOWN drift (BUG #28) and strike above the reversion mean (P0 PTB gate).
     prices = [100_000.0] * (lookback + 20) + [101_500.0]
     return bot.analyze(make_market(), make_signals(
         prices=prices, latest=prices[-1], btc_drift=-0.30,
+        btc_strike=102_000.0,
         vol_regime=vol_regime))
 
 

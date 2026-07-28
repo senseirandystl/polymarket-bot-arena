@@ -322,4 +322,16 @@ class ArbitrageBot(BaseBot):
                 f"{str(market.get('id', ''))[:12]}…: filled "
                 f"{filled[0].fill_source} — other leg failed"
             )
+            try:
+                if mode == "live":
+                    from arena.alerts import alert_live_fill
+                    alert_live_fill(
+                        self.name, "naked_arb_leg",
+                        market_id=str(market.get("id") or ""),
+                        detail={"filled_legs": len(filled),
+                                "fill_source": filled[0].fill_source},
+                    )
+            except Exception:
+                pass
+            return {"success": False, "reason": "naked_arb_leg"}
         return {"success": False, "reason": "arb_leg_unfilled"}

@@ -286,6 +286,10 @@ LANE_MONITOR_MIN_TRADES = 50        # resolved readings before a verdict
 LANE_MONITOR_MIN_ACCURACY = 0.53    # live sign-vs-outcome accuracy to stay live
 LANE_MONITOR_DEADBAND = 0.05        # |reading| below this = no directional read
 LANE_MONITOR_INTERVAL_SEC = 1800    # check cadence (piggybacks the evolution loop)
+# Fast demote: don't wait for the full sample if a newly-live lane is clearly
+# anti-predictive (fut post-approval ran ~38% at n=21 while still "collecting").
+LANE_MONITOR_FAST_DEMOTE_MIN_TRADES = 20
+LANE_MONITOR_FAST_DEMOTE_MAX_ACC = 0.45
 
 # --- Auto-validation scheduler (arena/validation_scheduler.py) ---
 # Runs tools/validate_signals.py --propose from inside the arena every
@@ -315,6 +319,9 @@ AUTO_VALIDATE_WINDOW_MARKETS = 300  # --markets passed to the harness
 AUTO_APPROVE_LANES_ENABLED = True
 AUTO_APPROVE_MIN_TRADES = 60      # live shadow readings before a promotion verdict
 AUTO_APPROVE_MIN_ACCURACY = 0.55  # live sign-vs-outcome accuracy to auto-promote
+# Require positive LIVE shadow net edge (¢/share after fee) in addition to
+# accuracy — accuracy alone promoted fut at ~55% that later scored ~38% live.
+AUTO_APPROVE_MIN_NET_EDGE = 0.005  # +0.5¢/share on shadow follow-the-sign
 AUTO_APPROVE_MAX_ACTIVE = 3       # cap on simultaneously-enabled CANDIDATE lanes
 
 # --- Core-lane auto-tuner (arena/core_lane_tuner.py) — the loop's core half ---
@@ -438,6 +445,14 @@ DEAD_ZONE_PRICE_LO = 0.42
 DEAD_ZONE_PRICE_HI = 0.58
 DEAD_ZONE_DRIFT_MIN = 0.10
 
+# --- Extreme-drift market-lag gate (soak 2026-07-27) ---
+# |drift| 0.30–0.50 was the money zone (85% WR); |drift| ≥ 0.50 lost (41% WR).
+# Do not hard-veto extreme drift — require the market to still LAG (side mid
+# at or below the harness "market lags" ceiling). Same spirit as meanrev's
+# STRATEGY_MAX_SIDE_PRICE / sniper lag rule.
+DRIFT_EXTREME_ABS = 0.50
+DRIFT_EXTREME_MAX_SIDE_MID = 0.58
+
 # Conviction-scaled trust (2026-07-17 chop-regime leak): trust_eff =
 # trust * min(1, |P_model - 0.5| / MODEL_CONVICTION_SCALE). The edge formula
 # trust*(P_model - mid) derives its MAGNITUDE from the market's displacement,
@@ -506,7 +521,7 @@ SIZING_BANKROLL_CACHE_SEC = 5.0
 # full shared pool (N bots × full bankroll oversubscribed correlated risk).
 # Weights sum to 1; rebalance on timer and/or regime change. Editable in the
 # dashboard Settings → Portfolio Allocation card.
-PORTFOLIO_ALLOCATION_ENABLED = False  # opt-in; off preserves legacy full-pool Kelly
+PORTFOLIO_ALLOCATION_ENABLED = True   # default on; Kelly sizes against bankroll × weight
 PORTFOLIO_METHOD = "kelly_portfolio"  # equal | sharpe | expectancy | kelly_portfolio
 PORTFOLIO_WINDOW_HOURS = 24.0         # lookback for Sharpe / expectancy / corr
 PORTFOLIO_MIN_TRADES = 10             # sample floor before a bot's score counts
@@ -549,8 +564,33 @@ RISK_EVENT_LOG_MAX = 500
 RISK_KILL_SWITCH_FILE = str(Path(__file__).parent / "logs" / "KILL_SWITCH")
 
 # --- Production alerts + health (arena/alerts.py, arena/health.py) ---
-ALERTS_ENABLED = False              # master switch; enable in dashboard Settings
+# Master switch defaults ON when at least one channel has credentials configured
+# (see arena/alerts._default_config). Explicit dashboard Off still wins once saved.
+ALERTS_ENABLED = False              # static fallback when no channel credentials
 ALERT_DEBOUNCE_SEC = 300            # min seconds between identical alerts
+ALERT_HOURLY_REPORT_SEC = 3600      # cadence for hourly performance digests
+# Daily EOD: after this America/New_York hour, send previous ET calendar day's
+# summary once (default 0 = just after midnight ET + grace for late resolutions).
+ALERT_DAILY_REPORT_HOUR_ET = 0
+ALERT_DAILY_REPORT_GRACE_MIN = 5    # wait a few minutes for late resolutions
+# Deprecated alias — same semantic as HOUR_ET (kept so old env/docs still resolve).
+ALERT_DAILY_REPORT_HOUR_UTC = ALERT_DAILY_REPORT_HOUR_ET
+# Paper (and pool) capital warnings
+ALERT_LOW_BANKROLL_USD = 25.0       # absolute available floor
+ALERT_LOW_BANKROLL_FRAC = 0.50      # fraction of bankroll / PAPER_BANKROLL_DEFAULT
+# Feed / market-data staleness
+ALERT_FEED_STALE_SEC = 90.0
+# Skip storm: large skip delta with almost no fills over the check window
+ALERT_SKIP_STORM_MIN_SKIPS = 200
+ALERT_SKIP_STORM_MAX_TRADES = 2
+ALERT_SKIP_STORM_WINDOW_SEC = 600
+# Pending trades older than this are "resolver stuck"
+ALERT_RESOLVER_STUCK_AGE_MIN = 15.0
+ALERT_RESOLVER_STUCK_MIN_COUNT = 2
+# Portfolio rebalance digest when any bot weight moves by this much (absolute)
+ALERT_PORTFOLIO_REBALANCE_MIN_SHIFT = 0.08
+# Core-lane tuner: notify when applied |Δw| ≥ this (one step is 0.05)
+ALERT_CORE_LANE_MIN_SHIFT = 0.05
 ARENA_LOG_STALE_SEC = 300           # health /healthz stale threshold
 HEALTH_EVAL_INTERVAL_SEC = 60       # full health recompute on evolution loop
 
@@ -576,6 +616,59 @@ CONSENSUS_GUARD = 0.35
 # headroom or skip. Arbitrage (hedged, own execute()) is exempt. In live
 # mode the cap base is LIVE_MAX_POSITION * 2 per market-side.
 MARKET_SIDE_EXPOSURE_CAP = 0.10
+# Correlation-aware concentration (long-term pile-in control): when counting
+# open exposure toward MARKET_SIDE_EXPOSURE_CAP, weight each peer bot's open
+# cost by max(corr(self, peer), EXPOSURE_CORR_FLOOR). ρ≈1 bots (momentum/
+# phantom/hybrid) almost fully share the same budget slot so tandem fills
+# cannot 4× one candle. Floor keeps partially-independent bots from free-riding.
+EXPOSURE_CORR_AWARE = True
+EXPOSURE_CORR_FLOOR = 0.35
+# Hard cap on distinct bots already open on the same (market, side) before
+# another directional bot is allowed in (arb exempt). Soft "one thesis" limit.
+MARKET_SIDE_MAX_BOTS = 3
+
+# --- Order execution: limit-first (maker fee = 0 when resting) ---
+# "limit" posts a buy limit; "market" keeps the legacy walk-the-asks path.
+# Limit price modes for BUYs:
+#   passive_mid — min(mid, best_ask − tick): prefer resting maker (fee 0)
+#   join_bid    — best_bid (true join; lowest fill rate, pure maker)
+#   aggressive  — best_ask (marketable limit; still taker fee when it crosses)
+ORDER_STYLE = "limit"
+LIMIT_PRICE_MODE = "passive_mid"
+LIMIT_TICK = 0.01
+# Paper: when a resting limit does not cross the ask, still fill at the limit
+# as maker (fee 0) so the soak can measure maker economics. Live posts a real
+# GTC and only logs a trade when the CLOB reports matched. Documented
+# optimism for paper — compare live fills before trusting paper edge fully.
+LIMIT_PAPER_ASSUME_MAKER_FILL = True
+
+# --- Regime-adaptive size (live regime_performance → size mult) ---
+# Automatically shrinks (or mildly boosts) size from realized regime WR/P&L
+# so regimes like low_vol_trend (−$ / sub-50% WR) pay less risk without a
+# hardcoded skip list. Uses arena_state regime_performance written by the
+# detector; hot-path cached.
+REGIME_ADAPT_ENABLED = True
+REGIME_ADAPT_MIN_TRADES = 15
+REGIME_ADAPT_BAD_WR = 0.48       # at/below → size toward MIN
+REGIME_ADAPT_GOOD_WR = 0.62      # at/above → size toward MAX
+REGIME_ADAPT_SIZE_MIN = 0.35
+REGIME_ADAPT_SIZE_MAX = 1.15
+REGIME_ADAPT_CACHE_SEC = 30.0
+
+# --- Decision-event log (counterfactual learning) ---
+# Hot path only enqueues; a background flusher batch-inserts. Non-buy actions
+# are throttled per (bot, market) so 1s re-evals do not flood SQLite. Buys
+# always log. Resolved against market outcomes for lane/strategy fine-tuning
+# beyond the trade-only sample.
+DECISION_LOG_ENABLED = True
+DECISION_LOG_MIN_INTERVAL_SEC = 20.0   # throttle non-buy per (bot, market)
+DECISION_LOG_FLUSH_SEC = 2.0
+DECISION_LOG_QUEUE_MAX = 8000
+DECISION_ROLLUP_INTERVAL_SEC = 900     # offline rollup cadence (evolution loop)
+# When True, core tuner + lane promoter prefer decision_events (incl. skips)
+# over trade-only reasoning parses once enough resolved decisions exist.
+DECISION_LEARN_FROM_ALL = True
+DECISION_LEARN_MIN_RESOLVED = 30       # floor before replacing trade-only path
 
 # --- Session-timing skip filter (arena/session_filter.py) ---
 # 'Build the skip': sit flat during high-flip session handovers. Defaults are

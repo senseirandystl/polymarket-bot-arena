@@ -73,6 +73,14 @@ class TradeResolver(threading.Thread):
                 f"Resolved {count} trades ({matched} pending matched "
                 f"{len(resolved)} resolved markets)"
             )
+        # Stamp decision_events (incl. skips) with the same market outcomes
+        # so offline rollups can score lanes without a placed trade.
+        try:
+            from arena.decision_log import resolve_from_resolution_map, flush
+            flush()
+            resolve_from_resolution_map(resolved)
+        except Exception as e:
+            logger.debug("decision_events resolve failed: %s", e)
 
     def _settle_trade(self, trade, market_outcome: bool) -> bool:
         """Write win/loss + fee-aware P&L + learning for one resolved trade.

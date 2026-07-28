@@ -312,7 +312,33 @@ def run_ga_cycle(
         report["reason"] = "no_replacements"
         for bot in evolving:
             bot.reset_daily()
-        # Persist generation snapshot even when no replacement
+        # Persist generation snapshot even when no replacement — write both the
+        # arena_state GA status AND a ga_generations row so the dashboard
+        # evolution log shows every cycle (not only culling events).
+        try:
+            rankings = [{
+                "name": ind["name"],
+                "strategy_type": ind["strategy_type"],
+                "generation": ind["generation"],
+                "pnl": ind["pnl"],
+                "win_rate": ind["win_rate"],
+                "trades": ind["trades"],
+                "be_gap": ind.get("be_gap"),
+                "fitness": ind["fitness"],
+                "components": ind["components"],
+                "ranks": ind["ranks"],
+                "status": ind["status"],
+                "elite": ind["elite"],
+                "lineage": ind.get("lineage"),
+            } for ind in individuals]
+            survivors = [ind["name"] for ind in keep]
+            db.log_evolution(cycle_number, survivors, [], [], rankings)
+        except Exception as e:
+            logger.warning("Failed to log skipped evolution_events: %s", e)
+        try:
+            db.log_ga_generation(cycle_number, report)
+        except Exception as e:
+            logger.warning("Failed to log skipped ga_generation: %s", e)
         _persist_ga_state(cycle_number, report)
         return evolving + exempt, report
 

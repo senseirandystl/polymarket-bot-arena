@@ -41,16 +41,31 @@ logger = logging.getLogger("arena.lane_promoter")
 def _shadow_accuracy(conn, lane: str, deadband: float) -> dict:
     """Live sign-vs-outcome accuracy of a (still-shadow) candidate lane.
 
-    Unlike the monitor — which scores only trades placed *after* a lane went
-    live — a pending lane has no approval time, so we score every resolved
-    directional trade that carries a cand(...) read. That is the lane's live
-    predictiveness measured with zero live weight.
+    Prefers decision_events (buys + throttled skips) so promotion uses *all*
+    evaluations, not only filled trades. Falls back to trade cand(...) parse.
     """
+    try:
+        from arena.decision_log import (
+            candidate_lane_attribution, should_use_decision_attribution,
+        )
+        if should_use_decision_attribution(conn):
+            stats = candidate_lane_attribution(conn, lane, deadband)
+            if (stats.get("n") or 0) > 0:
+                return stats
+        # Even when below the global floor, merge decision samples if any.
+        dec = candidate_lane_attribution(conn, lane, deadband)
+    except Exception:
+        dec = {"n": 0, "accuracy": None, "net_edge": None}
+
     rows = conn.execute(
-        """SELECT side, outcome, reasoning FROM trades
+        """SELECT side, outcome, reasoning, entry_price FROM trades
            WHERE outcome IN ('win', 'loss') AND reasoning LIKE '%cand(%'"""
     ).fetchall()
-    return _lane_accuracy(rows, lane, deadband)
+    trade_stats = _lane_accuracy(rows, lane, deadband)
+    # Prefer the larger sample; decision_events typically win once logging runs.
+    if (dec.get("n") or 0) >= (trade_stats.get("n") or 0) and (dec.get("n") or 0) > 0:
+        return dec
+    return trade_stats
 
 
 def check_proposals() -> dict:
@@ -67,6 +82,7 @@ def check_proposals() -> dict:
     auto_on = db.get_auto_approve_lanes()
     min_trades = getattr(config, "AUTO_APPROVE_MIN_TRADES", 60)
     min_acc = getattr(config, "AUTO_APPROVE_MIN_ACCURACY", 0.55)
+    min_net = getattr(config, "AUTO_APPROVE_MIN_NET_EDGE", 0.005)
     max_active = getattr(config, "AUTO_APPROVE_MAX_ACTIVE", 3)
     deadband = getattr(config, "LANE_MONITOR_DEADBAND", 0.05)
 
@@ -87,14 +103,19 @@ def check_proposals() -> dict:
                 continue
             stats = _shadow_accuracy(conn, lane, deadband)
             acc = stats["accuracy"]
-            clears = (stats["n"] >= min_trades and acc is not None
-                      and acc >= min_acc)
+            net = stats.get("net_edge")
+            clears = (
+                stats["n"] >= min_trades
+                and acc is not None and acc >= min_acc
+                and net is not None and net >= min_net
+            )
             verdict = "collecting"
             if stats["n"] >= min_trades:
                 verdict = "clears_bar" if clears else "below_bar"
             report[lane] = {
                 **stats, "verdict": verdict, "proposal_id": p["id"],
                 "min_trades": min_trades, "min_accuracy": min_acc,
+                "min_net_edge": min_net,
                 "auto_approve": auto_on,
             }
 
@@ -106,7 +127,9 @@ def check_proposals() -> dict:
         if pid is not None and "accuracy" in r:
             db.annotate_lane_proposal(pid, {
                 "n": r["n"], "accuracy": r["accuracy"],
+                "net_edge": r.get("net_edge"),
                 "min_trades": r["min_trades"], "min_accuracy": r["min_accuracy"],
+                "min_net_edge": r.get("min_net_edge"),
             })
 
     if not auto_on:
@@ -140,6 +163,15 @@ def check_proposals() -> dict:
             f"Lane '{lane}' AUTO-APPROVED: live accuracy {r['accuracy']:.1%} "
             f"over {r['n']} shadow reads (bar {min_acc:.0%} after {min_trades})"
         )
+        try:
+            from arena.alerts import alert_lane_change
+            alert_lane_change(
+                "approve", lane,
+                accuracy=r.get("accuracy"), n=r.get("n"),
+                detail={"min_accuracy": min_acc, "min_trades": min_trades},
+            )
+        except Exception:
+            pass
         break  # one promotion per cycle — let the monitor watch it before more
 
     return report

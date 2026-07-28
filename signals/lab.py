@@ -125,6 +125,18 @@ class SignalView(Mapping):
         return float(self._d.get("btc_drift", 0.0) or 0.0)
 
     @property
+    def btc_strike(self) -> Optional[float]:
+        """Window Price-to-Beat (Binance open @ eventStartTime), or None."""
+        v = self._d.get("btc_strike")
+        if v is None:
+            return None
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            return None
+        return f if f > 0 else None
+
+    @property
     def pm_momentum(self) -> float:
         return float(self._d.get("pm_momentum", 0.0) or 0.0)
 

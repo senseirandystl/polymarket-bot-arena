@@ -235,6 +235,44 @@ def init_db():
                 created_at TEXT DEFAULT (datetime('now')),
                 decided_at TEXT
             );
+
+            -- Counterfactual decision log: every evaluable make_decision outcome
+            -- (buy + throttled skips), not just filled trades. Resolved offline
+            -- against market outcomes for lane/strategy fine-tuning.
+            CREATE TABLE IF NOT EXISTS decision_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                bot_name TEXT NOT NULL,
+                strategy_type TEXT,
+                market_id TEXT NOT NULL,
+                action TEXT NOT NULL,            -- buy | skip | hold
+                side TEXT,                       -- yes | no | NULL
+                skip_reason TEXT,                -- weak_lean | no_edge | ...
+                edge REAL,
+                confidence REAL,
+                entry_price REAL,                -- price used for hyp EV
+                drift REAL,
+                mom REAL,
+                strat REAL,
+                fut REAL,
+                tech REAL,
+                xasset REAL,
+                model_prob REAL,
+                trust_eff REAL,
+                regime TEXT,
+                features TEXT,                   -- JSON feature list
+                trade_id INTEGER,                -- trades.id when filled
+                market_up INTEGER,               -- 1/0 once market resolved
+                would_win INTEGER,               -- side correct vs market_up
+                hyp_pnl REAL,                    -- per-share hyp PnL after fee
+                resolved_at TEXT,
+                created_at TEXT DEFAULT (datetime('now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_decision_events_market
+                ON decision_events(market_id, market_up);
+            CREATE INDEX IF NOT EXISTS idx_decision_events_bot
+                ON decision_events(bot_name, created_at);
+            CREATE INDEX IF NOT EXISTS idx_decision_events_unresolved
+                ON decision_events(market_up) WHERE market_up IS NULL;
         """)
 
         # Migrations

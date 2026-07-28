@@ -1,48 +1,54 @@
-"""Sniper bot — only trades when historical data shows 65%+ win rate.
+"""Sniper bot — drift-vs-price lag hunter (v3).
 
-v2 adjustments from sniper-v1 trade data (13 trades):
-- cheap YES (40-48c): 100% WR, +$8.60 — KEEP, this is the money zone
-- strong YES (58-65c): 20% WR, -$10.03 — REMOVED, widened skip zone to 64c
-- strong YES (65-85c): 33% WR, -$6.49 — TIGHTENED, max YES now 78c
-- strong NO (0-35c): only <25c won — TIGHTENED, max NO now 25c
-- Momentum threshold tightened (0.0005 → 0.0003) to filter marginal trades
+Previous versions used hand-tuned YES/NO price buckets from unverified
+third-party WR tables. Those buckets bit us live (expensive YES snipes,
+near-flat P&L). v3 drops zone tables entirely.
 
-Trades less often but with much higher accuracy.
+Thesis
+------
+BTC 5-minute markets resolve from BTC vs the window-open strike. The
+validated edge is **"follow drift only when the market lags"** (harness +
+live soak). The sniper does only that:
 
-NO side (BUG_HISTORY #20): the old NO ban is removed. The sniper now applies the
-SAME cheap/strong zone rules to the NO token's price (with DOWN-momentum
-confirmation) that it applies to the YES token — a symmetric mirror of its own
-strategy, not a banned side. The NO zones are unvalidated by live data yet
-(mirror assumption); recheck once NO trades accumulate.
+1. Read signed ``btc_drift`` (YES-frame, in [-1, 1]).
+2. Convert to a drift-implied probability: ``p = 0.5 + 0.5 * signed_drift``.
+3. Score BOTH sides: ``edge = p_side - side_mid - fee`` (maker fee when
+   limit-first passive mode is on).
+4. Trade only when:
+   * |drift| ≥ min_drift (real conviction),
+   * edge ≥ min_edge,
+   * the chosen side's MID still **lags** (≤ max_side_mid, default 0.58),
+   * model leans the same way as drift (no fade).
+
+No arbitrary cheap/strong price buckets. Optional late-window confidence
+ramp (direction locks in near expiry). Sizing uses fractional Kelly on the
+fee-adjusted edge, same as the directional stack.
 """
+
+from __future__ import annotations
 
 import config
 import learning
+import polymarket_fills
 from bots.base_bot import BaseBot, strategy_decision
-from signals.curves import gaussian_zone, smooth_ramp
+from signals.curves import smooth_ramp
 from signals.lab import SignalView
 
 DEFAULT_PARAMS = {
-    "min_price_yes": 0.40,     # Min YES price for YES bets
-    "max_price_yes": 0.78,     # Max YES price for YES bets (was 0.85 — 80c+ lost money)
-    "max_price_no": 0.25,      # Max YES price for NO bets (was 0.35 — 30-35c lost, only <25c won)
-    "skip_zone_low": 0.48,     # Start of coin-flip dead zone (cheap-YES 40-48¢ has 100% WR)
-    "skip_zone_high": 0.64,    # End of coin-flip dead zone (was 0.58 — 58-65c was 20% WR)
-    "require_momentum": True,  # Only trade when BTC momentum confirms
-    "momentum_threshold": 0.0003,  # Tighter threshold (was 0.0005 hardcoded)
-    # Drift confirmation (2026-07-16, harness net-edge, ~300 markets): the cheap
-    # zone WITHOUT confirmation is toxic — 37.5% WR, -8.8c/share (the original
-    # "100% WR" came from 13 Simmer-era trades). With signed drift ≥ 0.15 toward
-    # the sniped side it flips to 62.9% WR / +16.3c per share. Zones say WHERE
-    # to look; drift says WHETHER the pattern is backed by BTC's actual position.
+    # Minimum |signed drift| toward the chosen side (quiet regime gets a bump).
     "min_drift": 0.15,
-    # Regime conditioning: in QUIET tape a drift reading is more likely noise
-    # (small absolute moves inflate the normalized z), so the drift bar rises
-    # by this bump when the vol regime reads "quiet". No effect when the
-    # regime feed is silent.
     "quiet_drift_bump": 0.05,
-    "position_size_pct": 0.08, # Larger positions since we're more selective
-    "min_confidence": 0.10,    # Only trade with real edge
+    # Net edge floor after fee (probability units).
+    "min_edge": 0.02,
+    # Market-lag ceiling: never snipe a side already priced above this mid.
+    # Matches the harness "follow drift when side ≤ 58¢" rule.
+    "max_side_mid": 0.58,
+    # Optional absolute floor so we don't buy deep longshots on noise.
+    "min_side_mid": 0.30,
+    # Extreme drift must still lag (same as base_bot gate).
+    "extreme_drift_abs": 0.50,
+    "position_size_pct": 0.08,  # fallback if Kelly path unavailable
+    "min_confidence": 0.10,
 }
 
 
@@ -57,191 +63,162 @@ class SniperBot(BaseBot):
         )
 
     def analyze(self, market, signals):
-        """Only emit a signal when conditions match high-WR patterns."""
+        """Sniper does not use the strat lane blend — pure drift-vs-price."""
         return strategy_decision("hold", reasoning="sniper: no signal")
 
-    def _zone_signal(self, price):
-        """Snipe-worthiness of a token priced ``price`` (side-agnostic).
-
-        Mirrors the sniper's YES zones onto whichever token is being priced, so
-        the SAME data-driven pattern (cheap favorite / strong signal) is applied
-        to YES and NO alike. Returns ``(tradeable, confidence, label)``.
-        """
-        p = self.strategy_params
-        skip_lo = p.get("skip_zone_low", 0.48)
-        skip_hi = p.get("skip_zone_high", 0.64)
-        max_price = p.get("max_price_yes", 0.78)
-        min_price = p.get("min_price_yes", 0.40)
-        # Zone MEMBERSHIP stays a hard gate (the brackets are measured live-WR
-        # boundaries); confidence WITHIN a zone is a smooth Gaussian bump
-        # peaking mid-zone — an entry at the zone edge earns proportionally
-        # less conviction instead of the old linear cliff at the boundary.
-        if min_price <= price < skip_lo:
-            center = (min_price + skip_lo) / 2.0
-            width = max((skip_lo - min_price) / 2.0, 0.01)
-            return True, 0.15 + 0.25 * gaussian_zone(price, center, width), "cheap"
-        if skip_hi < price <= max_price:
-            center = (skip_hi + max_price) / 2.0
-            width = max((max_price - skip_hi) / 2.0, 0.01)
-            return True, 0.12 + 0.22 * gaussian_zone(price, center, width), "strong"
-        return False, 0.0, "skip"
-
     def make_decision(self, market, signals):
-        """Override full decision logic — pure data-driven rules.
-
-        Ignores the base class signal hierarchy. Instead uses simple
-        rules derived from historical trade data analysis.
-        """
-        market_price = market.get("current_price") or 0.5  # None if book down
+        """Drift-implied fair vs mid/ask — snipe only when the market lags."""
         p = self.strategy_params
-
-        # Zone thresholds are applied inside _zone_signal (per token price).
-        require_mom = p.get("require_momentum", True)
-
-        # Extract BTC momentum from signals
         sv = SignalView.of(signals)
-        prices = sv.prices
-        btc_momentum = 0.0
-        if len(prices) >= 2 and prices[-1] > 0:
-            btc_momentum = (prices[-1] - prices[-2]) / prices[-2]
 
-        of_data = sv.orderflow
-        volume = of_data.get("volume_24h")
-        time_rem = market.get("time_remaining_seconds")
+        yes_mid = market.get("current_price") or 0.5
+        no_mid = market.get("no_price")
+        if no_mid is None:
+            no_mid = round(1.0 - yes_mid, 4)
 
-        features = learning.extract_features(
-            market_price, btc_momentum,
-            volume=volume, time_rem=time_rem
-        )
+        # Executable costs (asks) for entry_price / fill; guards use mids.
+        yes_ask = market.get("yes_ask") or yes_mid
+        no_ask = market.get("no_ask") or no_mid
 
-        # --- Determine side: snipe whichever token's price is in a good zone ---
-        # Evaluate the SAME data-driven zones on both the YES token (yes price)
-        # and the NO token (no price). BTC momentum must confirm the side's
-        # direction: YES needs BTC not dropping, NO needs BTC not rising. Since
-        # yes+no ~= 1, at most one side's price lands in a buy zone.
-        no_price = market.get("no_price")
-        if no_price is None:
-            no_price = round(1.0 - market_price, 4)
-
-        mom_thresh = p.get("momentum_threshold", 0.0003)
-        yes_ok, yes_conf, yes_label = self._zone_signal(market_price)
-        no_ok, no_conf, no_label = self._zone_signal(no_price)
-        if require_mom:
-            yes_ok = yes_ok and btc_momentum >= -mom_thresh
-            no_ok = no_ok and btc_momentum <= mom_thresh
-
-        # Drift confirmation: the sniped side must be backed by BTC's actual
-        # position vs the strike (signed drift ≥ min_drift). Without it the
-        # cheap zone measured 37.5% WR / -8.8c per share offline. The price
-        # must also be justified by drift's calibrated implied probability
-        # (0.5 + 0.5*signed_drift ≥ price + fee + min_edge) — same gate that
-        # fixed the late-window maker's buy-conviction-already-in-the-price leak.
-        import polymarket_fills
-        drift = sv.btc_drift
-        min_drift = p.get("min_drift", 0.15)
-        min_edge = p.get("min_edge", 0.02)
-
-        # Regime awareness: quiet tape inflates drift's normalized reading
-        # relative to the information it carries — demand more of it.
+        drift = float(sv.btc_drift or 0.0)
+        min_drift = float(p.get("min_drift", 0.15))
         regime = self.regime_context(signals)
-        # Quiet / low-vol regimes: drift readings are noisier — raise the bar.
         quiet = (
             regime.get("legacy") == "quiet"
             or regime.get("label") in ("low_vol_range", "low_vol_trend", "quiet")
             or (regime.get("known") and regime.get("vol_score", 0.5) < 0.35)
         )
         if quiet:
-            min_drift += p.get("quiet_drift_bump", 0.05)
+            min_drift += float(p.get("quiet_drift_bump", 0.05))
 
-        def _drift_edge(side_price, signed_drift):
-            """Drift-implied net edge for a side (prob units, fee-adjusted)."""
-            implied_p = 0.5 + 0.5 * signed_drift
-            return (implied_p - side_price
-                    - polymarket_fills.taker_fee(1.0, side_price))
+        min_edge = float(p.get("min_edge", 0.02))
+        max_mid = float(p.get("max_side_mid", 0.58))
+        min_mid = float(p.get("min_side_mid", 0.30))
+        ext_abs = float(p.get("extreme_drift_abs",
+                              getattr(config, "DRIFT_EXTREME_ABS", 0.50)))
 
-        yes_edge = _drift_edge(market_price, drift)
-        no_edge = _drift_edge(no_price, -drift)
-        yes_ok = yes_ok and drift >= min_drift and yes_edge >= min_edge
-        no_ok = no_ok and -drift >= min_drift and no_edge >= min_edge
+        is_maker = (
+            getattr(config, "ORDER_STYLE", "limit") == "limit"
+            and getattr(config, "LIMIT_PRICE_MODE", "passive_mid")
+            in ("passive_mid", "join_bid")
+        )
 
-        contributing = {"drift": drift, "btc_momentum": btc_momentum,
-                        "regime": regime["label"], "min_drift": min_drift,
-                        "yes_edge": yes_edge, "no_edge": no_edge}
+        def _edge(side_mid: float, signed_drift: float) -> float:
+            implied = 0.5 + 0.5 * signed_drift
+            fee = polymarket_fills.fee_per_share(side_mid, is_maker=is_maker)
+            return implied - side_mid - fee
 
-        side = None
-        confidence = 0
-        reasoning_parts = [f"yes={market_price:.2f} no={no_price:.2f}"]
-        if yes_ok and yes_conf >= no_conf:
-            side, confidence, side_edge = "yes", yes_conf, yes_edge
-            reasoning_parts.append(f"{yes_label}-YES zone ({market_price:.0%})")
+        yes_edge = _edge(yes_mid, drift)
+        no_edge = _edge(no_mid, -drift)
+
+        prices = sv.prices
+        btc_momentum = 0.0
+        if len(prices) >= 2 and prices[-1] > 0:
+            btc_momentum = (prices[-1] - prices[-2]) / prices[-2]
+        of_data = sv.orderflow
+        features = learning.extract_features(
+            yes_mid, btc_momentum,
+            volume=of_data.get("volume_24h"),
+            time_rem=market.get("time_remaining_seconds"),
+        )
+        contributing = {
+            "drift": drift, "yes_edge": yes_edge, "no_edge": no_edge,
+            "regime": regime.get("label"), "min_drift": min_drift,
+        }
+
+        # Eligibility per side: drift magnitude + lag + edge + not deep junk.
+        def _ok(signed_d: float, mid: float, edge: float) -> bool:
+            if abs(signed_d) < min_drift:
+                return False
+            if mid > max_mid or mid < min_mid:
+                return False
+            if abs(signed_d) >= ext_abs and mid > max_mid:
+                return False
+            return edge >= min_edge
+
+        yes_ok = drift >= min_drift and _ok(drift, yes_mid, yes_edge)
+        no_ok = (-drift) >= min_drift and _ok(-drift, no_mid, no_edge)
+
+        if yes_ok and (not no_ok or yes_edge >= no_edge):
+            side, side_mid, side_ask, side_edge = "yes", yes_mid, yes_ask, yes_edge
+            signed = drift
         elif no_ok:
-            side, confidence, side_edge = "no", no_conf, no_edge
-            reasoning_parts.append(f"{no_label}-NO zone ({no_price:.0%})")
+            side, side_mid, side_ask, side_edge = "no", no_mid, no_ask, no_edge
+            signed = -drift
         else:
             return strategy_decision(
                 "skip",
-                reasoning=(f"sniper: no snipe zone (yes={market_price:.2f} "
-                           f"no={no_price:.2f} mom={btc_momentum:+.4f})"),
-                signals=contributing, features=features)
+                reasoning=(
+                    f"sniper: no lag edge (drift={drift:+.3f} "
+                    f"yes_mid={yes_mid:.2f} eY={yes_edge:+.3f} "
+                    f"no_mid={no_mid:.2f} eN={no_edge:+.3f} "
+                    f"min_d={min_drift:.2f})"
+                ),
+                signals=contributing, features=features,
+            )
 
-        # --- Learned bias adjustment ---
-        prior = 0.50
-        learned_bias = learning.get_learned_bias(self.name, features, prior)
-        # Slight adjustment from learning (don't let it override data rules)
-        if side == "yes" and learned_bias < 0.35:
-            confidence *= 0.7  # reduce confidence if learning says NO
-        elif side == "no" and learned_bias > 0.65:
-            confidence *= 0.7
-
-        confidence = min(0.95, confidence)
-
-        # --- Minimum confidence gate ---
-        min_conf = p.get("min_confidence", 0.10)
-        if confidence < min_conf:
-            return strategy_decision(
-                "skip", side, confidence=confidence,
-                reasoning=f"sniper: conf {confidence:.2f} < {min_conf}",
-                signals=contributing, features=features)
-
-        # (Early-window boost REMOVED 2026-07-16: live data showed early-window
-        # entries were the arena's entire loss — 107 trades, 49% WR, -$79.53 —
-        # boosting confidence AND size exactly there was backwards. See BUG #24.)
-
-        # --- Late-window boost (smooth) ---
-        # BTC direction increasingly certain toward close: ramp from x1.0 at
-        # 90s remaining to full boost inside 30s (no hard step at 60s).
+        # Confidence from edge magnitude + drift conviction (no zone Gaussian).
+        confidence = min(0.95, max(0.0, side_edge) * 3.0 + 0.15 * abs(signed))
         time_rem = market.get("time_remaining_seconds")
         late = 0.0
         if time_rem is not None and time_rem > 0:
             late = smooth_ramp(-float(time_rem), -90.0, -30.0)
             if late > 0.05:
-                confidence = min(0.95, confidence * (1.0 + 0.30 * late))
-                reasoning_parts.append(f"late-window-boost(rem={time_rem:.0f}s)")
+                confidence = min(0.95, confidence * (1.0 + 0.25 * late))
 
-        # --- Position sizing ---
-        max_pos = config.get_max_position()
-        size_pct = p.get("position_size_pct", 0.08) * (1.0 + 0.2 * late)
-        amount = max_pos * size_pct * (0.5 + confidence)
-        amount = min(amount, max_pos)
+        min_conf = float(p.get("min_confidence", 0.10))
+        if confidence < min_conf:
+            return strategy_decision(
+                "skip", side, confidence=confidence,
+                reasoning=f"sniper: conf {confidence:.2f} < {min_conf}",
+                signals=contributing, features=features,
+            )
 
-        mom_str = f"mom={btc_momentum:+.4f}" if btc_momentum != 0 else "mom=flat"
-        reasoning_parts.append(mom_str)
-        reasoning_parts.append(f"=> {side} conf={confidence:.2f}")
+        # Fractional Kelly on fee-adjusted edge (shares-first), with portfolio
+        # + risk + regime mults — same stack as BaseBot.make_decision.
+        price = max(float(side_ask), 0.01)
+        try:
+            from bots.base_bot import (
+                _sizing_bankroll, _portfolio_weight, _risk_size_mult,
+                _kelly_fraction,
+            )
+            from arena.regime_adapt import size_multiplier as regime_mult
+            bankroll = (
+                _sizing_bankroll(self.trading_mode)
+                * _portfolio_weight(self.name)
+                * _risk_size_mult(self.name)
+                * regime_mult(regime.get("label"))
+            )
+            sizing_edge = min(max(0.0, side_edge),
+                              getattr(config, "KELLY_EDGE_CAP", 0.10))
+            kelly_f = sizing_edge / max(1.0 - price, 0.05)
+            kelly_usd = kelly_f * _kelly_fraction() * bankroll
+            target_shares = max(
+                kelly_usd / price, config.POLYMARKET_MIN_SHARES * 1.15)
+            target_shares = round(target_shares, 4)
+            amount = target_shares * price
+        except Exception:
+            max_pos = config.get_max_position()
+            pct = float(p.get("position_size_pct", 0.08)) * (1.0 + 0.2 * late)
+            amount = min(max_pos * pct * (0.5 + confidence), max_pos)
+            target_shares = None
 
-        # Expected executable price for the venue slippage band (BUG #28):
-        # the chosen side's warm best ask when available, else its mid.
-        if side == "yes":
-            entry = market.get("yes_ask") or market_price
-        else:
-            entry = market.get("no_ask") or no_price
-
-        return strategy_decision(
+        reasoning = (
+            f"sniper: drift={drift:+.3f} → {side} mid={side_mid:.2f} "
+            f"ask={side_ask:.2f} edge={side_edge:+.3f} "
+            f"implied={0.5 + 0.5 * signed:.2f} lag≤{max_mid:.2f} "
+            f"reg={regime.get('label', '?')} conf={confidence:.2f}"
+        )
+        out = strategy_decision(
             "buy", side,
             edge=side_edge,
             confidence=confidence,
-            reasoning="sniper: " + " ".join(reasoning_parts),
+            reasoning=reasoning,
             signals=contributing,
             suggested_amount=amount,
-            entry_price=round(float(entry), 4),
+            entry_price=round(float(side_ask), 4),
             features=features,
         )
+        if target_shares is not None:
+            out["target_shares"] = target_shares
+        return out

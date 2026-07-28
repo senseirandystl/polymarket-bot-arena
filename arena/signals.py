@@ -120,6 +120,7 @@ def build_combined_signals(
 
     # Robust multi-feature regime (online EMA + hysteresis + optional
     # centroids). Continuous: updates every tick, not only at resolution.
+    # Soft market_id stamp logs window rollovers without resetting state.
     market_regime: dict = {}
     try:
         from signals.regime_detector import get_detector
@@ -130,6 +131,10 @@ def build_combined_signals(
             vol_score=vol_base.get("vol_score"),
             trend_score=vol_base.get("trend_score"),
             realized_vol=vol_base.get("realized_vol"),
+            market_id=(
+                (market.get("id") or market.get("market_id"))
+                if market is not None else None
+            ),
         )
     except Exception as e:
         logger.debug(f"regime detector update failed: {e}")

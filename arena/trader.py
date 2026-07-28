@@ -173,7 +173,36 @@ class Trader(threading.Thread):
                 if signal.get("action") == "skip":
                     # Do NOT mark traded — re-evaluate next tick. Skip is a
                     # first-class outcome; tally it so runs are explainable.
-                    self._state.note_skip("no_edge")
+                    # Classify coarse reason from reasoning for skip-storm
+                    # diagnostics (dead-zone was historically the largest leak).
+                    why = (signal.get("reasoning") or "").lower()
+                    if "dead-zone" in why or "dead zone" in why:
+                        skip_bucket = "dead_zone"
+                    elif "macro-release" in why or "macro" in why:
+                        skip_bucket = "macro"
+                    elif "consensus" in why:
+                        skip_bucket = "consensus"
+                    elif "high-price" in why:
+                        skip_bucket = "high_price"
+                    elif "model lean" in why:
+                        skip_bucket = "weak_lean"
+                    elif "no edge" in why:
+                        skip_bucket = "no_edge"
+                    else:
+                        skip_bucket = "skip"
+                    self._state.note_skip(skip_bucket)
+                    # Counterfactual log (throttled): skips still carry lane
+                    # reads for offline fine-tuning. Hot path = queue only.
+                    try:
+                        from arena.decision_log import enqueue as _dec_enqueue
+                        _dec_enqueue(
+                            bot_name=bot.name,
+                            strategy_type=bot.strategy_type,
+                            market_id=market_id,
+                            signal=signal,
+                        )
+                    except Exception:
+                        pass
                     log_event(
                         logger, logging.DEBUG,
                         f"[{bot.name}] skip | {signal.get('reasoning', '')}",
@@ -188,6 +217,18 @@ class Trader(threading.Thread):
                 if result.get("success"):
                     self._state.mark_traded(key)  # one position per market
                     new_trades += 1
+                    try:
+                        from arena.decision_log import enqueue as _dec_enqueue
+                        _dec_enqueue(
+                            bot_name=bot.name,
+                            strategy_type=bot.strategy_type,
+                            market_id=market_id,
+                            signal=signal,
+                            trade_id=result.get("trade_id"),
+                            force=True,
+                        )
+                    except Exception:
+                        pass
                     log_event(
                         logger, logging.INFO,
                         f"[{bot.name}] {signal['side'].upper()} "
@@ -210,6 +251,18 @@ class Trader(threading.Thread):
                     if reason in slip_reasons:
                         self._state.mark_slippage_reject(key, slip_cd)
                         self._state.note_skip("slippage")
+                    # Live-mode fill anomalies: slippage rejects, venue errors,
+                    # naked arb legs — notify operators (debounced in alerts).
+                    if (getattr(bot, "trading_mode", "paper") or "paper") == "live":
+                        try:
+                            from arena.alerts import alert_live_fill
+                            alert_live_fill(
+                                bot.name, str(reason or "not_placed"),
+                                side=str(signal.get("side") or ""),
+                                market_id=str(market_id),
+                            )
+                        except Exception:
+                            pass
                     # Transient (no book / bankroll dry / cooldown) — don't mark
                     # traded; retry next eligible tick.
                     log_event(

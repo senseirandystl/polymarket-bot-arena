@@ -168,4 +168,23 @@ def ops_snapshot() -> dict[str, Any]:
     except Exception as e:
         out["sizing"] = {"error": str(e)}
 
+    # Live BTC (and ETH) from arena-written price_feed_status — no WS in dashboard.
+    try:
+        import json as _json
+        raw = db.get_arena_state("price_feed_status")
+        pf = _json.loads(raw) if raw else {}
+        syms = (pf or {}).get("symbols") or {}
+        btc = syms.get("btc") or {}
+        eth = syms.get("eth") or {}
+        out["prices"] = {
+            "btc": btc.get("latest"),
+            "btc_stale": bool(btc.get("stale") or pf.get("stale")),
+            "btc_age_sec": btc.get("age_sec"),
+            "eth": eth.get("latest"),
+            "eth_stale": bool(eth.get("stale")),
+            "ts": pf.get("ts"),
+        }
+    except Exception as e:
+        out["prices"] = {"error": str(e)}
+
     return out

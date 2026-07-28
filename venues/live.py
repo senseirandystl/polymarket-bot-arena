@@ -99,24 +99,73 @@ class LiveEngine:
             return TradeResult(success=False, reason="missing_token_id")
 
         neg_risk = bool(market.get("polymarket_neg_risk"))
-        result = polymarket_client.place_market_order(
-            token_id=token_id, side=side, amount=amount, neg_risk=neg_risk,
+        import config
+        use_limit = (
+            getattr(config, "ORDER_STYLE", "limit") == "limit"
+            and target_shares is None
         )
-        if not result.get("success"):
-            logger.error(f"[{bot_name}] LIVE order failed: {result.get('error')}")
-            return TradeResult(success=False, reason=result.get("error"))
+        if use_limit:
+            # Size in shares; price from caller limit or book-derived mode.
+            mid = (market.get("current_price") if side == "yes"
+                   else market.get("no_price"))
+            probe = book if book is not None else polymarket_markets.get_order_book(
+                book_side)
+            lim = limit_price
+            if lim is None:
+                lim = polymarket_fills.limit_buy_price(probe, mid=mid)
+            if lim is None or lim <= 0:
+                return TradeResult(success=False, reason="no_limit_price")
+            shares_req = (float(target_shares) if target_shares is not None
+                          else (float(amount or 0.0) / lim))
+            if shares_req < getattr(config, "POLYMARKET_MIN_SHARES", 5):
+                shares_req = float(getattr(config, "POLYMARKET_MIN_SHARES", 5))
+            result = polymarket_client.place_limit_order(
+                token_id=token_id,
+                side="buy",
+                size=shares_req,
+                price=float(lim),
+                order_type="GTC",
+                neg_risk=neg_risk,
+            )
+            if not result.get("success"):
+                logger.error(
+                    f"[{bot_name}] LIVE limit order failed: {result.get('error')}")
+                return TradeResult(success=False, reason=result.get("error"))
+            status = (result.get("status") or "").lower()
+            # Only book a position when the CLOB reports an immediate match.
+            # Resting orders need a fill watcher (future); do not invent PnL.
+            if status not in ("matched", "filled"):
+                logger.info(
+                    f"[{bot_name}] LIVE limit resting ({status}) "
+                    f"{shares_req:.2f}sh @ {lim:.3f} — not logged as fill"
+                )
+                return TradeResult(
+                    success=False, reason=f"limit_resting:{status or 'live'}")
+            price = float(result.get("price") or lim)
+            shares = float(result.get("size") or shares_req)
+            # Matched at our limit without walking asks → treat as maker.
+            is_maker = abs(price - float(lim)) <= 1e-6
+            fee = polymarket_fills.trading_fee(shares, price, is_maker=is_maker)
+            amount_out = shares * price
+        else:
+            result = polymarket_client.place_market_order(
+                token_id=token_id, side=side, amount=amount, neg_risk=neg_risk,
+            )
+            if not result.get("success"):
+                logger.error(
+                    f"[{bot_name}] LIVE order failed: {result.get('error')}")
+                return TradeResult(success=False, reason=result.get("error"))
+            price = float(result.get("price") or 0.0)
+            shares = float(result.get("size") or (amount / price if price else 0.0))
+            fee = polymarket_fills.taker_fee(shares, price)
+            amount_out = amount
 
-        price = float(result.get("price") or 0.0)
-        shares = float(result.get("size") or (amount / price if price else 0.0))
-        # Polymarket charges the taker fee on-chain; record our estimate so
-        # paper and live P&L are computed the same way.
-        fee = polymarket_fills.taker_fee(shares, price)
         row_id = db.log_trade(
             bot_name=bot_name,
             market_id=market_id,
             market_question=market.get("question"),
             side=side,
-            amount=amount,
+            amount=amount_out,
             venue="polymarket",
             mode=mode,
             confidence=confidence,
@@ -130,8 +179,9 @@ class LiveEngine:
             context=context,
         )
         logger.info(
-            f"[{bot_name}] LIVE fill: {side} ${amount:.2f} @ {price} "
-            f"({shares} sh) on {str(market.get('question', ''))[:40]}"
+            f"[{bot_name}] LIVE fill: {side} ${amount_out:.2f} @ {price} "
+            f"({shares} sh, fee ${fee:.3f}) on "
+            f"{str(market.get('question', ''))[:40]}"
         )
         return TradeResult(
             success=True, trade_id=str(row_id), fill_source="polymarket",

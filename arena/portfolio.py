@@ -620,6 +620,7 @@ def rebalance(
     hours = float(state.get("window_hours") or
                   getattr(config, "PORTFOLIO_WINDOW_HOURS", 24))
     overrides = state.get("manual_overrides") or {}
+    prev_weights = dict(state.get("weights") or {})
 
     # Regime-conditioning (Layer 3): when the toggle is on and the CURRENT
     # regime has been discovered + OOS-validated, fetch its per-bot shrunk
@@ -666,6 +667,14 @@ def rebalance(
         reason, method, len(names),
         {k: round(v, 3) for k, v in result["weights"].items()},
     )
+    try:
+        from arena.alerts import alert_portfolio_rebalance
+        alert_portfolio_rebalance(
+            reason, result["weights"], prev_weights,
+            method=str(result.get("method") or method),
+        )
+    except Exception:
+        pass
     return state
 
 

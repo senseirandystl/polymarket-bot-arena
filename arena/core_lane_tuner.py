@@ -63,12 +63,27 @@ def _strategy_map(conn) -> dict:
 
 def compute_core_attribution(conn, deadband: float, *,
                              cell_filter: tuple | None = None) -> dict:
-    """{strategy_type: {lane: {n, accuracy}}} from resolved directional trades.
+    """{strategy_type: {lane: {n, accuracy}}} from resolved decisions/trades.
 
-    When ``cell_filter`` is a context cell (6-tuple), only trades taken in that
-    regime are counted (regime-conditioned tuning). When None, behavior is the
-    global default — every resolved directional trade is counted, unchanged.
+    Prefers ``decision_events`` (buys + throttled skips with lane reads) when
+    enough rows are resolved — this is the closed-loop fine-tune on *all*
+    evaluations, not just fills. Falls back to trade reasoning parse when
+    the decision log is still cold. ``cell_filter`` only applies to the
+    trade-path fallback (context JSON); decision_events use strategy_type
+    global attribution for sample power.
     """
+    # Prefer decision_events once the soak has enough resolved decisions.
+    try:
+        from arena.decision_log import (
+            should_use_decision_attribution, core_lane_attribution,
+        )
+        if should_use_decision_attribution(conn) and cell_filter is None:
+            attr = core_lane_attribution(conn, deadband)
+            if attr:
+                return attr
+    except Exception:
+        pass
+
     smap = _strategy_map(conn)
     rows = conn.execute(
         """SELECT bot_name, side, outcome, reasoning, context FROM trades
@@ -109,6 +124,19 @@ def compute_core_attribution(conn, deadband: float, *,
         for lane, c in lanes.items():
             out[strat][lane] = {"n": c["n"],
                                 "accuracy": c["correct"] / c["n"] if c["n"] else None}
+    # Merge decision_events on top of thin trade samples when available
+    # (even under cell_filter: decisions are global, boost n).
+    try:
+        from arena.decision_log import core_lane_attribution, resolved_count
+        if resolved_count(conn) > 0:
+            dec = core_lane_attribution(conn, deadband)
+            for st, lanes in dec.items():
+                for lane, st_lane in lanes.items():
+                    prev = out.setdefault(st, {}).get(lane)
+                    if prev is None or (prev.get("n") or 0) < (st_lane.get("n") or 0):
+                        out.setdefault(st, {})[lane] = st_lane
+    except Exception:
+        pass
     return out
 
 
@@ -158,10 +186,30 @@ def tune() -> dict:
 
     with db.get_conn() as conn:
         attribution = compute_core_attribution(conn, deadband, cell_filter=cell_filter)
+        # Audit fix: fine-grained context cells often starve every
+        # (strategy, lane) below CORE_TUNE_MIN_TRADES, leaving lanes:{} empty
+        # while applied=true (soak 2026-07-27). Fall back to GLOBAL attribution
+        # when the cell has no strategy with a full sample on any core lane.
+        fallback = None
+        if cell_filter is not None:
+            enough = any(
+                (st.get("n") or 0) >= min_trades
+                for lanes in attribution.values()
+                for st in lanes.values()
+            )
+            if not enough:
+                attribution = compute_core_attribution(
+                    conn, deadband, cell_filter=None)
+                fallback = "global_insufficient_cell_samples"
+                logger.info(
+                    "Core-lane tuner: cell_filter %s starved samples — "
+                    "using global attribution", list(cell_filter),
+                )
 
     overrides = db.get_lane_overrides()
     report: dict = {"applied": apply,
                     "cell_filter": list(cell_filter) if cell_filter else None,
+                    "fallback": fallback,
                     "lanes": {}}
     new_overrides = dict(overrides)
     dirty = False
@@ -196,6 +244,15 @@ def tune() -> dict:
                     "current": cur, "suggested": new_w, "action": action,
                     "default": default,
                 }
+            elif st and st["n"]:
+                # Surface partial samples so the dashboard is not empty.
+                lane_report[strat] = {
+                    "n": st["n"],
+                    "accuracy": (round(st["accuracy"], 3)
+                                 if st.get("accuracy") is not None else None),
+                    "current": cur, "suggested": cur, "action": "collecting",
+                    "default": default,
+                }
             profile[strat] = new_w
         report["lanes"][lane] = lane_report
         if apply and changed:
@@ -205,7 +262,7 @@ def tune() -> dict:
             }
             dirty = True
             for strat, r in lane_report.items():
-                if r["action"] != "hold":
+                if r["action"] not in ("hold", "collecting"):
                     logger.info(
                         f"Core-lane tune: {strat}.{lane} {r['current']}->"
                         f"{r['suggested']} (acc {r['accuracy']:.1%}/{r['n']})"
@@ -213,6 +270,26 @@ def tune() -> dict:
 
     if apply and dirty:
         db.set_arena_state("lane_overrides", json.dumps(new_overrides))
+        # Notify operators of applied weight shifts (large moves only).
+        try:
+            changes = []
+            for lane, lane_report in (report.get("lanes") or {}).items():
+                for strat, r in (lane_report or {}).items():
+                    if r.get("action") in ("up", "down") and r.get(
+                            "current") != r.get("suggested"):
+                        changes.append({
+                            "lane": lane,
+                            "strategy": strat,
+                            "from": r.get("current"),
+                            "to": r.get("suggested"),
+                            "accuracy": r.get("accuracy"),
+                            "action": r.get("action"),
+                        })
+            if changes:
+                from arena.alerts import alert_core_lane_tune
+                alert_core_lane_tune(changes)
+        except Exception:
+            pass
 
     db.set_arena_state("core_lane_tuner", json.dumps(report))
     return report

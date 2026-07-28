@@ -370,6 +370,101 @@ def test_manual_pause_sticky(monkeypatch):
     assert raw["bots"]["x"]["status"] == "paused"
 
 
+def test_resume_sticky_overrides_auto_pause(monkeypatch):
+    """Resume must not be immediately undone by the same max-DD auto-pause."""
+    saved = {}
+    monkeypatch.setattr(risk_engine.db, "set_arena_state",
+                        lambda k, v: saved.__setitem__(k, v))
+    monkeypatch.setattr(risk_engine.db, "get_arena_state",
+                        lambda k, d=None: saved.get(k, d))
+    monkeypatch.setattr(risk_engine.db, "log_risk_event", lambda **kw: 1)
+    monkeypatch.setattr(risk_engine.db, "get_active_bots",
+                        lambda: [{"bot_name": "sniper-v1"}])
+    monkeypatch.setattr(config, "RISK_BOT_DAILY_LOSS", 9999.0)
+    monkeypatch.setattr(config, "RISK_PAPER_BOT_DAILY_LOSS", 9999.0)
+    monkeypatch.setattr(config, "RISK_PAPER_PORTFOLIO_DAILY_LOSS", 9999.0)
+    monkeypatch.setattr(config, "RISK_PORTFOLIO_DAILY_LOSS", 9999.0)
+    monkeypatch.setattr(config, "RISK_BOT_MAX_DRAWDOWN", 0.35)
+    monkeypatch.setattr(config, "RISK_PORTFOLIO_MAX_DRAWDOWN", 0.99)
+    monkeypatch.setattr(config, "RISK_UNDERPERFORM_PAUSE_PNL", -9999.0)
+    monkeypatch.setattr(config, "RISK_SIZE_REDUCE_MIN_MULT", 0.25)
+
+    # ~50% DD on $200 bankroll → auto-pause without resume override
+    series = [-20.0] * 5  # start 200 → equity 100, dd=50%
+    monkeypatch.setattr(risk_engine, "_capital_now", lambda: 100.0)
+    monkeypatch.setattr(risk_engine, "_bot_capital_weight", lambda _n: 0.05)
+    monkeypatch.setattr(
+        risk_engine, "_pnls_for_bots",
+        lambda names, hours=None, today_only=False, mode=None: {
+            "sniper-v1": [] if today_only else list(series),
+        },
+    )
+    monkeypatch.setattr(
+        risk_engine, "_portfolio_pnls",
+        lambda hours=None, today_only=False, mode=None: (
+            [] if today_only else list(series)),
+    )
+    monkeypatch.setattr(risk_engine, "_file_kill_armed", lambda: False)
+
+    state = risk_engine.evaluate(bot_names=["sniper-v1"], mode="paper")
+    assert state["bots"]["sniper-v1"]["status"] == "paused"
+    assert "bot_max_drawdown" in (state["bots"]["sniper-v1"]["reason"] or "")
+
+    entry = risk_engine.resume_bot("sniper-v1")
+    assert entry["status"] in ("active", "reduced")
+    assert entry.get("manual_resume") is True
+    assert entry["size_mult"] > 0.0
+    assert "manual_resume" in (entry.get("reason") or "")
+
+
+def test_bot_dd_uses_full_pool_not_portfolio_weight(monkeypatch):
+    """Regression: 5% weight micro-book must not invent 35%+ DD on tiny $ swings."""
+    saved = {}
+    monkeypatch.setattr(risk_engine.db, "set_arena_state",
+                        lambda k, v: saved.__setitem__(k, v))
+    monkeypatch.setattr(risk_engine.db, "get_arena_state",
+                        lambda k, d=None: saved.get(k, d))
+    monkeypatch.setattr(risk_engine.db, "log_risk_event", lambda **kw: 1)
+    monkeypatch.setattr(risk_engine.db, "get_active_bots",
+                        lambda: [{"bot_name": "sniper-v1"}])
+    monkeypatch.setattr(config, "RISK_BOT_DAILY_LOSS", 9999.0)
+    monkeypatch.setattr(config, "RISK_PAPER_BOT_DAILY_LOSS", 9999.0)
+    monkeypatch.setattr(config, "RISK_PAPER_PORTFOLIO_DAILY_LOSS", 9999.0)
+    monkeypatch.setattr(config, "RISK_PORTFOLIO_DAILY_LOSS", 9999.0)
+    monkeypatch.setattr(config, "RISK_BOT_MAX_DRAWDOWN", 0.35)
+    monkeypatch.setattr(config, "RISK_PORTFOLIO_MAX_DRAWDOWN", 0.99)
+    monkeypatch.setattr(config, "RISK_UNDERPERFORM_PAUSE_PNL", -9999.0)
+
+    # Live shape of the sniper false-pause: weight 5%, ~$7 giveback from peak
+    # after a run-up, window still net positive, daily ~−$0.50.
+    series = [2.0, 3.0, 4.0, 2.0, -1.0, -2.0, -2.5, -1.0, 0.5, -0.5]
+    assert len(series) >= 5
+    window_sum = sum(series)
+    capital_now = 200.0 + window_sum
+    monkeypatch.setattr(risk_engine, "_capital_now", lambda: capital_now)
+    monkeypatch.setattr(risk_engine, "_bot_capital_weight", lambda _n: 0.05)
+    monkeypatch.setattr(
+        risk_engine, "_pnls_for_bots",
+        lambda names, hours=None, today_only=False, mode=None: {
+            "sniper-v1": ([-0.53] if today_only else list(series)),
+        },
+    )
+    monkeypatch.setattr(
+        risk_engine, "_portfolio_pnls",
+        lambda hours=None, today_only=False, mode=None: (
+            [] if today_only else list(series)),
+    )
+    monkeypatch.setattr(risk_engine, "_file_kill_armed", lambda: False)
+
+    state = risk_engine.evaluate(bot_names=["sniper-v1"], mode="paper")
+    bot = state["bots"]["sniper-v1"]
+    # Against full pool (~$200), this path is a few % DD — not a pause.
+    assert bot["starting_equity"] == pytest.approx(200.0, abs=0.01)
+    assert bot["drawdown"] < 0.10
+    assert bot["status"] == "active"
+    assert bot["size_mult"] == pytest.approx(1.0)
+
+
 def test_legacy_daily_check_when_disabled(monkeypatch):
     state = {
         "enabled": False,

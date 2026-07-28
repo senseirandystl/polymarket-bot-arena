@@ -136,6 +136,43 @@ def test_record_outcome_updates_performance(monkeypatch):
     assert perf["high_vol_trend"]["pnl"] == pytest.approx(1.5)
 
 
+def test_market_rollover_soft_note_retains_state(monkeypatch, caplog):
+    """P2: window change logs a soft note; EMA/regime are NOT reset."""
+    import logging
+    det = reset_detector()
+    monkeypatch.setattr(det, "_persist", lambda force=False: None)
+    monkeypatch.setattr(det, "_ensure_loaded", lambda: None)
+
+    for _ in range(4):
+        det.update(_quiet_range(), cvd=0.0, obi=0.0,
+                   vol_score=0.15, trend_score=0.15, market_id="mkt-a")
+    snap_before = det.snapshot()
+    ema_before = dict(det._ema)
+    regime_before = snap_before["regime_id"]
+    ticks_before = snap_before["ticks"]
+
+    with caplog.at_level(logging.INFO, logger="signals.regime_detector"):
+        det.update(_quiet_range(), cvd=0.1, obi=0.0,
+                   vol_score=0.15, trend_score=0.15, market_id="mkt-b")
+
+    assert any("REGIME MARKET ROLLOVER" in r.message for r in caplog.records)
+    assert any("mkt-a -> mkt-b" in r.message for r in caplog.records)
+    snap_after = det.snapshot()
+    # Soft note only — continuous state retained (no partial reset).
+    assert snap_after["market_id"] == "mkt-b"
+    assert snap_after["ticks"] == ticks_before + 1
+    assert snap_after["regime_id"] == regime_before or snap_after["regime_id"] in REGIME_IDS
+    assert det._ema  # still populated
+    # Same quiet inputs → EMA should still be present for feature keys
+    for k in ema_before:
+        assert k in det._ema
+
+    # Same market again → no second rollover log
+    caplog.clear()
+    det.note_market("mkt-b")
+    assert not any("ROLLOVER" in r.message for r in caplog.records)
+
+
 # ---------------------------------------------------------------------------
 # Propagation: SignalView, BaseBot, Lab, meta-learner
 # ---------------------------------------------------------------------------
