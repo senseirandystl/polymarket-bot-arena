@@ -41,13 +41,17 @@ a{color:var(--grn)}
 /* ===== app shell ===== */
 .topbar{
   position:fixed; top:0; left:0; right:0; height:var(--top-h); z-index:50;
-  display:flex; align-items:center; gap:16px; padding:0 18px;
+  display:flex; align-items:center; justify-content:center; gap:16px; padding:0 18px;
   background:linear-gradient(180deg,rgba(8,20,13,.96),rgba(5,10,7,.92));
   backdrop-filter:blur(6px);
   border-bottom:1px solid var(--line);
   box-shadow:0 1px 0 rgba(0,255,156,.12), 0 8px 24px rgba(0,0,0,.5);
   transition:left .25s ease;
 }
+.topbar-center{
+  flex:1; min-width:0; display:flex; align-items:center; justify-content:center; gap:18px;
+}
+
 .hamburger{
   width:38px;height:34px;flex:0 0 auto;display:flex;flex-direction:column;justify-content:center;gap:5px;
   background:transparent;border:1px solid var(--line);border-radius:5px;cursor:pointer;padding:0 8px;
@@ -62,13 +66,13 @@ body.nav-open .hamburger span:nth-child(3){transform:translateY(-7px) rotate(-45
   body.nav-open .hamburger span:nth-child(2){opacity:1}
   body.nav-open .hamburger span:nth-child(3){transform:none}
 }
-.brand{display:flex;align-items:baseline;gap:8px;flex:0 0 auto;user-select:none}
-.brand .mark{color:var(--grn);font-weight:700;letter-spacing:.5px;text-shadow:var(--glow)}
+.brand{display:flex;align-items:center;justify-content:center;gap:8px;flex:0 0 auto;user-select:none}
+.brand .mark{color:var(--grn);font-weight:700;letter-spacing:.5px;text-shadow:var(--glow);white-space:nowrap}
 .brand .mark .slash{color:var(--dim)}
 .brand .sub{color:var(--dim);font-size:10px;letter-spacing:2px;text-transform:uppercase}
 
 /* live ticker in topbar */
-.ticker{display:flex;align-items:center;gap:10px;flex:1;overflow:hidden;min-width:0}
+.ticker{display:flex;align-items:center;justify-content:center;gap:10px;flex:1;overflow:hidden;min-width:0}
 .tick{
   display:flex;flex-direction:column;line-height:1.15;padding:0 12px;border-left:1px solid var(--line);
   white-space:nowrap;
@@ -79,13 +83,16 @@ body.nav-open .hamburger span:nth-child(3){transform:translateY(-7px) rotate(-45
 .tick .v.pos{color:var(--pos);text-shadow:0 0 8px rgba(53,255,135,.45)}
 .tick .v.neg{color:var(--neg);text-shadow:0 0 8px rgba(255,59,92,.4)}
 @media(max-width:1100px){.hide-sm{display:none}}
-@media(max-width:880px){.ticker{display:none}}
+@media(max-width:880px){
+  .ticker{display:none}
+  .brand .mark{font-size:12px;letter-spacing:.2px}
+}
 .dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px;vertical-align:1px}
 .dot.ok{background:var(--grn);box-shadow:var(--glow);animation:beat 2.4s ease-in-out infinite}
 .dot.warn{background:var(--amb);box-shadow:0 0 8px rgba(255,176,32,.6)}
 .dot.crit{background:var(--neg);box-shadow:0 0 8px rgba(255,59,92,.7);animation:beat 1s ease-in-out infinite}
 @keyframes beat{0%,100%{opacity:1}50%{opacity:.35}}
-.top-actions{display:flex;align-items:center;gap:10px;flex:0 0 auto}
+.top-actions{display:flex;align-items:center;gap:10px;flex:0 0 auto;margin-left:auto}
 
 /* mode badge (id=mode-btn) */
 .mode-badge{padding:6px 16px;border-radius:4px;font-weight:700;font-size:12px;letter-spacing:1px;cursor:pointer;border:1px solid transparent;font-family:inherit}
@@ -110,7 +117,7 @@ body.nav-open .hamburger span:nth-child(3){transform:translateY(-7px) rotate(-45
 }
 body.nav-open .sidebar{transform:none}
 .sidebar-head{padding:0 18px;height:var(--top-h);display:flex;align-items:center;gap:10px;border-bottom:1px solid var(--line);flex:0 0 auto}
-.sidebar-head .logo{color:var(--grn);font-weight:700;letter-spacing:1px;text-shadow:var(--glow)}
+.sidebar-head .logo{color:var(--grn);font-weight:700;letter-spacing:.5px;text-shadow:var(--glow);font-size:13px;line-height:1.2}
 .sidebar-head .logo .slash{color:var(--dim)}
 .nav-scroll{padding:14px 12px 24px;flex:1}
 .nav-group{margin-bottom:18px}
@@ -155,7 +162,7 @@ body.nav-open .sidebar{transform:none}
   /* sidebar already shows the wordmark when the drawer is open — drop the duplicate */
   body.nav-open .topbar .brand{display:none}
 }
-.container{max-width:1440px;margin:0 auto;padding:14px 18px 20px}
+.container{max-width:1280px;margin:0 auto;padding:14px 18px 20px}
 
 /* ===== cards / grids ===== */
 .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:10px;margin-bottom:12px}
@@ -165,20 +172,25 @@ body.nav-open .sidebar{transform:none}
 }
 .card::before{content:"";position:absolute;top:0;left:0;right:0;height:1px;
   background:linear-gradient(90deg,transparent,rgba(0,255,156,.35),transparent);opacity:.7}
-.card h2{font-size:11px;color:var(--grn);margin-bottom:8px;text-transform:uppercase;letter-spacing:.14em;font-weight:600}
+.card h2{font-size:11px;color:var(--grn);margin-bottom:8px;text-transform:uppercase;letter-spacing:.14em;font-weight:600;text-align:center}
 .card h2 span{color:var(--dim)}
 .card.dense{padding:10px 12px}
 .card.dense h2{margin-bottom:6px}
-.section-title{font-size:13px;color:var(--hi);margin:16px 0 8px;text-transform:uppercase;letter-spacing:.1em;
-  padding-left:12px;border-left:2px solid var(--grn);box-shadow:-1px 0 8px rgba(0,255,156,.3)}
-.stat-row{display:flex;justify-content:space-between;margin-bottom:8px}
+.section-title{font-size:13px;color:var(--hi);margin:16px auto 8px;text-transform:uppercase;letter-spacing:.1em;
+  text-align:center;padding:0 12px 6px;border-left:none;border-bottom:1px solid var(--line);
+  box-shadow:none;max-width:42rem}
+/* Center-weighted rows: label | value with gap, not sparse space-between */
+.stat-row{display:flex;justify-content:center;align-items:baseline;gap:14px;flex-wrap:wrap;margin-bottom:8px;text-align:center}
+.stat-row .stat-label{flex:0 1 auto}
+.stat-row .stat-value{flex:0 1 auto}
 
 /* Overview density helpers — Approach 2 command center */
 .ov-ribbon{
-  display:flex;flex-wrap:wrap;gap:8px;align-items:stretch;margin-bottom:10px
+  display:flex;flex-wrap:wrap;gap:8px;align-items:stretch;justify-content:center;margin-bottom:10px
 }
 .btc-chip{
-  flex:0 0 auto;min-width:148px;display:flex;flex-direction:column;justify-content:center;
+  flex:0 0 auto;min-width:148px;display:flex;flex-direction:column;justify-content:center;align-items:center;
+  text-align:center;
   background:linear-gradient(180deg,var(--panel),var(--panel2));border:1px solid var(--line);
   border-left:3px solid var(--amb);border-radius:6px;padding:8px 12px
 }
@@ -187,13 +199,13 @@ body.nav-open .sidebar{transform:none}
 .btc-chip .btc-sub{font-size:10px;color:var(--muted);margin-top:2px}
 .btc-chip.stale .btc-px{color:var(--amb)}
 .btc-chip.live .btc-px{color:var(--hi)}
-.ov-ribbon .ops-strip{flex:1;margin:0;min-width:0}
-.ov-ribbon .ops-chip{min-width:100px;padding:6px 10px}
+.ov-ribbon .ops-strip{flex:0 1 auto;margin:0;min-width:0;justify-content:center}
+.ov-ribbon .ops-chip{min-width:100px;padding:6px 10px;text-align:center}
 .ov-ribbon .ops-chip .val{font-size:14px}
 
-/* Main pulse: Performance | Market | Regime */
+/* Main pulse: Performance | Market | Regime — denser equal-ish columns */
 .ov-main-row{
-  display:grid;grid-template-columns:minmax(180px,.85fr) minmax(280px,1.4fr) minmax(180px,.85fr);
+  display:grid;grid-template-columns:minmax(200px,1fr) minmax(260px,1.25fr) minmax(200px,1fr);
   gap:10px;margin-bottom:10px;align-items:stretch
 }
 @media(max-width:1100px){.ov-main-row{grid-template-columns:1fr 1fr}}
@@ -212,11 +224,11 @@ body.nav-open .sidebar{transform:none}
 
 /* Compact risk band */
 .risk-port-chips{
-  display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px
+  display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px;justify-content:center
 }
 .risk-chip{
   background:var(--inset);border:1px solid var(--line);border-radius:4px;
-  padding:5px 10px;min-width:72px
+  padding:5px 10px;min-width:72px;text-align:center
 }
 .risk-chip .k{display:block;font-size:9px;letter-spacing:.1em;text-transform:uppercase;color:var(--dim);margin-bottom:1px}
 .risk-chip .v{font-size:13px;font-weight:700;color:var(--hi);font-variant-numeric:tabular-nums}
@@ -226,21 +238,33 @@ body.nav-open .sidebar{transform:none}
 }
 .risk-events-toggle:hover{color:var(--hi)}
 .next-mkt-pill{
-  display:inline-flex;align-items:center;gap:8px;flex-wrap:wrap;
+  display:flex;align-items:center;justify-content:center;gap:8px;flex-wrap:wrap;
   font-size:11px;color:var(--muted);padding:5px 8px;margin-top:6px;
   background:var(--inset);border:1px solid var(--line);border-radius:4px
 }
-.next-mkt-pill .dot-q{width:7px;height:7px;border-radius:50%;background:var(--amb);box-shadow:0 0 6px rgba(255,176,32,.5)}
+.next-mkt-pill .dot-q{width:7px;height:7px;border-radius:50%;background:var(--amb);box-shadow:0 0 6px rgba(255,176,32,.5);flex:0 0 auto}
 .next-mkt-pill.ready .dot-q{background:var(--grn);box-shadow:var(--glow)}
 .next-mkt-pill.missing .dot-q{background:var(--dim);box-shadow:none}
-.mkt-ptb{display:flex;flex-wrap:wrap;gap:10px;align-items:baseline;margin-top:5px;font-size:12px}
-.mkt-ptb .ptb-k{color:var(--dim);font-size:10px;letter-spacing:.08em;text-transform:uppercase;margin-right:4px}
-.mkt-ptb .ptb-v{color:var(--hi);font-weight:700;font-variant-numeric:tabular-nums}
-.mkt-ptb .ptb-delta{font-weight:700;font-variant-numeric:tabular-nums}
+.mkt-ptb{display:flex;flex-wrap:wrap;gap:10px 22px;align-items:baseline;justify-content:center;margin:6px 0 4px;font-size:12px;text-align:center}
+.mkt-ptb .ptb-item{display:inline-flex;align-items:baseline;gap:6px;flex-wrap:wrap;justify-content:center}
+.mkt-ptb .ptb-k{color:var(--dim);font-size:10px;letter-spacing:.08em;text-transform:uppercase}
+.mkt-ptb .ptb-v{color:var(--hi);font-weight:700;font-variant-numeric:tabular-nums;font-size:15px}
+.mkt-ptb .ptb-delta{font-weight:700;font-variant-numeric:tabular-nums;font-size:12px;margin-left:2px}
 .mkt-ptb .ptb-delta.pos{color:var(--pos)}
 .mkt-ptb .ptb-delta.neg{color:var(--neg)}
+.compact-table{width:100%;margin:0 auto}
 .compact-table td,.compact-table th{padding:4px 6px;font-size:12px}
-.compact-table th{padding:5px 6px}
+.compact-table th{padding:5px 6px;text-align:center}
+.compact-table td{text-align:center}
+.compact-table th:first-child,.compact-table td:first-child{text-align:left}
+.compact-table th:last-child,.compact-table td:last-child{text-align:right}
+/* Fully centered tables (Market Regime / Capital Allocation) */
+.compact-table.center-all th,
+.compact-table.center-all td,
+.compact-table.center-all th:first-child,
+.compact-table.center-all td:first-child,
+.compact-table.center-all th:last-child,
+.compact-table.center-all td:last-child{text-align:center}
 .inline-chips{display:flex;flex-wrap:wrap;gap:5px;align-items:center}
 .inline-chips .chip-btn{padding:3px 9px;font-size:11px;margin:0}
 .health-mini{font-size:11px;color:var(--muted);line-height:1.45}
@@ -255,13 +279,47 @@ body.nav-open .sidebar{transform:none}
 /* bots */
 .bot-card{border-left:2px solid var(--grn-soft)}
 .bot-card.top{border-left-color:var(--grn);box-shadow:inset 2px 0 22px rgba(0,255,156,.12)}
-.bot-name{font-size:15px;color:var(--grn);margin-bottom:4px;letter-spacing:.02em}
-.bot-meta{color:var(--muted);font-size:12px;margin-bottom:12px}
-.bot-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:4px}
+.bot-name{font-size:15px;color:var(--grn);margin-bottom:4px;letter-spacing:.02em;text-align:center}
+.bot-meta{color:var(--muted);font-size:12px;margin-bottom:12px;text-align:center}
+.bot-header{display:flex;justify-content:center;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:4px;text-align:center}
 .bot-balance{color:var(--muted);font-size:12px}
 .bot-mode-btn{padding:3px 10px;border-radius:4px;font-size:11px;font-weight:700;cursor:pointer;border:1px solid transparent;font-family:inherit}
 .bot-mode-paper{background:rgba(0,255,156,.08);color:var(--grn);border-color:var(--grn-soft)}
 .bot-mode-live{background:rgba(255,59,92,.12);color:var(--neg);border-color:var(--neg2)}
+
+/* Elite gene bank (bots tab) */
+.gene-bank-grid{
+  display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));
+  gap:10px;align-items:stretch
+}
+.gene-bank-card{
+  background:var(--inset);border:1px solid var(--line);border-radius:6px;
+  padding:10px 12px;border-left:3px solid var(--ylw);text-align:center
+}
+.gene-bank-card .gb-name{
+  color:var(--ylw);font-weight:700;font-size:13px;letter-spacing:.02em;margin-bottom:2px
+}
+.gene-bank-card .gb-meta{
+  color:var(--muted);font-size:11px;margin-bottom:8px
+}
+.gene-bank-card .gb-stats{
+  display:flex;flex-wrap:wrap;gap:6px 10px;justify-content:center;margin-bottom:8px;font-size:11px
+}
+.gene-bank-card .gb-stats span{white-space:nowrap}
+.gene-bank-card .gb-stats .k{color:var(--dim);margin-right:3px;text-transform:uppercase;font-size:9px;letter-spacing:.06em}
+.gene-bank-card .gb-params{
+  display:flex;flex-wrap:wrap;gap:4px;justify-content:center;max-height:88px;overflow-y:auto
+}
+.gene-bank-card .gb-chip{
+  background:rgba(0,255,156,.06);border:1px solid var(--line);border-radius:3px;
+  padding:2px 6px;font-size:10px;color:var(--text);font-variant-numeric:tabular-nums
+}
+.gene-bank-card .gb-chip .pk{color:var(--dim)}
+.gene-bank-card .gb-lineage{
+  margin-top:8px;font-size:10px;color:var(--dim);line-height:1.35;
+  overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical
+}
+.gene-bank-empty{color:var(--muted);font-size:12px;text-align:center;padding:16px 8px}
 
 /* trade lists */
 .trade-list{max-height:200px;overflow-y:auto}
@@ -324,21 +382,27 @@ tbody tr:hover{background:rgba(0,255,156,.035)}
 .health-rec.crit{border-left-color:var(--neg)}
 
 /* current / next market cards */
-.mkt-head{display:flex;justify-content:space-between;align-items:flex-start;gap:12px}
-.mkt-q{color:var(--text);font-size:13px;flex:1;line-height:1.35}
-.mkt-countdown{text-align:right;min-width:88px}
-.mkt-countdown .lbl{display:block;font-size:9px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:var(--dim);margin-bottom:1px}
-.mkt-countdown .val{font-size:22px;font-weight:700;font-family:var(--mono)}
+.mkt-head{display:flex;justify-content:space-between;align-items:center;gap:16px;flex-wrap:nowrap}
+.mkt-q{color:var(--text);font-size:13px;flex:1 1 auto;line-height:1.35;min-width:0;
+  display:flex;align-items:center;text-align:left}
+.mkt-countdown{flex:0 0 auto;min-width:100px;text-align:center}
+.mkt-countdown .lbl{display:block;font-size:9px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:var(--dim);margin-bottom:1px;text-align:center}
+.mkt-countdown .val{display:block;font-size:22px;font-weight:700;font-family:var(--mono);text-align:center}
 .mkt-countdown.urgent .val{color:var(--neg);text-shadow:0 0 10px rgba(255,59,92,.5)}
 .mkt-countdown.warning .val{color:var(--amb)}
 .mkt-countdown.normal .val{color:var(--grn);text-shadow:var(--glow-soft)}
-.mkt-price{color:var(--muted);font-size:13px;margin-top:4px;font-weight:600}
+.mkt-price{color:var(--muted);font-size:15px;margin-top:6px;font-weight:700;text-align:center;letter-spacing:.02em}
 .mkt-yes{color:var(--pos)}
 .mkt-no{color:var(--neg)}
 .mkt-trades{margin-top:8px;border-top:1px solid var(--line2);padding-top:6px;max-height:120px;overflow-y:auto}
-.mkt-trades-title{color:var(--dim);font-size:10px;text-transform:uppercase;letter-spacing:.06em;margin-bottom:4px}
-.mkt-trade{display:flex;justify-content:space-between;gap:8px;font-size:11px;padding:2px 0}
-.mkt-trade .who{color:var(--grn);min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.mkt-trades-title{color:var(--dim);font-size:10px;text-transform:uppercase;letter-spacing:.06em;margin-bottom:4px;text-align:center}
+.mkt-trade{display:flex;align-items:center;gap:8px;font-size:11px;padding:3px 0}
+.mkt-trade .who{color:var(--grn);min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:0 1 auto;text-align:left}
+.mkt-trade .mtm{flex:1 1 auto;font-weight:700;font-variant-numeric:tabular-nums;min-width:4.5rem;text-align:center}
+.mkt-trade .mtm.pos{color:var(--pos)}
+.mkt-trade .mtm.neg{color:var(--neg)}
+.mkt-trade .mtm.flat{color:var(--muted)}
+.mkt-empty{text-align:center}
 .mkt-empty{color:var(--dim);font-size:12px}
 
 /* legacy market rows */
@@ -439,7 +503,7 @@ tbody tr:hover{background:rgba(0,255,156,.035)}
 <!-- ===== Left drawer nav ===== -->
 <aside class="sidebar" id="sidebar">
     <div class="sidebar-head">
-        <span class="logo">PBA<span class="slash">//</span>ARENA</span>
+        <span class="logo">Polymarket Bot Arena</span>
     </div>
     <nav class="nav-scroll" id="nav-scroll">
         <div class="nav-group">
@@ -487,13 +551,15 @@ tbody tr:hover{background:rgba(0,255,156,.035)}
 <!-- ===== Top status ticker (hero) ===== -->
 <header class="topbar">
     <button class="hamburger" onclick="toggleNav()" aria-label="Toggle menu"><span></span><span></span><span></span></button>
-    <div class="brand"><span class="mark">PBA<span class="slash">//</span>ARENA</span><span class="sub hide-sm">Bot Arena</span></div>
-    <div class="ticker">
-        <div class="tick"><span class="k">Status</span><span class="v" id="tick-health"><span class="dot ok"></span>—</span></div>
-        <div class="tick"><span class="k">Net P&amp;L (Today)</span><span class="v" id="tick-pnl">—</span></div>
-        <div class="tick hide-sm"><span class="k">Pool</span><span class="v" id="tick-pool">—</span></div>
-        <div class="tick hide-sm"><span class="k">Regime</span><span class="v" id="tick-regime">—</span></div>
-        <div class="tick hide-sm"><span class="k">Arena Clock (ET)</span><span class="v" id="tick-clock">--:--:--</span></div>
+    <div class="topbar-center">
+        <div class="brand"><span class="mark">Polymarket Bot Arena</span></div>
+        <div class="ticker">
+            <div class="tick"><span class="k">Status</span><span class="v" id="tick-health"><span class="dot ok"></span>—</span></div>
+            <div class="tick"><span class="k">Net P&amp;L (Today)</span><span class="v" id="tick-pnl">—</span></div>
+            <div class="tick hide-sm"><span class="k">Pool</span><span class="v" id="tick-pool">—</span></div>
+            <div class="tick hide-sm"><span class="k">Regime</span><span class="v" id="tick-regime">—</span></div>
+            <div class="tick hide-sm"><span class="k">Arena Clock (ET)</span><span class="v" id="tick-clock">--:--:--</span></div>
+        </div>
     </div>
     <div class="top-actions">
         <span id="mode-text">Mode</span>
@@ -510,7 +576,7 @@ tbody tr:hover{background:rgba(0,255,156,.035)}
     <div class="tab-content" id="tab-overview">
         <!-- Ops ribbon: live BTC + system KPIs -->
         <div class="ov-ribbon">
-            <div class="btc-chip" id="btc-strip" title="Binance BTCUSDT via browser WebSocket">
+            <div class="btc-chip" id="btc-strip" title="Chainlink BTC/USD via Polymarket RTDS (same oracle as Price to Beat)">
                 <div class="btc-lbl">Bitcoin (live)</div>
                 <div class="btc-px" id="btc-price-val">—</div>
                 <div class="btc-sub" id="btc-price-sub">connecting…</div>
@@ -543,14 +609,37 @@ tbody tr:hover{background:rgba(0,255,156,.035)}
             </div>
             <div class="card dense" id="ov-regime-card" style="border-left:3px solid #22e6ff">
                 <h2>Market regime</h2>
-                <div id="ov-regime-summary" style="color:#5f9c78;font-size:12px;margin-bottom:4px">—</div>
-                <table id="ov-regime-features" class="compact-table"><thead><tr><th>Feature</th><th>Score</th></tr></thead><tbody></tbody></table>
+                <div id="ov-regime-summary" style="color:#5f9c78;font-size:12px;margin-bottom:4px;text-align:center">—</div>
+                <table id="ov-regime-features" class="compact-table center-all"><thead><tr><th>Feature</th><th>Score</th></tr></thead><tbody></tbody></table>
             </div>
         </div>
         <!-- Hidden body kept for pollers that still refresh next-market prices -->
         <div id="next-market-body" style="display:none" aria-hidden="true"></div>
 
-        <!-- Risk Engine (compact — limits on Settings) -->
+        <!-- Secondary context: Health | Signals | Allocation -->
+        <div class="ov-context-row">
+            <div class="card dense" id="health-card" style="border-left:3px solid #00ff9c">
+                <h2>Health</h2>
+                <div id="health-summary" class="health-mini" style="margin-bottom:4px">Loading…</div>
+                <div id="health-recs"></div>
+                <div id="health-restart" class="health-mini" style="margin-top:4px"></div>
+                <table id="health-checks-table" class="compact-table" style="margin-top:6px">
+                    <thead><tr><th>Check</th><th>Status</th><th>Detail</th></tr></thead>
+                    <tbody id="health-checks-tbody"><tr><td colspan="3" style="color:#3f6b52">—</td></tr></tbody>
+                </table>
+            </div>
+            <div class="card dense" id="ov-signals-card" style="border-left:3px solid #00ff9c">
+                <h2>Signal contributions <span style="font-weight:normal">6h |blend|</span></h2>
+                <div id="ov-signals-body" style="color:#5f9c78;font-size:11px">—</div>
+            </div>
+            <div class="card dense" id="ov-alloc-card" style="border-left:3px solid #35ff87">
+                <h2>Capital allocation</h2>
+                <div id="ov-alloc-summary" style="color:#5f9c78;font-size:12px;margin-bottom:4px;text-align:center">—</div>
+                <table id="ov-alloc-table" class="compact-table center-all"><thead><tr><th>Bot</th><th>Weight</th></tr></thead><tbody></tbody></table>
+            </div>
+        </div>
+
+        <!-- Risk Engine (below Health / Signals / Allocation) -->
         <div class="card dense" id="risk-card" style="border-left:3px solid #ffb020;margin-bottom:10px">
             <div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center;justify-content:space-between;margin-bottom:6px">
                 <div>
@@ -590,29 +679,6 @@ tbody tr:hover{background:rgba(0,255,156,.035)}
             </div>
             <div class="test-result" id="risk-result" style="margin-top:4px;font-size:11px"></div>
         </div>
-
-        <!-- Secondary context: Health | Signals | Allocation -->
-        <div class="ov-context-row">
-            <div class="card dense" id="health-card" style="border-left:3px solid #00ff9c">
-                <h2>Health</h2>
-                <div id="health-summary" class="health-mini" style="margin-bottom:4px">Loading…</div>
-                <div id="health-recs"></div>
-                <div id="health-restart" class="health-mini" style="margin-top:4px"></div>
-                <table id="health-checks-table" class="compact-table" style="margin-top:6px">
-                    <thead><tr><th>Check</th><th>Status</th><th>Detail</th></tr></thead>
-                    <tbody id="health-checks-tbody"><tr><td colspan="3" style="color:#3f6b52">—</td></tr></tbody>
-                </table>
-            </div>
-            <div class="card dense" id="ov-signals-card" style="border-left:3px solid #00ff9c">
-                <h2>Signal contributions <span style="font-weight:normal">6h |blend|</span></h2>
-                <div id="ov-signals-body" style="color:#5f9c78;font-size:11px">—</div>
-            </div>
-            <div class="card dense" id="ov-alloc-card" style="border-left:3px solid #35ff87">
-                <h2>Capital allocation</h2>
-                <div id="ov-alloc-summary" style="color:#5f9c78;font-size:12px;margin-bottom:4px">—</div>
-                <table id="ov-alloc-table" class="compact-table"><thead><tr><th>Bot</th><th>Weight</th></tr></thead><tbody></tbody></table>
-            </div>
-        </div>
     </div>
 
     <!-- ===== BOTS TAB ===== -->
@@ -637,6 +703,15 @@ tbody tr:hover{background:rgba(0,255,156,.035)}
                 <tbody></tbody>
             </table>
         </div>
+
+        <div class="section-title">Elite Gene Bank</div>
+        <div class="card" id="gene-bank-card" style="margin-bottom:14px;border-left:3px solid #ffe23f">
+            <div id="gene-bank-summary" style="color:#5f9c78;font-size:12px;margin-bottom:10px;text-align:center">
+                Shadow elites saved each GA cycle as future parents — not removed from the live roster.
+            </div>
+            <div id="gene-bank-grid" class="gene-bank-grid"></div>
+        </div>
+
         <div class="section-title">Evolution History</div>
         <div class="card" id="evolution-card">
             <div style="color:#5f9c78;font-size:12px;margin-bottom:10px">
@@ -1188,6 +1263,54 @@ function renderTradePnl(t) {
     return '<span class="' + pnlClass(t.pnl) + '">' + fmtPnl(t.pnl) + '</span>';
 }
 
+/** Display label for a trade side (internal yes/no → UP/DOWN). */
+function formatSide(side) {
+    const s = String(side || '').toLowerCase();
+    if (s === 'yes' || s === 'up') return 'UP';
+    if (s === 'no' || s === 'down') return 'DOWN';
+    return String(side || '').toUpperCase();
+}
+
+/** Mark-to-market vs entry for an open trade (USD). null if not computable. */
+function tradeUnrealizedUsd(t, yesPx, noPx) {
+    if (t == null || t.pnl != null) return null;  // resolved — use pnl
+    if (t.outcome === 'expired') return null;
+    const entry = t.entry_price != null ? Number(t.entry_price) : null;
+    if (entry == null || !(entry > 0) || !(entry < 1)) return null;
+    const side = String(t.side || '').toUpperCase();
+    let cur = null;
+    if (side === 'YES' || side === 'UP') cur = yesPx;
+    else if (side === 'NO' || side === 'DOWN') cur = noPx;
+    if (cur == null || !(cur >= 0) || !(cur <= 1)) return null;
+    let shares = t.shares_bought != null ? Number(t.shares_bought) : null;
+    if (shares == null || !(shares > 0)) {
+        const amt = t.amount != null ? Number(t.amount) : null;
+        if (amt == null || !(amt > 0)) return null;
+        shares = amt / entry;
+    }
+    return shares * (cur - entry);
+}
+
+/** Right-side P&L chip for Current Market trade rows: resolved pnl or live MTM. */
+function renderMarketTradeMtm(t, yesPx, noPx) {
+    if (t.outcome === 'expired') {
+        return '<span class="mtm flat" title="Legacy unsettled row">—</span>';
+    }
+    if (t.pnl != null) {
+        const p = Number(t.pnl);
+        const cls = p > 0 ? 'pos' : (p < 0 ? 'neg' : 'flat');
+        const sign = p > 0 ? '+' : (p < 0 ? '−' : '');
+        return `<span class="mtm ${cls}" title="Resolved P&amp;L">${sign}$${Math.abs(p).toFixed(2)}</span>`;
+    }
+    const u = tradeUnrealizedUsd(t, yesPx, noPx);
+    if (u == null) {
+        return '<span class="mtm flat" title="Awaiting mark">…</span>';
+    }
+    const cls = u > 0.005 ? 'pos' : (u < -0.005 ? 'neg' : 'flat');
+    const sign = u > 0 ? '+' : (u < 0 ? '−' : '');
+    return `<span class="mtm ${cls}" title="Mark-to-market vs entry">${sign}$${Math.abs(u).toFixed(2)}</span>`;
+}
+
 // ---------- Nav / tabs ----------
 function switchTab(name) {
     document.querySelectorAll('.tab-content').forEach(el => el.classList.add('hidden'));
@@ -1421,7 +1544,7 @@ function updateOps(ops) {
     _setOpsChip('ops-size', 'info',
         sz.paper_available != null ? ('$' + Number(sz.paper_available).toFixed(0)) : '—',
         sz.kelly_fraction != null ? ('Kelly ' + Number(sz.kelly_fraction).toFixed(2)) : '—');
-    // Arena SQLite feed is a fallback only when the browser Binance WS is down.
+    // Arena SQLite feed is a fallback only when the browser Chainlink RTDS is down.
     if (ops.prices && !_btcWsLive) {
         updateBtcPrice(ops.prices.btc, ops.prices.btc_stale, 'arena');
     }
@@ -1445,7 +1568,7 @@ function updateOps(ops) {
                     <span style="color:#5f9c78;width:32px;text-align:right">n=${l.n}</span>
                 </div>`;
             }).join('') +
-            `<div style="margin-top:4px;color:#5f9c78;font-size:10px">${sig.trades_with_blend || 0}/${sig.trades_scanned || 0} trades · last ${sig.hours || 6}h · green=YES lean, red=NO lean (signed mean)</div>`;
+            `<div style="margin-top:4px;color:#5f9c78;font-size:10px">${sig.trades_with_blend || 0}/${sig.trades_scanned || 0} trades · last ${sig.hours || 6}h · green=UP lean, red=DOWN lean (signed mean)</div>`;
         }
     }
 }
@@ -2330,7 +2453,7 @@ function updateBots(bots) {
             <div class="stat-row"><span class="stat-label">Trades (${statsLabel})</span><span class="stat-value">${p12.total_trades || 0}${pending ? ' <span style="color:#ffb020">+' + pending + ' pending</span>' : ''}</span></div>
             <div class="trade-list">${trades.slice(0, 5).map(t => `
                 <div class="trade-item">
-                    <span>${t.side} ${(t.market_question || '').slice(0, 30)}</span>
+                    <span>${formatSide(t.side)} ${(t.market_question || '').slice(0, 30)}</span>
                     ${renderTradePnl(t)}
                 </div>
             `).join('')}</div>
@@ -2469,9 +2592,78 @@ function updateRegimeMap(map) {
     }).join('');
 }
 
+function _fmtGeneParam(v) {
+    if (v == null) return '—';
+    if (typeof v === 'number') {
+        if (!Number.isFinite(v)) return String(v);
+        if (Number.isInteger(v)) return String(v);
+        const a = Math.abs(v);
+        if (a > 0 && a < 0.001) return v.toExponential(2);
+        return Number(v.toPrecision(4)).toString();
+    }
+    if (typeof v === 'boolean') return v ? 'true' : 'false';
+    return String(v);
+}
+
+function updateGeneBank(ga) {
+    const grid = document.getElementById('gene-bank-grid');
+    const summary = document.getElementById('gene-bank-summary');
+    if (!grid) return;
+    const bank = (ga && ga.gene_bank) || {};
+    const entries = bank.entries || [];
+    const maxSz = bank.max_size != null ? bank.max_size
+        : ((ga && ga.config && ga.config.gene_bank_size) || 20);
+    const count = bank.count != null ? bank.count : entries.length;
+
+    if (summary) {
+        summary.innerHTML = count
+            ? `<b>${count}</b> / ${maxSz} elite genomes · newest first · used as GA parents without leaving the live roster`
+            : `Empty (0 / ${maxSz}) · elites are deposited here each GA cycle and reused as future parents`;
+    }
+
+    if (!entries.length) {
+        grid.innerHTML = '<div class="gene-bank-empty">No elites in the gene bank yet — they appear after the first GA cycle scores a survivor.</div>';
+        return;
+    }
+
+    grid.innerHTML = entries.map(e => {
+        const name = e.name || 'elite';
+        const stype = e.strategy_type || '—';
+        const gen = e.generation != null ? e.generation : '—';
+        const cyc = e.cycle != null ? e.cycle : '—';
+        const fit = e.fitness != null ? Number(e.fitness).toFixed(3) : '—';
+        const pnl = e.pnl != null ? fmtPnl(e.pnl) : '—';
+        const wr = e.win_rate != null ? (Number(e.win_rate) * 100).toFixed(0) + '%' : '—';
+        const n = e.trades != null ? e.trades : '—';
+        const params = e.params && typeof e.params === 'object' ? e.params : {};
+        const keys = Object.keys(params).sort();
+        const chips = keys.length
+            ? keys.map(k =>
+                `<span class="gb-chip"><span class="pk">${k}</span> ${_fmtGeneParam(params[k])}</span>`
+            ).join('')
+            : '<span class="neutral" style="font-size:10px">no params</span>';
+        const lineage = e.lineage
+            ? `<div class="gb-lineage" title="${String(e.lineage).replace(/"/g, '&quot;')}">${e.lineage}</div>`
+            : '';
+        return `<div class="gene-bank-card">
+            <div class="gb-name">${name}</div>
+            <div class="gb-meta">${stype} · gen ${gen} · cycle #${cyc}</div>
+            <div class="gb-stats">
+                <span><span class="k">Fit</span><b>${fit}</b></span>
+                <span><span class="k">P&amp;L</span><b class="${pnlClass(e.pnl)}">${pnl}</b></span>
+                <span><span class="k">WR</span><b>${wr}</b></span>
+                <span><span class="k">N</span><b>${n}</b></span>
+            </div>
+            <div class="gb-params">${chips}</div>
+            ${lineage}
+        </div>`;
+    }).join('');
+}
+
 function updateGA(ga) {
     const summary = document.getElementById('ga-status-summary');
     const fitBody = document.querySelector('#ga-fitness-table tbody');
+    updateGeneBank(ga);
     if (!summary || !fitBody) return;
     if (!ga) {
         summary.textContent = 'No GA data';
@@ -2481,10 +2673,12 @@ function updateGA(ga) {
     const st = ga.status || {};
     const last = st.last_cycle;
     const cfg = ga.config || {};
+    const bankN = (ga.gene_bank && ga.gene_bank.count != null)
+        ? ga.gene_bank.count : ((ga.gene_bank && ga.gene_bank.entries) || []).length;
     if (last) {
-        summary.innerHTML = `Cycle <b>#${last.cycle}</b> · best fit <b>${Number(last.best_fitness || 0).toFixed(3)}</b> · mean <b>${Number(last.mean_fitness || 0).toFixed(3)}</b> · elites: ${(last.elites || []).join(', ') || '—'} · replaced: ${(last.replaced || []).length}${last.skipped ? ' · <span class="neutral">(skipped: ' + (last.reason || '') + ')</span>' : ''} · interval ${cfg.interval_hours || '?'}h / window ${cfg.window_hours || '?'}h`;
+        summary.innerHTML = `Cycle <b>#${last.cycle}</b> · best fit <b>${Number(last.best_fitness || 0).toFixed(3)}</b> · mean <b>${Number(last.mean_fitness || 0).toFixed(3)}</b> · elites: ${(last.elites || []).join(', ') || '—'} · replaced: ${(last.replaced || []).length}${last.skipped ? ' · <span class="neutral">(skipped: ' + (last.reason || '') + ')</span>' : ''} · gene bank <b>${bankN}</b> · interval ${cfg.interval_hours || '?'}h / window ${cfg.window_hours || '?'}h`;
     } else {
-        summary.textContent = `No GA cycles yet · elite=${cfg.elite_count ?? 1} mut=${cfg.mutation_rate ?? '—'} σ=${cfg.mutation_sigma ?? '—'} · interval ${cfg.interval_hours || '?'}h`;
+        summary.textContent = `No GA cycles yet · elite=${cfg.elite_count ?? 1} mut=${cfg.mutation_rate ?? '—'} σ=${cfg.mutation_sigma ?? '—'} · gene bank ${bankN} · interval ${cfg.interval_hours || '?'}h`;
     }
     // Sparkline from fitness history
     const hist = st.fitness_history || [];
@@ -2532,7 +2726,7 @@ function updateTrades(trades) {
         <tr>
             <td>${t.bot_name}</td>
             <td>${(t.market_question || '').slice(0, 40)}</td>
-            <td>${t.side}</td>
+            <td>${formatSide(t.side)}</td>
             <td>$${(t.amount || 0).toFixed(2)}</td>
             <td>${renderTradePnl(t)}</td>
             <td>${formatEtTime(t.created_at)}</td>
@@ -2596,8 +2790,8 @@ function updateEarnings(data) {
 }
 
 let activeMarkets = { current: null, next: null };
-// Fresh YES/NO prices keyed by market id (updated by the 1s/10s pollers). Keeping
-// prices out of the market objects avoids stale-reference races on re-fetch.
+// Fresh UP/DOWN (yes/no token) prices keyed by market id (1s/10s pollers).
+// Kept out of market objects to avoid stale-reference races on re-fetch.
 let livePrices = {};
 let liveBtcPrice = null;
 let liveBtcStrike = null;  // last strike used for vs-BTC delta (from market card)
@@ -2612,8 +2806,8 @@ function _fmtUsd(n) {
 }
 
 /**
- * Update live BTC display (header chip + Current Market BTC now / vs BTC).
- * source: 'ws' (browser Binance) | 'arena' (SQLite fallback) | other.
+ * Update live BTC display (header chip + Current Market BTC now / delta).
+ * source: 'ws' (Polymarket RTDS Chainlink) | 'arena' (SQLite Chainlink feed) | other.
  */
 function updateBtcPrice(price, stale, source) {
     const strip = document.getElementById('btc-strip');
@@ -2633,22 +2827,22 @@ function updateBtcPrice(price, stale, source) {
             val.textContent = _fmtUsd(liveBtcPrice);
             if (strip) {
                 strip.classList.toggle('stale', !!stale);
-                strip.classList.toggle('live', source === 'ws' && !stale);
+                strip.classList.toggle('live', (source === 'ws' || source === 'arena') && !stale);
             }
             if (sub) {
-                if (stale) sub.textContent = 'feed stale / delayed';
-                else if (source === 'ws') sub.textContent = 'Binance · live tick';
-                else if (source === 'arena') sub.textContent = 'Binance · arena feed';
-                else sub.textContent = 'Binance BTCUSDT';
+                if (stale) sub.textContent = 'Chainlink feed stale / delayed';
+                else if (source === 'ws') sub.textContent = 'Chainlink · RTDS';
+                else if (source === 'arena') sub.textContent = 'Chainlink · arena';
+                else sub.textContent = 'Chainlink BTC/USD';
             }
             _patchMarketBtcDeltas();
         }
     } else if (sub && !liveBtcPrice) {
-        sub.textContent = 'waiting for feed…';
+        sub.textContent = 'waiting for Chainlink…';
     }
 }
 
-/** Patch BTC now / vs strike without re-rendering the whole market card. */
+/** Patch BTC now / strike delta without re-rendering the whole market card. */
 function _patchMarketBtcDeltas() {
     const btc = liveBtcPrice;
     const nowEl = document.getElementById('mkt-btc-now');
@@ -2658,56 +2852,88 @@ function _patchMarketBtcDeltas() {
     const strike = liveBtcStrike != null ? liveBtcStrike
         : (activeMarkets.current && activeMarkets.current.strike != null
             ? Number(activeMarkets.current.strike) : null);
-    if (strike == null || !(strike > 0) || btc == null || !(btc > 0)) return;
+    if (strike == null || !(strike > 0) || btc == null || !(btc > 0)) {
+        dEl.textContent = '';
+        return;
+    }
     const d = btc - strike;
     const sign = d >= 0 ? '+' : '';
     const pct = ((d / strike) * 100).toFixed(3);
     dEl.className = 'ptb-delta ' + (d >= 0 ? 'pos' : 'neg');
-    dEl.textContent = `${sign}${_fmtUsd(d)} (${sign}${pct}%)`;
+    // Parenthetical after BTC now: (+$59.73 +0.094%)
+    dEl.textContent = `(${sign}${_fmtUsd(d)} ${sign}${pct}%)`;
 }
 
 /**
- * Browser-side Binance trade stream — same spot venue as arena price_feed,
- * without SQLite publish lag. True last-trade ticks (UI throttled ~5 Hz).
- * Falls back to arena SQLite when WS is down.
+ * Browser-side Polymarket RTDS Chainlink BTC/USD — same oracle as Price to Beat
+ * and market resolution. Never Binance (basis ~$60–80 vs Polymarket UI).
+ * Falls back to arena SQLite (also Chainlink) when the socket is down.
  */
-function startBinanceBtcFeed() {
+function startChainlinkBtcFeed() {
     if (_btcWs) {
         try { _btcWs.close(); } catch (e) { /* ignore */ }
         _btcWs = null;
     }
-    // @trade = last sale; denser than 1m kline and matches "vs strike" intuition.
-    const url = 'wss://stream.binance.com:9443/ws/btcusdt@trade';
+    const url = 'wss://ws-live-data.polymarket.com';
+    let pingTimer = null;
     try {
         const ws = new WebSocket(url);
         _btcWs = ws;
+        const clearPing = () => {
+            if (pingTimer) { clearInterval(pingTimer); pingTimer = null; }
+        };
         ws.onopen = () => {
             _btcWsLive = true;
             _btcWsRetry = 0;
             const sub = document.getElementById('btc-price-sub');
-            if (sub && !liveBtcPrice) sub.textContent = 'Binance · connected';
+            if (sub && !liveBtcPrice) sub.textContent = 'Chainlink · connected';
+            // Same subscription Polymarket's UI / arena price_feed use.
+            ws.send(JSON.stringify({
+                action: 'subscribe',
+                subscriptions: [{
+                    topic: 'crypto_prices_chainlink',
+                    type: '*',
+                    filters: JSON.stringify({ symbol: 'btc/usd' }),
+                }],
+            }));
+            // RTDS application heartbeat
+            clearPing();
+            pingTimer = setInterval(() => {
+                try { if (ws.readyState === 1) ws.send('PING'); } catch (e) { /* ignore */ }
+            }, 5000);
         };
         ws.onmessage = (ev) => {
+            if (ev.data === 'PONG' || ev.data === 'pong' || !ev.data) return;
             try {
                 const msg = JSON.parse(ev.data);
-                // trade: {p: price} · also accept combined-stream envelope
-                const t = msg.data || msg;
-                const px = parseFloat(t.p != null ? t.p : (t.c != null ? t.c : NaN));
-                if (px > 0) updateBtcPrice(px, false, 'ws');
+                const p = msg.payload || {};
+                // Snapshot: ~60s of 1Hz history — use last point as live price
+                if (Array.isArray(p.data) && p.data.length) {
+                    const last = p.data[p.data.length - 1];
+                    const px = parseFloat(last && last.value);
+                    if (px > 0) updateBtcPrice(px, false, 'ws');
+                    return;
+                }
+                // Live update frame
+                if (p.value != null) {
+                    const px = parseFloat(p.value);
+                    if (px > 0) updateBtcPrice(px, false, 'ws');
+                }
             } catch (e) { /* bad frame */ }
         };
         ws.onerror = () => { /* onclose handles retry */ };
         ws.onclose = () => {
+            clearPing();
             _btcWsLive = false;
             _btcWs = null;
             const sub = document.getElementById('btc-price-sub');
-            if (sub) sub.textContent = 'Binance WS reconnecting…';
+            if (sub) sub.textContent = 'Chainlink RTDS reconnecting…';
             const delay = Math.min(30000, 1000 * Math.pow(1.6, _btcWsRetry++));
-            setTimeout(startBinanceBtcFeed, delay);
+            setTimeout(startChainlinkBtcFeed, delay);
         };
     } catch (e) {
         _btcWsLive = false;
-        setTimeout(startBinanceBtcFeed, 5000);
+        setTimeout(startChainlinkBtcFeed, 5000);
     }
 }
 
@@ -2717,27 +2943,13 @@ function renderNextMarketPill(market) {
     if (!pill || !text) return;
     if (!market || !market.id) {
         pill.className = 'next-mkt-pill missing';
-        text.textContent = 'Next market: not queued yet';
+        text.textContent = 'Next market: searching…';
         return;
     }
-    let endMs = null;
-    if (market.resolves_at) {
-        const s = String(market.resolves_at).replace(' ', 'T').replace(/([^Z])$/, '$1Z');
-        endMs = new Date(s).getTime();
-    }
-    let secLeft = endMs !== null ? Math.floor((endMs - Date.now()) / 1000) : null;
-    let opensIn = '';
-    if (secLeft !== null && secLeft > 300) {
-        const o = secLeft - 300;
-        const m = Math.floor(o / 60), s2 = o % 60;
-        opensIn = ` · opens in ${m}:${s2.toString().padStart(2, '0')}`;
-    } else if (secLeft !== null && secLeft > 0) {
-        opensIn = ' · window open soon';
-    }
     const shortId = String(market.id).slice(0, 10) + '…';
-    const shortQ = (market.question || '').replace('Bitcoin Up or Down - ', '').slice(0, 36);
+    const shortQ = (market.question || '').replace('Bitcoin Up or Down - ', '').slice(0, 42);
     pill.className = 'next-mkt-pill ready';
-    text.innerHTML = `Next queued <b style="color:var(--hi)">${shortQ || shortId}</b>${opensIn}`;
+    text.innerHTML = `Next <b style="color:var(--hi)">${shortQ || shortId}</b>`;
 }
 
 function renderMarketCard(market, bodyId, kind) {
@@ -2772,8 +2984,8 @@ function renderMarketCard(market, bodyId, kind) {
         }
     }
 
-    // Prices shown in cents like Polymarket (YES + NO). Read from the livePrices
-    // map (keyed by market id, updated by the 1s poller) so a stale market-object
+    // Prices shown in cents like Polymarket (UP + DOWN). Read from livePrices
+    // (keyed by market id, updated by the 1s poller) so a stale market-object
     // reference from an in-flight re-fetch can't render the wrong window's price.
     const lp = livePrices[market.id] || {};
     const yes = lp.yes != null ? lp.yes : market.current_price;
@@ -2781,11 +2993,11 @@ function renderMarketCard(market, bodyId, kind) {
     const yesC = yes != null ? Math.round(yes * 100) : null;
     const noC = no != null ? Math.round(no * 100) : (yesC != null ? 100 - yesC : null);
     const priceHtml = yesC != null
-        ? `<span class="mkt-yes">YES ${yesC}&cent;</span> &nbsp; <span class="mkt-no">NO ${noC}&cent;</span>`
+        ? `<span class="mkt-yes">UP ${yesC}&cent;</span> &nbsp; <span class="mkt-no">DOWN ${noC}&cent;</span>`
         : '-';
 
-    // Price-to-beat (strike) + delta vs live BTC — current market only.
-    // IDs mkt-btc-now / mkt-btc-delta are patched every Binance WS tick.
+    // Price-to-beat (strike) + BTC now with parenthetical delta — current only.
+    // IDs mkt-btc-now / mkt-btc-delta are patched every Chainlink RTDS tick.
     let ptbHtml = '';
     if (kind === 'current') {
         const strike = market.strike != null ? Number(market.strike) : null;
@@ -2798,38 +3010,37 @@ function renderMarketCard(market, bodyId, kind) {
                 const dCls = d >= 0 ? 'pos' : 'neg';
                 const sign = d >= 0 ? '+' : '';
                 const pct = ((d / strike) * 100).toFixed(3);
-                deltaHtml = `<span><span class="ptb-k">vs BTC</span><span class="ptb-delta ${dCls}" id="mkt-btc-delta">${sign}${_fmtUsd(d)} (${sign}${pct}%)</span></span>`;
+                deltaHtml = `<span class="ptb-delta ${dCls}" id="mkt-btc-delta">(${sign}${_fmtUsd(d)} ${sign}${pct}%)</span>`;
             } else {
-                deltaHtml = `<span><span class="ptb-k">vs BTC</span><span class="ptb-delta" id="mkt-btc-delta">—</span></span>`;
+                deltaHtml = `<span class="ptb-delta" id="mkt-btc-delta"></span>`;
             }
             ptbHtml = `<div class="mkt-ptb">
-                <span><span class="ptb-k">Price to beat</span><span class="ptb-v">${_fmtUsd(strike)}</span></span>
-                <span><span class="ptb-k">BTC now</span><span class="ptb-v" id="mkt-btc-now">${btc != null ? _fmtUsd(btc) : '—'}</span></span>
-                ${deltaHtml}
+                <span class="ptb-item"><span class="ptb-k">Price to beat</span><span class="ptb-v">${_fmtUsd(strike)}</span></span>
+                <span class="ptb-item"><span class="ptb-k">BTC now</span><span class="ptb-v" id="mkt-btc-now">${btc != null ? _fmtUsd(btc) : '—'}</span>${deltaHtml}</span>
             </div>`;
         } else {
-            ptbHtml = `<div class="mkt-ptb"><span class="ptb-k">Price to beat</span><span class="neutral">fetching…</span></div>`;
+            ptbHtml = `<div class="mkt-ptb"><span class="ptb-item"><span class="ptb-k">Price to beat</span><span class="neutral">fetching…</span></span></div>`;
         }
     }
 
     const trades = market.trades || [];
     const tradeRows = trades.length
         ? trades.map(t => {
-            const side = (t.side || '').toUpperCase();
+            const side = formatSide(t.side);
             // Prefer "<shares> @ <entryPrice¢>" (e.g. "5 @ 56.0"); fall back to
             // the USD spend for older rows that predate entry_price/shares.
             let detail;
             if (t.shares_bought != null && t.entry_price != null) {
                 const sh = (+t.shares_bought).toFixed(1).replace(/\.0$/, '');
                 const px = (t.entry_price * 100).toFixed(1);
-                detail = `${sh} @ ${px}`;
+                detail = `${sh} @ ${px}¢`;
             } else {
                 detail = `$${(t.amount || 0).toFixed(2)}`;
             }
             return `
             <div class="mkt-trade">
                 <span class="who">${t.bot_name} &middot; ${side} ${detail}</span>
-                ${renderTradePnl(t)}
+                ${renderMarketTradeMtm(t, yes, no)}
             </div>`;
         }).join('')
         : '<div class="mkt-empty">No trades placed yet</div>';
@@ -2839,8 +3050,8 @@ function renderMarketCard(market, bodyId, kind) {
             <div class="mkt-q">${shortQ}</div>
             <div class="mkt-countdown ${cls}"><span class="lbl">${label}</span><span class="val">${val}</span></div>
         </div>
-        <div class="mkt-price">${priceHtml}</div>
         ${ptbHtml}
+        <div class="mkt-price">${priceHtml}</div>
         <div class="mkt-trades">
             <div class="mkt-trades-title">Trades placed (${trades.length})</div>
             ${tradeRows}
@@ -2950,7 +3161,7 @@ function updateCopyBots(wallets) {
         const recentRows = (w.recent_trades || []).map(t => {
             const oc = t.outcome === 'win' ? 'positive' : t.outcome === 'loss' ? 'negative' : 'neutral';
             return `<div class="trade-item">
-                <span class="${t.side === 'yes' ? 'positive' : 'negative'}">${(t.side||'').toUpperCase()}</span>
+                <span class="${(String(t.side||'').toLowerCase() === 'yes' || String(t.side||'').toLowerCase() === 'up') ? 'positive' : 'negative'}">${formatSide(t.side)}</span>
                 <span class="neutral" style="flex:1;padding:0 8px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${(t.market_question||'').substring(0,40)}</span>
                 <span class="${oc}">${t.outcome ? (t.pnl >= 0 ? '+' : '') + '$' + (t.pnl||0).toFixed(2) : 'pending'}</span>
             </div>`;
@@ -3023,7 +3234,7 @@ async function refresh() {
 
 // --- Live market-card refresh (independent of the 10s heavy refresh) ---
 
-// Fetch fresh YES/NO for a market id into livePrices (keyed by id, so it can't
+// Fetch fresh UP/DOWN prices for a market id into livePrices (keyed by id, so it can't
 // bleed into a different window's card), then re-render both cards.
 async function pollPriceById(marketId) {
     if (!marketId) return;
@@ -3350,7 +3561,7 @@ async function pollValidation() {
 if (!window.matchMedia('(max-width:880px)').matches) document.body.classList.add('nav-open');
 initMatrixRain();
 startArenaClock();
-startBinanceBtcFeed();  // live BTC for header + Current Market deltas
+startChainlinkBtcFeed();  // live BTC = Chainlink (same oracle as PTB / resolution)
 loadSignalLab().catch(() => {});  // populate the Signal Lab nav badge up front
 
 refresh();

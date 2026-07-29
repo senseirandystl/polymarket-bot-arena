@@ -31,17 +31,83 @@ DEFAULT_WEIGHTS = {
 
 def _trade_pnls(trades: Sequence[dict]) -> list[float]:
     """Extract ordered P&L list from resolved trade rows (oldest first)."""
+    resolved = _resolved_trades(trades)
+    return [float(t["pnl"]) for t in resolved]
+
+
+def _resolved_trades(trades: Sequence[dict]) -> list[dict]:
     resolved = [
         t for t in trades
         if t.get("outcome") in ("win", "loss", "exit_tp", "exit_sl")
         and t.get("pnl") is not None
     ]
-    # Prefer chronological order for equity / consistency
     try:
         resolved = sorted(resolved, key=lambda t: t.get("created_at") or "")
     except Exception:
         pass
-    return [float(t["pnl"]) for t in resolved]
+    return resolved
+
+
+def _parse_trade_ts(t: dict) -> float | None:
+    """Best-effort epoch seconds from created_at (str or number)."""
+    raw = t.get("created_at")
+    if raw is None:
+        return None
+    if isinstance(raw, (int, float)):
+        return float(raw)
+    try:
+        from datetime import datetime, timezone
+        s = str(raw).replace("Z", "+00:00")
+        # SQLite often stores "YYYY-MM-DD HH:MM:SS" without tz — treat as UTC
+        if "T" not in s and "+" not in s:
+            s = s.replace(" ", "T") + "+00:00"
+        return datetime.fromisoformat(s).timestamp()
+    except Exception:
+        return None
+
+
+def weighted_trade_pnls(
+    trades: Sequence[dict],
+    *,
+    current_regime: str | None = None,
+    now_ts: float | None = None,
+    halflife_hours: float | None = None,
+    regime_boost: float | None = None,
+) -> list[float]:
+    """P&L series with recency + current-regime reweighting.
+
+    Each trade contributes ``pnl * weight`` as a synthetic sample (weight
+    rounded into repeated unit samples would bias length; instead we scale
+    the P&L value so total/mean emphasize recent + in-regime outcomes while
+    keeping one sample per trade for Sharpe/drawdown structure).
+    """
+    import time as _time
+
+    resolved = _resolved_trades(trades)
+    if not resolved:
+        return []
+    hl = float(halflife_hours if halflife_hours is not None
+               else getattr(config, "GA_REGIME_RECENCY_HALFLIFE_H", 6.0))
+    boost = float(regime_boost if regime_boost is not None
+                  else getattr(config, "GA_REGIME_MATCH_BOOST", 1.5))
+    now = float(now_ts if now_ts is not None else _time.time())
+    hl_sec = max(hl, 0.25) * 3600.0
+    out: list[float] = []
+    for t in resolved:
+        w = 1.0
+        ts = _parse_trade_ts(t)
+        if ts is not None and hl_sec > 0:
+            age = max(0.0, now - ts)
+            # half-life decay: w = 0.5 ** (age / hl)
+            w *= 0.5 ** (age / hl_sec)
+        if current_regime:
+            rid = _regime_from_trade(t)
+            if rid and rid == current_regime:
+                w *= boost
+        # Floor so ancient trades still count a little
+        w = max(0.15, w)
+        out.append(float(t["pnl"]) * w)
+    return out
 
 
 def max_drawdown_pct(pnls: Sequence[float]) -> float:
@@ -116,6 +182,24 @@ def _regime_from_trade(t: dict) -> str | None:
     return None
 
 
+def _current_regime_from_state() -> str | None:
+    """Best-effort read of the live regime id from arena_state."""
+    try:
+        import json
+        import db
+        raw = db.get_arena_state("regime") or db.get_arena_state("regime_detector")
+        if not raw:
+            return None
+        data = json.loads(raw) if isinstance(raw, str) else raw
+        if isinstance(data, dict):
+            return data.get("regime") or data.get("id") or data.get("label")
+        if isinstance(data, str):
+            return data
+    except Exception:
+        return None
+    return None
+
+
 def regime_breakdown(trades: Sequence[dict]) -> dict[str, dict[str, float]]:
     """Per-regime multi-objective components from stamped trades."""
     buckets: dict[str, list[float]] = {}
@@ -126,7 +210,10 @@ def regime_breakdown(trades: Sequence[dict]) -> dict[str, dict[str, float]]:
             continue
         rid = _regime_from_trade(t) or "unknown"
         buckets.setdefault(rid, []).append(float(t["pnl"]))
-    return {rid: multi_objective_fitness(pnls=pnls) for rid, pnls in buckets.items()}
+    return {
+        rid: multi_objective_fitness(pnls=pnls, use_recency=False)
+        for rid, pnls in buckets.items()
+    }
 
 
 def multi_objective_fitness(
@@ -135,6 +222,8 @@ def multi_objective_fitness(
     pnls: Sequence[float] | None = None,
     block_size: int | None = None,
     regime_condition: bool | None = None,
+    current_regime: str | None = None,
+    use_recency: bool | None = None,
 ) -> dict[str, float]:
     """Compute raw objective components from trades or a P&L series.
 
@@ -145,10 +234,24 @@ def multi_objective_fitness(
     and trades carry ``regime:*`` feature stamps, the composite also includes
     a cross-regime robustness term: bots that only print in one regime and
     bleed in others are penalized via the worst-regime P&L rank.
+
+    When ``use_recency`` is True (default from config.GA_RECENCY_WEIGHTING),
+    P&L samples are reweighted by exponential half-life and a boost for trades
+    stamped with ``current_regime`` so the fitness favors the present tape.
     """
     trade_list = list(trades or [])
     if pnls is None:
-        pnls = _trade_pnls(trade_list)
+        do_rec = use_recency
+        if do_rec is None:
+            do_rec = bool(getattr(config, "GA_RECENCY_WEIGHTING", True))
+        if do_rec and trade_list:
+            # Resolve current regime from arena_state if not provided
+            cr = current_regime
+            if cr is None:
+                cr = _current_regime_from_state()
+            pnls = weighted_trade_pnls(trade_list, current_regime=cr)
+        else:
+            pnls = _trade_pnls(trade_list)
     else:
         pnls = list(pnls)
     n = len(pnls)

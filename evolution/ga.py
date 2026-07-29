@@ -16,7 +16,11 @@ from typing import Any, Callable
 import config
 import db
 from evolution.fitness import multi_objective_fitness, rank_normalize_fitness
-from evolution.operators import crossover, elite_indices, mutate, tournament_select
+from evolution.operators import crossover, elite_indices, tournament_select
+from evolution import gene_bank as gene_bank_mod
+from evolution.type_alloc import pick_strategy_type
+from evolution.param_search import adaptive_mutate
+from evolution.backtest_gate import evaluate_offspring
 
 logger = logging.getLogger("arena")
 
@@ -306,6 +310,15 @@ def run_ga_cycle(
         "operators": [],
     }
 
+    # Always deposit elites into the shadow gene bank (even if no culls).
+    try:
+        bank = gene_bank_mod.record_elites(individuals, cycle_number)
+        report["gene_bank_size"] = len(bank)
+    except Exception as e:
+        logger.warning("gene bank update failed: %s", e)
+        bank = gene_bank_mod.load_bank()
+        report["gene_bank_size"] = len(bank)
+
     if not to_replace:
         logger.info("  No bots below threshold — skipping replacement (elites hold)")
         report["skipped"] = True
@@ -342,8 +355,7 @@ def run_ga_cycle(
         _persist_ga_state(cycle_number, report)
         return evolving + exempt, report
 
-    # Breeding pool: elites + survivors (immune count as keepers but poor parents
-    # if they have ~0 trades — prefer those with trades for tournament)
+    # Breeding pool: live keepers + gene-bank elites (shadow parents)
     parent_pool = [
         ind for ind in keep
         if ind["trades"] >= max(5, config.MIN_TRADES_FOR_JUDGMENT // 3)
@@ -351,6 +363,10 @@ def run_ga_cycle(
     ]
     if not parent_pool:
         parent_pool = keep[:]
+    bank_parents = gene_bank_mod.as_parent_records(bank)
+    if bank_parents:
+        parent_pool = parent_pool + bank_parents
+        logger.info("  Gene bank parents available: %d", len(bank_parents))
 
     # Build factory
     if bot_factory is None:
@@ -371,59 +387,119 @@ def run_ga_cycle(
     for b in new_bots:
         b.reset_daily()
 
-    for dead in to_replace:
-        # Two parents via tournament
-        p1 = tournament_select(parent_pool, rng=rng)
-        p2 = tournament_select(parent_pool, rng=rng)
-        # Prefer fitter as primary parent for non-numeric inheritance
-        if p2["fitness"] > p1["fitness"]:
-            p1, p2 = p2, p1
+    max_attempts = max(1, int(getattr(config, "GA_SPAWN_ATTEMPTS", 3)))
 
-        # Start from strategy defaults so type-specific keys are always present,
-        # then overlay crossover of parent params on overlapping keys.
-        base = _default_params_for(dead["strategy_type"])
-        # Inherit shared keys from parents via crossover, then fill gaps
-        # from the strategy defaults.
-        blended = crossover(p1["params"], p2["params"], rng=rng)
-        child_params = dict(base)
-        for k, v in blended.items():
-            if k in child_params or k in base:
-                child_params[k] = v
-            elif k in p1["params"] or k in p2["params"]:
-                # Only keep keys that belong on this strategy (intersection with
-                # defaults) — avoids polluting meanrev with sniper price zones.
+    for dead in to_replace:
+        evolved = None
+        spawn_meta: dict[str, Any] = {}
+        for attempt in range(max_attempts):
+            # --- Tier 1: strategy-type allocation ---
+            child_type = pick_strategy_type(
+                dead["strategy_type"], individuals, bank_parents, rng=rng,
+            )
+
+            # Prefer parents of the chosen type when available
+            typed_pool = [
+                p for p in parent_pool
+                if p.get("strategy_type") == child_type
+            ] or parent_pool
+
+            p1 = tournament_select(typed_pool, rng=rng)
+            p2 = tournament_select(typed_pool, rng=rng)
+            if p2["fitness"] > p1["fitness"]:
+                p1, p2 = p2, p1
+
+            # --- Tier 2: param crossover + adaptive mutation ---
+            base = _default_params_for(child_type)
+            blended = crossover(p1["params"], p2["params"], rng=rng)
+            child_params = dict(base)
+            for k, v in blended.items():
                 if k in base:
                     child_params[k] = v
-        # Also copy overlapping keys that defaults have
-        for k in list(child_params.keys()):
-            if k in blended:
-                child_params[k] = blended[k]
+            for k in list(child_params.keys()):
+                if k in blended and k in base:
+                    child_params[k] = blended[k]
 
-        child_params = mutate(child_params, rng=rng)
-
-        child_name = f"{dead['strategy_type']}-g{cycle_number}-{rng.randint(100, 999)}"
-        lineage = (
-            f"{p1['name']}+{p2['name']} -> {child_name} "
-            f"(crossover+mutate; fit={p1['fitness']:.3f}/{p2['fitness']:.3f})"
-        )
-        evolved = bot_factory(
-            dead["strategy_type"], child_name, child_params, cycle_number, lineage,
-        )
-
-        if validate_fn is not None and not validate_fn(evolved):
-            logger.warning(
-                "  %s failed validation, recreating with pure defaults", child_name,
+            elite_genomes = [
+                p["params"] for p in typed_pool
+                if p.get("params")
+            ]
+            child_params = adaptive_mutate(
+                child_params,
+                strategy_type=child_type,
+                elite_genomes=elite_genomes,
+                rng=rng,
             )
-            fallback_params = _default_params_for(dead["strategy_type"])
-            child_name = f"{p1['name']}-g{cycle_number}-fallback"
-            lineage = f"{p1['name']} -> {child_name} (fallback)"
+
+            child_name = f"{child_type}-g{cycle_number}-{rng.randint(100, 999)}"
+            lineage = (
+                f"{p1['name']}+{p2['name']} -> {child_name} "
+                f"(type={child_type}; crossover+adaptive; "
+                f"fit={p1['fitness']:.3f}/{p2['fitness']:.3f}; "
+                f"attempt={attempt + 1})"
+            )
+            candidate = bot_factory(
+                child_type, child_name, child_params, cycle_number, lineage,
+            )
+
+            if validate_fn is not None and not validate_fn(candidate):
+                logger.warning(
+                    "  %s failed smoke validation (attempt %d)", child_name, attempt + 1,
+                )
+                continue
+
+            # Backtest gate vs the culled bot (same type when possible)
+            baseline = dead.get("bot")
+            if baseline is not None and getattr(baseline, "strategy_type", None) != child_type:
+                # Different type — build a defaults bot of child_type as baseline
+                try:
+                    baseline = bot_factory(
+                        child_type,
+                        f"baseline-{child_type}",
+                        _default_params_for(child_type),
+                        0, "baseline",
+                    )
+                except Exception:
+                    baseline = None
+            gate = evaluate_offspring(candidate, baseline_bot=baseline)
+            spawn_meta = {
+                "parents": [p1["name"], p2["name"]],
+                "child_type": child_type,
+                "gate_reason": gate.reason,
+                "gate_child_pnl": gate.child_pnl,
+                "gate_baseline_pnl": gate.baseline_pnl,
+                "gate_markets": gate.markets,
+            }
+            if not gate.passed:
+                logger.info(
+                    "  %s failed backtest gate (%s) attempt %d — retrying",
+                    child_name, gate.reason, attempt + 1,
+                )
+                continue
+
+            evolved = candidate
+            operator = "crossover+adaptive+backtest"
+            if gate.reason in ("disabled", "data_unavailable", "no_markets",
+                               "run_failed_soft"):
+                operator = f"crossover+adaptive({gate.reason})"
+            break
+
+        if evolved is None:
+            # Last resort: pure defaults of the culled type (slot must fill)
+            child_type = dead["strategy_type"]
+            child_name = f"{child_type}-g{cycle_number}-fallback"
+            lineage = f"{dead['name']} -> {child_name} (fallback defaults)"
             evolved = bot_factory(
-                dead["strategy_type"], child_name, fallback_params,
+                child_type, child_name,
+                _default_params_for(child_type),
                 cycle_number, lineage,
             )
             operator = "fallback"
-        else:
-            operator = "crossover+mutate"
+            spawn_meta = {
+                "parents": [dead["name"]],
+                "child_type": child_type,
+                "gate_reason": "all_attempts_failed",
+            }
 
         db.retire_bot(dead["name"])
         db.save_bot_config(
@@ -437,17 +513,24 @@ def run_ga_cycle(
             "strategy_type": evolved.strategy_type,
             "generation": evolved.generation,
             "lineage": evolved.lineage,
-            "parents": [p1["name"], p2["name"]],
+            "parents": list(spawn_meta.get("parents") or [dead["name"]]),
             "operator": operator,
             "replaced": dead["name"],
             "params": copy.deepcopy(evolved.strategy_params),
+            "gate": {
+                "reason": spawn_meta.get("gate_reason"),
+                "child_pnl": spawn_meta.get("gate_child_pnl"),
+                "baseline_pnl": spawn_meta.get("gate_baseline_pnl"),
+                "markets": spawn_meta.get("gate_markets"),
+            },
         }
         report["spawned"].append(spawn_rec)
         report["replaced"].append(dead["name"])
         report["operators"].append(spawn_rec)
         logger.info(
-            "  Spawned %s from %s × %s (replaced %s)",
-            evolved.name, p1["name"], p2["name"], dead["name"],
+            "  Spawned %s (%s) replacing %s op=%s gate=%s",
+            evolved.name, evolved.strategy_type, dead["name"],
+            operator, spawn_meta.get("gate_reason"),
         )
 
     # Rankings payload for legacy evolution_events + dashboard

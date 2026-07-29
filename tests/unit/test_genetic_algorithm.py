@@ -257,6 +257,9 @@ def test_ga_cycle_replaces_loser_keeps_elite(monkeypatch):
     monkeypatch.setattr(config, "MIN_TRADES_FOR_JUDGMENT", 10, raising=False)
     monkeypatch.setattr(config, "GA_ELITE_COUNT", 1, raising=False)
     monkeypatch.setattr(config, "EVOLUTION_BE_GAP_MIN", 0.03, raising=False)
+    monkeypatch.setattr(config, "GA_TYPE_ALLOC_ENABLED", False, raising=False)
+    monkeypatch.setattr(config, "GA_BACKTEST_GATE_ENABLED", False, raising=False)
+    monkeypatch.setattr(config, "GA_RECENCY_WEIGHTING", False, raising=False)
 
     winner = FakeBot("winner", "mean_reversion",
                      {"pnl": 47.0, "wr": 0.63, "trades": 30, "gap": 0.13},
@@ -292,7 +295,10 @@ def test_ga_cycle_replaces_loser_keeps_elite(monkeypatch):
     assert "loser" not in names
     assert "arb-v1" in names  # exempt
     assert retired == ["loser"]
-    assert any(s[0].startswith("momentum-g3-") or "fallback" in s[0] for s in saved)
+    assert any(
+        s[0].startswith("momentum-g3-") or "fallback" in s[0]
+        for s in saved
+    )
     assert report["replaced"] == ["loser"]
     assert report["elites"]  # at least one elite
     assert "winner" in report["elites"]
@@ -302,10 +308,13 @@ def test_ga_cycle_replaces_loser_keeps_elite(monkeypatch):
     assert spawn["parents"]
     assert "crossover" in (spawn["operator"] or "") or spawn["operator"] == "fallback"
     assert spawn["lineage"]
+    # Gene bank recorded the elite
+    assert report.get("gene_bank_size", 0) >= 1
 
 
 def test_ga_cycle_immune_below_min_trades(monkeypatch):
     monkeypatch.setattr(config, "MIN_TRADES_FOR_JUDGMENT", 30, raising=False)
+    monkeypatch.setattr(config, "GA_BACKTEST_GATE_ENABLED", False, raising=False)
     thin = FakeBot("thin", "momentum",
                    {"pnl": -50.0, "wr": 0.30, "trades": 5, "gap": -0.2})
     bots = [thin]
@@ -323,6 +332,7 @@ def test_ga_cycle_immune_below_min_trades(monkeypatch):
 
 def test_ga_cycle_skips_when_all_profitable(monkeypatch):
     monkeypatch.setattr(config, "MIN_TRADES_FOR_JUDGMENT", 10, raising=False)
+    monkeypatch.setattr(config, "GA_BACKTEST_GATE_ENABLED", False, raising=False)
     a = FakeBot("a", "momentum", {"pnl": 10.0, "wr": 0.6, "trades": 40, "gap": 0.1})
     b = FakeBot("b", "hybrid", {"pnl": 5.0, "wr": 0.55, "trades": 40, "gap": 0.05})
     bots = [a, b]
@@ -463,3 +473,154 @@ def test_arena_run_evolution_delegates_to_ga(monkeypatch):
     assert called.get("cycle") == 5
     assert out is bots or [b.name for b in out] == ["x"]
     assert isinstance(report, dict)
+
+
+# ---------------------------------------------------------------------------
+# Gene bank / type alloc / backtest gate / frozen genes
+# ---------------------------------------------------------------------------
+
+def test_gene_bank_records_and_exposes_parents(monkeypatch):
+    from evolution import gene_bank as gb
+    state = {}
+    monkeypatch.setattr(gb.db, "get_arena_state", lambda k, d=None: state.get(k, d))
+    monkeypatch.setattr(gb.db, "set_arena_state", lambda k, v: state.update({k: v}))
+    monkeypatch.setattr(config, "GA_GENE_BANK_SIZE", 5, raising=False)
+
+    inds = [{
+        "name": "elite-a", "strategy_type": "momentum", "generation": 2,
+        "fitness": 0.9, "pnl": 20, "win_rate": 0.6, "trades": 40,
+        "params": {"lookback_candles": 8, "momentum_threshold": 0.0003},
+        "elite": True, "lineage": None,
+    }, {
+        "name": "scrub", "strategy_type": "hybrid", "generation": 1,
+        "fitness": 0.1, "pnl": -10, "win_rate": 0.4, "trades": 40,
+        "params": {"min_confidence": 0.5}, "elite": False,
+    }]
+    bank = gb.record_elites(inds, cycle=4)
+    assert len(bank) == 1
+    assert bank[0]["name"] == "elite-a"
+    parents = gb.as_parent_records(bank)
+    assert parents[0]["from_gene_bank"] is True
+    assert parents[0]["fitness"] == 0.9
+
+
+def test_type_alloc_stickiness_prefers_dead_type(monkeypatch):
+    from evolution.type_alloc import pick_strategy_type
+    monkeypatch.setattr(config, "GA_TYPE_ALLOC_ENABLED", True, raising=False)
+    monkeypatch.setattr(config, "GA_TYPE_STICKINESS", 0.95, raising=False)
+    monkeypatch.setattr(config, "GA_TYPE_ALLOC_TEMPERATURE", 0.5, raising=False)
+    # Even with a strong hybrid, high stickiness keeps momentum
+    inds = [
+        {"strategy_type": "hybrid", "fitness": 1.0},
+        {"strategy_type": "momentum", "fitness": 0.1},
+    ]
+    rng = random.Random(0)
+    picks = [pick_strategy_type("momentum", inds, [], rng=rng) for _ in range(30)]
+    assert picks.count("momentum") >= 20
+
+
+def test_type_alloc_disabled_returns_dead(monkeypatch):
+    from evolution.type_alloc import pick_strategy_type
+    monkeypatch.setattr(config, "GA_TYPE_ALLOC_ENABLED", False, raising=False)
+    assert pick_strategy_type("sniper", [{"strategy_type": "hybrid", "fitness": 1}], []) == "sniper"
+
+
+def test_frozen_genes_skip_volume_and_kelly():
+    from evolution.frozen import evolvable_keys, frozen_genes
+    assert "volume_weight" in frozen_genes()
+    assert "position_size_pct" in frozen_genes()
+    params = {
+        "lookback_candles": 10,
+        "momentum_threshold": 0.0003,
+        "volume_weight": 0.5,
+        "position_size_pct": 0.05,
+        "min_confidence": 0.5,
+    }
+    keys = evolvable_keys("momentum", params)
+    assert "lookback_candles" in keys
+    assert "volume_weight" not in keys
+    assert "position_size_pct" not in keys
+
+
+def test_adaptive_mutate_preserves_frozen(monkeypatch):
+    from evolution.param_search import adaptive_mutate
+    monkeypatch.setattr(config, "GA_ADAPTIVE_MUTATION", True, raising=False)
+    rng = random.Random(1)
+    params = {
+        "lookback_candles": 10,
+        "momentum_threshold": 0.0003,
+        "volume_weight": 0.77,
+        "position_size_pct": 0.05,
+        "min_confidence": 0.5,
+        "trend_strength_weight": 0.5,
+        "regime_conf_weight": 0.3,
+    }
+    out = adaptive_mutate(
+        params, strategy_type="momentum",
+        elite_genomes=[{"lookback_candles": 12, "momentum_threshold": 0.0004,
+                        "min_confidence": 0.55, "trend_strength_weight": 0.6,
+                        "regime_conf_weight": 0.2}],
+        rate=1.0, rng=rng,
+    )
+    assert out["volume_weight"] == 0.77
+    assert out["position_size_pct"] == 0.05
+
+
+def test_backtest_gate_rejects_worse_child(monkeypatch):
+    from evolution.backtest_gate import evaluate_offspring, clear_cache
+    clear_cache()
+    monkeypatch.setattr(config, "GA_BACKTEST_GATE_ENABLED", True, raising=False)
+    monkeypatch.setattr(config, "GA_BACKTEST_BEAT_BASELINE", True, raising=False)
+    monkeypatch.setattr(config, "GA_BACKTEST_EPS", 0.5, raising=False)
+
+    class FakeData:
+        markets = [1, 2, 3]
+
+    child = object()
+    base = object()
+    gate = evaluate_offspring(
+        child, baseline_bot=base,
+        load_fn=lambda n: FakeData(),
+        run_fn=lambda bot, data: -10.0 if bot is child else 5.0,
+    )
+    assert gate.passed is False
+    assert gate.reason == "worse_than_baseline"
+
+
+def test_backtest_gate_passes_better_child(monkeypatch):
+    from evolution.backtest_gate import evaluate_offspring, clear_cache
+    clear_cache()
+    monkeypatch.setattr(config, "GA_BACKTEST_GATE_ENABLED", True, raising=False)
+    monkeypatch.setattr(config, "GA_BACKTEST_BEAT_BASELINE", True, raising=False)
+
+    class FakeData:
+        markets = [1, 2, 3]
+
+    child = object()
+    base = object()
+    gate = evaluate_offspring(
+        child, baseline_bot=base,
+        load_fn=lambda n: FakeData(),
+        run_fn=lambda bot, data: 8.0 if bot is child else 2.0,
+    )
+    assert gate.passed is True
+    assert gate.child_pnl == 8.0
+
+
+def test_weighted_pnls_boost_recent_and_regime():
+    from evolution.fitness import weighted_trade_pnls
+    import time
+    now = time.time()
+    trades = [
+        {"pnl": 10.0, "outcome": "win", "created_at": now - 3600,
+         "trade_features": ["regime:high_vol_trend"]},
+        {"pnl": 10.0, "outcome": "win", "created_at": now - 48 * 3600,
+         "trade_features": ["regime:low_vol_range"]},
+    ]
+    w = weighted_trade_pnls(
+        trades, current_regime="high_vol_trend", now_ts=now,
+        halflife_hours=6.0, regime_boost=2.0,
+    )
+    assert len(w) == 2
+    # Ordered oldest-first: recent+regime-match (index 1) outweights old (0)
+    assert abs(w[1]) > abs(w[0])

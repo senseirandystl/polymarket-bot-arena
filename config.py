@@ -154,8 +154,30 @@ GA_PERF_TRIGGER_DROP = 40.0    # optional: fire if pool P&L drops this much vs l
 # Minimum seconds between GA cycles even when performance-triggered (anti-thrash).
 GA_MIN_INTERVAL_SEC = 30 * 60
 
+# --- GA upgrades (gene bank, type alloc, backtest gate, adaptive mutation) ---
+GA_GENE_BANK_SIZE = 20            # max shadow elites kept as future parents
+GA_TYPE_ALLOC_ENABLED = True      # tier-1: sample strategy_type by fitness softmax
+GA_TYPE_STICKINESS = 0.40         # mass kept on the culled slot's original type
+GA_TYPE_ALLOC_TEMPERATURE = 0.35  # lower = greedier toward high-fitness types
+GA_RECENCY_WEIGHTING = True       # fitness favors recent + current-regime trades
+GA_REGIME_RECENCY_HALFLIFE_H = 6.0
+GA_REGIME_MATCH_BOOST = 1.5       # multiplier for trades stamped with live regime
+GA_ADAPTIVE_MUTATION = True       # tier-2: sample near elite cloud (TPE-ish)
+GA_ELITE_SAMPLE_RATE = 0.55       # P(sample from elite cloud vs local Gaussian)
+GA_BACKTEST_GATE_ENABLED = True   # promote only after offline backtest clears
+GA_BACKTEST_REQUIRED = False      # if True, reject spawn when history unavailable
+GA_BACKTEST_MARKETS = 40          # recent resolved markets for the gate
+GA_BACKTEST_CACHE_SEC = 3600.0    # reuse fetched history within this TTL
+GA_BACKTEST_BEAT_BASELINE = True  # child must not be worse than replaced bot
+GA_BACKTEST_EPS = 0.50            # $ noise band when comparing to baseline
+GA_BACKTEST_MIN_PNL = None        # optional absolute floor (None = off)
+GA_SPAWN_ATTEMPTS = 3             # type/param samples before fallback defaults
+# Extra frozen gene names (merged with evolution.frozen defaults)
+GA_FROZEN_GENES = ()
+
 # Signal Feed Settings
-BINANCE_WS_URL = "wss://stream.binance.com:9443/ws"
+BINANCE_WS_URL = "wss://stream.binance.com:9443/ws"  # ETH/SOL only; BTC = Chainlink
+POLYMARKET_RTDS_WS = "wss://ws-live-data.polymarket.com"
 PRICE_UPDATE_INTERVAL_SEC = 1  # Real-time price updates
 
 # --- Arbitrage bot (bots/bot_arbitrage.py) ---
@@ -376,12 +398,14 @@ SENTIMENT_FEED_ENABLED = False
 MARKET_WINDOW_SEC = 300           # 5-min window length
 DRIFT_VOL_SCALE = 0.0015          # typical BTC move (fraction) over a full window
 # RE-ENABLED (2026-07-16) after the #23 blow-up was traced to a MISCALCULATED
-# strike (mid-window "first sighting"), not a bad signal. With the accurate
-# strike (Binance open @ eventStartTime) the offline harness
-# (tools/validate_signals.py, 300 resolved markets, 50% UP base rate) measures
-# drift ~76% predictive — symmetric and 86% near expiry. Drift is now weighted
-# per-strategy inside STRATEGY_SIGNAL_PROFILE (bots/base_bot.py); it is the
-# anchor lane of every strategy's model.
+# strike (mid-window "first sighting"), not a bad signal. Live strike is
+# Polymarket's official openPrice (Chainlink BTC/USD at eventStartTime — the
+# same /api/crypto/crypto-price endpoint the website uses for "Price to Beat").
+# Binance is NOT used live (basis ~$60–80 / ~0.1% vs Chainlink — enough to flip
+# near-strike drift); if openPrice is briefly unavailable, drift stays 0 until
+# the next fetch. Offline harnesses may still use Binance klines for ranking.
+# Drift is weighted per-strategy inside STRATEGY_SIGNAL_PROFILE
+# (bots/base_bot.py); it is the anchor lane of every strategy's model.
 
 # --- Two-sided (YES/NO) net-edge side selection: MODEL-BLEND fair value ---
 # fair_yes = yes_mid + trust * (P_model - yes_mid). Edge exists ONLY when the

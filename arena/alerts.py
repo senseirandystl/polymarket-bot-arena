@@ -277,6 +277,14 @@ def _level_rank(level: str) -> int:
 
 
 def _should_send(cfg: dict, event_type: str, level: str, debounce_key: str) -> bool:
+    """Return True if this alert is eligible (filters + debounce).
+
+    Debounce is only *checked* here. Callers must call ``_mark_sent`` after a
+    successful delivery so a failed Telegram/Discord/SMTP attempt does not
+    burn the debounce window — otherwise a VPN/DNS outage silently drops the
+    disconnect alert and only the later restore (when the network is back)
+    reaches the operator.
+    """
     if not cfg.get("enabled"):
         return False
     if event_type != "test" and not cfg.get("events", {}).get(event_type, True):
@@ -291,8 +299,13 @@ def _should_send(cfg: dict, event_type: str, level: str, debounce_key: str) -> b
         last = _debounce.get(debounce_key, 0.0)
         if now - last < deb:
             return False
-        _debounce[debounce_key] = now
     return True
+
+
+def _mark_sent(debounce_key: str) -> None:
+    """Record a successful delivery for debounce purposes."""
+    with _lock:
+        _debounce[debounce_key] = time.time()
 
 
 def _append_log(entry: dict) -> None:
@@ -445,6 +458,189 @@ def _send_email(title: str, body: str, level: str) -> tuple[bool, str]:
         return False, str(e)
 
 
+# ---------------------------------------------------------------------------
+# Undelivered alert queue
+# ---------------------------------------------------------------------------
+# When the host network is down (VPN drop, DNS failure), Telegram/Discord
+# cannot be reached. Previously debounce was stamped *before* the send, so
+# the disconnect alert burned its window while failing, and only
+# feed_restored (once the network returned) made it to the operator.
+# Failed sends now go into a durable pending queue and are retried from
+# run_periodic_alerts until they deliver or expire.
+PENDING_KEY = "alerts_pending"
+_PENDING_MAX = 30
+_PENDING_TTL_SEC = 24 * 3600
+_PENDING_RETRY_SEC = 45.0  # retry cadence while network is still down
+
+
+def _pending_load() -> list[dict[str, Any]]:
+    try:
+        raw = db.get_arena_state(PENDING_KEY)
+        data = json.loads(raw) if raw else []
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def _pending_save(items: list[dict[str, Any]]) -> None:
+    try:
+        db.set_arena_state(PENDING_KEY, json.dumps(items[:_PENDING_MAX], default=str))
+    except Exception:
+        pass
+
+
+def _enqueue_undelivered(
+    event_type: str,
+    title: str,
+    body: str,
+    level: str,
+    key: str,
+    detail: Optional[dict] = None,
+) -> None:
+    """Persist a failed alert for later retry (deduped by event_type+key)."""
+    deb_key = f"{event_type}:{key or title}"
+    now = time.time()
+    items = _pending_load()
+    # Drop expired first
+    items = [it for it in items if now - float(it.get("first_ts") or now) < _PENDING_TTL_SEC]
+    for it in items:
+        if it.get("deb_key") == deb_key:
+            # Keep earliest first_ts; refresh body (e.g. growing BTC age)
+            it["title"] = title
+            it["body"] = body
+            it["level"] = level
+            it["detail"] = detail
+            it["last_fail_ts"] = now
+            it["attempts"] = int(it.get("attempts") or 0) + 1
+            _pending_save(items)
+            return
+    items.insert(0, {
+        "deb_key": deb_key,
+        "event_type": event_type,
+        "title": title,
+        "body": body,
+        "level": level,
+        "key": key or title,
+        "detail": detail,
+        "first_ts": now,
+        "last_fail_ts": now,
+        "next_retry_ts": now + _PENDING_RETRY_SEC,
+        "attempts": 1,
+    })
+    _pending_save(items)
+
+
+def _dequeue_undelivered(deb_key: str) -> None:
+    items = [it for it in _pending_load() if it.get("deb_key") != deb_key]
+    _pending_save(items)
+
+
+def _deliver_channels(
+    title: str,
+    body: str,
+    level: str,
+    channels_cfg: dict,
+) -> tuple[bool, dict[str, dict]]:
+    """Fan out to enabled channel senders. Returns (any_ok, per-channel results)."""
+    results: dict[str, dict] = {}
+    any_ok = False
+    for ch, sender in (
+        ("telegram", _send_telegram),
+        ("discord", _send_discord),
+        ("email", _send_email),
+    ):
+        if not channels_cfg.get(ch):
+            continue
+        ok, msg = sender(title, body, level)
+        results[ch] = {"ok": ok, "detail": msg}
+        any_ok = any_ok or ok
+        if not ok:
+            logger.warning("alert %s failed: %s", ch, msg)
+    return any_ok, results
+
+
+def flush_undelivered_alerts(*, force: bool = False) -> dict[str, Any]:
+    """Retry pending alerts whose network path may have recovered.
+
+    Called at the top of each periodic-alert tick. Delivers in oldest-first
+    order so a queued feed_stale reaches the operator *before* a later
+    feed_restored on the same recovery cycle.
+
+    ``force=True`` ignores per-item ``next_retry_ts`` (used on feed recovery
+    so the disconnect alert is attempted immediately when the network is
+    known-good again).
+    """
+    now = time.time()
+    items = _pending_load()
+    if not items:
+        return {"retried": 0, "delivered": 0, "remaining": 0}
+    try:
+        cfg = load_config()
+    except Exception:
+        return {"retried": 0, "delivered": 0, "remaining": len(items)}
+    if not cfg.get("enabled"):
+        return {"retried": 0, "delivered": 0, "remaining": len(items)}
+
+    channels_cfg = cfg.get("channels") or {}
+    remaining: list[dict[str, Any]] = []
+    delivered = 0
+    retried = 0
+    # Oldest first so disconnect lands before restore if both are pending
+    ordered = sorted(items, key=lambda it: float(it.get("first_ts") or 0))
+    for it in ordered:
+        first_ts = float(it.get("first_ts") or now)
+        if now - first_ts >= _PENDING_TTL_SEC:
+            continue  # expired — drop
+        next_retry = float(it.get("next_retry_ts") or 0)
+        if not force and now < next_retry:
+            remaining.append(it)
+            continue
+        event_type = it.get("event_type") or "error"
+        if event_type != "test" and not cfg.get("events", {}).get(event_type, True):
+            continue  # event type disabled — drop
+        if _level_rank(it.get("level") or "info") < _level_rank(cfg.get("min_level") or "info"):
+            continue
+        retried += 1
+        title = str(it.get("title") or event_type)
+        body = str(it.get("body") or "")
+        level = str(it.get("level") or "info")
+        any_ok, ch_results = _deliver_channels(title, body, level, channels_cfg)
+        _append_log({
+            "ts": now,
+            "event_type": event_type,
+            "level": level,
+            "title": title,
+            "body": body[:300],
+            "detail": it.get("detail"),
+            "sent": any_ok,
+            "channels": ch_results,
+            "pending_retry": True,
+            "attempts": int(it.get("attempts") or 0) + 1,
+        })
+        if any_ok:
+            delivered += 1
+            deb_key = it.get("deb_key") or f"{event_type}:{it.get('key') or title}"
+            _mark_sent(str(deb_key))
+            # Sticky "operator was told about stale feed" once disconnect lands
+            if event_type == "feed_stale":
+                try:
+                    db.set_arena_state(_FEED_STALE_DELIVERED_KEY, "1")
+                except Exception:
+                    pass
+        else:
+            it["attempts"] = int(it.get("attempts") or 0) + 1
+            it["last_fail_ts"] = now
+            it["next_retry_ts"] = now + _PENDING_RETRY_SEC
+            remaining.append(it)
+    _pending_save(remaining)
+    if delivered or retried:
+        logger.info(
+            "alerts pending flush: retried=%d delivered=%d remaining=%d",
+            retried, delivered, len(remaining),
+        )
+    return {"retried": retried, "delivered": delivered, "remaining": len(remaining)}
+
+
 def notify(
     event_type: str,
     title: str,
@@ -475,20 +671,22 @@ def notify(
         # that produced messages like `{"from": "normal", "confidence": 0.82...}`.
         full_body = body
         channels_cfg = cfg.get("channels") or {}
-        any_ok = False
-        for ch, sender in (
-            ("telegram", _send_telegram),
-            ("discord", _send_discord),
-            ("email", _send_email),
-        ):
-            if not channels_cfg.get(ch):
-                continue
-            ok, msg = sender(title, full_body, level)
-            result["channels"][ch] = {"ok": ok, "detail": msg}
-            any_ok = any_ok or ok
-            if not ok:
-                logger.warning("alert %s failed: %s", ch, msg)
+        any_ok, ch_results = _deliver_channels(title, full_body, level, channels_cfg)
+        result["channels"] = ch_results
         result["sent"] = any_ok
+        if not ch_results:
+            # Master on but every channel toggled off — nothing to deliver;
+            # stamp debounce so we don't spin, and don't queue forever.
+            result["reason"] = "no_channels_enabled"
+            _mark_sent(deb_key)
+        elif any_ok:
+            _mark_sent(deb_key)
+            _dequeue_undelivered(deb_key)
+        else:
+            # Network / channel failure — queue for retry when connectivity
+            # returns. Do NOT stamp debounce so a later flush can re-deliver.
+            _enqueue_undelivered(event_type, title, body, level, key or title, detail)
+            result["queued"] = True
         _append_log({
             "ts": time.time(),
             "event_type": event_type,
@@ -498,6 +696,7 @@ def notify(
             "detail": detail or None,
             "sent": any_ok,
             "channels": result["channels"],
+            "queued": bool(result.get("queued")),
         })
     except Exception as e:
         logger.warning("notify failed: %s", e)
@@ -1178,7 +1377,7 @@ def maybe_alert_low_bankroll() -> Optional[dict]:
 
 
 def publish_price_feed_status() -> dict[str, Any]:
-    """Write Binance feed heartbeat into arena_state for health + alerts."""
+    """Write price-feed heartbeat into arena_state for health + alerts."""
     status: dict[str, Any] = {"ts": time.time(), "stale": False, "symbols": {}}
     try:
         from signals.price_feed import get_feed
@@ -1203,6 +1402,9 @@ def publish_price_feed_status() -> dict[str, Any]:
             status["symbols"][sym] = {
                 "latest": latest, "stale": is_stale,
                 "age_sec": round(age, 1) if age is not None else None,
+                "source": sig.get("source") or (
+                    "chainlink" if sym == "btc" else "binance"
+                ),
             }
             any_stale = any_stale or is_stale
         status["stale"] = any_stale
@@ -1217,14 +1419,33 @@ def publish_price_feed_status() -> dict[str, Any]:
 
 
 _FEED_STALE_FLAG_KEY = "price_feed_was_stale"
+_FEED_STALE_SINCE_KEY = "price_feed_stale_since"
+_FEED_STALE_DELIVERED_KEY = "price_feed_stale_delivered"
+
+
+def _format_outage_duration(seconds: float) -> str:
+    """Human outage length for restore alerts (e.g. '5h 24m')."""
+    sec = max(0, int(seconds))
+    hours, rem = divmod(sec, 3600)
+    mins, secs = divmod(rem, 60)
+    if hours:
+        return f"{hours}h {mins}m"
+    if mins:
+        return f"{mins}m {secs}s"
+    return f"{secs}s"
 
 
 def maybe_alert_feed_stale() -> Optional[dict]:
-    """Alert when the Binance price feed goes stale — and again when it recovers.
+    """Alert when the BTC/xasset price feed goes stale — and again when it recovers.
 
-    Recovery fires only on a stale→healthy edge (tracked in arena_state) so
-    operators get a clear "restored" notification after an outage, not a
-    continuous healthy spam.
+    * Rising edge (healthy→stale): fire ``feed_stale`` once. If Telegram is
+      unreachable (VPN/DNS down — the common case that takes the feed out
+      too), ``notify`` queues it for retry so the operator still learns
+      about the disconnect once the network returns.
+    * Falling edge (stale→healthy): flush any queued disconnect alert first,
+      then fire ``feed_restored`` with outage duration.
+    * Continuous stale / continuous healthy: quiet (pending queue retries
+      the undelivered disconnect in the background).
     """
     status = publish_price_feed_status()
     was_stale = False
@@ -1234,10 +1455,32 @@ def maybe_alert_feed_stale() -> Optional[dict]:
         was_stale = False
 
     if status.get("stale"):
+        rising = not was_stale
         try:
             db.set_arena_state(_FEED_STALE_FLAG_KEY, "1")
+            if rising:
+                db.set_arena_state(_FEED_STALE_SINCE_KEY, str(time.time()))
+                db.set_arena_state(_FEED_STALE_DELIVERED_KEY, "0")
         except Exception:
             pass
+        # Build body for rising edge, or re-arm if a prior attempt was lost
+        # (process restart mid-outage with empty pending queue).
+        already_delivered = False
+        try:
+            already_delivered = db.get_arena_state(_FEED_STALE_DELIVERED_KEY) in (
+                "1", "true", "on",
+            )
+        except Exception:
+            pass
+        pending_keys = {
+            it.get("deb_key") for it in _pending_load()
+        }
+        queued = "feed_stale:feed_stale" in pending_keys
+        if not rising and (already_delivered or queued):
+            # Still stale — disconnect already fired (or queued). Pending
+            # flush in run_periodic_alerts keeps retrying delivery.
+            return status
+
         syms = status.get("symbols") or {}
         parts = []
         for s, info in syms.items():
@@ -1248,20 +1491,48 @@ def maybe_alert_feed_stale() -> Optional[dict]:
                     else f"{s.upper()} unavailable"
                 )
         body = ", ".join(parts) if parts else status.get("error") or "feed stale"
-        notify(
+        result = notify(
             "feed_stale",
             "Price feed stale / unavailable",
-            body + "\nRestart arena to reconnect Binance WebSocket if this persists.",
+            body + "\nRestart arena to reconnect Chainlink RTDS / Binance xasset feeds if this persists.",
             level="warn",
             key="feed_stale",
             detail=status,
         )
+        if result.get("sent"):
+            try:
+                db.set_arena_state(_FEED_STALE_DELIVERED_KEY, "1")
+            except Exception:
+                pass
         return status
 
     # Healthy — clear sticky flag and notify once on recovery
     if was_stale:
+        since = 0.0
+        delivered = False
+        try:
+            since = float(db.get_arena_state(_FEED_STALE_SINCE_KEY) or 0)
+            delivered = db.get_arena_state(_FEED_STALE_DELIVERED_KEY) in (
+                "1", "true", "on",
+            )
+        except Exception:
+            pass
+        outage_sec = (time.time() - since) if since > 0 else None
+
+        # Deliver any queued disconnect alert *before* the restore so the
+        # operator's chat reads "down" then "up", not only "up".
+        try:
+            flush_undelivered_alerts(force=True)
+            delivered = delivered or db.get_arena_state(
+                _FEED_STALE_DELIVERED_KEY
+            ) in ("1", "true", "on")
+        except Exception:
+            pass
+
         try:
             db.set_arena_state(_FEED_STALE_FLAG_KEY, "0")
+            db.set_arena_state(_FEED_STALE_SINCE_KEY, "0")
+            db.set_arena_state(_FEED_STALE_DELIVERED_KEY, "0")
         except Exception:
             pass
         syms = status.get("symbols") or {}
@@ -1276,19 +1547,41 @@ def maybe_alert_feed_stale() -> Optional[dict]:
                 )
             else:
                 parts.append(s.upper())
-        body = ", ".join(parts) if parts else "Binance WebSocket healthy again"
+        body = ", ".join(parts) if parts else "Price feeds healthy again"
+        if outage_sec is not None and outage_sec >= 0:
+            body += f"\nOutage lasted {_format_outage_duration(outage_sec)}"
+            if since > 0:
+                try:
+                    from zoneinfo import ZoneInfo
+                    started = datetime.fromtimestamp(
+                        since, tz=ZoneInfo(_ET_ZONE),
+                    ).strftime("%Y-%m-%d %H:%M ET")
+                    body += f" (since {started})"
+                except Exception:
+                    pass
+        if not delivered:
+            body += (
+                "\nNote: disconnect alert could not be delivered while the "
+                "network was down; it was queued and retried on recovery."
+            )
+        detail = dict(status) if isinstance(status, dict) else {"status": status}
+        if outage_sec is not None:
+            detail["outage_sec"] = round(outage_sec, 1)
+            detail["stale_delivered"] = bool(delivered)
         notify(
             "feed_restored",
             "Price feed restored",
             body,
             level="info",
             key="feed_restored",
-            detail=status,
+            detail=detail,
         )
-        return {"restored": True, **status}
+        return {"restored": True, "outage_sec": outage_sec, **status}
 
     try:
         db.set_arena_state(_FEED_STALE_FLAG_KEY, "0")
+        db.set_arena_state(_FEED_STALE_SINCE_KEY, "0")
+        db.set_arena_state(_FEED_STALE_DELIVERED_KEY, "0")
     except Exception:
         pass
     return None
@@ -1575,6 +1868,15 @@ def alert_startup(
 def run_periodic_alerts() -> dict[str, Any]:
     """Evolution-loop host: hourly/daily digests + ops threshold alerts."""
     out: dict[str, Any] = {}
+    # Flush undelivered alerts first so a recovered network delivers the
+    # queued disconnect (etc.) before new digests fire this tick.
+    try:
+        flushed = flush_undelivered_alerts()
+        if flushed.get("delivered") or flushed.get("remaining"):
+            out["pending_flush"] = flushed
+    except Exception as e:
+        logger.debug("pending alert flush failed: %s", e)
+        out["pending_flush"] = {"error": str(e)}
     for name, fn in (
         ("hourly", maybe_send_hourly_report),
         ("daily", maybe_send_daily_report),

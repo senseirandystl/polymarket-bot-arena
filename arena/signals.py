@@ -78,8 +78,8 @@ def build_combined_signals(
             if cond:
                 cvd = get_cvd_feed().get_cvd(cond)
 
-    # BTC drift from the window's "price to beat" (accurate strike = Binance open
-    # at eventStartTime). Warm path reads the strike the warmer already fetched;
+    # BTC drift from the window's "price to beat" (official Polymarket openPrice
+    # / Chainlink at eventStartTime). Warm path reads the strike the warmer fetched;
     # cold path (maker) fetches via the registry (cached). Regime-agnostic
     # fundamental; 0.0 until a strike is available.
     btc_latest = float(price_signals.get("latest", 0.0) or 0.0)

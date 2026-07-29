@@ -187,7 +187,7 @@ def check_price_feed() -> dict:
         if not raw:
             return _check(
                 "price_feed", True, level="ok",
-                message="No feed heartbeat stored (check arena.log for Binance WS)",
+                message="No feed heartbeat stored (check arena.log for Chainlink RTDS / price feed)",
             )
         data = json.loads(raw) if isinstance(raw, str) else raw
         if not isinstance(data, dict):
@@ -202,7 +202,7 @@ def check_price_feed() -> dict:
             return _check(
                 "price_feed", False, level="warn",
                 message="Price feed marked stale / unavailable",
-                recommend="Restart arena to reconnect Binance WebSocket",
+                recommend="Restart arena to reconnect Chainlink RTDS (BTC) / Binance (ETH/SOL)",
                 detail=data,
             )
         return _check("price_feed", True, message="Feed OK", detail=data)

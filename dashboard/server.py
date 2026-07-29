@@ -349,7 +349,7 @@ def get_markets():
 
     # Fresh CLOB prices for the visible markets in ONE batch call (POST
     # /midpoints) — atomic snapshot, one round trip instead of a /midpoint GET
-    # per market. Prices current + the next card; both YES and NO are set.
+    # per market. Prices current + the next card; both UP and DOWN are set.
     polymarket_markets.price_markets([current, upcoming[0] if upcoming else None])
 
     def _shape(m, *, with_strike: bool = False):
@@ -364,14 +364,14 @@ def get_markets():
         shaped = {
             "id": m.get("id"),
             "question": m.get("question"),
-            "current_price": yes,                     # YES/Up (0-1)
-            "no_price": no,                           # NO/Down (0-1), real mid
+            "current_price": yes,                     # UP token mid (0-1)
+            "no_price": no,                           # DOWN token mid (0-1)
             "resolves_at": m.get("resolves_at"),
             "event_start_time": event_start,
             "time_remaining_seconds": tr,
             "is_current_window": tr is not None and 0 < tr <= 300,
             "url": None,
-            "strike": None,                           # price-to-beat (Binance open)
+            "strike": None,                           # price-to-beat (PM openPrice)
         }
         if with_strike and event_start and shaped["id"]:
             try:
@@ -418,7 +418,7 @@ def get_markets():
 
 @app.get("/api/price/{condition_id}")
 def get_price(condition_id: str):
-    """Fresh YES/NO prices for one market (fast poll for the market cards)."""
+    """Fresh UP/DOWN prices for one market (fast poll for the market cards)."""
     import polymarket_markets
     prices = polymarket_markets.current_prices(condition_id)
     if not prices:
@@ -1151,7 +1151,9 @@ def get_regime():
 
 @app.get("/api/ga")
 def get_ga():
-    """Genetic Algorithm status: last cycle snapshot, fitness curve, recent gens."""
+    """Genetic Algorithm status: last cycle snapshot, fitness curve, recent gens,
+    and the shadow elite gene bank used as future parents.
+    """
     status = db.get_ga_status()
     gens = db.get_ga_history(limit=15)
     # Compact generation rows for the UI (full report available on demand)
@@ -1195,9 +1197,25 @@ def get_ga():
                 for i in (report.get("individuals") or [])
             ],
         })
+
+    # Shadow gene bank — elites deposited each cycle (newest last in storage).
+    gene_bank_entries = []
+    gene_bank_max = int(getattr(config, "GA_GENE_BANK_SIZE", 20))
+    try:
+        from evolution.gene_bank import load_bank, _max_size
+        gene_bank_entries = load_bank()
+        gene_bank_max = _max_size()
+    except Exception:
+        gene_bank_entries = []
+
     return JSONResponse({
         "status": status,
         "generations": compact,
+        "gene_bank": {
+            "entries": list(reversed(gene_bank_entries)),  # newest first for UI
+            "count": len(gene_bank_entries),
+            "max_size": gene_bank_max,
+        },
         "config": {
             "elite_count": getattr(config, "GA_ELITE_COUNT", 1),
             "mutation_rate": getattr(config, "GA_MUTATION_RATE", 0.2),
@@ -1208,6 +1226,9 @@ def get_ga():
             "perf_trigger_enabled": getattr(config, "GA_PERF_TRIGGER_ENABLED", True),
             "perf_trigger_pnl": getattr(config, "GA_PERF_TRIGGER_PNL", -25.0),
             "fitness_weights": getattr(config, "GA_FITNESS_WEIGHTS", {}),
+            "gene_bank_size": gene_bank_max,
+            "type_alloc_enabled": getattr(config, "GA_TYPE_ALLOC_ENABLED", True),
+            "backtest_gate_enabled": getattr(config, "GA_BACKTEST_GATE_ENABLED", True),
         },
     })
 

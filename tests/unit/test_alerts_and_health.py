@@ -1,5 +1,6 @@
 """Alerts dispatcher + health checks + ops snapshot."""
 
+import json
 from unittest import mock
 
 import pytest
@@ -153,7 +154,12 @@ def test_new_event_types_in_defaults(monkeypatch):
 
 def test_feed_restored_alert_on_recovery(monkeypatch):
     """Stale→healthy edge fires feed_restored once; healthy→healthy is quiet."""
-    saved = {alerts._FEED_STALE_FLAG_KEY: "1"}
+    import time as _time
+    saved = {
+        alerts._FEED_STALE_FLAG_KEY: "1",
+        alerts._FEED_STALE_SINCE_KEY: str(_time.time() - 3600),
+        alerts._FEED_STALE_DELIVERED_KEY: "0",
+    }
     notified = []
 
     monkeypatch.setattr(alerts.db, "get_arena_state",
@@ -162,6 +168,8 @@ def test_feed_restored_alert_on_recovery(monkeypatch):
                         lambda k, v: saved.__setitem__(k, v))
     monkeypatch.setattr(alerts, "notify",
                         lambda *a, **kw: notified.append((a, kw)) or {"sent": True})
+    monkeypatch.setattr(alerts, "flush_undelivered_alerts",
+                        lambda: {"retried": 0, "delivered": 0, "remaining": 0})
     monkeypatch.setattr(
         alerts, "publish_price_feed_status",
         lambda: {
@@ -175,12 +183,95 @@ def test_feed_restored_alert_on_recovery(monkeypatch):
     assert r.get("restored") is True
     assert any(kw.get("key") == "feed_restored" or (a and a[0] == "feed_restored")
                for a, kw in notified)
+    # Restore body includes outage duration
+    body = notified[0][0][2] if notified[0][0] else ""
+    assert "Outage lasted" in body
     assert saved.get(alerts._FEED_STALE_FLAG_KEY) == "0"
 
     notified.clear()
     r2 = alerts.maybe_alert_feed_stale()
     assert r2 is None
     assert not notified
+
+
+def test_feed_stale_rising_edge_only(monkeypatch):
+    """Disconnect alert fires once on healthy→stale; continuous stale is quiet."""
+    saved = {}
+    notified = []
+
+    monkeypatch.setattr(alerts.db, "get_arena_state",
+                        lambda k, d=None: saved.get(k, d))
+    monkeypatch.setattr(alerts.db, "set_arena_state",
+                        lambda k, v: saved.__setitem__(k, v))
+    monkeypatch.setattr(alerts, "notify",
+                        lambda *a, **kw: notified.append((a, kw)) or {"sent": True})
+    monkeypatch.setattr(
+        alerts, "publish_price_feed_status",
+        lambda: {
+            "stale": True,
+            "symbols": {"btc": {"latest": 1.0, "stale": True, "age_sec": 120.0}},
+        },
+    )
+
+    r1 = alerts.maybe_alert_feed_stale()
+    assert r1 is not None and r1.get("stale") is True
+    assert len(notified) == 1
+    assert notified[0][0][0] == "feed_stale"
+    assert saved.get(alerts._FEED_STALE_FLAG_KEY) == "1"
+    assert saved.get(alerts._FEED_STALE_DELIVERED_KEY) == "1"
+
+    notified.clear()
+    r2 = alerts.maybe_alert_feed_stale()
+    assert r2 is not None and r2.get("stale") is True
+    assert not notified  # no spam while still stale
+
+
+def test_failed_notify_queues_for_retry(monkeypatch):
+    """When Telegram is unreachable, the alert is queued (not lost to debounce)."""
+    saved = {}
+    monkeypatch.setattr(alerts.db, "get_arena_state",
+                        lambda k, d=None: saved.get(k, d))
+    monkeypatch.setattr(alerts.db, "set_arena_state",
+                        lambda k, v: saved.__setitem__(k, v))
+    monkeypatch.setattr(alerts, "load_config", lambda: {
+        "enabled": True,
+        "channels": {"telegram": True, "discord": False, "email": False},
+        "events": {e: True for e in alerts.EVENT_TYPES},
+        "min_level": "info",
+        "debounce_sec": 300,
+    })
+    monkeypatch.setattr(alerts, "_append_log", lambda e: None)
+    monkeypatch.setattr(
+        alerts, "_send_telegram",
+        lambda *a, **k: (False, "nodename nor servname provided"),
+    )
+    alerts._debounce.clear()
+
+    r = alerts.notify("feed_stale", "Price feed stale", "BTC age=90s",
+                      level="warn", key="feed_stale")
+    assert r["sent"] is False
+    assert r.get("queued") is True
+    # Debounce must NOT be stamped on failure — otherwise recovery is blocked
+    assert f"feed_stale:feed_stale" not in alerts._debounce
+
+    pending = json.loads(saved.get(alerts.PENDING_KEY) or "[]")
+    assert len(pending) == 1
+    assert pending[0]["event_type"] == "feed_stale"
+
+    # Network recovers — flush delivers and clears the queue
+    monkeypatch.setattr(
+        alerts, "_send_telegram",
+        lambda *a, **k: (True, "ok"),
+    )
+    # Allow immediate retry
+    pending[0]["next_retry_ts"] = 0
+    saved[alerts.PENDING_KEY] = json.dumps(pending)
+
+    flushed = alerts.flush_undelivered_alerts()
+    assert flushed["delivered"] == 1
+    assert flushed["remaining"] == 0
+    assert f"feed_stale:feed_stale" in alerts._debounce
+    assert saved.get(alerts._FEED_STALE_DELIVERED_KEY) == "1"
 
 
 def test_event_toggle_roundtrip(monkeypatch):

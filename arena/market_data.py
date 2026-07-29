@@ -175,8 +175,9 @@ class MarketDataWarmer(threading.Thread):
         cvd = self._cvd_feed.get_cvd(cond) if cond else 0.0
         pm = self._pm_feed.get_momentum(yes_tok)
 
-        # Accurate strike (Binance open @ eventStartTime), fetched once per market
-        # off the hot path and cached in the registry. None until available.
+        # Accurate strike = Polymarket official openPrice (Chainlink at
+        # eventStartTime) — same value the website shows as Price to Beat.
+        # Fetched once per market off the hot path; None until available.
         strike = get_strike_registry().get_strike(
             market_id, market.get("event_start_time"))
 
