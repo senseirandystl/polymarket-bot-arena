@@ -58,6 +58,140 @@ def test_allocate_equal():
         assert w[n] == pytest.approx(0.25, abs=0.01)
 
 
+def test_arbitrage_pinned_to_equal_share():
+    """Arb is a fixed 1/N staple — Kelly must not starve or over-weight it."""
+    names = ["arbitrage-v1", "hybrid-v1", "sniper-v1", "sentiment-g11-794"]
+    metrics = {
+        "arbitrage-v1": {
+            "n": 20, "sharpe": 0.05, "expectancy": 0.1,
+            "total_pnl": 2.0, "variance": 50.0, "ready": True,
+        },
+        "hybrid-v1": {
+            "n": 50, "sharpe": 0.5, "expectancy": 0.5,
+            "total_pnl": 25.0, "variance": 2.0, "ready": True,
+        },
+        "sniper-v1": {
+            "n": 40, "sharpe": 0.2, "expectancy": 0.2,
+            "total_pnl": 8.0, "variance": 5.0, "ready": True,
+        },
+        "sentiment-g11-794": {
+            "n": 40, "sharpe": 0.4, "expectancy": 0.4,
+            "total_pnl": 16.0, "variance": 3.0, "ready": True,
+        },
+    }
+    with mock.patch.object(portfolio, "compute_metrics", return_value=metrics), \
+         mock.patch.object(portfolio, "_market_returns_by_bot",
+                           return_value={n: {} for n in names}):
+        result = portfolio.allocate(names, method="kelly_portfolio")
+    w = result["weights"]
+    assert abs(sum(w.values()) - 1.0) < 1e-6
+    assert w["arbitrage-v1"] == pytest.approx(0.25, abs=0.01)
+    # Manual override still wins
+    result2 = portfolio.allocate(
+        names, method="kelly_portfolio",
+        manual_overrides={"arbitrage-v1": 0.10},
+    )
+    assert result2["weights"]["arbitrage-v1"] == pytest.approx(0.10, abs=0.01)
+
+
+def test_losers_starved_not_floored():
+    """Ready bots with negative expectancy get a tiny score, not cold-start floor."""
+    # Need ≥3 bots so the simplex min/max box can actually starve a loser
+    # (with n=2, max_w is forced to 0.5 and weights collapse to equal).
+    names = ["winner-v1", "mid-v1", "loser-v1"]
+    metrics = {
+        "winner-v1": {
+            "n": 40, "sharpe": 0.5, "expectancy": 0.4,
+            "total_pnl": 16.0, "variance": 2.0, "ready": True,
+        },
+        "mid-v1": {
+            "n": 40, "sharpe": 0.2, "expectancy": 0.15,
+            "total_pnl": 6.0, "variance": 3.0, "ready": True,
+        },
+        "loser-v1": {
+            "n": 40, "sharpe": -0.2, "expectancy": -0.3,
+            "total_pnl": -12.0, "variance": 4.0, "ready": True,
+        },
+    }
+    with mock.patch.object(portfolio, "compute_metrics", return_value=metrics), \
+         mock.patch.object(portfolio, "_market_returns_by_bot",
+                           return_value={n: {} for n in names}):
+        result = portfolio.allocate(names, method="kelly_portfolio")
+    w = result["weights"]
+    assert w["winner-v1"] > w["loser-v1"]
+    assert w["loser-v1"] <= w["mid-v1"]
+    assert w["loser-v1"] < 0.25  # not an equal 1/3 floor
+
+
+def test_rebalance_force_evolution_reason(monkeypatch):
+    """Post-GA path uses force=True + reason=evolution on the new roster."""
+    names = ["phantom-v1", "hybrid-g4-158", "sniper-g4-144"]
+    monkeypatch.setattr(portfolio, "active_bot_names", lambda: names)
+    monkeypatch.setattr(portfolio, "_current_regime_label", lambda: "low_vol_range")
+    saved = {}
+
+    def fake_save(state):
+        saved.update(state)
+
+    monkeypatch.setattr(portfolio, "save_state", fake_save)
+    monkeypatch.setattr(portfolio, "load_state", lambda: {
+        "enabled": True,
+        "method": "equal",
+        "window_hours": 24.0,
+        "weights": {"old-v1": 1.0},
+        "manual_overrides": {},
+        "last_rebalance_at": 0.0,
+        "last_regime": "normal",
+    })
+    with mock.patch.object(portfolio, "allocate", return_value={
+        "weights": {n: 1.0 / len(names) for n in names},
+        "auto_weights": {n: 1.0 / len(names) for n in names},
+        "manual_overrides": {},
+        "metrics": {},
+        "correlations": {},
+        "method": "equal",
+        "window_hours": 24.0,
+    }):
+        state = portfolio.rebalance(force=True, reason="evolution")
+    assert state["rebalance_reason"] == "evolution"
+    assert set(state["weights"]) == set(names)
+    assert "old-v1" not in state["weights"]
+
+
+def test_explore_floor_caps_new_gn_bots(monkeypatch):
+    """New hybrid-g4-* with n=0 gets weight ≤ PORTFOLIO_EXPLORE_MAX_WEIGHT."""
+    names = ["phantom-v1", "hybrid-g4-158", "hybrid-g4-259"]
+    metrics = {
+        "phantom-v1": {
+            "n": 40, "sharpe": 1.0, "expectancy": 0.5,
+            "total_pnl": 20.0, "variance": 1.0, "ready": True,
+        },
+        "hybrid-g4-158": {
+            "n": 0, "sharpe": 0.0, "expectancy": 0.0,
+            "total_pnl": 0.0, "variance": 0.0, "ready": False,
+        },
+        "hybrid-g4-259": {
+            "n": 0, "sharpe": 0.0, "expectancy": 0.0,
+            "total_pnl": 0.0, "variance": 0.0, "ready": False,
+        },
+    }
+    monkeypatch.setattr(config, "PORTFOLIO_EXPLORE_MAX_WEIGHT", 0.08, raising=False)
+    monkeypatch.setattr(config, "PORTFOLIO_EXPLORE_MIN_TRADES", 15, raising=False)
+    monkeypatch.setattr(config, "PORTFOLIO_MIN_WEIGHT", 0.05, raising=False)
+    monkeypatch.setattr(config, "PORTFOLIO_MAX_WEIGHT", 0.70, raising=False)
+    monkeypatch.setattr(config, "PORTFOLIO_CORR_SHRINK", 0.0, raising=False)
+    with mock.patch.object(portfolio, "compute_metrics", return_value=metrics), \
+         mock.patch.object(portfolio, "_market_returns_by_bot",
+                           return_value={n: {} for n in names}):
+        result = portfolio.allocate(names, method="equal")
+    w = result["weights"]
+    assert w["hybrid-g4-158"] <= 0.08 + 1e-6
+    assert w["hybrid-g4-259"] <= 0.08 + 1e-6
+    assert abs(sum(w.values()) - 1.0) < 1e-5
+    # Veteran keeps the bulk
+    assert w["phantom-v1"] > w["hybrid-g4-158"]
+
+
 def test_allocate_sharpe_favors_winners():
     names = ["winner", "loser", "mid"]
     metrics = {
@@ -319,17 +453,24 @@ def _sig(drift=0.5):
 
 def test_kelly_size_scales_with_portfolio_weight():
     """Half capital weight → roughly half suggested amount (same edge)."""
-    with mock.patch.object(base_bot, "_sizing_bankroll", lambda mode: 200.0), \
-         mock.patch.object(base_bot, "_kelly_fraction", lambda: 0.25), \
-         mock.patch.object(base_bot, "_portfolio_weight",
-                           side_effect=lambda name: 1.0):
-        full = _bot().make_decision(_market(), _sig())
-    with mock.patch.object(base_bot, "_sizing_bankroll", lambda mode: 200.0), \
-         mock.patch.object(base_bot, "_kelly_fraction", lambda: 0.25), \
-         mock.patch.object(base_bot, "_portfolio_weight",
-                           side_effect=lambda name: 0.5):
-        half = _bot().make_decision(_market(), _sig())
+    from arena.regime_adapt import RegimeAdjust
+    neutral = RegimeAdjust(size_mult=1.0, label="normal")
+    m = _market(yes=0.60)
+    m["yes_ask"] = 0.61
+    m["no_ask"] = 0.40
+    sig = _sig(drift=0.5)
 
+    def _run(w):
+        with mock.patch.object(base_bot, "_sizing_bankroll", lambda mode: 5000.0), \
+             mock.patch.object(base_bot, "_kelly_fraction", lambda: 0.25), \
+             mock.patch.object(base_bot, "_portfolio_weight",
+                               side_effect=lambda name: w), \
+             mock.patch.object(base_bot, "_risk_size_mult", lambda name: 1.0), \
+             mock.patch("arena.regime_adapt.adjustments", return_value=neutral):
+            return _bot().make_decision(m, sig)
+
+    full = _run(1.0)
+    half = _run(0.5)
     if full.get("action") != "buy" or half.get("action") != "buy":
         pytest.skip("momentum bot did not trade under test signals")
     # Allow small shares-first rounding
@@ -347,11 +488,18 @@ def test_execute_scales_zone_bot_amount():
     }
     market = _market()
 
+    class _RiskOK:
+        allow = True
+        action = "allow"
+        reason = None
+        size_mult = 1.0
+
     with mock.patch.object(bot, "_paused", False), \
          mock.patch.object(base_bot.db, "get_bot_mode", return_value="paper"), \
          mock.patch.object(base_bot.db, "get_bot_daily_loss", return_value=0.0), \
          mock.patch.object(base_bot.db, "get_total_daily_loss", return_value=0.0), \
          mock.patch.object(base_bot, "_portfolio_size_mult", return_value=2.0), \
+         mock.patch("arena.risk_engine.pre_trade", return_value=_RiskOK()), \
          mock.patch.object(bot, "_exposure_headroom", return_value=None), \
          mock.patch.object(bot, "_place_via_engine") as place:
         place.return_value = {"success": True}

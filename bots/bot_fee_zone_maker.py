@@ -1,89 +1,55 @@
-"""FeeZoneMaker — fee-aware directional maker for BTC 5-min markets.
+"""FeeZoneMaker — drift-backed taker entries in the fee-friction price band.
 
-Taker fee formula (official Polymarket docs — https://docs.polymarket.com/trading/fees):
-    fee_usdc = feeRate × shares × p × (1 - p)     (makers pay ZERO)
+REALITY: venues still fill as *takers* (paper walks asks; live market orders).
+The zero-fee maker advantage is aspirational until true limit posting exists.
+So this bot is a **selective directional** entry in the mid-high fee band,
+not a spread-capture MM.
 
-BTC markets are the *crypto* tier, feeRate = 0.07 (peaks at $1.75 / 100 shares
-at 50¢). Per-share taker fee across the quoting zone (feeRate 0.07):
-    50¢ → 175 bps   60¢ → 168 bps   65¢ → 159 bps
-    70¢ → 147 bps   75¢ → 131 bps   80¢ → 112 bps
-    82¢ → 103 bps   85¢ →  89 bps   90¢ →  63 bps
-
-The fee math lives in ONE place — :func:`polymarket_fills.taker_fee` (the same
-function paper + live P&L use) — so this bot never re-derives it. (Earlier
-versions carried a bogus quadratic ``0.25 × (p(1-p))²`` here; see BUG_HISTORY #17.)
-
-Strategy:
-  Post maker orders in the 60-82¢ YES zone where:
-    1. Taker fee is ~103–168 bps (significant friction for takers crossing us)
-    2. Market price gives a clear directional signal (>60¢ = YES favored)
-    3. Maker pays ZERO fees — double advantage over takers
-
-We run throughout the full market window (not time-gated), quoting
-whenever the price is in the fee-advantage zone. Smaller positions,
-higher frequency than LateWindowMaker.
-
-REALITY CHECK (2026-07-16): in the current venues, "maker" quotes execute as
-TAKER fills (paper walks the real asks and pays the taker fee; live uses
-market orders) — the zero-fee maker advantage is aspirational until real
-limit-order posting exists. So an in-zone favorite must be backed by the
-drift fundamental (``min_drift`` gate) to carry real edge; the zone alone
-measured barely break-even net of price+fee in the offline harness.
-
-Competing hypothesis:
-  Always-on fee-zone quoting beats late-window time-gating because
-  price signal alone (no momentum requirement) is sufficient in the
-  60-82¢ range, and more trades → more learning data.
+2026-08 redesign (after soak):
+  * Hard mid/ask consistency gate (fantasy fills at ask≪mid rejected).
+  * Side chosen by *signed drift first*, then zone membership — not
+    "whichever side is in zone" alone (that bought expensive favorites).
+  * Edge priced on ask; lag rule: mid must still lag implied_P enough.
+  * Size via calibrated Kelly (not flat %); conf from structure not zone depth.
+  * Tighter zone [0.58, 0.78] for better BE after fees.
 """
+
+from __future__ import annotations
 
 import config
 import learning
 import polymarket_fills
 from bots.base_bot import BaseBot, strategy_decision
+from bots.edge_calibration import quality_confidence
+from bots.maker_utils import maker_kelly_amount, mid_ask_gap_ok, resolve_side_exec
 from signals.lab import SignalView
 
 
 def taker_fee(price: float) -> float:
-    """Canonical Polymarket taker fee for ONE share at ``price`` (USDC).
-
-    Thin wrapper over :func:`polymarket_fills.taker_fee` (crypto tier,
-    ``config.POLYMARKET_TAKER_FEE_RATE``) so the fee-zone gate uses the exact
-    same formula as settled P&L. Do not re-derive the formula here.
-    """
+    """Canonical Polymarket taker fee for ONE share at ``price`` (USDC)."""
     return polymarket_fills.taker_fee(1.0, price)
 
 
 DEFAULT_PARAMS = {
-    # Zone widened 0.60-0.82 → 0.56-0.86 (still all ≥80 bps taker fee) because
-    # 5-min BTC markets only sat in the old band ~9% of the time — the bot was
-    # starved (1 trade/session). The wider band ~doubles quoting opportunities
-    # while staying in the fee-friction range. Tune from live data.
-    "min_price_zone": 0.56,    # Only quote at YES price ≥ 56¢
-    "max_price_zone": 0.86,    # Only quote at YES price ≤ 86¢ (fee still ≥80 bps here)
-    "min_fee_bps": 80,         # Require taker fee ≥ 80 bps at this price to justify quoting
-    # Drift confirmation (2026-07-16, harness net-edge, ~300 markets): quoting
-    # the in-zone favorite WITHOUT drift backing is barely break-even (+0.8c/sh,
-    # 72.2% WR at avg 0.70 — the price already demands that WR). Requiring the
-    # signed drift ≥ 0.15 toward the quoted side lifts it to +9.4c/sh at 82.6%.
-    # The zone picks WHERE to quote; drift decides WHETHER the favorite is real.
-    "min_drift": 0.15,         # Signed btc_drift toward the quoted side must be ≥ this
-    "min_edge": 0.02,          # implied_P(drift) − price − fee must clear this
-    "spread_ticks": 2,         # Half-spread: 2 ticks (±2¢ around market price)
-    "momentum_weight": 0.30,   # Weight of momentum signal in confidence (vs price signal)
-    "position_size_pct": 0.06, # 6% of max — smaller per-trade, higher frequency
-    "lookback_candles": 5,     # BTC candles for momentum context
-    "min_confidence": 0.25,    # Skip if we can't reach this confidence
-    # Inventory management: stand down when the shared pool already holds
-    # this much open USD on the quoted (market, side); clamp size to the
-    # remaining headroom below the cap. An always-on quoter is the easiest
-    # bot to pile correlated inventory with — the cap is its discipline.
-    "max_inventory_usd": 25.0,
+    # Tighter than the old 0.56–0.86 band: extremes either thin margin or
+    # underdog fights. Fee still ≥ ~100 bps through most of this range.
+    "min_price_zone": 0.58,
+    "max_price_zone": 0.78,
+    "min_fee_bps": 90,
+    "min_drift": 0.18,          # signed drift toward quoted side
+    "min_edge": 0.025,          # implied_P − ask − fee
+    "max_mid_vs_implied": 0.02, # mid must lag implied by at least this
+    "spread_ticks": 2,
+    "position_size_pct": 0.06,  # Kelly cap as fraction of get_max_position()
+    "lookback_candles": 5,
+    "min_confidence": 0.20,     # structure conf floor (not zone-depth conf)
+    "max_inventory_usd": 20.0,
+    "mom_contradict": 0.0012,   # hard BTC move against side → stand down
 }
 
 
 class FeeZoneMakerBot(BaseBot):
-    """Quotes in the taker-fee-friction zone (56-86¢) throughout the window —
-    whichever side (YES or NO) has its price in the zone (symmetric mirror)."""
+    """Drift-first selective entries when the lagging side sits in the fee zone."""
 
     strategy_type = "fee_zone_maker"
 
@@ -98,10 +64,9 @@ class FeeZoneMakerBot(BaseBot):
 
     def analyze(self, market: dict, signals: dict) -> dict:
         p = self.strategy_params
-        market_price = market.get("current_price") or 0.5  # None if book down
+        market_price = market.get("current_price") or 0.5
         time_rem = market.get("time_remaining_seconds")
 
-        # Maker quote fields — always computed so run_maker_section() can log
         tick = 0.01
         half_spread = p["spread_ticks"] * tick
         maker_bid = round(max(0.01, market_price - half_spread), 2)
@@ -111,112 +76,111 @@ class FeeZoneMakerBot(BaseBot):
         def _hold(reason, signals_out=None):
             return strategy_decision(
                 "hold", reasoning=reason, signals=signals_out or {},
-                maker_bid=maker_bid,
-                maker_ask=maker_ask,
-                maker_mid=maker_mid,
-                maker_side="both",
+                maker_bid=maker_bid, maker_ask=maker_ask,
+                maker_mid=maker_mid, maker_side="both",
             )
 
-        # ── Fee-zone gate: quote whichever SIDE's MID is in the fee zone ─────
-        # The fee zone [56¢,86¢] never contains both yes and no (yes+no ~= 1),
-        # so at most one side qualifies. NO is a first-class mirror: quote the NO
-        # token when its price sits in the same fee-friction band. Fee is
-        # symmetric (fee(p) == fee(1-p)), so the advantage is identical per side.
-        # Zone membership keys off MID; executable cost + slippage expected price
-        # key off warm best ASK when present.
-        min_zone = p["min_price_zone"]
-        max_zone = p["max_price_zone"]
+        sv = SignalView.of(signals)
+        drift = float(sv.btc_drift or 0.0)
+        min_drift = float(p.get("min_drift", 0.18))
+        if abs(drift) < min_drift:
+            return _hold(f"fzm: |drift|={abs(drift):.3f} < {min_drift:.2f}")
+
+        # Drift picks the side; zone membership is a filter, not the selector.
         no_price = market.get("no_price")
         if no_price is None:
             no_price = round(1.0 - market_price, 4)
-        if min_zone <= market_price <= max_zone:
-            side, side_mid = "yes", market_price
-            side_exec = market.get("yes_ask") or side_mid
-        elif min_zone <= no_price <= max_zone:
-            side, side_mid = "no", no_price
-            side_exec = market.get("no_ask") or side_mid
+        if drift > 0:
+            side, side_mid = "yes", float(market_price)
         else:
-            return _hold(
-                f"fzm: neither side in fee zone [{min_zone},{max_zone}] "
-                f"(yes={market_price:.2f} no={no_price:.2f})"
-            )
+            side, side_mid = "no", float(no_price)
 
-        # Recompute the maker quote around the CHOSEN side's mid.
+        min_zone = float(p["min_price_zone"])
+        max_zone = float(p["max_price_zone"])
+        if not (min_zone <= side_mid <= max_zone):
+            return _hold(
+                f"fzm: {side} mid={side_mid:.2f} outside fee zone "
+                f"[{min_zone:.2f},{max_zone:.2f}]")
+
+        side_exec, _src = resolve_side_exec(market, side, side_mid)
+        ok, why = mid_ask_gap_ok(side_mid, side_exec)
+        if not ok:
+            return _hold(f"fzm: book integrity — {why}")
+
         maker_bid = round(max(0.01, side_mid - half_spread), 2)
         maker_ask = round(min(0.99, side_mid + half_spread), 2)
         maker_mid = side_mid
 
-        # Verify taker fee is large enough to justify quoting (at executable).
         fee = taker_fee(side_exec)
         fee_bps = fee * 10000
-        min_fee = p["min_fee_bps"]
+        min_fee = float(p["min_fee_bps"])
         if fee_bps < min_fee:
-            return _hold(f"fzm: fee {fee_bps:.0f}bps < {min_fee}bps at price={side_exec:.2f}")
-
-        # ── Drift confirmation: the in-zone favorite must be BACKED by BTC ───
-        # Paper/live fills cross the book as takers (we pay the very fee that
-        # defines the zone), so the quoted side needs real fundamental backing,
-        # not just a favorable price. Signed drift toward the side ≥ min_drift.
-        sv = SignalView.of(signals)
-        drift = sv.btc_drift
-        signed_drift = drift if side == "yes" else -drift
-        min_drift = p.get("min_drift", 0.15)
-        if signed_drift < min_drift:
             return _hold(
-                f"fzm: drift does not back {side} "
-                f"(drift={drift:+.3f}, need signed ≥ {min_drift})")
+                f"fzm: fee {fee_bps:.0f}bps < {min_fee:.0f}bps at ask={side_exec:.2f}")
 
-        # The price must also be JUSTIFIED by drift's calibrated implied
-        # probability (0.5 + 0.5*signed_drift) — being in-zone and drift-backed
-        # is not enough if the book already charges more than the fundamental
-        # supports (the late-window maker lost -$41.66 exactly this way).
+        signed_drift = drift if side == "yes" else -drift
         implied_p = 0.5 + 0.5 * signed_drift
-        fzm_edge = implied_p - side_exec - taker_fee(side_exec)
-        min_edge = p.get("min_edge", 0.02)
+        # Lag rule: crowd mid must still sit below implied (market lags drift).
+        max_mid_vs = float(p.get("max_mid_vs_implied", 0.02))
+        if side_mid > implied_p - max_mid_vs:
+            return _hold(
+                f"fzm: mid={side_mid:.2f} not lagging implied={implied_p:.2f} "
+                f"(need mid ≤ {implied_p - max_mid_vs:.2f})")
+
+        fzm_edge = implied_p - float(side_exec) - fee
+        min_edge = float(p.get("min_edge", 0.025))
         if fzm_edge < min_edge:
             return _hold(
-                f"fzm: price {side_exec:.2f} not justified by drift "
-                f"(implied_P={implied_p:.2f}, edge={fzm_edge:+.3f} < {min_edge})")
+                f"fzm: edge {fzm_edge:+.3f} < {min_edge:.3f} "
+                f"(implied={implied_p:.2f} ask={side_exec:.2f})")
 
-        # ── Inventory discipline: never quote into a loaded side ─────────────
         inventory = self._inventory_usd(market, side)
-        max_inv = p.get("max_inventory_usd", 25.0)
+        max_inv = float(p.get("max_inventory_usd", 20.0))
         inv_headroom = max_inv - inventory
         if inv_headroom <= 0:
             return _hold(
-                f"fzm: inventory cap — ${inventory:.2f} open on {side} "
-                f"≥ ${max_inv:.2f}")
+                f"fzm: inventory cap — ${inventory:.2f} open on {side} ≥ ${max_inv:.2f}")
 
-        # ── BTC momentum context ──────────────────────────────────────────────
         prices = sv.prices
-        lb = p["lookback_candles"]
+        lb = int(p["lookback_candles"])
         momentum = 0.0
         if len(prices) >= lb and prices[-lb] > 0:
             momentum = (prices[-1] - prices[-lb]) / prices[-lb]
-
-        # Momentum must not contradict the side. YES price >56¢ says "up"; hard
-        # BTC drop contradicts. For NO (betting "down"), a hard BTC rally
-        # contradicts. Signed so the check mirrors per side.
         signed_mom = momentum if side == "yes" else -momentum
-        if signed_mom < -0.0015:
-            return _hold(f"fzm: BTC momentum contradicts {side} zone (mom={momentum:+.5f})")
+        if signed_mom < -float(p.get("mom_contradict", 0.0012)):
+            return _hold(
+                f"fzm: BTC momentum contradicts {side} (mom={momentum:+.5f})")
 
-        # ── Confidence ────────────────────────────────────────────────────────
-        # Price signal: how far into the fee zone is the chosen side (mid)?
-        price_signal = (side_mid - min_zone) / (max_zone - min_zone)
+        conf = quality_confidence(
+            edge=fzm_edge,
+            abs_drift=abs(drift),
+            side_mid=side_mid,
+            side=side,
+        )
+        min_conf = float(p.get("min_confidence", 0.20))
+        if conf < min_conf:
+            return _hold(f"fzm: quality conf {conf:.3f} < {min_conf:.2f}")
 
-        # Momentum signal: momentum confirming the side boosts confidence
-        mw = p["momentum_weight"]
-        mom_boost = min(0.30, max(0.0, signed_mom * 50))  # up to +0.30 from momentum
-        drift_boost = min(0.20, signed_drift * 0.20)      # drift conviction adds up to +0.20
-        confidence = min(0.88, 0.30 + price_signal * (1.0 - mw) * 0.50
-                         + mom_boost * mw + drift_boost)
+        # Size: calibrated Kelly against a bankroll slice, capped by inventory.
+        try:
+            import db as _db
+            bankroll = float(_db.get_paper_available())
+        except Exception:
+            bankroll = float(getattr(config, "PAPER_BANKROLL_DEFAULT", 200.0))
+        try:
+            from arena.portfolio import get_weight
+            w = float(get_weight(self.name) or (1.0 / 8.0))
+        except Exception:
+            w = 0.125
+        amount = maker_kelly_amount(
+            fzm_edge, float(side_exec), bankroll * w,
+            size_pct_cap=float(p["position_size_pct"]),
+            inv_headroom=inv_headroom,
+        )
+        min_usd = float(getattr(config, "POLYMARKET_MIN_SHARES", 5)) * float(side_exec) * 0.5
+        if amount < max(0.50, min_usd * 0.25):
+            return _hold(f"fzm: size ${amount:.2f} too small")
 
-        min_conf = p["min_confidence"]
-        if confidence < min_conf:
-            return _hold(f"fzm: conf {confidence:.3f} < {min_conf}")
-
-        # ── Features ─────────────────────────────────────────────────────────
         of_data = sv.orderflow
         features = learning.extract_features(
             market_price, momentum,
@@ -224,26 +188,23 @@ class FeeZoneMakerBot(BaseBot):
             time_rem=time_rem,
         )
 
-        amount = min(config.get_max_position() * p["position_size_pct"],
-                     inv_headroom)
-
         return strategy_decision(
             "buy", side,
             edge=fzm_edge,
-            confidence=confidence,
+            confidence=conf,
             reasoning=(
                 f"fzm: {side} mid={side_mid:.2f} exec={float(side_exec):.2f} "
-                f"fee={fee_bps:.0f}bps "
-                f"mom={momentum:+.5f} psig={price_signal:.2f} conf={confidence:.3f} "
+                f"fee={fee_bps:.0f}bps drift={drift:+.3f} implied={implied_p:.2f} "
+                f"edge={fzm_edge:+.3f} conf={conf:.3f} "
                 f"quote_bid={maker_bid:.2f} quote_ask={maker_ask:.2f} "
                 f"inv=${inventory:.2f}"
             ),
-            signals={"drift": drift, "signed_drift": signed_drift,
-                     "momentum": momentum, "fee_bps": fee_bps,
-                     "price_signal": price_signal, "implied_p": implied_p,
-                     "inventory_usd": inventory},
+            signals={
+                "drift": drift, "signed_drift": signed_drift,
+                "momentum": momentum, "fee_bps": fee_bps,
+                "implied_p": implied_p, "inventory_usd": inventory,
+            },
             suggested_amount=amount,
-            # Expected taker price = warm best ask (matches paper fill book).
             entry_price=round(float(side_exec), 4),
             features=features,
             maker_bid=maker_bid,

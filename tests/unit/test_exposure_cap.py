@@ -57,3 +57,45 @@ def test_exposure_headroom_clamps_and_skips(db, monkeypatch):
     # At/over the cap: no headroom.
     _open_trade(db, "third-bot", amount=2.0)
     assert bot._exposure_headroom("mkt-1", "yes", "paper") <= 0.0
+
+
+def test_max_bots_per_side_blocks_new_bot(db, monkeypatch):
+    """MARKET_SIDE_MAX_BOTS: fourth distinct bot gets zero headroom."""
+    from bots.bot_momentum import MomentumBot
+    monkeypatch.setattr(db, "get_paper_pool_gross", lambda: 1000.0)
+    monkeypatch.setattr(config, "MARKET_SIDE_MAX_BOTS", 3, raising=False)
+    monkeypatch.setattr(config, "EXPOSURE_CORR_AWARE", False, raising=False)
+    for name in ("a", "b", "c"):
+        _open_trade(db, name, amount=1.0)
+    bot = MomentumBot(name="new-bot", generation=0)
+    assert bot._exposure_headroom("mkt-1", "yes", "paper") == 0.0
+    # Bot that already has a position can still add
+    bot_a = MomentumBot(name="a", generation=0)
+    assert bot_a._exposure_headroom("mkt-1", "yes", "paper") > 0
+
+
+def test_corr_aware_weights_high_rho_peers(db, monkeypatch):
+    """ρ≈1 peers nearly fully share the concentration budget."""
+    from bots.bot_momentum import MomentumBot
+    from arena import portfolio
+    monkeypatch.setattr(db, "get_paper_pool_gross", lambda: 100.0)
+    monkeypatch.setattr(config, "EXPOSURE_CORR_AWARE", True, raising=False)
+    monkeypatch.setattr(config, "EXPOSURE_CORR_FLOOR", 0.35, raising=False)
+    monkeypatch.setattr(config, "MARKET_SIDE_MAX_BOTS", 10, raising=False)
+    # Peer open $5; with ρ=1 effective used ≈ $5
+    _open_trade(db, "peer-bot", amount=5.0)
+    bot = MomentumBot(name="momentum-test", generation=0)
+    monkeypatch.setattr(
+        portfolio, "load_state",
+        lambda: {"correlations": {"momentum-test|peer-bot": 1.0}},
+    )
+    used, n = bot._effective_open_exposure("mkt-1", "yes", "paper")
+    assert n == 1
+    assert used == pytest.approx(5.0)
+    # ρ=0.0 floors to EXPOSURE_CORR_FLOOR
+    monkeypatch.setattr(
+        portfolio, "load_state",
+        lambda: {"correlations": {"momentum-test|peer-bot": 0.0}},
+    )
+    used0, _ = bot._effective_open_exposure("mkt-1", "yes", "paper")
+    assert used0 == pytest.approx(5.0 * config.EXPOSURE_CORR_FLOOR)

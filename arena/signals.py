@@ -118,6 +118,19 @@ def build_combined_signals(
         futures = {"funding": 0.0, "oi_delta": 0.0, "taker_delta": 0.0,
                    "stale": True}
 
+    # Volume activity for regime context. BTC *price* is Chainlink (no volume);
+    # price_feed fills volumes["btc"] from Binance btcusdt 1m klines
+    # (volume-only — never overwrites Chainlink price). Classifier rules still
+    # use volatility, not volume.
+    vol_series = list(price_signals.get("volumes") or [])
+    if not any(v and v > 0 for v in vol_series[-10:]) and price_feed is not None:
+        # Cold start / WS not primed yet — read lock-side buffer directly.
+        try:
+            with price_feed._lock:
+                vol_series = list(price_feed.volumes.get("btc") or [])
+        except Exception:
+            pass
+
     # Robust multi-feature regime (online EMA + hysteresis + optional
     # centroids). Continuous: updates every tick, not only at resolution.
     # Soft market_id stamp logs window rollovers without resetting state.
@@ -131,6 +144,7 @@ def build_combined_signals(
             vol_score=vol_base.get("vol_score"),
             trend_score=vol_base.get("trend_score"),
             realized_vol=vol_base.get("realized_vol"),
+            volumes=vol_series,
             market_id=(
                 (market.get("id") or market.get("market_id"))
                 if market is not None else None

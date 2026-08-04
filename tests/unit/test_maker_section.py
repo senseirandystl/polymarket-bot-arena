@@ -70,8 +70,13 @@ def test_late_window_maker_holds_early_trades_late():
     early = {"current_price": 0.65, "time_remaining_seconds": 1200}
     assert bot.analyze(early, signals)["action"] == "hold"
 
-    late = {"current_price": 0.65, "time_remaining_seconds": 45}
-    assert bot.analyze(late, signals)["action"] == "buy"
+    late = {
+        "current_price": 0.65,
+        "yes_ask": 0.66,
+        "time_remaining_seconds": 45,
+    }
+    out = bot.analyze(late, signals)
+    assert out["action"] == "buy", out.get("reasoning")
 
 
 def test_late_window_maker_requires_drift_conviction():

@@ -1,16 +1,20 @@
-"""Real-time crypto price data — Chainlink for BTC, Binance for ETH/SOL.
+"""Real-time crypto price data — Chainlink for BTC price, Binance for volume + xasset.
 
-**BTC** resolves on Polymarket against **Chainlink BTC/USD**, so the live BTC
-feed (latest, 1m candles for momentum/acceleration/mtf, drift ``btc_now``)
+**BTC price** resolves on Polymarket against **Chainlink BTC/USD**, so the live
+BTC level (latest, 1m candles for momentum/acceleration/mtf, drift ``btc_now``)
 comes from Polymarket RTDS ``crypto_prices_chainlink`` / symbol ``btc/usd``.
 That is the same oracle family as Price to Beat (``signals/strike.py``).
 
-**ETH / SOL** stay on Binance 1m klines for the cross-asset lane (not used for
-BTC market resolution). One process runs both sockets.
+**BTC volume** is not on Chainlink. We subscribe to Binance ``btcusdt@kline_1m``
+**volume-only** (never overwrite Chainlink price) for regime activity /
+relative-volume context. Basis risk vs Chainlink is fine for volume.
+
+**ETH / SOL** stay on Binance 1m klines for the cross-asset lane. One process
+runs both sockets.
 
 ``get_signals`` keys are unchanged: ``prices``, ``volumes``, ``latest``,
-``stale``, ``momentum``, ``acceleration``, ``mtf``. BTC volumes are empty
-(Chainlink has no volume); ETH/SOL still carry Binance volume.
+``stale``, ``momentum``, ``acceleration``, ``mtf``. For BTC, ``prices`` are
+Chainlink and ``volumes`` are Binance.
 """
 
 from __future__ import annotations
@@ -29,8 +33,10 @@ logger = logging.getLogger(__name__)
 BINANCE_WS = "wss://stream.binance.com:9443/ws"
 RTDS_WS = "wss://ws-live-data.polymarket.com"
 
-# Cross-asset (non-resolution) symbols still on Binance.
+# Cross-asset (non-resolution) price+volume on Binance.
 BINANCE_SYMBOLS = {"eth": "ethusdt", "sol": "solusdt"}
+# BTC volume-only on Binance (price stays Chainlink).
+BINANCE_BTC_SYMBOL = "btcusdt"
 
 MOMENTUM_SCALE = 0.002   # 0.2% one-candle move reads ~0.76 (~p97, see BUG #25)
 ACCEL_SCALE = 0.001
@@ -84,7 +90,8 @@ class PriceFeed:
         for t in self._threads:
             t.start()
         logger.info(
-            "Price feed started (BTC=Chainlink RTDS, ETH/SOL=Binance klines)"
+            "Price feed started (BTC price=Chainlink RTDS, "
+            "BTC volume+ETH/SOL=Binance klines)"
         )
 
     def stop(self) -> None:
@@ -97,18 +104,26 @@ class PriceFeed:
         Polymarket's RTDS often delivers a ~60s 1Hz snapshot on subscribe and
         few (or no) follow-up update frames. We therefore:
           * apply the snapshot (last point = live price)
-          * if quiet for ``_RTDS_REFRESH_SEC``, reconnect for a fresh snapshot
+          * if quiet for ``refresh_sec``, reconnect for a fresh snapshot
         so the live level stays within a few seconds of the oracle.
+
+        Socket timeout is short (1s) so the quiet-refresh check is not delayed
+        by a long blocking ``recv`` (a 5s timeout + 8s quiet ≈ 13s stale).
         """
         import websocket
 
         backoff = 2.0
-        refresh_sec = 8.0
+        refresh_sec = 5.0
+        # Quiet-refresh reconnects are normal (RTDS snapshot cadence) — log
+        # INFO only on first connect and after a real error, DEBUG otherwise.
+        # Otherwise arena.log fills with ~12 "Connected" lines/minute.
+        first_connect = True
+        after_error = False
         while self._running:
             ws = None
             try:
                 ws = websocket.WebSocket()
-                ws.settimeout(5)
+                ws.settimeout(1.0)
                 ws.connect(RTDS_WS)
                 sub = {
                     "action": "subscribe",
@@ -119,7 +134,17 @@ class PriceFeed:
                     }],
                 }
                 ws.send(json.dumps(sub))
-                logger.info("Connected to Polymarket RTDS Chainlink btc/usd")
+                if first_connect or after_error:
+                    logger.info(
+                        "Connected to Polymarket RTDS Chainlink btc/usd%s",
+                        " (recovered)" if after_error and not first_connect else "",
+                    )
+                    first_connect = False
+                    after_error = False
+                else:
+                    logger.debug(
+                        "RTDS Chainlink snapshot refresh reconnect btc/usd"
+                    )
                 backoff = 2.0
                 last_ping = time.time()
                 last_msg = time.time()
@@ -156,9 +181,10 @@ class PriceFeed:
                     pass
                 # Brief pause before snapshot refresh reconnect (not error backoff)
                 if self._running:
-                    time.sleep(0.3)
+                    time.sleep(0.2)
                     backoff = 2.0
             except Exception as e:
+                after_error = True
                 logger.error(
                     "Chainlink BTC feed error: %s (retry in %.0fs)", e, backoff,
                 )
@@ -223,10 +249,11 @@ class PriceFeed:
                 self._btc_candle_open_min = minute
                 self._btc_candle_last = price
             elif minute > self._btc_candle_open_min:
-                # Close prior minute with last seen price
+                # Close prior minute with last seen Chainlink price.
+                # Volume is filled separately from Binance BTC klines — do not
+                # append 0.0 here (that polluted the activity series).
                 if self._btc_candle_last and self._btc_candle_last > 0:
                     self.prices["btc"].append(self._btc_candle_last)
-                    self.volumes["btc"].append(0.0)
                 self._btc_candle_open_min = minute
                 self._btc_candle_last = price
             else:
@@ -255,10 +282,19 @@ class PriceFeed:
 
     # -------------------------------------------------------------- Binance
     def _run_binance_xasset(self) -> None:
+        """Binance 1m klines: ETH/SOL price+volume, BTC **volume only**.
+
+        BTC price/resolution stays on Chainlink. We only harvest
+        ``btcusdt`` base-asset volume for regime activity scoring.
+        """
         import websocket
 
-        streams = "/".join(f"{s}@kline_1m" for s in BINANCE_SYMBOLS.values())
-        url = f"{BINANCE_WS}/{streams}"
+        streams = "/".join(
+            f"{s}@kline_1m"
+            for s in (*BINANCE_SYMBOLS.values(), BINANCE_BTC_SYMBOL)
+        )
+        # Combined stream endpoint (multiple streams on one connection)
+        url = f"wss://stream.binance.com:9443/stream?streams={streams}"
         backoff = 2.0
 
         while self._running:
@@ -266,7 +302,9 @@ class PriceFeed:
                 ws = websocket.WebSocket()
                 ws.settimeout(10)
                 ws.connect(url)
-                logger.info("Connected to Binance WS (ETH/SOL): %s", url)
+                logger.info(
+                    "Connected to Binance WS (BTC vol + ETH/SOL): %s", url
+                )
                 backoff = 2.0
 
                 while self._running:
@@ -276,11 +314,23 @@ class PriceFeed:
                         break
                     try:
                         msg = json.loads(raw)
+                        # Combined stream wraps payload: {"stream":..., "data":{...}}
+                        data = msg.get("data") if isinstance(msg, dict) else None
+                        if isinstance(data, dict) and "k" in data:
+                            msg = data
                         kline = msg.get("k", {})
-                        symbol = kline.get("s", "").lower()
-                        close = float(kline.get("c", 0))
-                        volume = float(kline.get("v", 0))
-                        is_closed = kline.get("x", False)
+                        symbol = (kline.get("s") or "").lower()
+                        close = float(kline.get("c", 0) or 0)
+                        volume = float(kline.get("v", 0) or 0)
+                        is_closed = bool(kline.get("x", False))
+
+                        # BTC: volume-only — never touch Chainlink price series
+                        if symbol == BINANCE_BTC_SYMBOL:
+                            if is_closed and volume >= 0:
+                                with self._lock:
+                                    self.volumes["btc"].append(volume)
+                            continue
+
                         for name, binance_sym in BINANCE_SYMBOLS.items():
                             if symbol != binance_sym:
                                 continue

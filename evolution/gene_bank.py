@@ -42,14 +42,45 @@ def load_bank() -> list[dict]:
         return []
 
 
+def _max_per_type() -> int:
+    return max(1, int(getattr(config, "GA_GENE_BANK_MAX_PER_TYPE", 3)))
+
+
+def apply_type_quotas(entries: list[dict]) -> list[dict]:
+    """Keep at most N highest-fitness entries per strategy_type, then global cap.
+
+    Prevents a single elite type (e.g. phantom) from filling the entire bank
+    and dominating every future tournament parent pool.
+    """
+    per = _max_per_type()
+    by_type: dict[str, list[dict]] = {}
+    for e in entries:
+        st = e.get("strategy_type") or "unknown"
+        by_type.setdefault(st, []).append(e)
+    kept: list[dict] = []
+    for st, group in by_type.items():
+        group_sorted = sorted(
+            group,
+            key=lambda x: (float(x.get("fitness") or 0.0), int(x.get("cycle") or 0)),
+            reverse=True,
+        )
+        kept.extend(group_sorted[:per])
+    # Global cap: prefer higher fitness, then newer cycle
+    kept.sort(
+        key=lambda x: (float(x.get("fitness") or 0.0), int(x.get("cycle") or 0)),
+        reverse=True,
+    )
+    return kept[: _max_size()]
+
+
 def save_bank(entries: list[dict]) -> None:
-    """Persist bank (capped)."""
-    cap = _max_size()
-    trimmed = entries[-cap:]
+    """Persist bank (type quotas + global cap)."""
+    trimmed = apply_type_quotas(entries)
     try:
         db.set_arena_state(STATE_KEY, json.dumps({
             "entries": trimmed,
-            "max_size": cap,
+            "max_size": _max_size(),
+            "max_per_type": _max_per_type(),
         }))
     except Exception as e:
         logger.warning("gene_bank save failed: %s", e)
@@ -59,7 +90,7 @@ def record_elites(individuals: list[dict], cycle: int) -> list[dict]:
     """Append this cycle's elites into the bank; return the updated bank.
 
     Dedupes by (strategy_type, rounded params fingerprint) so identical elites
-    don't flood the bank every 2h.
+    don't flood the bank every 2h. Applies per-type quotas before persist.
     """
     bank = load_bank()
     existing_fps = {_fingerprint(e) for e in bank}
@@ -90,7 +121,7 @@ def record_elites(individuals: list[dict], cycle: int) -> list[dict]:
         bank.append(entry)
         existing_fps.add(fp)
     save_bank(bank)
-    return bank
+    return load_bank()
 
 
 def as_parent_records(bank: list[dict] | None = None) -> list[dict]:

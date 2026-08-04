@@ -57,6 +57,15 @@ def test_compute_features_bounded():
     feats = compute_features(_trending_prices())
     for k in ("vol", "trend", "mom", "flow"):
         assert 0.0 <= feats[k] <= 1.0
+    # volume is a separate feature (activity); missing series → 0
+    assert feats["volume"] == 0.0
+    # volume != volatility: explicit volume series moves only volume
+    with_vol = compute_features(
+        _trending_prices(),
+        volumes=[100, 100, 100, 100, 100, 300, 300, 300, 300, 300],
+    )
+    assert with_vol["volume"] > 0.5
+    assert "vol" in with_vol  # volatility key still present
 
 
 def test_high_vol_trend_classification():

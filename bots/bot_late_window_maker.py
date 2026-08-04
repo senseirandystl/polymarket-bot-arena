@@ -1,71 +1,44 @@
-"""LateWindowMaker — models the article's "T-10s maker" strategy.
+"""LateWindowMaker — late-window drift lag sniper (taker fills today).
 
-The article:
-  "At T-10 seconds before window close, BTC direction is ~85% determined.
-   Post a maker order on the winning side at 90-95¢."
+Thesis: near expiry, BTC direction is largely locked; buy the lagging side
+when drift is strong and the book still underprices it.
 
-We use a 90-second entry window because Simmer polling runs every 15s and
-the bot needs reaction time. At T-90s conviction is ~70%; the trade-off vs
-LateWindowMaker's peer (FeeZoneMaker) is: fewer trades, higher WR target.
-
-Paper mode: Simmer has no limit-order book, so we execute at market price
-like all other bots. The "maker" logic controls WHEN and IF we enter.
-Logs theoretical maker metrics (what limit we'd post, edge in bps) so we
-can compare against real maker results if this ever goes live.
-
-Competing hypothesis:
-  High-conviction, time-gated, momentum-confirmed entries beat
-  always-on fee-zone bets because the signal is strongest in the final seconds.
+2026-08 redesign:
+  * Mid/ask integrity gate (no more mid=0.90 ask=0.49 fantasy edges).
+  * Edge always on ask; lag rule on mid vs implied_P.
+  * Tighter price band [0.55, 0.80] — above ~0.80 BE gap is brutal as taker.
+  * Size via calibrated Kelly; conf from structure.
+  * Slightly shorter window (120s) so entries aren't early-window noise.
 """
+
+from __future__ import annotations
 
 import config
 import learning
 import polymarket_fills
 from bots.base_bot import BaseBot, strategy_decision
+from bots.edge_calibration import quality_confidence
+from bots.maker_utils import maker_kelly_amount, mid_ask_gap_ok, resolve_side_exec
 from signals.lab import SignalView
 
-# Retune (was: window=90s, min_mom=0.0008, price [0.58,0.92]): the bot had ZERO
-# trades all session. By T-90s a 5-min BTC market has almost always resolved to
-# an extreme (price near 0 or 1), so the [0.58,0.92] band was rarely occupied
-# that late and only ~4 evaluations fit in 90s at the ~23s maker cadence.
-# Widening the window to 150s lets it catch the market earlier, while it is
-# still in the profitable mid-high band; the max cap stays ≤0.90 to respect the
-# break-even rule (buying YES as a taker above ~0.90 needs an implausible WR).
-#
-# Retune 2 (2026-07-16, harness net-edge data, ~300 resolved markets): side
-# selection is now DRIFT-first — the validated fundamental (83% WR in the final
-# minute) picks the side, momentum only confirms. Late-window band entries
-# gated on |drift| ≥ 0.25 measured 85.8% WR / +7.7c per share net of price+fee;
-# requiring momentum agreement on top raised WR to 88.4%. Momentum-only side
-# selection is the weaker signal and is demoted to a non-contradiction check +
-# confidence booster.
 DEFAULT_PARAMS = {
-    "entry_window_sec": 150,   # Activate in the last 150s (more shots, less extreme prices)
-    "min_drift": 0.25,         # |btc_drift| needed for conviction (drift picks the side)
-    "min_momentum": 0.0005,    # Momentum must not CONTRADICT the drift side by more than this
-    "min_price_yes": 0.56,     # Chosen side's price must be ≥ 56¢ (direction confirmed by book)
-    "max_price_yes": 0.90,     # Cap: above 90¢ taker margin is too thin to profit
-    # Price must be JUSTIFIED by drift's calibrated probability (2026-07-17
-    # overnight run: 69 trades, 71% WR but -$41.66 at avg entry 0.788 — WR ran
-    # ~5-10pp BELOW the price paid at every level; the price already contained
-    # the conviction). Drift's implied P = 0.5 + 0.5*|drift| is empirically
-    # well-calibrated (see BUG #23 calibration table), so require
-    # implied_P >= side_price + taker_fee + min_edge.
+    "entry_window_sec": 120,
+    "min_drift": 0.28,
+    "min_momentum": 0.0004,     # momentum must not contradict drift
+    "min_price_yes": 0.55,
+    "max_price_yes": 0.80,      # was 0.90 — expensive favorites lost $ despite WR
     "min_edge": 0.03,
-    "maker_offset_pct": 0.06,  # Simulated limit = market_price + 6¢ (logged maker metric only)
-    "position_size_pct": 0.10, # 10% of max — large because entries are highly selective
-    "lookback_candles": 3,     # BTC candles used for momentum calculation
-    # Inventory management: max open USD the shared pool may already hold on
-    # this (market, side) before this maker stands down; below the cap the
-    # quote size is clamped to the remaining headroom. Quoting INTO existing
-    # inventory concentrates one BTC candle's risk (the hour-22 pile-in class).
-    "max_inventory_usd": 30.0,
+    "max_mid_vs_implied": 0.02,
+    "maker_offset_pct": 0.04,   # logged limit metric only
+    "position_size_pct": 0.08,
+    "lookback_candles": 3,
+    "max_inventory_usd": 25.0,
+    "min_confidence": 0.22,
 }
 
 
 class LateWindowMakerBot(BaseBot):
-    """Posts a directional maker quote in the final window when BTC momentum and
-    price align — YES on up-momentum, NO on down-momentum (symmetric mirror)."""
+    """Drift-first late-window lag entries on the winning side's token."""
 
     strategy_type = "late_window_maker"
 
@@ -81,9 +54,8 @@ class LateWindowMakerBot(BaseBot):
     def analyze(self, market: dict, signals: dict) -> dict:
         p = self.strategy_params
         time_rem = market.get("time_remaining_seconds")
-        market_price = market.get("current_price") or 0.5  # None if book down
+        market_price = market.get("current_price") or 0.5
 
-        # Maker quote fields always returned so run_maker_section() can log them
         def _hold(reason, signals_out=None):
             return strategy_decision(
                 "hold", reasoning=reason, signals=signals_out or {},
@@ -93,98 +65,107 @@ class LateWindowMakerBot(BaseBot):
                 maker_side="both",
             )
 
-        # ── Time gate ────────────────────────────────────────────────────────
-        entry_window = p["entry_window_sec"]
+        entry_window = int(p["entry_window_sec"])
         if time_rem is None or time_rem > entry_window:
             return _hold(f"lwm: waiting (rem={time_rem}s, window={entry_window}s)")
 
-        # ── Drift conviction gate (primary) ──────────────────────────────────
-        # btc_drift is the validated "price to beat" fundamental (signals/
-        # strike.py) — time-scaled, so late in the window a strong value means
-        # the direction is close to locked in. It PICKS the side.
         sv = SignalView.of(signals)
-        drift = sv.btc_drift
-        min_drift = p.get("min_drift", 0.25)
+        drift = float(sv.btc_drift or 0.0)
+        min_drift = float(p.get("min_drift", 0.28))
         if abs(drift) < min_drift:
             return _hold(f"lwm: weak drift ({drift:+.3f} < {min_drift})")
 
-        # ── BTC momentum (confirmation only) ─────────────────────────────────
         prices = sv.prices
-        lb = p["lookback_candles"]
+        lb = int(p["lookback_candles"])
         momentum = 0.0
         if len(prices) >= lb and prices[-lb] > 0:
             momentum = (prices[-1] - prices[-lb]) / prices[-lb]
-
-        # Momentum must not contradict the drift side (agreement measured
-        # +2.6pp WR in the harness; contradiction is a warning sign).
         signed_mom = momentum if drift > 0 else -momentum
-        min_mom = p["min_momentum"]
+        min_mom = float(p["min_momentum"])
         if signed_mom < -min_mom:
             return _hold(
-                f"lwm: momentum contradicts drift side "
+                f"lwm: momentum contradicts drift "
                 f"(drift={drift:+.3f} mom={momentum:+.5f})")
 
-        # ── Side selection: quote the DRIFT side on its own token price ──────
-        # Band / edge gates key off the side MID (crowd view); the taker fill
-        # and slippage expected price key off the warm best ASK when present.
-        min_price = p["min_price_yes"]
-        max_price = p["max_price_yes"]
         no_price = market.get("no_price")
         if no_price is None:
             no_price = round(1.0 - market_price, 4)
         if drift > 0:
-            side, side_mid = "yes", market_price
-            side_exec = market.get("yes_ask") or side_mid
+            side, side_mid = "yes", float(market_price)
         else:
-            side, side_mid = "no", no_price
-            side_exec = market.get("no_ask") or side_mid
+            side, side_mid = "no", float(no_price)
 
+        min_price = float(p["min_price_yes"])
+        max_price = float(p["max_price_yes"])
         if side_mid < min_price:
             return _hold(
-                f"lwm: {side} price {side_mid:.2f} < {min_price} (no confirmation)")
+                f"lwm: {side} mid {side_mid:.2f} < {min_price} (no book confirmation)")
         if side_mid > max_price:
             return _hold(
-                f"lwm: {side} price {side_mid:.2f} > {max_price} (margin too thin)")
+                f"lwm: {side} mid {side_mid:.2f} > {max_price} (margin too thin)")
 
-        # ── Edge gate: the price must be justified by drift's implied P ──────
-        # implied_P = 0.5 + 0.5*|drift| is calibrated against resolved markets.
-        # Buying above it is paying for conviction the fundamental doesn't
-        # have — exactly how a 71%-WR bot lost money at 79c entries.
-        # Cost is the executable ask (what the taker actually pays).
+        side_exec, _ = resolve_side_exec(market, side, side_mid)
+        ok, why = mid_ask_gap_ok(side_mid, side_exec)
+        if not ok:
+            return _hold(f"lwm: book integrity — {why}")
+
         implied_p = 0.5 + 0.5 * abs(drift)
+        max_mid_vs = float(p.get("max_mid_vs_implied", 0.02))
+        if side_mid > implied_p - max_mid_vs:
+            return _hold(
+                f"lwm: mid={side_mid:.2f} not lagging implied={implied_p:.2f}")
+
         fee = polymarket_fills.taker_fee(1.0, side_exec)
-        min_edge = p.get("min_edge", 0.03)
-        lwm_edge = implied_p - side_exec - fee
+        min_edge = float(p.get("min_edge", 0.03))
+        lwm_edge = implied_p - float(side_exec) - fee
         if lwm_edge < min_edge:
             return _hold(
-                f"lwm: price {side_exec:.2f} not justified by drift "
-                f"(implied_P={implied_p:.2f}, edge={lwm_edge:+.3f} < {min_edge})")
+                f"lwm: edge {lwm_edge:+.3f} < {min_edge:.3f} "
+                f"(implied={implied_p:.2f} ask={side_exec:.2f})")
 
-        # ── Inventory management: don't quote into a side the pool already
-        # holds. Cap total open USD on (market, side); clamp size to headroom.
         inventory = self._inventory_usd(market, side)
-        max_inv = p.get("max_inventory_usd", 30.0)
+        max_inv = float(p.get("max_inventory_usd", 25.0))
         inv_headroom = max_inv - inventory
         if inv_headroom <= 0:
             return _hold(
-                f"lwm: inventory cap — ${inventory:.2f} open on {side} "
-                f"≥ ${max_inv:.2f}")
+                f"lwm: inventory cap — ${inventory:.2f} open on {side} ≥ ${max_inv:.2f}")
 
-        # ── Maker quote computation (on the chosen side's mid) ────────────────
-        # What we'd post as a limit order: slightly ahead of market to capture spread
-        maker_ask = round(min(max_price, side_mid + p["maker_offset_pct"]), 2)
+        maker_ask = round(min(max_price, side_mid + float(p["maker_offset_pct"])), 2)
         maker_bid = round(max(0.01, side_mid - 0.02), 2)
         maker_mid = round((maker_bid + maker_ask) / 2, 3)
-        edge_bps = p["maker_offset_pct"] * 10000  # spread captured if filled
+        edge_bps = float(p["maker_offset_pct"]) * 10000
 
-        # ── Confidence: drift conviction × urgency × momentum agreement ──────
-        time_weight = 1.0 - (time_rem / entry_window)  # 0 at window-open, 1 at close
-        drift_strength = min(1.0, abs(drift))
-        mom_strength = min(1.0, max(0.0, signed_mom) / (min_mom * 5))
-        confidence = min(0.92, 0.35 + drift_strength * 0.30
-                         + time_weight * 0.20 + mom_strength * 0.10)
+        time_weight = 1.0 - (float(time_rem) / entry_window)
+        conf = quality_confidence(
+            edge=lwm_edge,
+            abs_drift=abs(drift),
+            side_mid=side_mid,
+            side=side,
+        )
+        # Mild urgency boost to conf only (not size-from-conf).
+        conf = min(0.92, conf + 0.08 * time_weight)
+        if conf < float(p.get("min_confidence", 0.22)):
+            return _hold(f"lwm: conf {conf:.3f} too low")
 
-        # ── Features ─────────────────────────────────────────────────────────
+        try:
+            import db as _db
+            bankroll = float(_db.get_paper_available())
+        except Exception:
+            bankroll = float(getattr(config, "PAPER_BANKROLL_DEFAULT", 200.0))
+        try:
+            from arena.portfolio import get_weight
+            w = float(get_weight(self.name) or 0.125)
+        except Exception:
+            w = 0.125
+        amount = maker_kelly_amount(
+            lwm_edge, float(side_exec), bankroll * w,
+            size_pct_cap=float(p["position_size_pct"]),
+            inv_headroom=inv_headroom,
+        )
+        min_usd = float(getattr(config, "POLYMARKET_MIN_SHARES", 5)) * float(side_exec) * 0.5
+        if amount < max(0.50, min_usd * 0.25):
+            return _hold(f"lwm: size ${amount:.2f} too small")
+
         of_data = sv.orderflow
         features = learning.extract_features(
             market_price, momentum,
@@ -192,27 +173,22 @@ class LateWindowMakerBot(BaseBot):
             time_rem=time_rem,
         )
 
-        amount = min(config.get_max_position() * p["position_size_pct"],
-                     inv_headroom)
-
         return strategy_decision(
             "buy", side,
             edge=lwm_edge,
-            confidence=confidence,
+            confidence=conf,
             reasoning=(
                 f"lwm: time={time_rem:.0f}s mom={momentum:+.5f} "
                 f"{side} mid={side_mid:.2f} ask={float(side_exec):.2f} "
-                f"limit={maker_ask:.2f} "
-                f"edge={edge_bps:.0f}bps tw={time_weight:.2f} "
-                f"inv=${inventory:.2f}"
+                f"limit={maker_ask:.2f} edge={lwm_edge:+.3f} "
+                f"bps={edge_bps:.0f} tw={time_weight:.2f} inv=${inventory:.2f}"
             ),
-            signals={"drift": drift, "momentum": momentum,
-                     "implied_p": implied_p, "time_weight": time_weight,
-                     "inventory_usd": inventory},
+            signals={
+                "drift": drift, "momentum": momentum,
+                "implied_p": implied_p, "time_weight": time_weight,
+                "inventory_usd": inventory,
+            },
             suggested_amount=amount,
-            # Expected taker price = warm best ask (same snapshot the paper
-            # engine walks when yes_book/no_book are laid on the market).
-            # Mid was a structural under-estimate of fill cost (half-spread).
             entry_price=round(float(side_exec), 4),
             features=features,
             maker_bid=maker_bid,

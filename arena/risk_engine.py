@@ -182,10 +182,6 @@ def historical_var(pnls: Sequence[float], confidence: float = 0.95) -> Optional[
     return round(max(0.0, -q), 4)
 
 
-def _today_utc() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
-
-
 def _cutoff_hours(hours: float) -> str:
     return (
         datetime.now(timezone.utc) - timedelta(hours=float(hours))
@@ -211,8 +207,10 @@ def _pnls_for_bots(
     ]
     params: list[Any] = list(bot_names)
     if today_only:
-        conds.append("date(created_at)=?")
-        params.append(_today_utc())
+        # ET calendar day (00:00 America/New_York), same as dashboard "Today".
+        # UTC date() misaligned Day P&L vs Overview when session spans ET midnight.
+        conds.append("created_at>=?")
+        params.append(db.et_day_start_utc(0))
     elif hours is not None:
         conds.append("created_at>=?")
         params.append(_cutoff_hours(hours))
@@ -250,8 +248,9 @@ def _portfolio_pnls(
     ]
     params: list[Any] = []
     if today_only:
-        conds.append("date(created_at)=?")
-        params.append(_today_utc())
+        # ET calendar day — keep Risk Engine Day P&L aligned with Overview Today.
+        conds.append("created_at>=?")
+        params.append(db.et_day_start_utc(0))
     elif hours is not None:
         conds.append("created_at>=?")
         params.append(_cutoff_hours(hours))

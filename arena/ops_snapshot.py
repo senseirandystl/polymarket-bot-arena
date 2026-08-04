@@ -108,14 +108,18 @@ def ops_snapshot() -> dict[str, Any]:
         from arena.portfolio import load_state
         p = load_state()
         weights = p.get("weights") or {}
-        top = sorted(weights.items(), key=lambda kv: -kv[1])[:6]
+        # Full weight vector (desc) so the Overview bar/list can sum to 100%.
+        # Previously truncated to 6 and left a visible gap when n_active > 6.
+        ranked = sorted(weights.items(), key=lambda kv: -float(kv[1] or 0))
         out["allocation"] = {
             "enabled": p.get("enabled"),
             "method": p.get("method"),
-            "n_active": p.get("n_active"),
+            "n_active": p.get("n_active") or len(ranked),
             "last_rebalance_at": p.get("last_rebalance_at"),
             "rebalance_reason": p.get("rebalance_reason"),
-            "top_weights": [{"bot": k, "weight": v} for k, v in top],
+            "top_weights": [
+                {"bot": k, "weight": float(v or 0)} for k, v in ranked
+            ],
         }
     except Exception as e:
         out["allocation"] = {"error": str(e)}
@@ -126,21 +130,19 @@ def ops_snapshot() -> dict[str, Any]:
     except Exception as e:
         out["signals"] = {"error": str(e), "lanes": []}
 
-    # Health (lightweight — full report on /api/health)
+    # Health — same overall status as /api/health (not a log-only subset).
+    # The ops ribbon "Health" chip must match the Health card + hero ticker.
     try:
-        from arena.health import check_arena_log, check_kill_switch
-        log_c = check_arena_log()
-        kill_c = check_kill_switch()
-        overall = "healthy"
-        if not log_c["ok"] or not kill_c["ok"]:
-            overall = "critical" if (
-                log_c.get("level") == "critical"
-                or kill_c.get("level") == "critical"
-            ) else "degraded"
+        from arena.health import run_health_checks
+        report = run_health_checks()
+        checks = {c.get("name"): c for c in (report.get("checks") or [])
+                  if isinstance(c, dict)}
         out["health"] = {
-            "status": overall,
-            "arena_log": log_c,
-            "kill_switch": kill_c,
+            "status": report.get("status") or "unknown",
+            "counts": report.get("counts"),
+            "arena_log": checks.get("arena_log") or {},
+            "kill_switch": checks.get("kill_switch") or {},
+            "restart": report.get("restart"),
         }
     except Exception as e:
         out["health"] = {"status": "unknown", "error": str(e)}
@@ -168,7 +170,8 @@ def ops_snapshot() -> dict[str, Any]:
     except Exception as e:
         out["sizing"] = {"error": str(e)}
 
-    # Live BTC (and ETH) from arena-written price_feed_status — no WS in dashboard.
+    # Live BTC (and ETH) from arena-written price_feed_status (dashboard
+    # also has a browser RTDS socket; this is the SQLite fallback path).
     try:
         import json as _json
         raw = db.get_arena_state("price_feed_status")

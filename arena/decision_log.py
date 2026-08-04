@@ -98,6 +98,10 @@ def classify_skip_reason(reasoning: str | None) -> Optional[str]:
         return "book"
     if "exposure" in why:
         return "exposure_cap"
+    if "learned_skip" in why or "learned skip" in why:
+        return "learned_skip"
+    if "ask gap" in why:
+        return "ask_quality"
     return "skip"
 
 
@@ -275,10 +279,17 @@ def flush() -> int:
     return len(batch)
 
 
-def _hyp_pnl(side: str, market_up: bool, entry_price: float | None) -> float:
-    """Per-share hypothetical PnL if we had bought ``side`` at entry."""
-    cost = float(entry_price) if entry_price is not None else 0.5
-    cost = max(0.01, min(0.99, cost))
+def _hyp_pnl(side: str, market_up: bool, entry_price: float | None) -> float | None:
+    """Per-share hypothetical PnL if we had bought ``side`` at entry.
+
+    Hold-to-resolution: direction alone is not enough — cost must be known.
+    When ``entry_price`` is missing, return None rather than assuming 0.50
+    (that default inflated extreme_drift skip CF to ~+47¢ overnight while
+    features said price_very_high).
+    """
+    if entry_price is None:
+        return None
+    cost = max(0.01, min(0.99, float(entry_price)))
     fee = polymarket_fills.fee_per_share(
         cost,
         is_maker=(getattr(config, "ORDER_STYLE", "limit") == "limit"

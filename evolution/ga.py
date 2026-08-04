@@ -16,11 +16,12 @@ from typing import Any, Callable
 import config
 import db
 from evolution.fitness import multi_objective_fitness, rank_normalize_fitness
-from evolution.operators import crossover, elite_indices, tournament_select
+from evolution.operators import crossover, elite_indices, tournament_select_pair
 from evolution import gene_bank as gene_bank_mod
 from evolution.type_alloc import pick_strategy_type
 from evolution.param_search import adaptive_mutate
 from evolution.backtest_gate import evaluate_offspring
+from evolution.diversity import is_diverse_enough
 
 logger = logging.getLogger("arena")
 
@@ -119,18 +120,42 @@ def evaluate_population(
 
 
 def _survives_legacy_bar(ind: dict) -> bool:
-    """Keep the pre-GA survival safety: positive P&L or BE-gap floor.
+    """Who is *eligible for replacement* (not for ranking).
 
-    Used only to decide who is *eligible for replacement* (not for ranking).
-    A bot that fails this bar is a replacement candidate; elites among those
-    who pass (or are immune) are protected.
+    2026-08 redesign: small negative P&L is noise, not a cull signal. Only
+    replace bots that are clearly underwater on both P&L and BE gap after a
+    full sample. Gen-0 founders get an extra loss floor so defaults are not
+    swapped for cold mutants on a −$3 dip.
     """
-    if ind["trades"] < config.MIN_TRADES_FOR_JUDGMENT:
-        return True  # immune
-    if ind["pnl"] > 0:
-        return True
+    n = int(ind.get("trades") or 0)
+    if n < int(config.MIN_TRADES_FOR_JUDGMENT):
+        return True  # immune — not enough data
+    pnl = float(ind.get("pnl") or 0.0)
     gap = ind.get("be_gap")
-    return gap is not None and gap >= config.EVOLUTION_BE_GAP_MIN
+    gap_f = float(gap) if gap is not None else None
+
+    # Clear survival
+    if pnl > 0:
+        return True
+    if gap_f is not None and gap_f >= float(config.EVOLUTION_BE_GAP_MIN):
+        return True
+
+    # Soft floor: mild red ink is not replaceable
+    cull_pnl = float(getattr(config, "EVOLUTION_PNL_CULL_MAX", -12.0))
+    if pnl > cull_pnl:
+        return True  # e.g. −$3 > −$12 → keep
+
+    # Founder / gen-0 protection: only cull when deeply bad
+    gen = int(ind.get("generation") or 0)
+    if gen == 0 and bool(getattr(config, "GA_PROTECT_FOUNDERS", True)):
+        founder_pnl = float(getattr(config, "GA_FOUNDER_CULL_PNL", -20.0))
+        founder_gap = float(getattr(config, "GA_FOUNDER_CULL_BE_GAP", -0.02))
+        if pnl > founder_pnl:
+            return True
+        if gap_f is not None and gap_f >= founder_gap:
+            return True
+
+    return False
 
 
 def should_trigger_evolution(
@@ -348,11 +373,11 @@ def run_ga_cycle(
             db.log_evolution(cycle_number, survivors, [], [], rankings)
         except Exception as e:
             logger.warning("Failed to log skipped evolution_events: %s", e)
+        _persist_ga_state(cycle_number, report)
         try:
             db.log_ga_generation(cycle_number, report)
         except Exception as e:
             logger.warning("Failed to log skipped ga_generation: %s", e)
-        _persist_ga_state(cycle_number, report)
         return evolving + exempt, report
 
     # Breeding pool: live keepers + gene-bank elites (shadow parents)
@@ -388,37 +413,84 @@ def run_ga_cycle(
         b.reset_daily()
 
     max_attempts = max(1, int(getattr(config, "GA_SPAWN_ATTEMPTS", 3)))
+    max_per_type = max(1, int(getattr(config, "GA_MAX_PER_TYPE_PER_CYCLE", 1)))
+    # Count types already kept on the live roster so we do not spawn a second
+    # hybrid when hybrid-v1 already survived, etc.
+    type_counts: dict[str, int] = {}
+    for ind in keep:
+        st = ind.get("strategy_type")
+        if st:
+            type_counts[st] = type_counts.get(st, 0) + 1
 
     for dead in to_replace:
         evolved = None
         spawn_meta: dict[str, Any] = {}
+        operator = "fallback"
         for attempt in range(max_attempts):
-            # --- Tier 1: strategy-type allocation ---
+            # --- Tier 1: strategy-type allocation (respect per-type cap) ---
+            saturated = {
+                t for t, n in type_counts.items() if n >= max_per_type
+            }
             child_type = pick_strategy_type(
-                dead["strategy_type"], individuals, bank_parents, rng=rng,
+                dead["strategy_type"], individuals, bank_parents,
+                rng=rng, exclude_types=saturated,
             )
+            if type_counts.get(child_type, 0) >= max_per_type:
+                # Softmax still returned a saturated type (fallback path) —
+                # force any unsaturated allocatable type, else proceed.
+                unsaturated = [
+                    t for t in (
+                        "momentum", "mean_reversion", "mean_reversion_tp",
+                        "phantom", "hybrid", "sniper", "sentiment",
+                    )
+                    if type_counts.get(t, 0) < max_per_type
+                ]
+                if unsaturated:
+                    child_type = rng.choice(unsaturated)
 
-            # Prefer parents of the chosen type when available
+            # Same-type parents only. Never overlay a phantom genome onto a
+            # hybrid/sniper/meanrev child — that only shares min_confidence /
+            # position_size_pct and silently degrades type-specific defaults.
             typed_pool = [
                 p for p in parent_pool
                 if p.get("strategy_type") == child_type
-            ] or parent_pool
+            ]
+            cross_type = not typed_pool
+            if typed_pool:
+                p1, p2, is_self_pair = tournament_select_pair(
+                    typed_pool, rng=rng,
+                )
+            else:
+                # No same-type parents: seed from type defaults + mutate.
+                # Parent labels still record the best available genomes for
+                # lineage transparency (often the monoculture elite).
+                p1, p2, is_self_pair = tournament_select_pair(
+                    parent_pool, rng=rng,
+                )
+                is_self_pair = True  # param path is clone-of-defaults, not xover
 
-            p1 = tournament_select(typed_pool, rng=rng)
-            p2 = tournament_select(typed_pool, rng=rng)
-            if p2["fitness"] > p1["fitness"]:
-                p1, p2 = p2, p1
-
-            # --- Tier 2: param crossover + adaptive mutation ---
+            # --- Tier 2: param construction ---
             base = _default_params_for(child_type)
-            blended = crossover(p1["params"], p2["params"], rng=rng)
-            child_params = dict(base)
-            for k, v in blended.items():
-                if k in base:
-                    child_params[k] = v
-            for k in list(child_params.keys()):
-                if k in blended and k in base:
-                    child_params[k] = blended[k]
+            if cross_type:
+                # Defaults of the child type only — do NOT blend foreign keys.
+                child_params = dict(base)
+                breed_mode = "defaults+adaptive"
+            elif is_self_pair:
+                # Single unique same-type parent → clone its params, then mutate.
+                child_params = dict(base)
+                for k, v in (p1.get("params") or {}).items():
+                    if k in base:
+                        child_params[k] = copy.deepcopy(v)
+                breed_mode = "clone+mutate"
+            else:
+                blended = crossover(
+                    p1.get("params") or {}, p2.get("params") or {}, rng=rng,
+                )
+                child_params = dict(base)
+                for k, v in blended.items():
+                    if k in base:
+                        child_params[k] = v
+                breed_mode = "crossover+adaptive"
 
             elite_genomes = [
                 p["params"] for p in typed_pool
@@ -431,13 +503,59 @@ def run_ga_cycle(
                 rng=rng,
             )
 
-            child_name = f"{child_type}-g{cycle_number}-{rng.randint(100, 999)}"
-            lineage = (
-                f"{p1['name']}+{p2['name']} -> {child_name} "
-                f"(type={child_type}; crossover+adaptive; "
-                f"fit={p1['fitness']:.3f}/{p2['fitness']:.3f}; "
-                f"attempt={attempt + 1})"
+            # Spawn diversity: reject near-clones of live same-type keepers
+            # or already-accepted spawns this cycle.
+            peer_params = [
+                ind.get("params") or {}
+                for ind in keep
+                if ind.get("strategy_type") == child_type
+            ]
+            peer_params.extend(
+                s.get("params") or {}
+                for s in report["spawned"]
+                if s.get("strategy_type") == child_type
             )
+            if not is_diverse_enough(
+                child_params, strategy_type=child_type, peers=peer_params,
+            ):
+                logger.info(
+                    "  diversity reject type=%s attempt=%d (too close to peer)",
+                    child_type, attempt + 1,
+                )
+                # Nudge harder and retry on next attempt
+                child_params = adaptive_mutate(
+                    child_params,
+                    strategy_type=child_type,
+                    elite_genomes=elite_genomes,
+                    rate=1.0,
+                    sigma=float(getattr(config, "GA_MUTATION_SIGMA", 0.12)) * 1.5,
+                    rng=rng,
+                )
+                if not is_diverse_enough(
+                    child_params, strategy_type=child_type, peers=peer_params,
+                ):
+                    continue
+
+            child_name = f"{child_type}-g{cycle_number}-{rng.randint(100, 999)}"
+            if breed_mode == "defaults+adaptive":
+                lineage = (
+                    f"defaults({child_type})+mutate -> {child_name} "
+                    f"(no same-type parents; seed elite={p1['name']}; "
+                    f"fit={p1['fitness']:.3f}; attempt={attempt + 1})"
+                )
+            elif breed_mode == "clone+mutate":
+                lineage = (
+                    f"{p1['name']} -> {child_name} "
+                    f"(type={child_type}; clone+mutate; "
+                    f"fit={p1['fitness']:.3f}; attempt={attempt + 1})"
+                )
+            else:
+                lineage = (
+                    f"{p1['name']}+{p2['name']} -> {child_name} "
+                    f"(type={child_type}; crossover+adaptive; "
+                    f"fit={p1['fitness']:.3f}/{p2['fitness']:.3f}; "
+                    f"attempt={attempt + 1})"
+                )
             candidate = bot_factory(
                 child_type, child_name, child_params, cycle_number, lineage,
             )
@@ -462,9 +580,16 @@ def run_ga_cycle(
                 except Exception:
                     baseline = None
             gate = evaluate_offspring(candidate, baseline_bot=baseline)
+            parent_names = (
+                [p1["name"]] if breed_mode in ("clone+mutate", "defaults+adaptive")
+                else [p1["name"], p2["name"]]
+            )
+            if breed_mode == "defaults+adaptive":
+                parent_names = [f"defaults:{child_type}", p1["name"]]
             spawn_meta = {
-                "parents": [p1["name"], p2["name"]],
+                "parents": parent_names,
                 "child_type": child_type,
+                "breed_mode": breed_mode,
                 "gate_reason": gate.reason,
                 "gate_child_pnl": gate.child_pnl,
                 "gate_baseline_pnl": gate.baseline_pnl,
@@ -478,10 +603,10 @@ def run_ga_cycle(
                 continue
 
             evolved = candidate
-            operator = "crossover+adaptive+backtest"
+            operator = f"{breed_mode}+backtest"
             if gate.reason in ("disabled", "data_unavailable", "no_markets",
                                "run_failed_soft"):
-                operator = f"crossover+adaptive({gate.reason})"
+                operator = f"{breed_mode}({gate.reason})"
             break
 
         if evolved is None:
@@ -498,6 +623,7 @@ def run_ga_cycle(
             spawn_meta = {
                 "parents": [dead["name"]],
                 "child_type": child_type,
+                "breed_mode": "fallback",
                 "gate_reason": "all_attempts_failed",
             }
 
@@ -507,6 +633,9 @@ def run_ga_cycle(
             evolved.strategy_params, evolved.lineage,
         )
         new_bots.append(evolved)
+        type_counts[evolved.strategy_type] = (
+            type_counts.get(evolved.strategy_type, 0) + 1
+        )
 
         spawn_rec = {
             "name": evolved.name,
@@ -515,6 +644,7 @@ def run_ga_cycle(
             "lineage": evolved.lineage,
             "parents": list(spawn_meta.get("parents") or [dead["name"]]),
             "operator": operator,
+            "breed_mode": spawn_meta.get("breed_mode"),
             "replaced": dead["name"],
             "params": copy.deepcopy(evolved.strategy_params),
             "gate": {
@@ -561,26 +691,50 @@ def run_ga_cycle(
         new_names,
         rankings,
     )
-    # Also log GA-specific detail (lineage + operators + fitness curve point)
-    db.log_ga_generation(cycle_number, report)
+    # Persist first so report gains mean_raw_fitness, then DB row uses it.
     _persist_ga_state(cycle_number, report)
+    db.log_ga_generation(cycle_number, report)
 
     return new_bots + exempt, report
 
 
 def _persist_ga_state(cycle_number: int, report: dict) -> None:
-    """Write a compact GA snapshot into arena_state for the dashboard."""
+    """Write a compact GA snapshot into arena_state for the dashboard.
+
+    Rank-normalized fitness averages ~0.5 by construction in any symmetric
+    population (mean of ranks on [0,1]). Dashboard history therefore also
+    records a **raw** composite mean/best from components so the curve can
+    actually move when the pool improves.
+    """
     try:
+        from evolution.fitness import composite_from_raw
+
         individuals = report.get("individuals") or []
         best_fit = max((i.get("fitness", 0.0) for i in individuals), default=0.0)
         mean_fit = (
             sum(i.get("fitness", 0.0) for i in individuals) / len(individuals)
             if individuals else 0.0
         )
+        raw_composites = []
+        for ind in individuals:
+            comps = ind.get("components") or {}
+            try:
+                raw_composites.append(float(composite_from_raw(comps)))
+            except Exception:
+                pass
+        best_raw = max(raw_composites) if raw_composites else 0.0
+        mean_raw = (
+            sum(raw_composites) / len(raw_composites) if raw_composites else 0.0
+        )
+        # Prefer raw composites for displayed mean/best (rank mean ≈ 0.5 always).
         snapshot = {
             "cycle": cycle_number,
-            "best_fitness": best_fit,
-            "mean_fitness": mean_fit,
+            "best_fitness": best_raw if raw_composites else best_fit,
+            "mean_fitness": mean_raw if raw_composites else mean_fit,
+            "best_rank_fitness": best_fit,
+            "mean_rank_fitness": mean_fit,
+            "best_raw_fitness": best_raw,
+            "mean_raw_fitness": mean_raw,
             "elites": report.get("elites") or [],
             "replaced": report.get("replaced") or [],
             "spawned": [s.get("name") for s in report.get("spawned") or []],
@@ -588,6 +742,9 @@ def _persist_ga_state(cycle_number: int, report: dict) -> None:
             "reason": report.get("reason"),
             "n_individuals": len(individuals),
         }
+        # So log_ga_generation can store raw means in the DB columns.
+        report["best_raw_fitness"] = best_raw
+        report["mean_raw_fitness"] = mean_raw
         db.set_arena_state("ga_last_cycle", json.dumps(snapshot))
         # Append to fitness history (capped)
         hist_raw = db.get_arena_state("ga_fitness_history")
@@ -596,8 +753,10 @@ def _persist_ga_state(cycle_number: int, report: dict) -> None:
             hist = []
         hist.append({
             "cycle": cycle_number,
-            "best_fitness": best_fit,
-            "mean_fitness": mean_fit,
+            "best_fitness": best_raw if raw_composites else best_fit,
+            "mean_fitness": mean_raw if raw_composites else mean_fit,
+            "best_raw_fitness": best_raw,
+            "mean_raw_fitness": mean_raw,
             "n_replaced": len(report.get("replaced") or []),
         })
         hist = hist[-50:]  # keep last 50 cycles

@@ -83,6 +83,21 @@ class SniperBot(BaseBot):
         drift = float(sv.btc_drift or 0.0)
         min_drift = float(p.get("min_drift", 0.15))
         regime = self.regime_context(signals)
+        # Data-driven hard stand-down when live regime is toxic.
+        try:
+            from arena.regime_adapt import adjustments as _regime_adj
+            _radj = _regime_adj(regime.get("label"), strategy_type="sniper")
+            if getattr(_radj, "block_directional", False):
+                return strategy_decision(
+                    "skip",
+                    reasoning=(
+                        f"sniper: regime hard-skip {_radj.label} "
+                        f"({_radj.reason})"
+                    ),
+                )
+            min_drift += float(getattr(_radj, "extra_drift_floor", 0.0) or 0.0)
+        except Exception:
+            _radj = None
         quiet = (
             regime.get("legacy") == "quiet"
             or regime.get("label") in ("low_vol_range", "low_vol_trend", "quiet")
@@ -111,11 +126,11 @@ class SniperBot(BaseBot):
         yes_edge = _edge(yes_mid, drift)
         no_edge = _edge(no_mid, -drift)
 
+        of_data = sv.orderflow
         prices = sv.prices
         btc_momentum = 0.0
         if len(prices) >= 2 and prices[-1] > 0:
             btc_momentum = (prices[-1] - prices[-2]) / prices[-2]
-        of_data = sv.orderflow
         features = learning.extract_features(
             yes_mid, btc_momentum,
             volume=of_data.get("volume_24h"),
@@ -124,20 +139,65 @@ class SniperBot(BaseBot):
         contributing = {
             "drift": drift, "yes_edge": yes_edge, "no_edge": no_edge,
             "regime": regime.get("label"), "min_drift": min_drift,
+            "btc_momentum": btc_momentum,
         }
 
+        # Ask-quality: refuse when mid still "lags" but the executable ask has
+        # already gapped away (2026-07-29: mid 0.54 / ask 0.75 losses). The
+        # edge math can look fine on mid while fill risk/reward is trash.
+        max_spread = float(p.get(
+            "max_ask_mid_spread",
+            getattr(config, "SNIPER_MAX_ASK_MID_SPREAD", 0.08),
+        ))
+
+        # Coin-flip mid band needs stronger signed drift (same spirit as base).
+        cf_lo = float(getattr(config, "MID_COINFLIP_LO", 0.50))
+        cf_hi = float(getattr(config, "MID_COINFLIP_HI", 0.58))
+        cf_drift = float(getattr(config, "MID_COINFLIP_DRIFT_MIN", 0.28))
+        if _radj is not None and getattr(_radj, "mid_band_drift_min", None):
+            cf_drift = max(cf_drift, float(_radj.mid_band_drift_min))
+
         # Eligibility per side: drift magnitude + lag + edge + not deep junk.
-        def _ok(signed_d: float, mid: float, edge: float) -> bool:
-            if abs(signed_d) < min_drift:
+        def _ok(signed_d: float, mid: float, edge: float, ask: float) -> bool:
+            need = min_drift
+            if cf_lo <= float(mid) <= cf_hi:
+                need = max(need, cf_drift)
+            if abs(signed_d) < need:
                 return False
             if mid > max_mid or mid < min_mid:
                 return False
             if abs(signed_d) >= ext_abs and mid > max_mid:
                 return False
-            return edge >= min_edge
+            if edge < min_edge:
+                return False
+            if (float(ask) - float(mid)) > max_spread:
+                return False
+            return True
 
-        yes_ok = drift >= min_drift and _ok(drift, yes_mid, yes_edge)
-        no_ok = (-drift) >= min_drift and _ok(-drift, no_mid, no_edge)
+        # NO needs a stricter drift floor + lag ceiling (2026-08 soak: sniper
+        # NO −$12 vs YES +$51). Intelligent lag hunt, not a mirror of YES.
+        no_min_drift = min_drift + float(p.get("no_extra_drift", 0.05))
+        no_max_mid = min(max_mid, float(p.get("no_max_side_mid", 0.52)))
+        no_min_edge = min_edge * float(p.get("no_edge_mult", 1.30))
+
+        # Momentum non-contradiction (especially for NO — rising BTC tape
+        # against a NO lag snipe was a live loser class).
+        mom_contra = float(p.get("mom_contradict", 0.0008))
+        yes_mom_ok = btc_momentum >= -mom_contra
+        no_mom_ok = btc_momentum <= mom_contra
+
+        yes_ok = (
+            drift >= min_drift
+            and yes_mom_ok
+            and _ok(drift, yes_mid, yes_edge, yes_ask)
+        )
+        no_ok = (
+            (-drift) >= no_min_drift
+            and no_mid <= no_max_mid
+            and no_edge >= no_min_edge
+            and no_mom_ok
+            and _ok(-drift, no_mid, no_edge, no_ask)
+        )
 
         if yes_ok and (not no_ok or yes_edge >= no_edge):
             side, side_mid, side_ask, side_edge = "yes", yes_mid, yes_ask, yes_edge
@@ -146,25 +206,49 @@ class SniperBot(BaseBot):
             side, side_mid, side_ask, side_edge = "no", no_mid, no_ask, no_edge
             signed = -drift
         else:
+            # Distinguish ask-quality skips for telemetry when lag edge existed
+            # on mid but ask gap killed it.
+            y_spread = float(yes_ask) - float(yes_mid)
+            n_spread = float(no_ask) - float(no_mid)
+            ask_gap = (
+                (drift >= min_drift and yes_edge >= min_edge
+                 and y_spread > max_spread)
+                or ((-drift) >= min_drift and no_edge >= min_edge
+                    and n_spread > max_spread)
+            )
+            why = (
+                f"sniper: ask gap (yes {y_spread:.2f}/no {n_spread:.2f}"
+                f">{max_spread:.2f})"
+                if ask_gap else
+                f"sniper: no lag edge (drift={drift:+.3f} "
+                f"yes_mid={yes_mid:.2f} eY={yes_edge:+.3f} "
+                f"no_mid={no_mid:.2f} eN={no_edge:+.3f} "
+                f"min_d={min_drift:.2f})"
+            )
             return strategy_decision(
                 "skip",
-                reasoning=(
-                    f"sniper: no lag edge (drift={drift:+.3f} "
-                    f"yes_mid={yes_mid:.2f} eY={yes_edge:+.3f} "
-                    f"no_mid={no_mid:.2f} eN={no_edge:+.3f} "
-                    f"min_d={min_drift:.2f})"
-                ),
+                reasoning=why,
                 signals=contributing, features=features,
             )
 
-        # Confidence from edge magnitude + drift conviction (no zone Gaussian).
-        confidence = min(0.95, max(0.0, side_edge) * 3.0 + 0.15 * abs(signed))
+        # Structure confidence (not edge × constant — inversion fix 2026-08).
+        try:
+            from bots.edge_calibration import quality_confidence
+            confidence = quality_confidence(
+                edge=float(side_edge),
+                abs_drift=abs(float(signed)),
+                side_mid=float(side_mid),
+                side=side,
+                regime_label=regime.get("label"),
+            )
+        except Exception:
+            confidence = min(0.85, 0.25 + 0.4 * abs(signed) + min(0.2, side_edge * 2))
         time_rem = market.get("time_remaining_seconds")
         late = 0.0
-        if time_rem is not None and time_rem > 0:
+        late_size = 1.0
+        if time_rem is not None and time_rem > 0 and abs(signed) >= 0.20:
             late = smooth_ramp(-float(time_rem), -90.0, -30.0)
-            if late > 0.05:
-                confidence = min(0.95, confidence * (1.0 + 0.25 * late))
+            late_size = 1.0 + 0.10 * late
 
         min_conf = float(p.get("min_confidence", 0.10))
         if confidence < min_conf:
@@ -174,6 +258,27 @@ class SniperBot(BaseBot):
                 signals=contributing, features=features,
             )
 
+        # Learned skip/go (same decision_events mining as directional bots)
+        _learn_size = 1.0
+        try:
+            from arena.learned_rules import evaluate as _learned_eval
+            _lr = _learned_eval(
+                regime=regime.get("label"),
+                side_price=side_mid,
+                drift=drift,
+                side=side,
+                strategy_type=self.strategy_type,
+            )
+            if _lr.get("action") == "skip":
+                return strategy_decision(
+                    "skip", side, confidence=confidence,
+                    reasoning=_lr.get("reason") or "sniper: learned_skip",
+                    signals=contributing, features=features,
+                )
+            _learn_size = float(_lr.get("size_mult") or 1.0)
+        except Exception:
+            pass
+
         # Fractional Kelly on fee-adjusted edge (shares-first), with portfolio
         # + risk + regime mults — same stack as BaseBot.make_decision.
         price = max(float(side_ask), 0.01)
@@ -182,15 +287,18 @@ class SniperBot(BaseBot):
                 _sizing_bankroll, _portfolio_weight, _risk_size_mult,
                 _kelly_fraction,
             )
-            from arena.regime_adapt import size_multiplier as regime_mult
+            from arena.regime_adapt import adjustments as regime_adj
+            from bots.edge_calibration import calibrated_sizing_edge
+            _ra = regime_adj(regime.get("label"), strategy_type="sniper")
             bankroll = (
                 _sizing_bankroll(self.trading_mode)
                 * _portfolio_weight(self.name)
                 * _risk_size_mult(self.name)
-                * regime_mult(regime.get("label"))
+                * float(_ra.size_mult)
+                * _learn_size
+                * late_size
             )
-            sizing_edge = min(max(0.0, side_edge),
-                              getattr(config, "KELLY_EDGE_CAP", 0.10))
+            sizing_edge = calibrated_sizing_edge(float(side_edge))
             kelly_f = sizing_edge / max(1.0 - price, 0.05)
             kelly_usd = kelly_f * _kelly_fraction() * bankroll
             target_shares = max(
@@ -199,8 +307,8 @@ class SniperBot(BaseBot):
             amount = target_shares * price
         except Exception:
             max_pos = config.get_max_position()
-            pct = float(p.get("position_size_pct", 0.08)) * (1.0 + 0.2 * late)
-            amount = min(max_pos * pct * (0.5 + confidence), max_pos)
+            pct = float(p.get("position_size_pct", 0.08)) * late_size
+            amount = min(max_pos * pct, max_pos)
             target_shares = None
 
         reasoning = (

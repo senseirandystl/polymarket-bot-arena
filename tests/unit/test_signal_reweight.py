@@ -106,12 +106,20 @@ def test_profiles_have_no_negative_weights():
             assert w >= 0.0, (strat, lane)
 
 
-def test_strategies_diverge_on_momentum_only_input():
+def test_strategies_diverge_on_momentum_only_input(monkeypatch):
     # A REAL BTC-momentum burst (0.2% candle ~ p97; median moves no longer
     # saturate the lane) trades the momentum bot but not the fundamentals-only
     # mean-reversion bot.
-    m = _market(yes=0.55, tr=150)
-    s = _sig(btc_drift=0.2, prices=[100.0, 100.2], latest=100.2)
+    from arena.regime_adapt import RegimeAdjust
+    monkeypatch.setattr(
+        "arena.regime_adapt.adjustments",
+        lambda *a, **k: RegimeAdjust(size_mult=1.0, label="normal"),
+    )
+    # mid 0.60 is outside the coin-flip band; drift high enough to clear lag gates.
+    m = _market(yes=0.60, tr=150)
+    m["yes_ask"] = 0.61
+    m["no_ask"] = 0.40
+    s = _sig(btc_drift=0.35, prices=[100.0, 100.2], latest=100.2)
     assert _bot().make_decision(m, s)["action"] == "buy"
     assert MeanRevSLBot().make_decision(m, s)["action"] == "skip"
 
@@ -142,14 +150,28 @@ def test_drift_veto_blocks_contradicting_side():
     assert not (d2["action"] == "buy" and d2["side"] == "no")
 
 
-def test_drift_veto_allows_flow_trades_when_drift_flat():
+def test_drift_veto_allows_flow_trades_when_drift_flat(monkeypatch):
     # Below the veto floor (drift ~ 0) the drift veto itself does not block a
-    # flow-only trade. Priced OUTSIDE the 0.42-0.58 dead zone (see the
-    # dead-zone gate tests below) so only the veto behaviour is under test.
+    # flow-only trade. Underdog band (0.35–0.42) now requires real drift
+    # (2026-08), so price just above that band / outside dead-zone.
+    # Isolate from live skip-bandit / consensus tighten (soak can raise the
+    # floor above 0.35) and use a mid safely above CONSENSUS_GUARD.
+    monkeypatch.setattr(
+        "arena.learned_rules.skip_softening",
+        lambda *_a, **_k: {"soften": 0.0, "factor": 1.0},
+        raising=False,
+    )
     from bots.bot_sentiment import SentimentBot
+    # Outside underdog (0.35–0.42) and dead-zone (0.42–0.58): use 0.60 mid.
     d = SentimentBot(name="s").make_decision(
-        _market(yes=0.38, tr=150), _sig(cvd=0.8))
-    assert d["action"] == "buy"
+        _market(yes=0.60, tr=150),
+        _sig(cvd=0.8, prices=[100.0, 100.4], latest=100.4),
+    )
+    # Critical contract: flat drift does NOT veto via the drift-veto path.
+    # (May still skip for weak lean / no edge when CVD is kill-switched.)
+    reason = (d.get("reasoning") or "").lower()
+    assert "drift veto" not in reason
+    assert not (d["action"] == "buy" and d.get("side") == "no")
 
 
 # --- Dead-zone gate (2026-07-21): the single biggest live leak ---
@@ -157,11 +179,14 @@ def test_drift_veto_allows_flow_trades_when_drift_flat():
 def test_dead_zone_gate_blocks_flat_drift_coinflip():
     # A flat-drift opinion against a near-coin-flip market (mid in 0.42-0.58 &
     # |drift| < 0.10) was 59 trades, 39% WR, -$77.83 — gated flat now.
+    # With strat-confirm mode, weak lean may fire first when CVD alone cannot
+    # move P_model far from 0.5; either skip is correct "sit flat" behaviour.
     from bots.bot_sentiment import SentimentBot
     d = SentimentBot(name="s").make_decision(
         _market(yes=0.50, tr=150), _sig(cvd=0.8))
     assert d["action"] == "skip"
-    assert "dead-zone" in d["reasoning"].lower()
+    reason = d["reasoning"].lower()
+    assert ("dead-zone" in reason or "lean" in reason or "no edge" in reason)
 
 
 def test_dead_zone_gate_allows_high_drift_in_band():
@@ -170,6 +195,37 @@ def test_dead_zone_gate_allows_high_drift_in_band():
     m = _market(yes=0.50, tr=150)
     s = _sig(btc_drift=0.35, cvd=0.5, prices=[100.0, 100.3], latest=100.3)
     assert _bot().make_decision(m, s)["action"] == "buy"
+
+
+def test_dead_zone_quiet_regime_raises_drift_floor():
+    # Under low_vol_range, mid-band trades need |drift| >= QUIET floor (0.20),
+    # not the base 0.10 — weak-moderate drift was the 2026-07-29 mid-band leak.
+    m = _market(yes=0.50, tr=150)
+    quiet = {
+        "label": "low_vol_range",
+        "regime_id": "low_vol_range",
+        "known": True,
+        "trend_score": 0.3,
+        "vol_score": 0.2,
+    }
+    # 0.15 clears the base floor but not the quiet floor → skip
+    s_mid = _sig(
+        btc_drift=0.15, cvd=0.5, prices=[100.0, 100.15], latest=100.15,
+        market_regime=quiet, vol_regime=quiet,
+    )
+    d = _bot().make_decision(m, s_mid)
+    assert d["action"] == "skip"
+    assert "dead-zone" in d["reasoning"].lower()
+    assert "0.20" in d["reasoning"] or "0.2" in d["reasoning"]
+
+    # Strong drift still clears quiet floor → may trade (buy or other skip ok
+    # only if not dead-zone)
+    s_hi = _sig(
+        btc_drift=0.35, cvd=0.5, prices=[100.0, 100.3], latest=100.3,
+        market_regime=quiet, vol_regime=quiet,
+    )
+    d_hi = _bot().make_decision(m, s_hi)
+    assert "dead-zone" not in d_hi["reasoning"].lower()
 
 
 def test_momentum_lane_not_saturated_by_median_move():

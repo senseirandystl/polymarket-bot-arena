@@ -564,6 +564,23 @@ def _evolution_check_loop(bots, state, pos_monitor, trader):
                 state.reset()
                 trader.set_bots(bots)
                 pos_monitor.update_bots(bots)
+
+                # Roster changed → rebalance capital weights immediately so
+                # Capital Allocation / Kelly slices match the new slate
+                # (otherwise the dashboard keeps retired -v1 names until the
+                # 30m timer or a regime flip).
+                if evo_report and (
+                    evo_report.get("replaced") or evo_report.get("spawned")
+                ):
+                    try:
+                        portfolio.rebalance(force=True, reason="evolution")
+                    except Exception as pe:
+                        log_event(
+                            logger, logging.WARNING,
+                            f"Post-evolution portfolio rebalance failed: {pe}",
+                            event_type="error", where="portfolio_rebalance",
+                            cycle=cycle_number,
+                        )
         except Exception as e:
             log_event(logger, logging.ERROR, f"Evolution cycle error (caught): {e}",
                       exc_info=True, event_type="error", where="evolution_cycle",
@@ -591,6 +608,13 @@ def _evolution_check_loop(bots, state, pos_monitor, trader):
                     from arena.decision_log import maybe_rollup, flush
                     flush()
                     maybe_rollup()
+                    # Mine decision_events into auto skip/go rules (data-driven
+                    # regime×price×drift cells — not hardcoded gates).
+                    try:
+                        from arena.learned_rules import mine_and_update
+                        mine_and_update()
+                    except Exception as le:
+                        logger.debug("learned_rules mine: %s", le)
                 except Exception as e:
                     logger.debug("decision rollup: %s", e)
                 last_lane_check = time.time()

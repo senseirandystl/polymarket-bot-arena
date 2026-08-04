@@ -53,7 +53,7 @@ def test_predictive_lane_nudged_up_bounded(tmp_db):
     clt.tune()
     ov = db.get_lane_overrides().get("drift")
     assert ov and ov["enabled"] and ov.get("core") is True
-    default = BaseBot.STRATEGY_SIGNAL_PROFILE["momentum"]["drift"]  # 0.35
+    default = BaseBot.STRATEGY_SIGNAL_PROFILE["momentum"]["drift"]
     w = ov["profile"]["momentum"]
     assert w == pytest.approx(default + config.CORE_TUNE_STEP)  # one step up
     assert w <= default + config.CORE_TUNE_BAND + 1e-9          # never past band

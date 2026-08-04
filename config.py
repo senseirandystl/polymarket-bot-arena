@@ -110,7 +110,10 @@ EVOLUTION_WINDOW_HOURS = 24
 # 1-2 trades. Empirically the per-bucket WR/P&L numbers in the run only
 # stabilized past ~30 samples, so a bot needs at least that many resolved this
 # window before it can be replaced.
-MIN_TRADES_FOR_JUDGMENT = 30   # Fewer resolved trades in the window = immune
+# Raised 30 → 40 (2026-08 soak): GA culled meanrev/mom/sniper/phantom on
+# noisy 30-trade dips mid-run; mutants then bled the book. Need a fuller
+# window sample before a bot is eligible for replacement.
+MIN_TRADES_FOR_JUDGMENT = 40   # Fewer resolved trades in the window = immune
 # Survival bar is the BREAK-EVEN GAP (win_rate - avg_entry_price), not a flat
 # WR threshold: 65% WR bought at 70c loses money while 55% bought at 45c
 # prints. A bot survives if its gap clears this floor OR its window P&L is
@@ -119,9 +122,17 @@ MIN_TRADES_FOR_JUDGMENT = 30   # Fewer resolved trades in the window = immune
 # (best WR was 63.3%). Still used by the GA as the *replacement eligibility*
 # bar (elites are protected regardless).
 EVOLUTION_BE_GAP_MIN = 0.03    # survive if WR beats avg entry by >= 3c
+# Soft P&L floor: small negative window P&L is noise, not a cull signal.
+# 2026-08: meanrev-v1 at −$3 was replaced by a worse mutant.
+EVOLUTION_PNL_CULL_MAX = -12.0  # only replaceable if window PnL ≤ this
+# Gen-0 / default-lineage bots: only replace when deeply underwater (founders
+# carry the slate until a mutant clearly earns the seat).
+GA_PROTECT_FOUNDERS = True
+GA_FOUNDER_CULL_PNL = -20.0     # gen0 replaceable only if pnl ≤ this
+GA_FOUNDER_CULL_BE_GAP = -0.02  # or BE gap worse than −2¢ with enough n
 
 # --- Genetic Algorithm (replaces simple mutate-from-winner, 2026-07-23) ---
-GA_ELITE_COUNT = 1             # top-N by multi-obj fitness never replaced
+GA_ELITE_COUNT = 2             # top-N by multi-obj fitness never replaced
 GA_TOURNAMENT_K = 3            # tournament selection size
 GA_MUTATION_RATE = 0.20        # per-gene probability of Gaussian noise
 GA_MUTATION_SIGMA = 0.12       # noise scale as fraction of param range
@@ -157,8 +168,14 @@ GA_MIN_INTERVAL_SEC = 30 * 60
 # --- GA upgrades (gene bank, type alloc, backtest gate, adaptive mutation) ---
 GA_GENE_BANK_SIZE = 20            # max shadow elites kept as future parents
 GA_TYPE_ALLOC_ENABLED = True      # tier-1: sample strategy_type by fitness softmax
-GA_TYPE_STICKINESS = 0.40         # mass kept on the culled slot's original type
+# High stickiness (2026-08): cross-type swaps (phantom→sentiment) destroyed
+# slate coherence. Prefer same-type offspring; still allow rare type shift.
+GA_TYPE_STICKINESS = 0.80         # mass kept on the culled slot's original type
 GA_TYPE_ALLOC_TEMPERATURE = 0.35  # lower = greedier toward high-fitness types
+# Hard same-type only when True (ignore fitness softmax for type pick).
+GA_TYPE_SAME_TYPE_ONLY = False
+# Types excluded from spawn until their lanes are live (sentiment needs pm/cvd).
+GA_SPAWN_EXCLUDE_TYPES = ()       # filled dynamically if empty — see type_alloc
 GA_RECENCY_WEIGHTING = True       # fitness favors recent + current-regime trades
 GA_REGIME_RECENCY_HALFLIFE_H = 6.0
 GA_REGIME_MATCH_BOOST = 1.5       # multiplier for trades stamped with live regime
@@ -172,8 +189,87 @@ GA_BACKTEST_BEAT_BASELINE = True  # child must not be worse than replaced bot
 GA_BACKTEST_EPS = 0.50            # $ noise band when comparing to baseline
 GA_BACKTEST_MIN_PNL = None        # optional absolute floor (None = off)
 GA_SPAWN_ATTEMPTS = 3             # type/param samples before fallback defaults
+# Cap identical strategy_types introduced in one cycle (kept survivors count
+# toward the cap). Prevents a monoculture elite from filling every open slot
+# with two identical hybrids (cycle-4 2026-07-29: hybrid-g4-158 + hybrid-g4-259).
+GA_MAX_PER_TYPE_PER_CYCLE = 1
+# Gene bank: max elites retained per strategy_type (then global GA_GENE_BANK_SIZE).
+GA_GENE_BANK_MAX_PER_TYPE = 3
+# Spawn diversity: min normalized L1 distance vs live same-type peers (0 = off).
+GA_DIVERSITY_MIN_DISTANCE = 0.08
+# Backtest gate: also require not-worse vs baseline in the live regime subset.
+GA_BACKTEST_REGIME_MIX = True
+GA_BACKTEST_REGIME_EPS = 0.50
+GA_BACKTEST_REGIME_MIN_TRADES = 3
 # Extra frozen gene names (merged with evolution.frozen defaults)
 GA_FROZEN_GENES = ()
+
+# --- Sniper ask quality ---
+# Max (ask − mid) on the chosen side; wider spreads mean the lag thesis on
+# mid is already stale at the executable price (2026-07-29 mid0.54/ask0.75).
+SNIPER_MAX_ASK_MID_SPREAD = 0.08
+
+# --- Portfolio explore floor for new gN bots ---
+# Until a post-evolution bot has this many resolved trades, cap its capital
+# weight so cold mutants cannot eat a full Kelly slice immediately.
+PORTFOLIO_EXPLORE_MIN_TRADES = 20
+PORTFOLIO_EXPLORE_MAX_WEIGHT = 0.06   # per cold bot
+# Total capital budget shared by ALL not-ready / cold bots (prevents 3×24%).
+PORTFOLIO_EXPLORE_TOTAL_BUDGET = 0.12
+# Proven bots (long-window exp>0 or gen0 with n≥floor) keep at least this
+# weight even if short-window expectancy dips slightly negative.
+PORTFOLIO_PROVEN_FLOOR = 0.06
+PORTFOLIO_PROVEN_MIN_TRADES = 25
+
+# --- Learned trade rules (decision_events → auto skip/go) ---
+# Mines regime×price×drift×side cells; promotes skip when buys lose and go
+# (softer min_edge + size boost) when buys print or skips miss winners.
+LEARNED_RULES_ENABLED = True
+LEARNED_RULES_MIN_N = 25
+LEARNED_RULES_SKIP_WR_MAX = 0.47
+LEARNED_RULES_SKIP_HYP_MAX = -0.005
+LEARNED_RULES_GO_WR_MIN = 0.58
+LEARNED_RULES_GO_HYP_MIN = 0.01
+LEARNED_RULES_MISSED_WR_MIN = 0.60
+LEARNED_RULES_DEMOTE_SKIP_WR = 0.53
+LEARNED_RULES_DEMOTE_GO_WR = 0.50
+LEARNED_RULES_GO_SIZE_MULT = 1.15
+LEARNED_RULES_GO_EDGE_MULT = 0.85
+LEARNED_RULES_MISSED_EDGE_MULT = 0.80
+# Never ease (GO) high-price cells from skip counterfactuals alone — that
+# re-opened expensive favorites (2026-08: ≥0.72 mid −$38). Require real buy
+# evidence with positive hyp (fee-aware).
+LEARNED_RULES_BAN_GO_HIGH_FROM_SKIP = True
+LEARNED_RULES_GO_HIGH_MIN_BUY_N = 15
+LEARNED_RULES_GO_HIGH_MIN_HYP = 0.02
+LEARNED_RULES_MAX = 40
+LEARNED_RULES_MAX_CONTINUOUS = 30
+LEARNED_RULES_CACHE_SEC = 30.0
+# Per-strategy cells: True forces on; False + AUTO enables when sample mass
+# clears LEARNED_RULES_PER_STRATEGY_MIN_* (no manual flip needed in normal use).
+LEARNED_RULES_PER_STRATEGY = False
+LEARNED_RULES_PER_STRATEGY_AUTO = True
+LEARNED_RULES_PER_STRATEGY_MIN_RESOLVED = 200
+LEARNED_RULES_PER_STRATEGY_MIN_CELLS = 8
+# Continuous size/edge mult from cell WR (process 1)
+LEARNED_RULES_CONTINUOUS = True
+LEARNED_RULES_CONT_BAD_WR = 0.45
+LEARNED_RULES_CONT_GOOD_WR = 0.60
+LEARNED_RULES_CONT_SIZE_MIN = 0.40
+LEARNED_RULES_CONT_SIZE_MAX = 1.25
+LEARNED_RULES_CONT_EDGE_TIGHT = 1.25
+LEARNED_RULES_CONT_EDGE_SOFT = 0.80
+# Walk-forward OOS (process 4)
+LEARNED_RULES_OOS_ENABLED = True
+LEARNED_RULES_OOS_TRAIN_FRAC = 0.70
+LEARNED_RULES_OOS_MIN_EVENTS = 40
+LEARNED_RULES_OOS_REQUIRE_TEST_CELL = False
+# Skip-reason bandit (process 3)
+LEARNED_RULES_SKIP_BANDIT_ENABLED = True
+LEARNED_RULES_SKIP_BANDIT_MIN_N = 30
+LEARNED_RULES_SKIP_BANDIT_HIGH_CF = 0.58
+LEARNED_RULES_SKIP_BANDIT_LOW_CF = 0.48
+LEARNED_RULES_SKIP_BANDIT_MAX_SOFTEN = 0.25
 
 # Signal Feed Settings
 BINANCE_WS_URL = "wss://stream.binance.com:9443/ws"  # ETH/SOL only; BTC = Chainlink
@@ -255,6 +351,18 @@ SIGNAL_WEIGHT_CVD = 0.0
 # reads "quiet", the mom lane's value is multiplied by this before blending.
 # Trending/volatile/normal regimes are untouched.
 MOM_QUIET_REGIME_DAMP = 0.5
+# Strat lane treatment (2026-08 redesign). ``strat`` is NOT a raw market
+# signal — it is the bot's analyze() thesis, usually derived from the same
+# prices/candles that feed drift/mom. Treating it as an independent additive
+# lane double-counts information and let overconfident theses mint edge.
+# Modes:
+#   confirm — only contribute when sign agrees with drift; magnitude scaled
+#   residual — always allow but scale down (legacy-ish)
+#   full — old additive behavior (not recommended)
+STRAT_LANE_MODE = "confirm"
+STRAT_CONFIRM_SCALE = 0.55          # keep this fraction when confirming drift
+STRAT_FIGHT_SCALE = 0.0             # scale when strat fights non-trivial drift
+STRAT_DRIFT_AGREE_MIN = 0.05        # |drift| above which fight/confirm applies
 # Strat-lane confidence cap (BUG #30, 2026-07-20). The per-strategy analyze()
 # thesis (EMA-crossover/breakout, z-score fade, trend-follow, etc.) has never
 # been offline-validated the way drift/mom were — it was assumed reasonable
@@ -275,7 +383,39 @@ MOM_QUIET_REGIME_DAMP = 0.5
 # (|strat| 0.3-0.6 ran 52.7% WR / -$14.81; >= 0.6 ran 46.0% / -$34.05), while
 # |strat| < 0.3 was the only profitable band (+$41.23). Clamp to 0.30 so the
 # blend only ever sees the magnitude that actually performed.
-STRAT_LANE_CONF_CAP = 0.30
+STRAT_LANE_CONF_CAP = 0.25
+
+# --- NO-side intelligence (2026-08 soak: YES +$245 / NO −$15) ---
+# Not a blanket NO ban. Prefer NO only when it is a true market-lag trade
+# (cheap relative to signed drift) with real drift conviction. Strategies
+# that already print on NO (momentum/meanrev) keep milder extras.
+NO_SIDE_ENABLED = True
+NO_SIDE_MIN_SIGNED_DRIFT = 0.12     # |signed drift toward NO| floor
+NO_SIDE_MAX_MID = 0.58              # lag ceiling (same spirit as sniper)
+NO_SIDE_EDGE_MULT = 1.20            # global min_edge mult on NO
+NO_SIDE_UNDERDOG_EDGE_MULT = 1.35   # extra when NO mid in cheap band
+# Per-strategy extra min_edge mult on NO (on top of global). 1.0 = no extra.
+NO_SIDE_STRATEGY_EDGE_MULT = {
+    "sniper": 1.35,
+    "hybrid": 1.40,
+    "phantom": 1.50,
+    "fee_zone_maker": 1.25,
+    "late_window_maker": 1.25,
+    "momentum": 1.05,
+    "mean_reversion": 1.05,
+    "mean_reversion_tp": 1.15,
+    "mean_reversion_sl": 1.15,
+    "sentiment": 1.25,
+}
+
+# --- Cheap underdog band (0.35–0.42): mild leak at 38% WR / −$23 ---
+UNDERDOG_BAND_LO = 0.35
+UNDERDOG_BAND_HI = 0.42
+UNDERDOG_MIN_DRIFT = 0.18           # need real drift to buy deep underdogs
+UNDERDOG_EDGE_MULT = 1.40           # higher min_edge in this band
+
+# --- Maker mid/ask integrity ---
+MAKER_MAX_MID_ASK_GAP = 0.08        # |mid − ask| above this → refuse trade
 # Tape volume (shares) below which CVD magnitude is damped: cvd =
 # net / max(total, floor). A 30-share one-sided tape reads 0.15, not 1.0;
 # a 1500-share one-sided tape still reads ~1.0. Calibrate offline before
@@ -364,6 +504,10 @@ CORE_TUNE_ENABLED = True
 CORE_TUNE_MIN_TRADES = 40      # per-(strategy,lane) resolved readings before tuning
 CORE_TUNE_HIGH_ACC = 0.56      # lane sign-accuracy above this => nudge weight UP
 CORE_TUNE_LOW_ACC = 0.48       # below this => nudge weight DOWN (toward the band floor)
+# Elevated weights that do not clear HIGH_ACC bleed back toward the class
+# default (one step/cycle). Prevents mediocre lanes from sitting at the band
+# ceiling forever (sentiment strat overnight: 56.7% acc at weight 0.9).
+CORE_TUNE_REVERT_BELOW_ACC = 0.56
 CORE_TUNE_STEP = 0.05          # per-cycle weight nudge (bounded, one step/lane/strategy)
 CORE_TUNE_BAND = 0.20          # max |deviation| of a tuned weight from its class default
 CORE_TUNE_WEIGHT_MAX = 0.90    # absolute ceiling on any single lane weight
@@ -452,7 +596,11 @@ DRIFT_VETO_MIN = 0.05
 # drift-veto, dead-zone, consensus and book-sum guards are unchanged. Revert to
 # 2.0 once enough trades accumulate to judge per-drift-band P&L live.
 FLOW_ONLY_EDGE_MULT_MAX = 1.5
-FLOW_ONLY_DRIFT_FULL_TRUST = 0.30
+# Full flow-only tax lifts only once |drift| reaches this. Live soak (2026-08):
+# profit concentrated at |drift| ≥ 0.20; 0.10–0.20 was barely BE. Was 0.30
+# conceptually; keep 0.25 as the practical full-trust floor (tax still
+# graduated below it).
+FLOW_ONLY_DRIFT_FULL_TRUST = 0.25
 
 # --- Dead-zone gate (2026-07-21) — the single biggest live leak ---
 # Over the 290-trade run the 0.42-0.58 price band with |drift| below
@@ -468,6 +616,15 @@ FLOW_ONLY_DRIFT_FULL_TRUST = 0.30
 DEAD_ZONE_PRICE_LO = 0.42
 DEAD_ZONE_PRICE_HI = 0.58
 DEAD_ZONE_DRIFT_MIN = 0.10
+# Quiet / range regimes: mid-band "market lags drift" at |drift| 0.10–0.20 was
+# a major leak (2026-07-29 soak: 0.50–0.58 band −$35.9 at 48.5% WR under
+# low_vol_range). Require stronger drift before allowing coin-flip mids.
+DEAD_ZONE_QUIET_DRIFT_MIN = 0.20
+DEAD_ZONE_QUIET_REGIMES = (
+    "low_vol_range",
+    "low_vol_trend",
+    "quiet",
+)
 
 # --- Extreme-drift market-lag gate (soak 2026-07-27) ---
 # |drift| 0.30–0.50 was the money zone (85% WR); |drift| ≥ 0.50 lost (41% WR).
@@ -535,7 +692,14 @@ KELLY_FRACTION = 0.25
 # usually means the model maximally disagrees with the market, which is when
 # its inputs are most likely stale/wrong, not when it knows the most. Edges
 # above the cap size as if they were exactly the cap.
-KELLY_EDGE_CAP = 0.10
+# Hard cap on edge fed into Kelly (trade/skip still uses raw edge). Lowered
+# 0.10 → 0.08 after confidence-inversion soak: max-edge trades were the
+# worst WR band once everything above the cap max-sized equally.
+KELLY_EDGE_CAP = 0.08
+# Concave sizing calibration (bots/edge_calibration.py): full Kelly credit
+# for edges ≤ this; diminishing returns between here and KELLY_EDGE_CAP.
+EDGE_CALIB_FULL_CREDIT = 0.04
+EDGE_CALIB_TAPER_SCALE = 0.06
 # How long make_decision may reuse the last bankroll read (it runs per-bot
 # per-second; the pool changes only on fills/resolutions).
 SIZING_BANKROLL_CACHE_SEC = 5.0
@@ -547,13 +711,19 @@ SIZING_BANKROLL_CACHE_SEC = 5.0
 # dashboard Settings → Portfolio Allocation card.
 PORTFOLIO_ALLOCATION_ENABLED = True   # default on; Kelly sizes against bankroll × weight
 PORTFOLIO_METHOD = "kelly_portfolio"  # equal | sharpe | expectancy | kelly_portfolio
-PORTFOLIO_WINDOW_HOURS = 24.0         # lookback for Sharpe / expectancy / corr
-PORTFOLIO_MIN_TRADES = 10             # sample floor before a bot's score counts
-PORTFOLIO_MIN_WEIGHT = 0.05           # floor so losers still explore
-PORTFOLIO_MAX_WEIGHT = 0.45           # cap so one bot can't dominate
+# Dual-window blend: long lookback stabilizes weights; short window keeps
+# regime freshness without letting a lucky 6h FZM streak steal 20% capital.
+PORTFOLIO_WINDOW_HOURS = 48.0         # primary (long) lookback
+PORTFOLIO_FAST_WINDOW_HOURS = 12.0    # short window for blend
+PORTFOLIO_LONG_WEIGHT = 0.65          # blend = long*W + fast*(1-W)
+PORTFOLIO_MIN_TRADES = 20             # sample floor before a bot's score counts
+PORTFOLIO_MIN_WEIGHT = 0.0            # no forced floor — losers can go to 0
+PORTFOLIO_MAX_WEIGHT = 1.0            # no single-bot cap; free mass always renorms to 100%
 PORTFOLIO_CORR_SHRINK = 0.65          # 0..1: how hard correlation cuts raw score
 PORTFOLIO_CORR_MIN_OVERLAP = 8        # shared markets needed to estimate ρ
 PORTFOLIO_COLD_START_SCORE = 0.05     # tiny score for bots under sample floor
+PORTFOLIO_LOSER_SCORE = 0.0           # ready bots with neg expectancy → zero weight
+PORTFOLIO_ARB_FIXED_EQUAL = True      # pin arbitrage at 1/N (market-neutral staple)
 PORTFOLIO_REBALANCE_INTERVAL_SEC = 30 * 60  # 30 min periodic rebalance
 PORTFOLIO_REBALANCE_ON_REGIME = True  # also rebalance on regime_detector flip
 
@@ -678,6 +848,20 @@ REGIME_ADAPT_GOOD_WR = 0.62      # at/above → size toward MAX
 REGIME_ADAPT_SIZE_MIN = 0.35
 REGIME_ADAPT_SIZE_MAX = 1.15
 REGIME_ADAPT_CACHE_SEC = 30.0
+# Data-driven HARD stand-down for directional bots when a regime is toxic
+# live (2026-08: low_vol_trend 32% WR / −$45). Clears when WR recovers
+# (hysteresis) so the system re-enables itself without a restart.
+REGIME_HARD_SKIP_ENABLED = True
+REGIME_HARD_SKIP_MIN_TRADES = 20
+REGIME_HARD_SKIP_WR = 0.42       # block directionals at/below this WR
+REGIME_HARD_SKIP_CLEAR_WR = 0.50 # re-enable only after recovery (hysteresis)
+REGIME_HARD_SKIP_REQUIRE_NEG_PNL = True
+# Coin-flip favorite band: mid in [0.50, 0.58] needs stronger drift/lag
+# (2026-08: 229 trades, 50% WR, −$37; with low_vol_trend −$49).
+MID_COINFLIP_LO = 0.50
+MID_COINFLIP_HI = 0.58
+MID_COINFLIP_DRIFT_MIN = 0.28
+MID_COINFLIP_DRIFT_MIN_BAD_REGIME = 0.40  # when regime size_mult is depressed
 
 # --- Decision-event log (counterfactual learning) ---
 # Hot path only enqueues; a background flusher batch-inserts. Non-buy actions

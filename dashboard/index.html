@@ -162,7 +162,7 @@ body.nav-open .sidebar{transform:none}
   /* sidebar already shows the wordmark when the drawer is open — drop the duplicate */
   body.nav-open .topbar .brand{display:none}
 }
-.container{max-width:1280px;margin:0 auto;padding:14px 18px 20px}
+.container{max-width:1600px;margin:0 auto;padding:14px 18px 20px;width:100%;box-sizing:border-box}
 
 /* ===== cards / grids ===== */
 .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:10px;margin-bottom:12px}
@@ -174,8 +174,8 @@ body.nav-open .sidebar{transform:none}
   background:linear-gradient(90deg,transparent,rgba(0,255,156,.35),transparent);opacity:.7}
 .card h2{font-size:11px;color:var(--grn);margin-bottom:8px;text-transform:uppercase;letter-spacing:.14em;font-weight:600;text-align:center}
 .card h2 span{color:var(--dim)}
-.card.dense{padding:10px 12px}
-.card.dense h2{margin-bottom:6px}
+.card.dense{padding:8px 11px}
+.card.dense h2{margin-bottom:5px}
 .section-title{font-size:13px;color:var(--hi);margin:16px auto 8px;text-transform:uppercase;letter-spacing:.1em;
   text-align:center;padding:0 12px 6px;border-left:none;border-bottom:1px solid var(--line);
   box-shadow:none;max-width:42rem}
@@ -184,72 +184,126 @@ body.nav-open .sidebar{transform:none}
 .stat-row .stat-label{flex:0 1 auto}
 .stat-row .stat-value{flex:0 1 auto}
 
-/* Overview density helpers — Approach 2 command center */
+/* Overview density helpers — command center hierarchy */
 .ov-ribbon{
-  display:flex;flex-wrap:wrap;gap:8px;align-items:stretch;justify-content:center;margin-bottom:10px
+  display:flex;flex-wrap:wrap;gap:6px;align-items:stretch;justify-content:stretch;
+  margin-bottom:8px;width:100%
 }
 .btc-chip{
   flex:0 0 auto;min-width:148px;display:flex;flex-direction:column;justify-content:center;align-items:center;
   text-align:center;
   background:linear-gradient(180deg,var(--panel),var(--panel2));border:1px solid var(--line);
-  border-left:3px solid var(--amb);border-radius:6px;padding:8px 12px
+  border-left:3px solid var(--amb);border-radius:6px;padding:6px 10px
 }
 .btc-chip .btc-lbl{font-size:9px;letter-spacing:.16em;text-transform:uppercase;color:var(--dim);margin-bottom:2px}
 .btc-chip .btc-px{font-size:18px;font-weight:700;color:var(--hi);font-variant-numeric:tabular-nums;line-height:1.1}
 .btc-chip .btc-sub{font-size:10px;color:var(--muted);margin-top:2px}
 .btc-chip.stale .btc-px{color:var(--amb)}
 .btc-chip.live .btc-px{color:var(--hi)}
-.ov-ribbon .ops-strip{flex:0 1 auto;margin:0;min-width:0;justify-content:center}
-.ov-ribbon .ops-chip{min-width:100px;padding:6px 10px;text-align:center}
+/* Ops strip grows to fill remaining ribbon width; chips share space evenly */
+.ov-ribbon .ops-strip{
+  flex:1 1 0;margin:0;min-width:0;display:flex;flex-wrap:wrap;gap:6px;
+  justify-content:stretch;align-items:stretch
+}
+.ov-ribbon .ops-chip{flex:1 1 0;min-width:90px;padding:4px 8px;text-align:center}
 .ov-ribbon .ops-chip .val{font-size:14px}
 
-/* Main pulse: Performance | Market | Regime — denser equal-ish columns */
+/* Main pulse: Performance | Current Market (hero) | Regime — full-width equal-ish cols */
 .ov-main-row{
-  display:grid;grid-template-columns:minmax(200px,1fr) minmax(260px,1.25fr) minmax(200px,1fr);
-  gap:10px;margin-bottom:10px;align-items:stretch
+  display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.35fr) minmax(0,1fr);
+  gap:8px;margin-bottom:8px;align-items:stretch;width:100%
 }
 @media(max-width:1100px){.ov-main-row{grid-template-columns:1fr 1fr}}
 @media(max-width:720px){.ov-main-row{grid-template-columns:1fr}}
 .ov-main-row > .card{margin:0;min-height:0;display:flex;flex-direction:column}
-.ov-main-row .market-card{border-left:3px solid #35ff87}
-.ov-main-row #current-market-body{flex:1}
-.ov-main-row .mkt-trades{max-height:88px}
+/* Hero: Current Market — stronger left accent + subtle lift + roomier padding */
+.ov-main-row .market-card{
+  border-left:3px solid #35ff87;
+  background:linear-gradient(165deg,rgba(0,255,156,.04),transparent 42%),
+    linear-gradient(180deg,var(--panel),var(--panel2));
+  box-shadow:0 0 18px rgba(0,255,156,.06);
+  padding:16px 18px
+}
+.ov-main-row .market-card h2{margin-bottom:10px}
+.ov-main-row #current-market-body{flex:1;display:flex;flex-direction:column;min-height:0}
+/* Side cards slightly quieter vs hero */
+.ov-main-row > .card:not(.market-card){opacity:.97}
+.ov-main-row .compact-table td.quiet-zero{color:var(--dim);opacity:.75}
 
-/* Context band: Health | Signals | Allocation */
+/* Context band: Health | Signals | Allocation — secondary strip under hero */
 .ov-context-row{
-  display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:10px
+  display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;margin-top:0;margin-bottom:8px;width:100%
 }
 @media(max-width:1000px){.ov-context-row{grid-template-columns:1fr 1fr}}
 @media(max-width:700px){.ov-context-row{grid-template-columns:1fr}}
 
+/* Compact equal-allocation strip + stacked bar (segments use % width, sum to 100%) */
+.ov-alloc-equal{
+  font-size:11px;color:var(--muted);text-align:center;margin:2px 0 6px
+}
+.ov-alloc-summary{
+  color:var(--muted);font-size:12px;margin-bottom:4px;text-align:center;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis
+}
+.ov-alloc-bar{
+  display:flex;height:6px;border-radius:3px;overflow:hidden;border:1px solid var(--line);
+  margin:0 0 6px;background:var(--inset);width:100%
+}
+.ov-alloc-bar span{
+  flex:0 0 auto;min-width:0;height:100%;box-sizing:border-box;
+  background:rgba(53,255,135,.35);border-right:1px solid rgba(0,0,0,.35)
+}
+.ov-alloc-bar span:last-child{border-right:0}
+.ov-alloc-bar span:nth-child(even){background:rgba(53,255,135,.22)}
+.ov-alloc-bar span:nth-child(3n){background:rgba(53,255,135,.28)}
+
 /* Compact risk band */
 .risk-port-chips{
-  display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px;justify-content:center
+  display:flex;flex-wrap:wrap;gap:6px;margin-bottom:6px;justify-content:center
 }
 .risk-chip{
   background:var(--inset);border:1px solid var(--line);border-radius:4px;
-  padding:5px 10px;min-width:72px;text-align:center
+  padding:4px 9px;min-width:72px;text-align:center
 }
 .risk-chip .k{display:block;font-size:9px;letter-spacing:.1em;text-transform:uppercase;color:var(--dim);margin-bottom:1px}
 .risk-chip .v{font-size:13px;font-weight:700;color:var(--hi);font-variant-numeric:tabular-nums}
-.risk-events-toggle{
+/* Shared toggle style: Recent decisions + Show bots */
+.risk-events-toggle,.risk-bots-toggle{
   background:transparent;border:none;color:var(--muted);font-family:inherit;font-size:10px;
   letter-spacing:.08em;text-transform:uppercase;cursor:pointer;padding:0;margin:6px 0 3px
 }
-.risk-events-toggle:hover{color:var(--hi)}
+.risk-events-toggle:hover,.risk-bots-toggle:hover{color:var(--hi)}
+/* Risk bot table: collapsed by default (chips only) */
+.risk-bots-wrap.collapsed #risk-bots-table{display:none}
+.risk-bots-wrap{margin-bottom:2px}
+/* Recent decisions: collapsed shows partial list via JS row limit */
+.risk-events-wrap.collapsed .risk-events-more{display:table-row}
+/* Quiet footer: next window only (low contrast strip under Current Market body) */
 .next-mkt-pill{
-  display:flex;align-items:center;justify-content:center;gap:8px;flex-wrap:wrap;
-  font-size:11px;color:var(--muted);padding:5px 8px;margin-top:6px;
-  background:var(--inset);border:1px solid var(--line);border-radius:4px
+  display:flex;align-items:center;justify-content:flex-start;gap:6px;
+  font-size:10px;color:var(--dim);padding:6px 0 0;margin-top:10px;
+  background:transparent;border:none;border-top:1px solid var(--line2);border-radius:0;
+  letter-spacing:.02em;line-height:1.3
 }
-.next-mkt-pill .dot-q{width:7px;height:7px;border-radius:50%;background:var(--amb);box-shadow:0 0 6px rgba(255,176,32,.5);flex:0 0 auto}
-.next-mkt-pill.ready .dot-q{background:var(--grn);box-shadow:var(--glow)}
-.next-mkt-pill.missing .dot-q{background:var(--dim);box-shadow:none}
-.mkt-ptb{display:flex;flex-wrap:wrap;gap:10px 22px;align-items:baseline;justify-content:center;margin:6px 0 4px;font-size:12px;text-align:center}
-.mkt-ptb .ptb-item{display:inline-flex;align-items:baseline;gap:6px;flex-wrap:wrap;justify-content:center}
-.mkt-ptb .ptb-k{color:var(--dim);font-size:10px;letter-spacing:.08em;text-transform:uppercase}
-.mkt-ptb .ptb-v{color:var(--hi);font-weight:700;font-variant-numeric:tabular-nums;font-size:15px}
-.mkt-ptb .ptb-delta{font-weight:700;font-variant-numeric:tabular-nums;font-size:12px;margin-left:2px}
+.next-mkt-pill .dot-q{display:none}
+.next-mkt-pill.ready{color:var(--dim)}
+.next-mkt-pill.missing{color:var(--dim);opacity:.75}
+.next-mkt-pill b,.next-mkt-pill strong{color:var(--muted);font-weight:600}
+
+/* Price comparison strip (PRICE TO BEAT | BTC NOW) — two even columns, centered */
+.mkt-ptb{
+  display:grid;grid-template-columns:1fr 1fr;gap:8px 12px;
+  margin:0 0 10px;padding:0;font-size:11px;color:var(--muted);
+  align-items:baseline;justify-items:center
+}
+.mkt-ptb .ptb-item{
+  display:inline-flex;align-items:baseline;justify-content:center;gap:5px;
+  flex-wrap:wrap;min-width:0;text-align:center;max-width:100%
+}
+.mkt-ptb .ptb-item.ptb-left,.mkt-ptb .ptb-item.ptb-right{margin-left:0;text-align:center}
+.mkt-ptb .ptb-k{color:var(--dim);font-size:9px;letter-spacing:.1em;text-transform:uppercase;font-weight:600}
+.mkt-ptb .ptb-v{color:var(--muted);font-weight:600;font-variant-numeric:tabular-nums;font-size:12px}
+.mkt-ptb .ptb-delta{font-weight:600;font-variant-numeric:tabular-nums;font-size:11px;margin-left:2px}
 .mkt-ptb .ptb-delta.pos{color:var(--pos)}
 .mkt-ptb .ptb-delta.neg{color:var(--neg)}
 .compact-table{width:100%;margin:0 auto}
@@ -381,29 +435,109 @@ tbody tr:hover{background:rgba(0,255,156,.035)}
 .health-rec{background:var(--inset);border-left:2px solid var(--amb);padding:8px 12px;margin-bottom:6px;border-radius:0 5px 5px 0;font-size:12px}
 .health-rec.crit{border-left-color:var(--neg)}
 
-/* current / next market cards */
-.mkt-head{display:flex;justify-content:space-between;align-items:center;gap:16px;flex-wrap:nowrap}
-.mkt-q{color:var(--text);font-size:13px;flex:1 1 auto;line-height:1.35;min-width:0;
-  display:flex;align-items:center;text-align:left}
-.mkt-countdown{flex:0 0 auto;min-width:100px;text-align:center}
-.mkt-countdown .lbl{display:block;font-size:9px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:var(--dim);margin-bottom:1px;text-align:center}
-.mkt-countdown .val{display:block;font-size:22px;font-weight:700;font-family:var(--mono);text-align:center}
-.mkt-countdown.urgent .val{color:var(--neg);text-shadow:0 0 10px rgba(255,59,92,.5)}
-.mkt-countdown.warning .val{color:var(--amb)}
-.mkt-countdown.normal .val{color:var(--grn);text-shadow:var(--glow-soft)}
+/* current / next market cards — header + sides hierarchy */
+/* Even two-column header: window label | countdown, both centered */
+.mkt-head{
+  display:grid;grid-template-columns:1fr 1fr;gap:8px 12px;
+  align-items:center;justify-items:center;padding:0 0 6px;margin:0
+}
+.mkt-q{
+  color:var(--text);font-size:12px;line-height:1.3;min-width:0;max-width:100%;
+  display:flex;align-items:center;justify-content:center;text-align:center;
+  font-weight:500;letter-spacing:.01em
+}
+.mkt-countdown{
+  text-align:center;font-family:var(--mono);font-weight:800;
+  font-size:20px;letter-spacing:.04em;white-space:nowrap;line-height:1.1;min-width:0
+}
+.mkt-countdown .lbl{font-size:inherit;font-weight:700;letter-spacing:.06em;text-transform:uppercase;margin-right:.35em}
+.mkt-countdown .val{font-size:inherit;font-weight:700;font-variant-numeric:tabular-nums}
+.mkt-countdown.urgent,.mkt-countdown.urgent .val{color:var(--neg);text-shadow:0 0 10px rgba(255,59,92,.5)}
+.mkt-countdown.warning,.mkt-countdown.warning .val{color:var(--amb)}
+.mkt-countdown.normal,.mkt-countdown.normal .val{color:var(--grn);text-shadow:var(--glow-soft)}
+
+/* Two-column UP / DOWN — content centered in each column */
+.mkt-sides{
+  display:grid;grid-template-columns:1fr 1fr;gap:0;margin:0;flex:1;min-height:0;
+  border-top:1px solid var(--line2)
+}
+.mkt-side{
+  min-width:0;padding:10px 10px 4px;display:flex;flex-direction:column;
+  align-items:center;gap:2px;text-align:center
+}
+.mkt-side.up{padding-left:0;padding-right:12px;border-right:1px solid var(--line2)}
+.mkt-side.down{padding-right:0;padding-left:12px}
+.mkt-side-label{
+  font-size:10px;font-weight:700;letter-spacing:.14em;text-transform:uppercase;margin-bottom:1px
+}
+.mkt-side.up .mkt-side-label{color:var(--cy)}
+.mkt-side.down .mkt-side-label{color:#f0718a}
+.mkt-side-odds{
+  font-size:28px;font-weight:800;font-family:var(--mono);line-height:1.05;
+  font-variant-numeric:tabular-nums;letter-spacing:.01em;margin:2px 0 6px
+}
+.mkt-side.up .mkt-side-odds{color:#5ef0c8;text-shadow:0 0 12px rgba(34,230,255,.22)}
+.mkt-side.down .mkt-side-odds{color:#ff7a92;text-shadow:0 0 12px rgba(255,59,92,.2)}
+/* Exposure + Value on one centered row */
+.mkt-side-meta{
+  display:flex;flex-direction:row;flex-wrap:wrap;justify-content:center;align-items:baseline;
+  gap:2px 14px;font-size:11px;color:var(--muted);margin-bottom:6px;
+  font-variant-numeric:tabular-nums;width:100%
+}
+.mkt-side-meta .meta-pair{display:inline-flex;align-items:baseline;gap:4px;white-space:nowrap}
+.mkt-side-meta .mk{color:var(--dim)}
+.mkt-side-meta .mv{color:var(--text);font-weight:600}
+.mkt-side-meta .mv.pos{color:var(--pos);text-shadow:0 0 6px rgba(53,255,135,.35)}
+.mkt-side-meta .mv.neg{color:var(--neg);text-shadow:0 0 6px rgba(255,59,92,.3)}
+.mkt-side-meta .mv.eq{color:var(--amb);text-shadow:0 0 6px rgba(255,176,32,.35)}
+/* Total open MTM under UP/DOWN columns, above next-market footer */
+.mkt-open-pnl{
+    display:flex;align-items:baseline;justify-content:center;gap:8px;flex-wrap:wrap;
+    margin:8px 0 2px;padding:6px 10px;
+    border:1px solid var(--border,#16301f);border-radius:6px;
+    background:rgba(5,12,8,.55);font-size:11px;
+}
+.mkt-open-pnl .mk{color:var(--dim);font-size:9px;letter-spacing:.1em;text-transform:uppercase;font-weight:600}
+.mkt-open-pnl .mv{font-weight:700;font-variant-numeric:tabular-nums;font-size:13px}
+.mkt-open-pnl .mv.pos{color:var(--pos);text-shadow:0 0 6px rgba(53,255,135,.35)}
+.mkt-open-pnl .mv.neg{color:var(--neg);text-shadow:0 0 6px rgba(255,59,92,.3)}
+.mkt-open-pnl .mv.eq{color:var(--amb)}
+.mkt-open-pnl .msub{color:var(--dim);font-size:10px;font-variant-numeric:tabular-nums}
+.mkt-open-pnl.empty{opacity:.65}
+.mkt-side-trades{
+  display:flex;flex-direction:column;align-items:stretch;gap:3px;
+  max-height:110px;overflow-y:auto;margin-top:2px;padding-top:2px;width:100%
+}
+.mkt-side-empty{
+  color:var(--dim);font-size:11px;opacity:.55;padding:4px 0 2px;font-style:normal;text-align:center
+}
+.mkt-trade{
+  display:flex;align-items:flex-start;justify-content:center;gap:6px 8px;flex-wrap:wrap;
+  font-size:10px;padding:3px 4px;line-height:1.3;text-align:center;
+  border-left:2px solid rgba(53,255,135,.18);border-radius:0 2px 2px 0
+}
+.mkt-side.down .mkt-trade{border-left-color:rgba(255,59,92,.2)}
+.mkt-trade .who{
+  color:var(--muted);min-width:0;flex:1 1 4.5rem;max-width:100%;
+  white-space:normal;overflow:visible;word-break:break-word;overflow-wrap:anywhere;
+  text-align:center
+}
+.mkt-trade .who .bot{color:var(--text);font-weight:600}
+.mkt-trade .who .sz{color:var(--dim)}
+.mkt-trade .mtm{
+  flex:0 0 auto;font-weight:700;font-variant-numeric:tabular-nums;
+  min-width:3rem;text-align:center
+}
+.mkt-trade .mtm.pos{color:var(--pos)}
+.mkt-trade .mtm.neg{color:var(--neg)}
+.mkt-trade .mtm.flat{color:var(--muted)}
+/* Legacy single-list (next-market hidden body / fallbacks) */
 .mkt-price{color:var(--muted);font-size:15px;margin-top:6px;font-weight:700;text-align:center;letter-spacing:.02em}
 .mkt-yes{color:var(--pos)}
 .mkt-no{color:var(--neg)}
 .mkt-trades{margin-top:8px;border-top:1px solid var(--line2);padding-top:6px;max-height:120px;overflow-y:auto}
 .mkt-trades-title{color:var(--dim);font-size:10px;text-transform:uppercase;letter-spacing:.06em;margin-bottom:4px;text-align:center}
-.mkt-trade{display:flex;align-items:center;gap:8px;font-size:11px;padding:3px 0}
-.mkt-trade .who{color:var(--grn);min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:0 1 auto;text-align:left}
-.mkt-trade .mtm{flex:1 1 auto;font-weight:700;font-variant-numeric:tabular-nums;min-width:4.5rem;text-align:center}
-.mkt-trade .mtm.pos{color:var(--pos)}
-.mkt-trade .mtm.neg{color:var(--neg)}
-.mkt-trade .mtm.flat{color:var(--muted)}
-.mkt-empty{text-align:center}
-.mkt-empty{color:var(--dim);font-size:12px}
+.mkt-empty{text-align:center;color:var(--dim);font-size:12px}
 
 /* legacy market rows */
 .market-row{display:flex;justify-content:space-between;align-items:center;padding:8px 0;border-bottom:1px solid var(--line2)}
@@ -555,8 +689,8 @@ tbody tr:hover{background:rgba(0,255,156,.035)}
         <div class="brand"><span class="mark">Polymarket Bot Arena</span></div>
         <div class="ticker">
             <div class="tick"><span class="k">Status</span><span class="v" id="tick-health"><span class="dot ok"></span>—</span></div>
-            <div class="tick"><span class="k">Net P&amp;L (Today)</span><span class="v" id="tick-pnl">—</span></div>
-            <div class="tick hide-sm"><span class="k">Pool</span><span class="v" id="tick-pool">—</span></div>
+            <div class="tick"><span class="k">Net P&amp;L (Current Session)</span><span class="v" id="tick-pnl">—</span></div>
+            <div class="tick hide-sm"><span class="k">Bankroll</span><span class="v" id="tick-pool">—</span></div>
             <div class="tick hide-sm"><span class="k">Regime</span><span class="v" id="tick-regime">—</span></div>
             <div class="tick hide-sm"><span class="k">Arena Clock (ET)</span><span class="v" id="tick-clock">--:--:--</span></div>
         </div>
@@ -586,7 +720,7 @@ tbody tr:hover{background:rgba(0,255,156,.035)}
                 <div class="ops-chip info" id="ops-risk"><div class="lbl">Risk</div><div class="val">…</div><div class="sub">—</div></div>
                 <div class="ops-chip info" id="ops-alloc"><div class="lbl">Allocation</div><div class="val">…</div><div class="sub">—</div></div>
                 <div class="ops-chip info" id="ops-evo"><div class="lbl">Evolution</div><div class="val">…</div><div class="sub">—</div></div>
-                <div class="ops-chip info" id="ops-size"><div class="lbl">Pool / Kelly</div><div class="val">…</div><div class="sub">—</div></div>
+                <div class="ops-chip info" id="ops-size"><div class="lbl">Bankroll / Kelly</div><div class="val">…</div><div class="sub">—</div></div>
             </div>
         </div>
 
@@ -603,8 +737,8 @@ tbody tr:hover{background:rgba(0,255,156,.035)}
                 <h2>Current Market</h2>
                 <div id="current-market-body"><div class="mkt-empty">Checking for active market&hellip;</div></div>
                 <div id="next-market-pill" class="next-mkt-pill missing">
-                    <span class="dot-q"></span>
-                    <span id="next-market-pill-text">Next market: searching…</span>
+                    <span class="dot-q" aria-hidden="true"></span>
+                    <span id="next-market-pill-text">Next · searching…</span>
                 </div>
             </div>
             <div class="card dense" id="ov-regime-card" style="border-left:3px solid #22e6ff">
@@ -633,15 +767,17 @@ tbody tr:hover{background:rgba(0,255,156,.035)}
                 <div id="ov-signals-body" style="color:#5f9c78;font-size:11px">—</div>
             </div>
             <div class="card dense" id="ov-alloc-card" style="border-left:3px solid #35ff87">
-                <h2>Capital allocation</h2>
-                <div id="ov-alloc-summary" style="color:#5f9c78;font-size:12px;margin-bottom:4px;text-align:center">—</div>
+                <h2 id="ov-alloc-title">Capital allocation</h2>
+                <div id="ov-alloc-summary" class="ov-alloc-summary">—</div>
+                <div id="ov-alloc-equal" class="ov-alloc-equal" style="display:none"></div>
+                <div id="ov-alloc-bar" class="ov-alloc-bar" style="display:none" aria-hidden="true"></div>
                 <table id="ov-alloc-table" class="compact-table center-all"><thead><tr><th>Bot</th><th>Weight</th></tr></thead><tbody></tbody></table>
             </div>
         </div>
 
         <!-- Risk Engine (below Health / Signals / Allocation) -->
-        <div class="card dense" id="risk-card" style="border-left:3px solid #ffb020;margin-bottom:10px">
-            <div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center;justify-content:space-between;margin-bottom:6px">
+        <div class="card dense" id="risk-card" style="border-left:3px solid #ffb020;margin-bottom:8px">
+            <div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center;justify-content:space-between;margin-bottom:4px">
                 <div>
                     <h2 style="margin:0;display:inline">Risk Engine</h2>
                     <span style="color:#3f6b52;font-size:10px;margin-left:8px">limits → Settings</span>
@@ -651,7 +787,7 @@ tbody tr:hover{background:rgba(0,255,156,.035)}
                     <button class="btn btn-secondary" onclick="forceRiskEval()" style="padding:4px 10px;font-size:11px;margin:0">Re-eval</button>
                 </div>
             </div>
-            <div id="risk-summary" style="color:#5f9c78;font-size:11px;margin-bottom:6px">Loading risk state&hellip;</div>
+            <div id="risk-summary" style="color:#5f9c78;font-size:11px;margin-bottom:4px">Loading risk state&hellip;</div>
             <div id="risk-port-chips" class="risk-port-chips">
                 <div class="risk-chip"><span class="k">Status</span><span class="v" id="risk-port-status">—</span></div>
                 <div class="risk-chip"><span class="k">Day P&amp;L</span><span class="v" id="risk-port-pnl">—</span></div>
@@ -659,17 +795,21 @@ tbody tr:hover{background:rgba(0,255,156,.035)}
                 <div class="risk-chip"><span class="k">VaR</span><span class="v" id="risk-port-var">—</span></div>
                 <div class="risk-chip"><span class="k">Size</span><span class="v" id="risk-port-size">—</span></div>
             </div>
-            <table id="risk-bots-table" class="compact-table" style="margin-bottom:0">
-                <thead>
-                    <tr>
-                        <th>Bot</th><th>Status</th><th>Size</th>
-                        <th title="Net P&amp;L for the UTC calendar day">Day P&amp;L</th>
-                        <th title="Peak-to-trough drawdown">DD</th>
-                        <th>Reason</th><th></th>
-                    </tr>
-                </thead>
-                <tbody id="risk-bots-tbody"><tr><td colspan="7" style="color:#3f6b52">—</td></tr></tbody>
-            </table>
+            <!-- Per-bot risk table: collapsed by default (Show bots / Hide bots) -->
+            <div id="risk-bots-wrap" class="risk-bots-wrap collapsed">
+                <button type="button" class="risk-bots-toggle" id="risk-bots-toggle" onclick="toggleRiskBots()">Show bots ▸</button>
+                <table id="risk-bots-table" class="compact-table" style="margin-bottom:0">
+                    <thead>
+                        <tr>
+                            <th>Bot</th><th>Status</th><th>Size</th>
+                            <th title="Net P&amp;L for the UTC calendar day">Day P&amp;L</th>
+                            <th title="Peak-to-trough drawdown">DD</th>
+                            <th>Reason</th><th></th>
+                        </tr>
+                    </thead>
+                    <tbody id="risk-bots-tbody"><tr><td colspan="7" style="color:#3f6b52">—</td></tr></tbody>
+                </table>
+            </div>
             <div id="risk-events-wrap" class="risk-events-wrap collapsed">
                 <button type="button" class="risk-events-toggle" id="risk-events-toggle" onclick="toggleRiskEvents()">Recent decisions ▸</button>
                 <table id="risk-events-table" class="compact-table">
@@ -848,6 +988,14 @@ tbody tr:hover{background:rgba(0,255,156,.035)}
         </div>
 
         <div class="section-title" style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px">
+            <span>Learned Trade Rules <span style="color:#5f9c78;font-size:11px;text-transform:none;letter-spacing:0;">&mdash; auto-mined from decision_events (regime &times; price &times; drift &times; side). Continuous size/edge mults from cell WR; hard skip/go only at extremes; walk-forward OOS gate; skip-reason bandit softens static guards when counterfactual says we stood down too often. Per-strategy cells auto-enable when sample mass is large enough.</span></span>
+            <button class="btn btn-primary" id="mine-learned-rules-btn" onclick="mineLearnedRules()" style="font-size:12px;padding:6px 12px">Re-mine now</button>
+        </div>
+        <div class="card" id="learned-rules-card">
+            <div style="color:#5f9c78">Loading&hellip;</div>
+        </div>
+
+        <div class="section-title" style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px">
             <span>Last Validation Run</span>
             <span style="display:flex;gap:8px;align-items:center">
                 <input type="number" id="validation-markets" min="50" max="1000" step="50" value="300"
@@ -868,7 +1016,7 @@ tbody tr:hover{background:rgba(0,255,156,.035)}
 
         <div class="settings-section">
             <h3>Paper Balance</h3>
-            <div class="settings-blurb">Shared virtual USDC pool for paper mode only. Enter the balance you want — it <b>tops the pool up to that amount</b> (history preserved). Pool size is shown read-only on Overview (Pool / Kelly chip).</div>
+            <div class="settings-blurb">Shared virtual USDC <b>bankroll</b> for paper mode only. Enter the balance you want — it <b>tops the bankroll up to that amount</b> (history preserved). Bankroll is shown read-only on Overview (Bankroll / Kelly chip). Live mode uses the configured wallet USDC balance.</div>
             <div class="chip-btn-row" style="margin-bottom:10px">
                 <button class="chip-btn" onclick="presetBankroll(100)">$100</button>
                 <button class="chip-btn primary" onclick="presetBankroll(200)">$200</button>
@@ -885,7 +1033,7 @@ tbody tr:hover{background:rgba(0,255,156,.035)}
 
         <div class="settings-section">
             <h3>Kelly Fraction</h3>
-            <div class="settings-blurb">Fraction of full Kelly used for every trade. <b>0.25</b> = quarter-Kelly (default). Changes apply within seconds; current value is mirrored on Overview (Pool / Kelly chip).</div>
+            <div class="settings-blurb">Fraction of full Kelly used for every trade. <b>0.25</b> = quarter-Kelly (default). Changes apply within seconds; current value is mirrored on Overview (Bankroll / Kelly chip).</div>
             <div class="chip-btn-row" style="margin-bottom:10px">
                 <button class="chip-btn" onclick="presetKelly(0.10)">0.10</button>
                 <button class="chip-btn primary" onclick="presetKelly(0.25)">0.25</button>
@@ -913,7 +1061,7 @@ tbody tr:hover{background:rgba(0,255,156,.035)}
                 </div>
                 <div class="cred-row" style="margin:4px 0;gap:6px">
                     <label style="min-width:130px">Portfolio daily $</label>
-                    <input type="number" id="risk-lim-port-daily" step="1" min="0" title="Pause the whole portfolio when pool net P&amp;L for the UTC day is at or below −this amount." style="width:90px;background:#050806;color:#bff0d2;border:1px solid #16301f;border-radius:4px;padding:4px 6px;font-family:inherit">
+                    <input type="number" id="risk-lim-port-daily" step="1" min="0" title="Pause the whole portfolio when bankroll net P&amp;L for the UTC day is at or below −this amount." style="width:90px;background:#050806;color:#bff0d2;border:1px solid #16301f;border-radius:4px;padding:4px 6px;font-family:inherit">
                 </div>
                 <div class="cred-row" style="margin:4px 0;gap:6px">
                     <label style="min-width:130px">Bot max DD %</label>
@@ -921,7 +1069,7 @@ tbody tr:hover{background:rgba(0,255,156,.035)}
                 </div>
                 <div class="cred-row" style="margin:4px 0;gap:6px">
                     <label style="min-width:130px">Portfolio max DD %</label>
-                    <input type="number" id="risk-lim-port-dd" step="1" min="1" max="100" title="Pause all bots when pool peak-to-trough drawdown reaches this % of peak equity." style="width:90px;background:#050806;color:#bff0d2;border:1px solid #16301f;border-radius:4px;padding:4px 6px;font-family:inherit">
+                    <input type="number" id="risk-lim-port-dd" step="1" min="1" max="100" title="Pause all bots when bankroll peak-to-trough drawdown reaches this % of peak equity." style="width:90px;background:#050806;color:#bff0d2;border:1px solid #16301f;border-radius:4px;padding:4px 6px;font-family:inherit">
                 </div>
                 <div class="cred-row" style="margin:4px 0;gap:6px">
                     <label style="min-width:130px">Underperform $</label>
@@ -1065,14 +1213,14 @@ tbody tr:hover{background:rgba(0,255,156,.035)}
             <h3>Portfolio Capital Allocation</h3>
             <div class="settings-blurb">
                 Split the shared bankroll across active bots. <b>Default: On</b> — each bot Kelly-sizes against
-                <code>bankroll &times; weight</code> (weights sum to 1) instead of the full pool, so correlated
-                bots no longer each size as if they own the whole bankroll. Off restores legacy full-pool Kelly.
+                <code>bankroll &times; weight</code> (weights sum to 1) instead of the full bankroll, so correlated
+                bots no longer each size as if they own the whole bankroll. Off restores legacy full-bankroll Kelly.
                 Methods: <b>equal</b>, <b>sharpe</b>, <b>expectancy</b>, or <b>kelly_portfolio</b>
                 (expectancy/variance, correlation-shrunk). Rebalances every 30&nbsp;min and on regime change.
                 Pin a bot with a manual weight; free capital is redistributed by the method.
             </div>
             <div class="cred-row">
-                <label>Enabled<small>Off = legacy full-pool Kelly</small></label>
+                <label>Enabled<small>Off = legacy full-bankroll Kelly</small></label>
                 <select id="portfolio-enabled" style="background:#050806;color:#bff0d2;border:1px solid #16301f;border-radius:6px;padding:8px 10px;font-family:inherit">
                     <option value="0">Off</option>
                     <option value="1">On</option>
@@ -1323,7 +1471,7 @@ function switchTab(name) {
     if (window.matchMedia('(max-width:880px)').matches) closeNav();
     document.querySelector('.content').scrollTo ? window.scrollTo(0, 0) : null;
     if (name === 'settings') refreshSettings();
-    if (name === 'signal-lab') { loadSignalLab(); loadHybridMeta(); pollValidation(); }
+    if (name === 'signal-lab') { loadSignalLab(); loadHybridMeta(); loadLearnedRules(); pollValidation(); }
 }
 
 // Drawer: persistent on desktop, overlay on mobile. `nav-open` on <body> is the
@@ -1372,9 +1520,9 @@ function updateTicker(o) {
         const cls = s === 'healthy' ? 'ok' : (s === 'critical' ? 'crit' : 'warn');
         th.innerHTML = '<span class="dot ' + cls + '"></span>' + s.toUpperCase();
     }
-    if (o.pnlToday != null) {
+    if (o.pnlSession != null) {
         const el = document.getElementById('tick-pnl');
-        if (el) { el.className = _clsPnl(o.pnlToday); el.textContent = fmtPnl(o.pnlToday); }
+        if (el) { el.className = _clsPnl(o.pnlSession); el.textContent = fmtPnl(o.pnlSession); }
     }
     if (o.pool != null) { const el = document.getElementById('tick-pool'); if (el) el.textContent = '$' + Number(o.pool).toFixed(2); }
     if (o.regime) { const el = document.getElementById('tick-regime'); if (el) el.textContent = o.regime; }
@@ -1473,10 +1621,19 @@ function updateOps(ops) {
     }
     const h = ops.health || {};
     const hSt = h.status || 'unknown';
+    // Prefer a non-ok check message when degraded/critical so the chip matches
+    // the Health card (arena_log alone often stays "fresh" while risk warns).
+    let hSub = (h.arena_log && h.arena_log.message) || '—';
+    if (hSt !== 'healthy' && hSt !== 'unknown') {
+        const counts = h.counts || {};
+        if (counts.warn || counts.critical) {
+            hSub = `${counts.critical || 0} crit · ${counts.warn || 0} warn`;
+        }
+    }
     _setOpsChip('ops-health',
         hSt === 'healthy' ? 'ok' : (hSt === 'critical' ? 'crit' : 'warn'),
         hSt.toUpperCase(),
-        (h.arena_log && h.arena_log.message) || '—');
+        hSub);
 
     const reg = ops.regime || {};
     const conf = reg.confidence != null ? (Number(reg.confidence) * 100).toFixed(0) + '%' : '—';
@@ -1492,9 +1649,17 @@ function updateOps(ops) {
     const featBody = document.querySelector('#ov-regime-features tbody');
     if (featBody) {
         const feats = reg.features || {};
-        featBody.innerHTML = ['vol', 'trend', 'mom', 'flow'].map(k => {
+        // vol = volatility (realized), volume = tape activity (separate)
+        const featRows = [
+            ['vol', 'volatility'],
+            ['volume', 'volume'],
+            ['trend', 'trend'],
+            ['mom', 'momentum'],
+            ['flow', 'flow'],
+        ];
+        featBody.innerHTML = featRows.map(([k, label]) => {
             const v = feats[k];
-            return `<tr><td>${k}</td><td>${v != null ? (Number(v) * 100).toFixed(0) + '%' : '—'}</td></tr>`;
+            return `<tr><td title="${k === 'vol' ? 'Volatility (not volume)' : ''}">${label}</td><td>${v != null ? (Number(v) * 100).toFixed(0) + '%' : '—'}</td></tr>`;
         }).join('');
     }
 
@@ -1517,17 +1682,70 @@ function updateOps(ops) {
         al.enabled ? (al.method || 'on') : 'OFF',
         al.enabled
             ? `${al.n_active || 0} bots · ${(al.top_weights || []).slice(0, 2).map(w => w.bot.split('-')[0] + ' ' + (w.weight * 100).toFixed(0) + '%').join(', ') || '—'}`
-            : 'full-pool Kelly');
+            : 'full-bankroll Kelly');
+    // Title carries method (span keeps method casing under uppercase h2);
+    // summary is one short line: n + last rebalance reason
+    const oatTitle = document.getElementById('ov-alloc-title');
+    if (oatTitle) {
+        if (al.enabled && al.method) {
+            const meth = String(al.method).replace(/[<>&"']/g, '');
+            oatTitle.innerHTML = `Capital allocation: <span style="text-transform:none;letter-spacing:.04em;color:var(--hi)">${meth}</span>`;
+        } else {
+            oatTitle.textContent = 'Capital allocation';
+        }
+    }
     const oas = document.getElementById('ov-alloc-summary');
     if (oas) {
-        oas.innerHTML = al.enabled
-            ? `<b>${al.method}</b> · n=${al.n_active || 0}` +
-              (al.rebalance_reason ? ` · last: ${al.rebalance_reason}` : '')
-            : 'Disabled — each bot sizes against the full shared bankroll.';
+        if (al.enabled) {
+            const n = al.n_active != null ? al.n_active : ((al.top_weights || []).length || 0);
+            oas.textContent = `n=${n}` +
+                (al.rebalance_reason ? ` · last: ${al.rebalance_reason}` : '');
+        } else {
+            oas.textContent = 'Disabled — each bot sizes against the full shared bankroll.';
+        }
     }
     const oat = document.querySelector('#ov-alloc-table tbody');
+    const equalEl = document.getElementById('ov-alloc-equal');
+    const barEl = document.getElementById('ov-alloc-bar');
     if (oat) {
-        const rows = al.top_weights || [];
+        // All active bots (API returns full ranked vector; was top-6 and left a gap)
+        const rows = (al.top_weights || []).filter(w => (Number(w.weight) || 0) > 0);
+        const totalW = rows.reduce((s, w) => s + (Number(w.weight) || 0), 0);
+        // Equal-allocation polish: compact summary when weights ~match
+        let equalHint = null;
+        if (rows.length >= 2 && totalW > 0) {
+            const target = totalW / rows.length;
+            const nearEqual = rows.every(w => Math.abs((Number(w.weight) || 0) - target) <= 0.02 * totalW);
+            if (nearEqual) {
+                equalHint = `equal allocation · ${rows.length} bots · ${((target / totalW) * 100).toFixed(1)}% each`;
+            }
+        }
+        if (equalEl) {
+            if (equalHint) {
+                equalEl.style.display = '';
+                equalEl.textContent = equalHint;
+            } else {
+                equalEl.style.display = 'none';
+                equalEl.textContent = '';
+            }
+        }
+        if (barEl) {
+            // Stacked bar via % widths (sum → 100%). Avoid flex-grow when
+            // partial weights sum < 1 — CSS only fills that fraction of free space.
+            if (rows.length >= 1 && totalW > 0) {
+                barEl.style.display = 'flex';
+                barEl.innerHTML = rows.map(w => {
+                    const raw = Number(w.weight) || 0;
+                    const pct = (raw / totalW) * 100;
+                    return `<span style="width:${pct.toFixed(3)}%" title="${w.bot}: ${pct.toFixed(1)}%"></span>`;
+                }).join('');
+                barEl.setAttribute('aria-hidden', 'false');
+            } else {
+                barEl.style.display = 'none';
+                barEl.innerHTML = '';
+                barEl.setAttribute('aria-hidden', 'true');
+            }
+        }
         oat.innerHTML = rows.length
             ? rows.map(w => `<tr><td>${w.bot}</td><td><b>${(Number(w.weight) * 100).toFixed(1)}%</b></td></tr>`).join('')
             : '<tr><td colspan="2" style="color:#5f9c78">No weights yet</td></tr>';
@@ -1544,8 +1762,9 @@ function updateOps(ops) {
     _setOpsChip('ops-size', 'info',
         sz.paper_available != null ? ('$' + Number(sz.paper_available).toFixed(0)) : '—',
         sz.kelly_fraction != null ? ('Kelly ' + Number(sz.kelly_fraction).toFixed(2)) : '—');
-    // Arena SQLite feed is a fallback only when the browser Chainlink RTDS is down.
-    if (ops.prices && !_btcWsLive) {
+    // Arena SQLite feed: fallback when browser RTDS is down OR quiet (socket
+    // open but no ticks — RTDS often only snapshots on subscribe).
+    if (ops.prices && !_btcWsFresh()) {
         updateBtcPrice(ops.prices.btc, ops.prices.btc_stale, 'arena');
     }
 
@@ -1921,7 +2140,7 @@ async function savePortfolioEnabled() {
     try {
         const resp = await postJSON('/api/portfolio', { enabled: en.value === '1' });
         if (resp && resp.error) return _portfolioResult(resp.error, false);
-        _portfolioResult(resp.enabled ? 'Portfolio allocation ON — sizes use capital weights.' : 'Portfolio allocation OFF — full-pool Kelly restored.', true);
+        _portfolioResult(resp.enabled ? 'Portfolio allocation ON — sizes use capital weights.' : 'Portfolio allocation OFF — full-bankroll Kelly restored.', true);
         await loadPortfolio();
     } catch (e) { _portfolioResult(String(e), false); }
 }
@@ -2208,7 +2427,7 @@ function updateRisk(r) {
             btb.innerHTML = names.map(name => {
                 const b = bots[name] || {};
                 const ddTitle = b.starting_equity != null
-                    ? `Peak-to-trough on pool-anchored equity (start $${Number(b.starting_equity).toFixed(0)}, peak $${Number(b.peak || 0).toFixed(2)}, equity $${Number(b.equity || 0).toFixed(2)}) · window P&L $${Number(b.window_pnl || 0).toFixed(2)}`
+                    ? `Peak-to-trough on bankroll-anchored equity (start $${Number(b.starting_equity).toFixed(0)}, peak $${Number(b.peak || 0).toFixed(2)}, equity $${Number(b.equity || 0).toFixed(2)}) · window P&L $${Number(b.window_pnl || 0).toFixed(2)}`
                     : 'Peak-to-trough drawdown';
                 const statusLabel = b.manual_resume
                     ? `${b.status || '—'}*`
@@ -2235,6 +2454,16 @@ function updateRisk(r) {
 
 let _riskEventsExpanded = false;
 let _riskEventsCache = [];
+// Per-bot risk table starts collapsed (portfolio chips only)
+let _riskBotsExpanded = false;
+
+function toggleRiskBots() {
+    _riskBotsExpanded = !_riskBotsExpanded;
+    const wrap = document.getElementById('risk-bots-wrap');
+    const btn = document.getElementById('risk-bots-toggle');
+    if (wrap) wrap.classList.toggle('collapsed', !_riskBotsExpanded);
+    if (btn) btn.textContent = _riskBotsExpanded ? 'Hide bots ▾' : 'Show bots ▸';
+}
 
 function toggleRiskEvents() {
     _riskEventsExpanded = !_riskEventsExpanded;
@@ -2392,19 +2621,41 @@ async function riskResumeBot(name) {
 function updateOverview(stats) {
     // Build the period rows, then sort ascending by (resolved) trade count so
     // the smallest count is always at the top. "Current Session" only appears
-    // once the arena has recorded a session start.
+    // once the arena has recorded a session start. "Current Bots" is all-time
+    // stats restricted to the live (active) roster.
     const rows = [];
     if (stats.session) rows.push(['Current Session', stats.session]);
     rows.push(['Today', stats.today]);
     rows.push(['This Week', stats.week]);
+    if (stats.current_bots) rows.push(['Current Bots', stats.current_bots]);
     rows.push(['All Time', stats.all_time]);
     rows.sort((a, b) => (a[1].trades || 0) - (b[1].trades || 0));
 
+    // Zero-state: if every period has 0 resolved trades, one quiet line instead
+    // of four identical zero rows (pending still shown when present).
+    const anyResolved = rows.some(([, el]) => (el.trades || 0) > 0);
+    const anyPending = rows.some(([, el]) => (el.pending || 0) > 0);
+    if (!anyResolved && !anyPending) {
+        document.getElementById('stats-tbody').innerHTML =
+            '<tr><td colspan="4" class="quiet-zero" style="text-align:center;color:#3f6b52;font-size:12px">No resolved trades yet</td></tr>';
+        return;
+    }
+
     document.getElementById('stats-tbody').innerHTML = rows.map(([label, el]) => {
         const pending = el.pending || 0;
+        const trades = el.trades || 0;
+        // Quiet dash for empty periods when other rows have activity
+        if (trades === 0 && pending === 0) {
+            return `<tr class="quiet-zero">
+                <td style="color:#3f6b52">${label}</td>
+                <td style="text-align:right;color:#3f6b52">—</td>
+                <td style="text-align:right;color:#3f6b52">—</td>
+                <td style="text-align:right;color:#3f6b52">—</td>
+            </tr>`;
+        }
         // Resolved count, plus an orange "+N" for pending (matches the pending
         // pill on the Active Bots cards).
-        const tradesCell = (el.trades || 0) +
+        const tradesCell = trades +
             (pending ? ' <span style="color:#ffb020">+' + pending + '</span>' : '');
         return `<tr>
             <td>${label}</td>
@@ -2430,7 +2681,7 @@ function updateBots(bots) {
         const isLive = botMode === 'live';
         const balance = bot.balance;
         // Paper bots share one virtual USDC bankroll, so the value is the same
-        // shared pool on every tile; live bots show their real wallet USDC.
+        // shared bankroll on every tile; live bots show their real wallet USDC.
         const balanceSuffix = isLive ? ' USDC' : ' USDC (shared)';
         const balanceStr = balance != null
             ? '$' + Number(balance).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2}) + balanceSuffix
@@ -2466,7 +2717,7 @@ function updateEvolution(events) {
     const tbody = document.querySelector('#evolution-table tbody');
     if (!tbody) return;
     if (!events || !events.length) {
-        tbody.innerHTML = '<tr><td colspan="5" style="color:#5f9c78">No evolution events yet — GA runs every 2h (or on pool drawdown).</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="5" style="color:#5f9c78">No evolution events yet — GA runs every 2h (or on bankroll drawdown).</td></tr>';
         return;
     }
     tbody.innerHTML = events.map(e => {
@@ -2522,10 +2773,19 @@ function updateRegime(reg) {
     const legacy = cur.legacy || cur.regime || '?';
     summary.innerHTML = `Now <b>${rid}</b> <span class="neutral">(legacy ${legacy})</span> · conf <b>${(Number(cur.confidence || 0) * 100).toFixed(0)}%</b> · meta bucket <b>${cur.meta_bucket || '?'}</b>${cur.last_change_from ? ' · last switch from ' + cur.last_change_from : ''}`;
     if (featBody) {
-        const rows = ['vol', 'trend', 'mom', 'flow'].map(k => {
+        // vol = volatility (realized log-return score); volume = tape activity
+        const featRows = [
+            ['vol', 'volatility'],
+            ['volume', 'volume'],
+            ['trend', 'trend'],
+            ['mom', 'momentum'],
+            ['flow', 'flow'],
+        ];
+        const rows = featRows.map(([k, label]) => {
             const v = feats[k] != null ? feats[k] : cur[k + '_score'];
             const pct = v != null ? (Number(v) * 100).toFixed(0) + '%' : '—';
-            return `<tr><td>${k}</td><td>${pct}</td></tr>`;
+            const tip = k === 'vol' ? ' title="Volatility (realized), not volume"' : '';
+            return `<tr><td${tip}>${label}</td><td>${pct}</td></tr>`;
         });
         featBody.innerHTML = rows.join('');
     }
@@ -2799,6 +3059,12 @@ let _btcWsLive = false;
 let _btcWs = null;
 let _btcWsRetry = 0;
 let _btcLastUiMs = 0;
+// RTDS often sends one snapshot on subscribe then goes quiet (no live frames).
+// Arena price_feed reconnects every ~8s for a fresh snapshot; mirror that here.
+let _btcLastTickMs = 0;           // last time a Chainlink price tick painted the UI
+let _btcWsQuietClose = false;     // intentional close for snapshot refresh (no backoff)
+const BTC_RTDS_REFRESH_MS = 5000; // match signals/price_feed.py refresh_sec
+const BTC_ARENA_FALLBACK_MS = 8000; // allow SQLite feed if browser WS is idle this long
 
 function _fmtUsd(n) {
     if (n == null || !Number.isFinite(Number(n))) return '—';
@@ -2857,17 +3123,23 @@ function _patchMarketBtcDeltas() {
         return;
     }
     const d = btc - strike;
-    const sign = d >= 0 ? '+' : '';
-    const pct = ((d / strike) * 100).toFixed(3);
+    const sign = d >= 0 ? '+' : '−';
+    const absD = Math.abs(d);
+    const pct = Math.abs((d / strike) * 100).toFixed(3);
+    const signedUsd = d >= 0 ? `+${_fmtUsd(d)}` : `−${_fmtUsd(absD)}`;
     dEl.className = 'ptb-delta ' + (d >= 0 ? 'pos' : 'neg');
-    // Parenthetical after BTC now: (+$59.73 +0.094%)
-    dEl.textContent = `(${sign}${_fmtUsd(d)} ${sign}${pct}%)`;
+    // Parenthetical after BTC now: (+$59.73 +0.094%) or (−$56.22 −0.087%)
+    dEl.textContent = `(${signedUsd} ${sign}${pct}%)`;
 }
 
 /**
  * Browser-side Polymarket RTDS Chainlink BTC/USD — same oracle as Price to Beat
  * and market resolution. Never Binance (basis ~$60–80 vs Polymarket UI).
- * Falls back to arena SQLite (also Chainlink) when the socket is down.
+ *
+ * Polymarket RTDS typically delivers one ~60s 1Hz snapshot on subscribe and
+ * few/no follow-up update frames. We force-reconnect after BTC_RTDS_REFRESH_MS
+ * of silence (same strategy as signals/price_feed.py) so "BTC now" stays fresh.
+ * Falls back to arena SQLite (also Chainlink) when the socket is down or idle.
  */
 function startChainlinkBtcFeed() {
     if (_btcWs) {
@@ -2876,15 +3148,23 @@ function startChainlinkBtcFeed() {
     }
     const url = 'wss://ws-live-data.polymarket.com';
     let pingTimer = null;
+    let lastMsgMs = 0;
     try {
         const ws = new WebSocket(url);
         _btcWs = ws;
         const clearPing = () => {
             if (pingTimer) { clearInterval(pingTimer); pingTimer = null; }
         };
+        const forceQuietRefresh = () => {
+            // Intentional close → onclose reconnects with short delay, no backoff.
+            if (ws.readyState !== 1) return;
+            _btcWsQuietClose = true;
+            try { ws.close(); } catch (e) { /* ignore */ }
+        };
         ws.onopen = () => {
             _btcWsLive = true;
             _btcWsRetry = 0;
+            lastMsgMs = Date.now();
             const sub = document.getElementById('btc-price-sub');
             if (sub && !liveBtcPrice) sub.textContent = 'Chainlink · connected';
             // Same subscription Polymarket's UI / arena price_feed use.
@@ -2896,14 +3176,18 @@ function startChainlinkBtcFeed() {
                     filters: JSON.stringify({ symbol: 'btc/usd' }),
                 }],
             }));
-            // RTDS application heartbeat
+            // RTDS application heartbeat + quiet-stream snapshot refresh
             clearPing();
             pingTimer = setInterval(() => {
                 try { if (ws.readyState === 1) ws.send('PING'); } catch (e) { /* ignore */ }
-            }, 5000);
+                if (lastMsgMs && (Date.now() - lastMsgMs) >= BTC_RTDS_REFRESH_MS) {
+                    forceQuietRefresh();
+                }
+            }, 2000);
         };
         ws.onmessage = (ev) => {
             if (ev.data === 'PONG' || ev.data === 'pong' || !ev.data) return;
+            lastMsgMs = Date.now();
             try {
                 const msg = JSON.parse(ev.data);
                 const p = msg.payload || {};
@@ -2911,13 +3195,19 @@ function startChainlinkBtcFeed() {
                 if (Array.isArray(p.data) && p.data.length) {
                     const last = p.data[p.data.length - 1];
                     const px = parseFloat(last && last.value);
-                    if (px > 0) updateBtcPrice(px, false, 'ws');
+                    if (px > 0) {
+                        _btcLastTickMs = Date.now();
+                        updateBtcPrice(px, false, 'ws');
+                    }
                     return;
                 }
                 // Live update frame
                 if (p.value != null) {
                     const px = parseFloat(p.value);
-                    if (px > 0) updateBtcPrice(px, false, 'ws');
+                    if (px > 0) {
+                        _btcLastTickMs = Date.now();
+                        updateBtcPrice(px, false, 'ws');
+                    }
                 }
             } catch (e) { /* bad frame */ }
         };
@@ -2926,9 +3216,17 @@ function startChainlinkBtcFeed() {
             clearPing();
             _btcWsLive = false;
             _btcWs = null;
+            const quiet = _btcWsQuietClose;
+            _btcWsQuietClose = false;
             const sub = document.getElementById('btc-price-sub');
-            if (sub) sub.textContent = 'Chainlink RTDS reconnecting…';
-            const delay = Math.min(30000, 1000 * Math.pow(1.6, _btcWsRetry++));
+            if (sub) {
+                sub.textContent = quiet
+                    ? 'Chainlink · refreshing…'
+                    : 'Chainlink RTDS reconnecting…';
+            }
+            // Quiet snapshot refresh: reconnect immediately. Real errors: backoff.
+            const delay = quiet ? 300 : Math.min(30000, 1000 * Math.pow(1.6, _btcWsRetry++));
+            if (quiet) _btcWsRetry = 0;
             setTimeout(startChainlinkBtcFeed, delay);
         };
     } catch (e) {
@@ -2937,19 +3235,150 @@ function startChainlinkBtcFeed() {
     }
 }
 
+/** True when browser RTDS is up AND recently delivered a price tick. */
+function _btcWsFresh() {
+    return _btcWsLive && _btcLastTickMs > 0
+        && (Date.now() - _btcLastTickMs) < BTC_ARENA_FALLBACK_MS;
+}
+
+/** Polish Polymarket window label → "July 30 · 8:15–8:20 AM ET". */
+function formatMarketWindowLabel(question) {
+    let s = String(question || 'Unknown market').replace(/^Bitcoin Up or Down\s*-\s*/i, '').trim();
+    // "July 30, 8:15AM-8:20AM ET" → "July 30 · 8:15–8:20 AM ET"
+    s = s.replace(/,\s*/, ' · ');
+    s = s.replace(/(\d{1,2}:\d{2})\s*AM/gi, '$1 AM').replace(/(\d{1,2}:\d{2})\s*PM/gi, '$1 PM');
+    s = s.replace(/(\d{1,2}:\d{2})\s*AM\s*-\s*(\d{1,2}:\d{2})\s*AM/i, '$1–$2 AM');
+    s = s.replace(/(\d{1,2}:\d{2})\s*PM\s*-\s*(\d{1,2}:\d{2})\s*PM/i, '$1–$2 PM');
+    s = s.replace(/(\d{1,2}:\d{2})\s*AM\s*-\s*(\d{1,2}:\d{2})\s*PM/i, '$1 AM–$2 PM');
+    s = s.replace(/(\d{1,2}:\d{2})\s*-\s*(\d{1,2}:\d{2})/g, '$1–$2');
+    return s;
+}
+
 function renderNextMarketPill(market) {
     const pill = document.getElementById('next-market-pill');
     const text = document.getElementById('next-market-pill-text');
     if (!pill || !text) return;
     if (!market || !market.id) {
         pill.className = 'next-mkt-pill missing';
-        text.textContent = 'Next market: searching…';
+        text.textContent = 'Next · searching…';
         return;
     }
-    const shortId = String(market.id).slice(0, 10) + '…';
-    const shortQ = (market.question || '').replace('Bitcoin Up or Down - ', '').slice(0, 42);
+    const label = formatMarketWindowLabel(market.question || String(market.id).slice(0, 12));
     pill.className = 'next-mkt-pill ready';
-    text.innerHTML = `Next <b style="color:var(--hi)">${shortQ || shortId}</b>`;
+    text.textContent = `Next · ${label}`;
+}
+
+/** True when a trade is still open (capital at risk). */
+function _isOpenMarketTrade(t) {
+    if (!t) return false;
+    if (t.outcome === 'expired') return false;
+    return t.outcome == null || t.outcome === '';
+}
+
+/** Side key UP|DOWN from trade.side (yes/no/up/down). */
+function _tradeSideKey(side) {
+    const s = String(side || '').toLowerCase();
+    if (s === 'yes' || s === 'up') return 'UP';
+    if (s === 'no' || s === 'down') return 'DOWN';
+    return null;
+}
+
+/** Prefer "5 @ 56.0¢"; fall back to USD spend. */
+function _tradeSizeDetail(t) {
+    if (t.shares_bought != null && t.entry_price != null) {
+        const sh = (+t.shares_bought).toFixed(1).replace(/\.0$/, '');
+        const px = (t.entry_price * 100).toFixed(1);
+        return `${sh} @ ${px}¢`;
+    }
+    return `$${(t.amount || 0).toFixed(2)}`;
+}
+
+/**
+ * Compact bot label for narrow UP/DOWN trade rows.
+ * Full name stays in title= (hover). Only long maker-style names are shortened;
+ * short defaults like hybrid-v1 stay as-is. Text can also wrap via CSS.
+ */
+function _shortBotName(name) {
+    let s = String(name || '').trim();
+    if (!s) return '—';
+    // Maker species — main cut-off offenders in the column
+    s = s.replace(/^late-window-maker/i, 'late-mkr');
+    s = s.replace(/^fee-zone-maker/i, 'fee-mkr');
+    s = s.replace(/^btc-maker/i, 'btc-mkr');
+    s = s.replace(/^copy-trade/i, 'copy');
+    // Soft cap for long GA offspring names (e.g. meanrev-g12-847-x…)
+    if (s.length > 18) {
+        s = s.slice(0, 10) + '…' + s.slice(-5);
+    }
+    return s;
+}
+
+/**
+ * Exposure = capital at risk (sum of open amounts).
+ * Value = mark value of open shares (shares × mid), else amount.
+ */
+function _sideExposureValue(trades, sideKey, yesPx, noPx) {
+    const mark = sideKey === 'UP' ? yesPx : noPx;
+    let exposure = 0;
+    let value = 0;
+    for (const t of trades) {
+        const amt = t.amount != null ? Number(t.amount) : 0;
+        if (Number.isFinite(amt) && amt > 0) exposure += amt;
+        let shares = t.shares_bought != null ? Number(t.shares_bought) : null;
+        if ((shares == null || !(shares > 0)) && t.entry_price != null && Number(t.entry_price) > 0 && amt > 0) {
+            shares = amt / Number(t.entry_price);
+        }
+        if (shares != null && shares > 0 && mark != null && mark >= 0) {
+            value += shares * Number(mark);
+        } else if (Number.isFinite(amt)) {
+            value += amt;
+        }
+    }
+    return { exposure, value };
+}
+
+/** Value vs Exposure: green above, red below, amber when equal (½¢ tol). */
+function _valueVsExposureClass(value, exposure) {
+    const eps = 0.005;
+    if (value > exposure + eps) return 'pos';
+    if (value < exposure - eps) return 'neg';
+    return 'eq';
+}
+
+function _renderSideColumn(sideKey, oddsCents, openTrades, yesPx, noPx) {
+    const cls = sideKey === 'UP' ? 'up' : 'down';
+    const oddsHtml = oddsCents != null
+        ? `${oddsCents}&cent;`
+        : '—';
+    const { exposure, value } = _sideExposureValue(openTrades, sideKey, yesPx, noPx);
+    const expStr = `$${exposure.toFixed(2)}`;
+    const valStr = `$${value.toFixed(2)}`;
+    const valCls = _valueVsExposureClass(value, exposure);
+    let tradesHtml;
+    if (!openTrades.length) {
+        tradesHtml = '<div class="mkt-side-empty">No positions</div>';
+    } else {
+        tradesHtml = openTrades.map(t => {
+            const full = String(t.bot_name || '');
+            const short = _shortBotName(full);
+            const title = full ? ` title="${full.replace(/"/g, '&quot;')}"` : '';
+            return `
+            <div class="mkt-trade">
+                <span class="who"${title}><span class="bot">${short}</span> <span class="sz">${_tradeSizeDetail(t)}</span></span>
+                ${renderMarketTradeMtm(t, yesPx, noPx)}
+            </div>`;
+        }).join('');
+    }
+    return `
+      <div class="mkt-side ${cls}">
+        <div class="mkt-side-label">${sideKey}</div>
+        <div class="mkt-side-odds">${oddsHtml}</div>
+        <div class="mkt-side-meta">
+          <span class="meta-pair"><span class="mk">Exposure</span><span class="mv">${expStr}</span></span>
+          <span class="meta-pair"><span class="mk">Value</span><span class="mv ${valCls}">${valStr}</span></span>
+        </div>
+        <div class="mkt-side-trades">${tradesHtml}</div>
+      </div>`;
 }
 
 function renderMarketCard(market, bodyId, kind) {
@@ -2959,7 +3388,7 @@ function renderMarketCard(market, bodyId, kind) {
         body.innerHTML = `<div class="mkt-empty">No ${kind} BTC 5-min market right now</div>`;
         return;
     }
-    const shortQ = (market.question || 'Unknown market').replace('Bitcoin Up or Down - ', '');
+    const windowLabel = formatMarketWindowLabel(market.question || 'Unknown market');
 
     // Countdown from resolves_at. For the NEXT market whose 5-min window hasn't
     // opened yet (>300s to resolution), count down to the window OPENING.
@@ -2984,78 +3413,98 @@ function renderMarketCard(market, bodyId, kind) {
         }
     }
 
-    // Prices shown in cents like Polymarket (UP + DOWN). Read from livePrices
-    // (keyed by market id, updated by the 1s poller) so a stale market-object
-    // reference from an in-flight re-fetch can't render the wrong window's price.
+    // Prices from livePrices (keyed by market id) so a stale market object
+    // from an in-flight re-fetch can't render the wrong window's price.
     const lp = livePrices[market.id] || {};
     const yes = lp.yes != null ? lp.yes : market.current_price;
     const no = lp.no != null ? lp.no : market.no_price;
     const yesC = yes != null ? Math.round(yes * 100) : null;
     const noC = no != null ? Math.round(no * 100) : (yesC != null ? 100 - yesC : null);
-    const priceHtml = yesC != null
-        ? `<span class="mkt-yes">UP ${yesC}&cent;</span> &nbsp; <span class="mkt-no">DOWN ${noC}&cent;</span>`
-        : '-';
 
-    // Price-to-beat (strike) + BTC now with parenthetical delta — current only.
-    // IDs mkt-btc-now / mkt-btc-delta are patched every Chainlink RTDS tick.
-    let ptbHtml = '';
-    if (kind === 'current') {
-        const strike = market.strike != null ? Number(market.strike) : null;
-        liveBtcStrike = (strike != null && strike > 0) ? strike : null;
-        const btc = liveBtcPrice;
-        if (strike != null && strike > 0) {
-            let deltaHtml = '';
-            if (btc != null && btc > 0) {
-                const d = btc - strike;
-                const dCls = d >= 0 ? 'pos' : 'neg';
-                const sign = d >= 0 ? '+' : '';
-                const pct = ((d / strike) * 100).toFixed(3);
-                deltaHtml = `<span class="ptb-delta ${dCls}" id="mkt-btc-delta">(${sign}${_fmtUsd(d)} ${sign}${pct}%)</span>`;
-            } else {
-                deltaHtml = `<span class="ptb-delta" id="mkt-btc-delta"></span>`;
-            }
-            ptbHtml = `<div class="mkt-ptb">
-                <span class="ptb-item"><span class="ptb-k">Price to beat</span><span class="ptb-v">${_fmtUsd(strike)}</span></span>
-                <span class="ptb-item"><span class="ptb-k">BTC now</span><span class="ptb-v" id="mkt-btc-now">${btc != null ? _fmtUsd(btc) : '—'}</span>${deltaHtml}</span>
-            </div>`;
+    // Next-market hidden body keeps a compact layout for legacy pollers.
+    if (kind !== 'current') {
+        const priceHtml = yesC != null
+            ? `<span class="mkt-yes">UP ${yesC}&cent;</span> &nbsp; <span class="mkt-no">DOWN ${noC}&cent;</span>`
+            : '-';
+        body.innerHTML = `
+            <div class="mkt-head">
+                <div class="mkt-q">${windowLabel}</div>
+                <div class="mkt-countdown ${cls}"><span class="lbl">${label}</span><span class="val">${val}</span></div>
+            </div>
+            <div class="mkt-price">${priceHtml}</div>`;
+        return;
+    }
+
+    // --- Current market: full hierarchy (header → PTB → UP/DOWN → footer is next pill) ---
+    const strike = market.strike != null ? Number(market.strike) : null;
+    liveBtcStrike = (strike != null && strike > 0) ? strike : null;
+    const btc = liveBtcPrice;
+    let ptbHtml;
+    if (strike != null && strike > 0) {
+        let deltaHtml = '';
+        if (btc != null && btc > 0) {
+            const d = btc - strike;
+            const dCls = d >= 0 ? 'pos' : 'neg';
+            const sign = d >= 0 ? '+' : '−';
+            const absD = Math.abs(d);
+            const pct = Math.abs((d / strike) * 100).toFixed(3);
+            // Unicode minus for negative so it matches the spec (−$56.22 −0.087%)
+            const signedUsd = d >= 0 ? `+${_fmtUsd(d)}` : `−${_fmtUsd(absD)}`;
+            deltaHtml = `<span class="ptb-delta ${dCls}" id="mkt-btc-delta">(${signedUsd} ${sign}${pct}%)</span>`;
         } else {
-            ptbHtml = `<div class="mkt-ptb"><span class="ptb-item"><span class="ptb-k">Price to beat</span><span class="neutral">fetching…</span></span></div>`;
+            deltaHtml = `<span class="ptb-delta" id="mkt-btc-delta"></span>`;
         }
+        ptbHtml = `<div class="mkt-ptb">
+            <span class="ptb-item ptb-left"><span class="ptb-k">Price to beat</span><span class="ptb-v">${_fmtUsd(strike)}</span></span>
+            <span class="ptb-item ptb-right"><span class="ptb-k">BTC now</span><span class="ptb-v" id="mkt-btc-now">${btc != null ? _fmtUsd(btc) : '—'}</span>${deltaHtml}</span>
+        </div>`;
+    } else {
+        ptbHtml = `<div class="mkt-ptb">
+            <span class="ptb-item ptb-left"><span class="ptb-k">Price to beat</span><span class="ptb-v neutral">fetching…</span></span>
+            <span class="ptb-item ptb-right"><span class="ptb-k">BTC now</span><span class="ptb-v" id="mkt-btc-now">${btc != null ? _fmtUsd(btc) : '—'}</span><span class="ptb-delta" id="mkt-btc-delta"></span></span>
+        </div>`;
     }
 
     const trades = market.trades || [];
-    const tradeRows = trades.length
-        ? trades.map(t => {
-            const side = formatSide(t.side);
-            // Prefer "<shares> @ <entryPrice¢>" (e.g. "5 @ 56.0"); fall back to
-            // the USD spend for older rows that predate entry_price/shares.
-            let detail;
-            if (t.shares_bought != null && t.entry_price != null) {
-                const sh = (+t.shares_bought).toFixed(1).replace(/\.0$/, '');
-                const px = (t.entry_price * 100).toFixed(1);
-                detail = `${sh} @ ${px}¢`;
-            } else {
-                detail = `$${(t.amount || 0).toFixed(2)}`;
-            }
-            return `
-            <div class="mkt-trade">
-                <span class="who">${t.bot_name} &middot; ${side} ${detail}</span>
-                ${renderMarketTradeMtm(t, yes, no)}
-            </div>`;
-        }).join('')
-        : '<div class="mkt-empty">No trades placed yet</div>';
+    const openUp = [];
+    const openDown = [];
+    for (const t of trades) {
+        if (!_isOpenMarketTrade(t)) continue;
+        const sk = _tradeSideKey(t.side);
+        if (sk === 'UP') openUp.push(t);
+        else if (sk === 'DOWN') openDown.push(t);
+    }
+
+    // Total open MTM P&L for this market:
+    // (Value_UP − Exposure_UP) + (Value_DOWN − Exposure_DOWN)
+    const upEV = _sideExposureValue(openUp, 'UP', yes, no);
+    const dnEV = _sideExposureValue(openDown, 'DOWN', yes, no);
+    const mktPnl = (upEV.value - upEV.exposure) + (dnEV.value - dnEV.exposure);
+    const hasOpen = openUp.length + openDown.length > 0;
+    let mktPnlHtml = '';
+    if (hasOpen) {
+        const pnlCls = mktPnl > 0.005 ? 'pos' : (mktPnl < -0.005 ? 'neg' : 'eq');
+        const sign = mktPnl > 0.005 ? '+' : '';
+        mktPnlHtml = `<div class="mkt-open-pnl" title="(Value UP − Exposure UP) + (Value DOWN − Exposure DOWN)">
+            <span class="mk">Open MTM</span>
+            <span class="mv ${pnlCls}">${sign}$${mktPnl.toFixed(2)}</span>
+            <span class="msub">exp $${(upEV.exposure + dnEV.exposure).toFixed(2)} · val $${(upEV.value + dnEV.value).toFixed(2)}</span>
+        </div>`;
+    } else {
+        mktPnlHtml = `<div class="mkt-open-pnl empty"><span class="mk">Open MTM</span><span class="mv eq">—</span></div>`;
+    }
 
     body.innerHTML = `
         <div class="mkt-head">
-            <div class="mkt-q">${shortQ}</div>
+            <div class="mkt-q">${windowLabel}</div>
             <div class="mkt-countdown ${cls}"><span class="lbl">${label}</span><span class="val">${val}</span></div>
         </div>
         ${ptbHtml}
-        <div class="mkt-price">${priceHtml}</div>
-        <div class="mkt-trades">
-            <div class="mkt-trades-title">Trades placed (${trades.length})</div>
-            ${tradeRows}
-        </div>`;
+        <div class="mkt-sides">
+            ${_renderSideColumn('UP', yesC, openUp, yes, no)}
+            ${_renderSideColumn('DOWN', noC, openDown, yes, no)}
+        </div>
+        ${mktPnlHtml}`;
 }
 
 function updateMarketCards() {
@@ -3080,7 +3529,7 @@ async function fetchMarkets() {
     }
     if (!data || data.error) return;  // server-side error — keep last-known-good
     activeMarkets = { current: data.current, next: data.next };
-    if (data.btc_price != null && !_btcWsLive) {
+    if (data.btc_price != null && !_btcWsFresh()) {
         updateBtcPrice(data.btc_price, data.btc_stale, 'arena');
     }
     // Seed livePrices from the (already-fresh) market payload, and drop
@@ -3216,9 +3665,13 @@ async function refresh() {
         // Feed the top status ticker + nav badges from data already in hand.
         const risk = (ops && ops.risk) || {};
         const riskAlert = !!(risk.killed || risk.portfolio_status === 'paused' || (risk.paused_bots || []).length);
+        const sess = overview && overview.stats && overview.stats.session;
+        const today = overview && overview.stats && overview.stats.today;
         updateTicker({
+            // Prefer full /api/health; ops.health now uses the same overall status.
             health: health || (ops && ops.health),
-            pnlToday: overview && overview.stats && overview.stats.today ? overview.stats.today.pnl : null,
+            // Hero Net P&L = Current Session (falls back to Today if no session yet).
+            pnlSession: sess ? sess.pnl : (today ? today.pnl : null),
             pool: ops && ops.sizing ? ops.sizing.paper_available : null,
             regime: ops && ops.regime ? (ops.regime.id || 'unknown') : null,
             killed: risk.killed,
@@ -3440,6 +3893,119 @@ async function loadSignalLab() {
     }
 }
 
+async function loadLearnedRules() {
+    const card = document.getElementById('learned-rules-card');
+    if (!card) return;
+    let data;
+    try { data = await fetchJSON('/api/learned-rules'); }
+    catch (e) {
+        card.innerHTML = '<div style="color:#ff3b5c">Failed to load learned rules</div>';
+        return;
+    }
+    if (data.error) {
+        card.innerHTML = `<div style="color:#ff3b5c">${escHtml(data.error)}</div>`;
+        return;
+    }
+    if (!data.enabled) {
+        card.innerHTML = '<div style="color:#5f9c78">Learned rules disabled (LEARNED_RULES_ENABLED=False).</div>';
+        return;
+    }
+    const oos = data.oos || {};
+    const soften = data.skip_soften || {};
+    const rules = data.rules || [];
+    const updated = data.updated_at
+        ? new Date(data.updated_at * 1000).toLocaleString()
+        : 'never';
+    const perStrat = data.per_strategy
+        ? `<span style="color:#35ff87">ON</span> <span style="color:#5f9c78">(${escHtml(data.per_strategy_reason || '')})</span>`
+        : `<span style="color:#5f9c78">OFF</span> <span style="color:#5f9c78">(${escHtml(data.per_strategy_reason || 'waiting for sample mass')})</span>`;
+
+    let html = `<div style="display:flex;flex-wrap:wrap;gap:14px;margin-bottom:12px;font-size:13px">
+        <div><span style="color:#5f9c78">Rules</span> <b>${data.n_rules || 0}</b>
+            <span style="color:#5f9c78">(skip ${data.n_skip || 0} · go ${data.n_go || 0} · cont ${data.n_continuous || 0})</span></div>
+        <div><span style="color:#5f9c78">Cells</span> <b>${data.n_cells ?? '—'}</b></div>
+        <div><span style="color:#5f9c78">Per-strategy</span> ${perStrat}</div>
+        <div><span style="color:#5f9c78">OOS</span> ${oos.enabled === false ? 'off' :
+            `train ${oos.train_cells ?? '—'} · test ${oos.test_cells ?? '—'} · rejected ${oos.rejected_oos ?? 0}`}</div>
+        <div style="color:#5f9c78">Updated ${escHtml(String(updated))}</div>
+    </div>`;
+
+    const softKeys = Object.keys(soften);
+    if (softKeys.length) {
+        html += `<div style="margin-bottom:10px"><div style="color:#5f9c78;font-size:12px;margin-bottom:4px">Skip-reason bandit (static guard soften / tighten)</div>
+            <table style="width:100%;font-size:12px;border-collapse:collapse">
+            <tr style="color:#5f9c78;text-align:left"><th>Guard</th><th>Dir</th><th>Soften</th><th>CF WR</th><th>n</th><th>Note</th></tr>`;
+        for (const k of softKeys) {
+            const s = soften[k] || {};
+            const dir = s.direction || '—';
+            const col = dir === 'ease' ? '#35ff87' : (dir === 'tighten' ? '#ffb020' : '#bff0d2');
+            html += `<tr>
+                <td>${escHtml(k)}</td>
+                <td style="color:${col}">${escHtml(dir)}</td>
+                <td>${s.soften != null ? Number(s.soften).toFixed(3) : '—'}</td>
+                <td>${s.cf_wr != null ? (s.cf_wr * 100).toFixed(1) + '%' : '—'}</td>
+                <td>${s.n ?? '—'}</td>
+                <td style="color:#5f9c78;font-size:11px">${escHtml(s.reason || '')}</td>
+            </tr>`;
+        }
+        html += '</table></div>';
+    } else {
+        html += `<div style="color:#5f9c78;font-size:12px;margin-bottom:10px">Skip-reason bandit: no guard has enough resolved skips yet (min n=${(data.config && data.config.min_n) || 25}+ bandit bar).</div>`;
+    }
+
+    if (!rules.length) {
+        html += '<div style="color:#5f9c78">No active rules yet &mdash; need resolved decision_events with enough samples per cell. Leave the arena running, or click <b>Re-mine now</b>.</div>';
+    } else {
+        html += `<table style="width:100%;font-size:12px;border-collapse:collapse">
+            <tr style="color:#5f9c78;text-align:left">
+                <th>Type</th><th>Cell</th><th>Size×</th><th>Edge×</th><th>Buy WR</th><th>n</th><th>OOS</th><th>Reason</th>
+            </tr>`;
+        for (const r of rules.slice(0, 30)) {
+            const t = r.type || '?';
+            const tcol = t === 'skip' ? '#ff3b5c' : (t === 'go' ? '#35ff87' : '#bff0d2');
+            const eff = r.effect || {};
+            const st = r.stats || {};
+            const wr = st.buy_wr != null ? (st.buy_wr * 100).toFixed(1) + '%' : '—';
+            const m = r.match || {};
+            const cell = [m.regime, m.price_band, m.drift_band, m.side, m.strategy_type].filter(Boolean).join(' · ');
+            html += `<tr>
+                <td style="color:${tcol};font-weight:600">${escHtml(t)}</td>
+                <td style="font-family:ui-monospace,monospace;font-size:11px">${escHtml(cell || r.cell || '')}</td>
+                <td>${eff.size_mult != null ? Number(eff.size_mult).toFixed(2) : '—'}</td>
+                <td>${eff.edge_mult != null ? Number(eff.edge_mult).toFixed(2) : '—'}</td>
+                <td>${wr}</td>
+                <td>${st.buy_n ?? st.skip_n ?? '—'}</td>
+                <td style="color:#5f9c78;font-size:11px">${escHtml(String(r.oos || '').slice(0, 40))}</td>
+                <td style="color:#5f9c78;font-size:11px">${escHtml(String(r.reason || '').slice(0, 60))}</td>
+            </tr>`;
+        }
+        html += '</table>';
+        if (rules.length > 30) {
+            html += `<div style="color:#5f9c78;font-size:11px;margin-top:6px">Showing 30 of ${rules.length} rules.</div>`;
+        }
+    }
+    card.innerHTML = html;
+}
+
+async function mineLearnedRules() {
+    const btn = document.getElementById('mine-learned-rules-btn');
+    if (btn) { btn.disabled = true; btn.textContent = 'Mining…'; }
+    try {
+        const res = await postJSON('/api/learned-rules/mine', {});
+        if (res && res.error) alert(res.error);
+    } catch (e) {
+        alert('Mine failed: ' + e);
+    }
+    if (btn) { btn.disabled = false; btn.textContent = 'Re-mine now'; }
+    loadLearnedRules();
+}
+
+function escHtml(s) {
+    return String(s == null ? '' : s)
+        .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
 async function loadHybridMeta() {
     const card = document.getElementById('hybrid-meta-card');
     let data;
@@ -3568,7 +4134,7 @@ refresh();
 setInterval(refresh, 10000);
 // Keep the Signal Lab fresh while it's the visible tab.
 setInterval(() => {
-    if (!document.getElementById('tab-signal-lab').classList.contains('hidden')) { loadSignalLab(); loadHybridMeta(); }
+    if (!document.getElementById('tab-signal-lab').classList.contains('hidden')) { loadSignalLab(); loadHybridMeta(); loadLearnedRules(); }
 }, 15000);
 // Market list re-pull every 3s keeps current/next turnover snappy.
 setInterval(fetchMarkets, 3000);

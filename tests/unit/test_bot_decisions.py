@@ -163,20 +163,28 @@ class TestMeanRevRegime:
 
 
 class TestPhantomRegime:
-    def _sig(self, vol_regime):
+    def _sig(self, vol_regime, *, drift=0.25):
         bot = PhantomBot(name="ph-t", generation=0)
         # Gentle rising tape (ATR in bounds) + latest above the recent high.
+        # Drift required (2026-08 redesign: breakout only times PTB lean).
         prices = [100_000.0 * (1 + 0.0004 * i) for i in range(40)]
-        return bot.analyze(make_market(), make_signals(
-            prices=prices, latest=prices[-1] * 1.001, vol_regime=vol_regime))
+        return bot.analyze(
+            make_market(yes_price=0.52),
+            make_signals(
+                prices=prices, latest=prices[-1] * 1.001,
+                vol_regime=vol_regime, btc_drift=drift,
+            ),
+        )
 
     def test_breakout_long_boosted_by_trend(self):
         trending = self._sig({"regime": "trending_up", "trend_score": 0.9})
+        # Chop is hard-blocked in redesign (false breakouts).
         chop = self._sig({"regime": "choppy", "trend_score": 0.1})
         assert trending["action"] == "buy" and trending["side"] == "yes"
-        assert chop["action"] == "buy"
-        assert trending["confidence"] > chop["confidence"]
-        assert trending["edge"] > chop["edge"]
+        assert chop["action"] == "hold"
+        ranging = self._sig({"regime": "quiet", "trend_score": 0.2})
+        if ranging["action"] == "buy":
+            assert trending["confidence"] >= ranging["confidence"] * 0.9
 
 
 # ---------------------------------------------------------------------------

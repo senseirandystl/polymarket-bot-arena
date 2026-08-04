@@ -75,12 +75,49 @@ STATE_KEY = "regime_detector"
 PERF_KEY = "regime_performance"
 HISTORY_KEY = "regime_transitions"
 
-# Feature vector keys (order fixed for centroid distance).
+# Feature vector keys used by the rule classifier + EMA centroids.
+# ``vol`` is VOLATILITY (realized log-return stdev score), not volume.
+# ``volume`` is a separate activity feature (dashboard / context only) —
+# filled from Binance BTC 1m kline volume (price stays Chainlink). Classifier
+# rules do not use volume (see compute_features).
 FEATURE_KEYS = ("vol", "trend", "mom", "flow")
+
+# Human labels for dashboard / ops (vol ≠ volume).
+FEATURE_LABELS = {
+    "vol": "volatility",
+    "trend": "trend",
+    "mom": "momentum",
+    "flow": "flow",
+    "volume": "volume",
+    "flow_align": "flow_align",
+    "realized_vol": "realized_vol",
+}
 
 
 def _clip01(x: float) -> float:
     return max(0.0, min(1.0, float(x)))
+
+
+def _volume_score(volumes: Optional[Sequence[float]]) -> float:
+    """Relative tape activity in ~[0, 1].
+
+    Compares recent mean volume to the longer baseline. 0.5 ≈ typical;
+    near 0 = dead tape; near 1 = expansion. Empty/missing series → 0
+    (unknown — e.g. Chainlink BTC has no volume).
+    """
+    if not volumes:
+        return 0.0
+    clean = [float(v) for v in volumes if v is not None and float(v) >= 0]
+    if len(clean) < 5:
+        return 0.0
+    recent_n = min(5, len(clean))
+    recent = sum(clean[-recent_n:]) / recent_n
+    baseline = sum(clean) / len(clean)
+    if baseline <= 1e-12:
+        return 0.0 if recent <= 1e-12 else 1.0
+    ratio = recent / baseline
+    # Soft map: half baseline → ~0.2, equal → ~0.5, 2× → ~0.85
+    return _clip01(1.0 / (1.0 + math.exp(-2.2 * (ratio - 1.0))))
 
 
 def compute_features(
@@ -91,10 +128,17 @@ def compute_features(
     vol_score: Optional[float] = None,
     trend_score: Optional[float] = None,
     realized_vol: Optional[float] = None,
+    volumes: Optional[Sequence[float]] = None,
+    volume_score: Optional[float] = None,
 ) -> dict[str, float]:
     """Derive continuous feature vector in ~[0, 1] from market inputs.
 
     Pure function — no module state. Safe for offline harness / tests.
+
+    Keys:
+      * ``vol`` — **volatility** score (not volume)
+      * ``volume`` — relative tape activity (separate; may be 0 for Chainlink)
+      * ``trend``, ``mom``, ``flow``, ``flow_align``, ``realized_vol``
     """
     clean = [p for p in (prices or []) if p and p > 0]
 
@@ -133,11 +177,17 @@ def compute_features(
     if flow_sign != 0.0 and mom_sign != 0.0:
         flow_align = 1.0 if flow_sign == mom_sign else 0.0
 
+    if volume_score is None:
+        volume_score = _volume_score(volumes)
+    else:
+        volume_score = _clip01(float(volume_score))
+
     return {
-        "vol": _clip01(vol_score),
+        "vol": _clip01(vol_score),  # volatility (name kept for API stability)
         "trend": _clip01(trend_score),
         "mom": _clip01(mom),
         "flow": _clip01(flow),
+        "volume": volume_score,  # activity — NOT the same as vol
         "flow_align": _clip01(flow_align),
         "realized_vol": float(realized_vol),
     }
@@ -400,6 +450,8 @@ class RegimeDetector:
         vol_score: Optional[float] = None,
         trend_score: Optional[float] = None,
         realized_vol: Optional[float] = None,
+        volumes: Optional[Sequence[float]] = None,
+        volume_score: Optional[float] = None,
         market_id: Optional[str] = None,
     ) -> dict[str, Any]:
         """Ingest one market tick; return current regime snapshot.
@@ -416,10 +468,14 @@ class RegimeDetector:
             prices, cvd=cvd, obi=obi,
             vol_score=vol_score, trend_score=trend_score,
             realized_vol=realized_vol,
+            volumes=volumes, volume_score=volume_score,
         )
         with self._lock:
-            # EMA smooth the classifier features
-            for k in FEATURE_KEYS:
+            # EMA smooth the classifier features (+ volume for display)
+            smooth_keys = FEATURE_KEYS + ("volume",)
+            for k in smooth_keys:
+                if k not in raw:
+                    continue
                 prev = self._ema.get(k)
                 cur = float(raw[k])
                 if prev is None:
@@ -428,6 +484,7 @@ class RegimeDetector:
                     a = self.ema_alpha
                     self._ema[k] = a * cur + (1.0 - a) * prev
             smoothed = {k: self._ema.get(k, raw[k]) for k in FEATURE_KEYS}
+            smoothed["volume"] = self._ema.get("volume", raw.get("volume", 0.0))
             smoothed["flow_align"] = raw.get("flow_align", 0.5)
             smoothed["realized_vol"] = raw.get("realized_vol", 0.0)
             self._last_features = dict(smoothed)

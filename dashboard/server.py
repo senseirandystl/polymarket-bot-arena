@@ -782,6 +782,31 @@ async def update_portfolio(request: Request, _auth: str = Depends(verify_auth)):
     return JSONResponse({"success": True, **state})
 
 
+@app.get("/api/learned-rules")
+def get_learned_rules(_auth: str = Depends(verify_auth)):
+    """Signal Lab: data-driven skip/go/continuous rules + skip-reason bandit.
+
+    Mined from decision_events (walk-forward OOS gated). Read-only snapshot
+    for the dashboard; mining runs in the arena evolution loop.
+    """
+    try:
+        from arena.learned_rules import snapshot
+        return JSONResponse(snapshot())
+    except Exception as e:
+        return JSONResponse({"error": str(e), "rules": [], "enabled": False})
+
+
+@app.post("/api/learned-rules/mine")
+def post_learned_rules_mine(_auth: str = Depends(verify_auth)):
+    """Force a mine cycle (dashboard button). Safe: read decision_events only."""
+    try:
+        from arena.learned_rules import mine_and_update, snapshot
+        mine_and_update()
+        return JSONResponse({"success": True, **snapshot()})
+    except Exception as e:
+        return JSONResponse({"success": False, "error": str(e)}, status_code=500)
+
+
 @app.get("/api/lane-proposals")
 def get_lane_proposals(_auth: str = Depends(verify_auth)):
     """Signal Lab: candidate-lane proposals + approved overrides + last run.

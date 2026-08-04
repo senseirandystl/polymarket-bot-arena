@@ -1,46 +1,42 @@
-"""Phantom Swing bot — adapted from strategy.md for 5-min binary markets.
+"""Phantom Swing — short-horizon EMA breakout with strict drift confirmation.
 
-Uses EMA trend filter and breakout logic to trade in the direction of momentum.
+2026-08 redesign (prior phantom: 50% WR, −$5, toxic NO book):
+  * Faster EMAs (5/13) + 6-bar breakout for 5-min markets (less lag).
+  * Drift is primary: breakout only *times* an already-signed PTB lean.
+  * NO side requires stronger drift + lag mid (same family as NO-side gates).
+  * Chop/range regimes heavily damp or block; quiet-trend uses higher bars.
+  * Strat confidence kept modest so confirm-mode blend doesn't over-weight.
 """
 
-import math
+from __future__ import annotations
+
 import config
 from bots.base_bot import BaseBot, strategy_decision
+from bots.edge_calibration import quality_confidence
 from signals.lab import SignalView
 
-# Retune (2026-07-16): the old EMA 20/50 + 20-candle breakout needed 70 one-min
-# candles (~70 minutes) before analyze() could fire at all — the price feed
-# fills at 1 candle/min from a cold start, so phantom was a silent base-stack
-# clone for the first hour of EVERY restart. EMA 9/26 + 10-candle breakout
-# (36-candle warmup) keeps the identity (trend filter + breakout + vol sanity)
-# on horizons that fit 5-min markets and halves the warmup.
 DEFAULT_PARAMS = {
-    "ema_fast": 9,
-    "ema_slow": 26,
-    "atr_period": 10,
-    "breakout_lookback": 10,
-    # Real BTC 1-min |move| distribution (2,740 samples from the harness kline
-    # cache): p50 0.022%, p75 0.042%, avg 0.032%. The old 0.05% floor sat at
-    # ~p75+ — phantom idled through most normal tape. 0.02% skips only truly
-    # dead tape; the 1% ceiling still rejects chaos.
-    "min_atr_pct": 0.0002,    # 0.02% (~median 1-min move)
-    "max_atr_pct": 0.01,      # 1.0%
-    "position_size_pct": 0.06,
-    "min_confidence": 0.20,
-    # Regime conditioning: a breakout in trending tape is trend continuation
-    # (the thesis); the same bar pattern in chop is usually a range boundary
-    # about to mean-revert. Same smooth scaling as the momentum bot.
-    "regime_conf_weight": 0.30,
+    "ema_fast": 5,
+    "ema_slow": 13,
+    "atr_period": 8,
+    "breakout_lookback": 6,
+    # BTC 1-min |move| ~ p50 0.022%; skip only dead / chaos tape.
+    "min_atr_pct": 0.00015,
+    "max_atr_pct": 0.008,
+    "position_size_pct": 0.05,
+    "min_confidence": 0.22,
+    # Drift alignment (YES-frame). NO uses no_min_drift_align (stricter).
+    "min_drift_align": 0.12,
+    "no_min_drift_align": 0.18,
+    "no_max_side_mid": 0.55,
+    "yes_max_side_mid": 0.62,
+    "regime_conf_weight": 0.25,
+    "chop_block": True,          # hard hold in chop labels
 }
 
 
 class PhantomBot(BaseBot):
     def __init__(self, name="phantom-v1", params=None, generation=0, lineage=None):
-        # "phantom" is a first-class strategy_type in base_bot's signal tables
-        # (STRATEGY_PRIORS / STRATEGY_SIGNAL_PROFILE / MIN_EDGE), so
-        # pass it straight through. The old code passed "hybrid" then reassigned
-        # to "phantom" afterwards — fragile, and wrong if the base ever reads
-        # strategy_type during __init__.
         super().__init__(
             name=name,
             strategy_type="phantom",
@@ -51,95 +47,164 @@ class PhantomBot(BaseBot):
 
     def _calc_ema(self, prices, period):
         if len(prices) < period:
-            return sum(prices) / len(prices) if prices else 0
-        
+            return sum(prices) / len(prices) if prices else 0.0
         alpha = 2 / (period + 1)
         ema = prices[0]
-        for p in prices[1:]:
-            ema = (p * alpha) + (ema * (1 - alpha))
+        for px in prices[1:]:
+            ema = (px * alpha) + (ema * (1 - alpha))
         return ema
 
     def _calc_atr(self, prices, period):
-        """Simple ATR approximation using close prices since we don't have H/L."""
         if len(prices) < period + 1:
-            return 0
-        
-        diffs = [abs(prices[i] - prices[i-1]) for i in range(len(prices)-period, len(prices))]
+            return 0.0
+        diffs = [abs(prices[i] - prices[i - 1])
+                 for i in range(len(prices) - period, len(prices))]
         return sum(diffs) / period
 
     def analyze(self, market: dict, signals: dict) -> dict:
-        """Swing strategy: follow the trend defined by EMAs and breakouts."""
         sv = SignalView.of(signals)
         prices = sv.prices
         p = self.strategy_params
 
-        if len(prices) < p["ema_slow"] + p["breakout_lookback"]:
+        need = int(p["ema_slow"]) + int(p["breakout_lookback"])
+        if len(prices) < need:
             return strategy_decision("hold", reasoning="insufficient data")
 
         current_price = sv.latest or prices[-1]
-        
-        # 1. Trend Filter
-        ema_fast = self._calc_ema(prices, p["ema_fast"])
-        ema_slow = self._calc_ema(prices, p["ema_slow"])
-        
-        # 2. Breakout
-        recent_window = prices[-p["breakout_lookback"]:]
+        ema_fast = self._calc_ema(prices, int(p["ema_fast"]))
+        ema_slow = self._calc_ema(prices, int(p["ema_slow"]))
+        recent_window = prices[-int(p["breakout_lookback"]):]
         recent_high = max(recent_window)
         recent_low = min(recent_window)
-        
-        # 3. Volatility (ATR)
-        atr = self._calc_atr(prices, p["atr_period"])
-        atr_pct = atr / current_price if current_price > 0 else 0
-        
-        # Volatility sanity check
-        if not (p["min_atr_pct"] <= atr_pct <= p["max_atr_pct"]):
+        atr = self._calc_atr(prices, int(p["atr_period"]))
+        atr_pct = atr / current_price if current_price > 0 else 0.0
+
+        if not (float(p["min_atr_pct"]) <= atr_pct <= float(p["max_atr_pct"])):
             return strategy_decision(
                 "hold", signals={"atr_pct": atr_pct},
                 reasoning=f"phantom: vol out of bounds ({atr_pct:.4%})")
 
-        # Regime conditioning: breakout continuation is a trending-tape edge.
         regime = self.regime_context(signals)
-        rw = p.get("regime_conf_weight", 0.30)
-        regime_factor = 1.0 + rw * (2.0 * regime["trend_score"] - 1.0)
+        label = (regime.get("label") or "") or ""
+        if p.get("chop_block") and (
+            regime.get("choppy")
+            or regime.get("chop")
+            or label.endswith("chop")
+            or label in ("choppy", "high_vol_chop", "volatile")
+        ):
+            return strategy_decision(
+                "hold",
+                reasoning=f"phantom: block in chop regime={label}")
+
+        rw = float(p.get("regime_conf_weight", 0.25))
+        regime_factor = 1.0 + rw * (2.0 * float(regime.get("trend_score") or 0.5) - 1.0)
+        if regime.get("ranging") or label == "low_vol_range":
+            regime_factor *= 0.55
+        if label == "low_vol_trend":
+            # Quiet "trend" was a live leak for breakout styles.
+            regime_factor *= 0.60
+
+        drift = float(sv.btc_drift or 0.0)
+        yes_mid = market.get("current_price") or 0.5
+        no_mid = market.get("no_price")
+        if no_mid is None:
+            no_mid = round(1.0 - float(yes_mid), 4)
 
         contributing = {
             "ema_fast": ema_fast, "ema_slow": ema_slow, "atr_pct": atr_pct,
             "recent_high": recent_high, "recent_low": recent_low,
-            "regime": regime["label"], "regime_factor": regime_factor,
+            "drift": drift, "regime": label, "regime_factor": regime_factor,
         }
 
-        # Long Entry (Bullish)
-        if ema_fast > ema_slow and current_price > ema_fast and current_price > recent_high:
+        # Long: EMA stack + breakout + drift above PTB + lagging YES mid
+        if (ema_fast > ema_slow and current_price > ema_fast
+                and current_price > recent_high):
+            min_align = float(p.get("min_drift_align", 0.12))
+            if label == "low_vol_trend":
+                min_align += 0.05
+            if drift < min_align:
+                return strategy_decision(
+                    "hold", signals=contributing,
+                    reasoning=(f"phantom LONG blocked: drift={drift:+.3f}"
+                               f"<{min_align:.2f}"))
+            yes_max = float(p.get("yes_max_side_mid", 0.62))
+            if float(yes_mid) > yes_max:
+                return strategy_decision(
+                    "hold", signals=contributing,
+                    reasoning=(f"phantom LONG blocked: yes mid={float(yes_mid):.2f}"
+                               f">{yes_max:.2f} (no lag)"))
             trend_strength = (ema_fast - ema_slow) / current_price
-            confidence = min(0.95, (0.3 + min(0.4, trend_strength * 100)) * regime_factor)
+            edge = min(0.08, trend_strength * 15.0 * regime_factor)
+            conf = quality_confidence(
+                edge=edge, abs_drift=abs(drift),
+                side_mid=float(yes_mid), side="yes", regime_label=label,
+            )
+            conf = min(conf, 0.55)  # never claim high conf from breakout alone
+            if conf < float(p.get("min_confidence", 0.22)):
+                return strategy_decision(
+                    "hold", signals=contributing,
+                    reasoning=f"phantom LONG conf {conf:.3f} low")
             return strategy_decision(
                 "buy", "yes",
-                edge=min(0.10, trend_strength * 20.0 * regime_factor),
-                confidence=confidence,
-                reasoning=(f"phantom LONG: trend={trend_strength:.4%}, breakout "
-                           f"above {recent_high:.0f}, regime={regime['label']}"
-                           f"x{regime_factor:.2f}"),
+                edge=edge,
+                confidence=conf,
+                reasoning=(
+                    f"phantom LONG: trend={trend_strength:.4%}, breakout "
+                    f"above {recent_high:.0f}, drift={drift:+.3f}, "
+                    f"regime={label}x{regime_factor:.2f}"
+                ),
                 signals={**contributing, "trend_strength": trend_strength},
-                suggested_amount=config.get_max_position() * p["position_size_pct"],
+                suggested_amount=config.get_max_position() * float(
+                    p["position_size_pct"]),
             )
 
-        # Short Entry (Bearish)
-        if ema_fast < ema_slow and current_price < ema_fast and current_price < recent_low:
+        # Short: stricter NO path
+        if (ema_fast < ema_slow and current_price < ema_fast
+                and current_price < recent_low):
+            min_align = float(p.get("no_min_drift_align", 0.18))
+            if label == "low_vol_trend":
+                min_align += 0.06
+            if drift > -min_align:
+                return strategy_decision(
+                    "hold", signals=contributing,
+                    reasoning=(f"phantom SHORT blocked: drift={drift:+.3f}"
+                               f">{-min_align:.2f}"))
+            no_max = float(p.get("no_max_side_mid", 0.55))
+            if float(no_mid) > no_max:
+                return strategy_decision(
+                    "hold", signals=contributing,
+                    reasoning=(f"phantom SHORT blocked: no mid={float(no_mid):.2f}"
+                               f">{no_max:.2f}"))
             trend_strength = (ema_slow - ema_fast) / current_price
-            confidence = min(0.95, (0.3 + min(0.4, trend_strength * 100)) * regime_factor)
+            edge = min(0.07, trend_strength * 12.0 * regime_factor)
+            conf = quality_confidence(
+                edge=edge, abs_drift=abs(drift),
+                side_mid=float(no_mid), side="no", regime_label=label,
+            )
+            conf = min(conf, 0.50)
+            if conf < float(p.get("min_confidence", 0.22)):
+                return strategy_decision(
+                    "hold", signals=contributing,
+                    reasoning=f"phantom SHORT conf {conf:.3f} low")
             return strategy_decision(
                 "buy", "no",
-                edge=min(0.10, trend_strength * 20.0 * regime_factor),
-                confidence=confidence,
-                reasoning=(f"phantom SHORT: trend={trend_strength:.4%}, breakdown "
-                           f"below {recent_low:.0f}, regime={regime['label']}"
-                           f"x{regime_factor:.2f}"),
+                edge=edge,
+                confidence=conf,
+                reasoning=(
+                    f"phantom SHORT: trend={trend_strength:.4%}, breakdown "
+                    f"below {recent_low:.0f}, drift={drift:+.3f}, "
+                    f"regime={label}x{regime_factor:.2f}"
+                ),
                 signals={**contributing, "trend_strength": trend_strength},
-                suggested_amount=config.get_max_position() * p["position_size_pct"],
+                suggested_amount=config.get_max_position() * float(
+                    p["position_size_pct"]),
             )
 
         return strategy_decision(
             "hold", signals=contributing,
-            reasoning=(f"phantom: no signal (ema_f={ema_fast:.0f}, "
-                       f"ema_s={ema_slow:.0f}, high={recent_high:.0f}, "
-                       f"low={recent_low:.0f})"))
+            reasoning=(
+                f"phantom: no signal (ema_f={ema_fast:.0f}, "
+                f"ema_s={ema_slow:.0f}, high={recent_high:.0f}, "
+                f"low={recent_low:.0f})"
+            ),
+        )

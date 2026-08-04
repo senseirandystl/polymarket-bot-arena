@@ -231,12 +231,25 @@ def tune() -> dict:
             if st and st["n"] >= min_trades and st["accuracy"] is not None:
                 lo = max(wmin, default - band)
                 hi = min(wmax, default + band)
-                if st["accuracy"] >= high_acc and cur < hi:
+                acc = float(st["accuracy"])
+                # Soft revert: elevated weights must keep earning HIGH_ACC.
+                # Overnight: sentiment strat sat at 0.9 with only 56.7% acc
+                # (above LOW_ACC so never "down") — bleed back toward default
+                # when not clearing the promote bar. Hold-to-resolution:
+                # mediocre lanes should not keep max weight.
+                revert_below = float(
+                    getattr(config, "CORE_TUNE_REVERT_BELOW_ACC", high_acc)
+                )
+                if acc >= high_acc and cur < hi:
                     new_w = round(min(hi, cur + step), 3)
                     action = "up"
-                elif st["accuracy"] <= low_acc and cur > lo:
+                elif acc <= low_acc and cur > lo:
                     new_w = round(max(lo, cur - step), 3)
                     action = "down"
+                elif (acc < revert_below and cur > default + 1e-9
+                      and cur > lo):
+                    new_w = round(max(default, lo, cur - step), 3)
+                    action = "revert"
                 if new_w != cur:
                     changed = True
                 lane_report[strat] = {

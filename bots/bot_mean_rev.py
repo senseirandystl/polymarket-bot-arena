@@ -19,7 +19,8 @@ DEFAULT_PARAMS = {
     "rsi_period": 14,
     "rsi_oversold": 40,
     "rsi_overbought": 60,
-    "reversion_threshold": 0.4, # z-score threshold to fade
+    # Slightly higher bar: weak z-fades were knife-catches even when drift-aligned.
+    "reversion_threshold": 0.5, # z-score threshold to fade
     # Drift-agreement gate (BUG #28): the fade may only fire toward the side
     # a signed btc_drift of at least this magnitude already favors. Ungated,
     # the z-fade was a pure contrarian knife-catcher — 10 of 11 live trades
@@ -27,7 +28,8 @@ DEFAULT_PARAMS = {
     # "contrarian loses in 5-min markets" death class). Gated, the identity
     # becomes "buy the dip in the WINNING direction": drift picks the side,
     # the z-score times the pullback entry.
-    "min_drift": 0.10,
+    # Overnight soak: meanrev YES 33% WR — require clearer PTB support.
+    "min_drift": 0.12,
     # PTB mean gate (P0): reversion TARGET (the z-score mean) must sit on the
     # same side of the Price-to-Beat as the bet. Fading UP → NO only when
     # mean ≤ strike (reversion still finishes ≤ PTB); fading DOWN → YES only

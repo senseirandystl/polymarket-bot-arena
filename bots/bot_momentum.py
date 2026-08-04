@@ -16,6 +16,8 @@ DEFAULT_PARAMS = {
     "min_confidence": 0.55,
     "trend_strength_weight": 0.7,
     "volume_weight": 0.3,
+    # Hold-to-resolution: candle momentum must not fight btc_drift (PTB side).
+    "min_drift_align": 0.05,
     # Regime conditioning: confidence scales by (1 + w * (2*trend_score - 1)).
     # Trend-following earns MORE trust on trending tape and LESS in chop
     # (2026-07-19 live: momentum-driven trades in chop ran 47.9% WR / -$74;
@@ -37,7 +39,12 @@ class MomentumBot(BaseBot):
         )
 
     def analyze(self, market: dict, signals: dict) -> dict:
-        """Trade in the direction of short-term price momentum."""
+        """Trade in the direction of short-term price momentum.
+
+        Hold-to-resolution: intermediate candle momentum only helps when it
+        agrees with BTC's side of the Price-to-Beat (``btc_drift``). A move
+        against the strike is noise, not a binary edge.
+        """
         sv = SignalView.of(signals)
         prices = sv.prices
         if len(prices) < self.strategy_params["lookback_candles"]:
@@ -64,18 +71,25 @@ class MomentumBot(BaseBot):
 
         trend_strength = consecutive / (len(recent) - 1) if len(recent) > 1 else 0
 
-        # Volume signal (if available)
-        volumes = sv.volumes
-        vol_signal = 0.5
-        if len(volumes) >= lookback:
+        # Volume signal (Chainlink BTC volumes are empty — do not invent 0.5)
+        volumes = sv.volumes or []
+        has_vol = (
+            len(volumes) >= lookback
+            and any(v and v > 0 for v in volumes[-lookback:])
+        )
+        vol_signal = 0.0
+        if has_vol:
             recent_vol = sum(volumes[-lookback:])
-            prev_vol = sum(volumes[-lookback*2:-lookback]) if len(volumes) >= lookback*2 else recent_vol
+            prev_vol = (
+                sum(volumes[-lookback * 2:-lookback])
+                if len(volumes) >= lookback * 2 else recent_vol
+            )
             vol_signal = min(1.0, recent_vol / max(prev_vol, 1)) * 0.5 + 0.25
-
-        # Combine signals
-        tw = self.strategy_params["trend_strength_weight"]
-        vw = self.strategy_params["volume_weight"]
-        confidence = (trend_strength * tw + vol_signal * vw)
+            tw = self.strategy_params["trend_strength_weight"]
+            vw = self.strategy_params["volume_weight"]
+            confidence = trend_strength * tw + vol_signal * vw
+        else:
+            confidence = trend_strength
 
         # Regime conditioning: trend-following deserves more say on trending
         # tape, less in chop. Smoothly scaled by trend_score; neutral when the
@@ -84,11 +98,22 @@ class MomentumBot(BaseBot):
         rw = self.strategy_params.get("regime_conf_weight", 0.35)
         regime_factor = 1.0 + rw * (2.0 * regime["trend_score"] - 1.0)
         confidence *= regime_factor
+        # Extra chop damp (hold-to-resolution): chop momentum is mean-reverting
+        if regime.get("choppy") or (regime.get("label") or "").endswith("chop"):
+            confidence *= 0.55
+        elif regime.get("ranging"):
+            confidence *= 0.70
+
+        # Drift alignment gate: only lean toward the side strike already favors
+        # (or flat drift with strong multi-candle trend). Prevents fading PTB.
+        drift = float(sv.btc_drift or 0.0)
+        min_align = float(self.strategy_params.get("min_drift_align", 0.05))
 
         contributing = {
             "pct_change": pct_change,
             "trend_strength": trend_strength,
             "vol_signal": vol_signal,
+            "drift": drift,
             "regime": regime["label"],
             "regime_factor": regime_factor,
         }
@@ -99,10 +124,28 @@ class MomentumBot(BaseBot):
                 reasoning=f"momentum {pct_change:.4f} below threshold {threshold}")
 
         side = "yes" if pct_change > 0 else "no"
+        # Require drift not to contradict (signed drift toward chosen side)
+        signed_drift = drift if side == "yes" else -drift
+        if signed_drift < -min_align:
+            return strategy_decision(
+                "hold", confidence=confidence, signals=contributing,
+                reasoning=(f"momentum {side} fights drift={drift:+.3f} "
+                           f"(hold-to-resolution: PTB wins)"))
+        if abs(drift) >= min_align and signed_drift < min_align:
+            # Drift flat-to-weak vs move — require stronger trend_strength
+            if trend_strength < 0.6:
+                return strategy_decision(
+                    "hold", confidence=confidence, signals=contributing,
+                    reasoning=(f"momentum weak vs PTB: drift={drift:+.3f} "
+                               f"trend_str={trend_strength:.2f}"))
+
         amount = config.get_max_position() * self.strategy_params["position_size_pct"]
         # Strategy edge estimate: how far the move clears the trigger, scaled
         # by trend quality — a thesis-strength proxy in probability units.
         edge = min(0.10, (abs(pct_change) - threshold) * 50.0 * max(trend_strength, 0.2))
+        # Boost edge slightly when drift agrees strongly (aligned thesis)
+        if signed_drift >= 0.15:
+            edge = min(0.10, edge * 1.15)
 
         return strategy_decision(
             "buy", side,
@@ -110,6 +153,7 @@ class MomentumBot(BaseBot):
             confidence=min(confidence, 0.95),
             reasoning=(f"Momentum {pct_change:.4f} ({lookback} candles), "
                        f"trend_str={trend_strength:.2f}, vol={vol_signal:.2f}, "
+                       f"drift={drift:+.3f}, "
                        f"regime={regime['label']}x{regime_factor:.2f}"),
             signals=contributing,
             suggested_amount=amount,

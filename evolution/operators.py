@@ -28,6 +28,53 @@ def tournament_select(
     return max(contenders, key=lambda ind: float(ind.get(fitness_key, 0.0)))
 
 
+def _parent_identity(ind: dict) -> str:
+    """Stable id for distinct-parent checks (name preferred; params fallback)."""
+    name = ind.get("name")
+    if name:
+        # Gene-bank clones of a live elite share the same name intentionally —
+        # treat them as the same parent so we do not fake "diversity".
+        return f"name:{name}"
+    st = ind.get("strategy_type") or ""
+    params = ind.get("params") or {}
+    try:
+        keys = sorted(params.keys())
+        body = "|".join(f"{k}={params[k]!r}" for k in keys)
+        return f"params:{st}|{body}"
+    except Exception:
+        return f"id:{id(ind)}"
+
+
+def tournament_select_pair(
+    population: list[dict],
+    *,
+    k: int | None = None,
+    fitness_key: str = "fitness",
+    rng: random.Random | None = None,
+) -> tuple[dict, dict, bool]:
+    """Select two parents, preferring distinct identities.
+
+    Returns ``(p1, p2, is_self_pair)``. When the pool has ≥2 unique identities,
+    ``p2`` is drawn from everyone *except* ``p1``'s identity (second tournament
+    on that reduced pool). When only one unique parent exists, both slots are
+    the same individual and ``is_self_pair`` is True (caller should label the
+    spawn as clone+mutate, not crossover).
+    """
+    if not population:
+        raise ValueError("tournament_select_pair requires a non-empty population")
+    rng = rng or random
+    p1 = tournament_select(population, k=k, fitness_key=fitness_key, rng=rng)
+    id1 = _parent_identity(p1)
+    others = [p for p in population if _parent_identity(p) != id1]
+    if not others:
+        return p1, p1, True
+    p2 = tournament_select(others, k=k, fitness_key=fitness_key, rng=rng)
+    # Convention at call sites: p1 is the fitter / primary parent
+    if float(p2.get(fitness_key, 0.0)) > float(p1.get(fitness_key, 0.0)):
+        p1, p2 = p2, p1
+    return p1, p2, False
+
+
 def crossover(
     parent_a: dict[str, Any],
     parent_b: dict[str, Any],

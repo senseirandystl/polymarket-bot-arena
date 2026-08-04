@@ -182,15 +182,11 @@ def pairwise_correlation(
     return corr
 
 
-def compute_metrics(
+def _metrics_from_pnls(
     bot_names: Sequence[str],
-    hours: float | None = None,
+    pnls: dict[str, list[float]],
+    min_trades: int,
 ) -> dict[str, dict[str, Any]]:
-    """Per-bot performance metrics used by the allocator."""
-    hours = float(hours if hours is not None else
-                  getattr(config, "PORTFOLIO_WINDOW_HOURS", 24))
-    min_trades = int(getattr(config, "PORTFOLIO_MIN_TRADES", 10))
-    pnls = _resolved_pnls_by_bot(bot_names, hours)
     metrics: dict[str, dict[str, Any]] = {}
     for name in bot_names:
         series = pnls.get(name) or []
@@ -209,6 +205,54 @@ def compute_metrics(
             "variance": round(var, 6),
             "ready": n >= min_trades,
         }
+    return metrics
+
+
+def compute_metrics(
+    bot_names: Sequence[str],
+    hours: float | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Per-bot performance metrics used by the allocator.
+
+    Dual-window blend (2026-08): long lookback stabilizes weights; short
+    window keeps freshness without letting a lucky 6–12h streak dominate.
+    ``ready`` / ``n`` use the long window so sample floors stay honest.
+    """
+    long_h = float(hours if hours is not None else
+                   getattr(config, "PORTFOLIO_WINDOW_HOURS", 48))
+    fast_h = float(getattr(config, "PORTFOLIO_FAST_WINDOW_HOURS", 12))
+    long_w = float(getattr(config, "PORTFOLIO_LONG_WEIGHT", 0.65))
+    long_w = max(0.0, min(1.0, long_w))
+    min_trades = int(getattr(config, "PORTFOLIO_MIN_TRADES", 20))
+
+    long_pnls = _resolved_pnls_by_bot(bot_names, long_h)
+    metrics = _metrics_from_pnls(bot_names, long_pnls, min_trades)
+
+    if fast_h > 0 and abs(long_w - 1.0) > 1e-9:
+        fast_pnls = _resolved_pnls_by_bot(bot_names, fast_h)
+        # Fast window uses a lower sample floor so it can contribute signal
+        # without requiring a full long-window count in 12h.
+        fast_min = max(8, min_trades // 2)
+        fast_m = _metrics_from_pnls(bot_names, fast_pnls, fast_min)
+        for name in bot_names:
+            lm = metrics[name]
+            fm = fast_m.get(name) or {}
+            if not lm.get("ready"):
+                continue
+            # Blend sharpe/expectancy/variance for scoring; keep long n/ready.
+            lm["sharpe"] = round(
+                long_w * float(lm["sharpe"])
+                + (1.0 - long_w) * float(fm.get("sharpe") or 0.0), 4)
+            lm["expectancy"] = round(
+                long_w * float(lm["expectancy"])
+                + (1.0 - long_w) * float(fm.get("expectancy") or 0.0), 4)
+            lm["variance"] = round(
+                long_w * float(lm["variance"])
+                + (1.0 - long_w) * float(fm.get("variance") or lm["variance"]),
+                6)
+            lm["fast_n"] = int(fm.get("n") or 0)
+            lm["fast_expectancy"] = fm.get("expectancy")
+            lm["blend_long_w"] = long_w
     return metrics
 
 
@@ -268,15 +312,58 @@ def _raw_scores(
             adjusted[n] = scores[n] * (1.0 - shrink * avg_corr)
         scores = adjusted
 
-    # Cold-start: bots under the sample floor keep a tiny positive score so
-    # they aren't starved of exploration capital.
-    floor_score = float(getattr(config, "PORTFOLIO_COLD_START_SCORE", 0.05))
+    # Ready bots with negative expectancy → hard zero (renorm onto winners).
+    # Not-ready bots get score 0 here; explore budget is applied later in
+    # allocate() so three cold bots cannot each take 24% of free mass.
+    loser_score = float(getattr(config, "PORTFOLIO_LOSER_SCORE", 0.0))
     for n in names:
-        if not metrics[n].get("ready"):
-            scores[n] = max(scores[n], floor_score)
+        m = metrics[n]
+        if not m.get("ready"):
+            scores[n] = 0.0  # explore budget is separate
+        elif float(m.get("expectancy") or 0.0) < 0:
+            # Proven floor: long-window / high-n bots with only mild short-window
+            # red ink keep a residual score so hybrid-class winners aren't
+            # zeroed by a noisy 12h blend.
+            proven_n = int(getattr(config, "PORTFOLIO_PROVEN_MIN_TRADES", 25))
+            if int(m.get("n") or 0) >= proven_n and float(
+                    m.get("total_pnl") or 0.0) > 0:
+                scores[n] = max(
+                    float(getattr(config, "PORTFOLIO_COLD_START_SCORE", 0.05)),
+                    scores[n],
+                )
+            else:
+                scores[n] = float(loser_score)
         elif scores[n] <= 0:
-            scores[n] = floor_score * 0.5  # losing but still trading
+            scores[n] = float(loser_score)
     return scores
+
+
+def _is_new_generation_bot(name: str, metrics_row: dict[str, Any] | None = None) -> bool:
+    """True for evolved gN bots still below the explore sample floor.
+
+    Heuristic: name contains ``-g`` + digits (hybrid-g4-158) OR generation>0
+    from bot_configs, AND resolved trade count under PORTFOLIO_EXPLORE_MIN_TRADES.
+    Caps capital so a bad spawn cannot immediately eat a full Kelly slice.
+    """
+    min_n = int(getattr(config, "PORTFOLIO_EXPLORE_MIN_TRADES", 15))
+    n = int((metrics_row or {}).get("n") or 0)
+    if n >= min_n:
+        return False
+    # Name pattern from GA: {type}-g{cycle}-{rand}
+    import re
+    if re.search(r"-g\d+-", name or ""):
+        return True
+    try:
+        with db.get_conn() as conn:
+            row = conn.execute(
+                "SELECT generation FROM bot_configs WHERE bot_name=? AND active=1",
+                (name,),
+            ).fetchone()
+            if row and int(row["generation"] or 0) > 0:
+                return True
+    except Exception:
+        pass
+    return False
 
 
 def apply_regime_tilt(
@@ -404,6 +491,12 @@ def _normalize(
     return {k: round(v / s, 6) for k, v in out.items()}
 
 
+def _is_arbitrage_bot(name: str) -> bool:
+    """Market-neutral arb is a fixed roster staple (equal 1/N weight)."""
+    n = (name or "").lower()
+    return n.startswith("arbitrage") or n.startswith("arb-")
+
+
 def allocate(
     bot_names: Sequence[str],
     method: str = "kelly_portfolio",
@@ -416,6 +509,10 @@ def allocate(
 
     Returns dict with keys: weights, auto_weights, metrics, correlations,
     method, window_hours.
+
+    Arbitrage bots (when present) are pinned to a fixed ``1/N`` share so
+    Kelly never starves the low-risk market-neutral staple. Manual overrides
+    still win if the operator pins arb explicitly.
     """
     names = list(dict.fromkeys(bot_names))  # stable unique
     method = method if method in METHODS else "equal"
@@ -433,7 +530,15 @@ def allocate(
         min_overlap=int(getattr(config, "PORTFOLIO_CORR_MIN_OVERLAP", 8)),
     )
 
-    # Split locked (manual) vs free bots
+    # Pin arb at 1/N unless the operator already set a manual override.
+    n_roster = max(len(names), 1)
+    equal_share = 1.0 / n_roster
+    for n in names:
+        if _is_arbitrage_bot(n) and n not in overrides:
+            if bool(getattr(config, "PORTFOLIO_ARB_FIXED_EQUAL", True)):
+                overrides[n] = equal_share
+
+    # Split locked (manual + arb staple) vs free bots
     locked = {k: overrides[k] for k in overrides}
     locked_sum = sum(locked.values())
     free_names = [n for n in names if n not in locked]
@@ -448,30 +553,93 @@ def allocate(
     free_mass = max(0.0, 1.0 - locked_sum)
     auto_weights: dict[str, float] = {}
 
-    if free_names and free_mass > 0:
-        scores = _raw_scores(method, {n: metrics[n] for n in free_names}, corr)
-        # Regime-conditioning (Layer 3): bounded, floored tilt by each bot's
-        # validated shrunk edge for the CURRENT regime. No-op (identity) when
-        # regime_edges is None — the conditioning-off / no-validated-regime path.
+    # Split free roster into veterans (enough samples) vs explorers (cold /
+    # not-ready). Explorers share a *capped total budget* so 3 cold bots
+    # cannot each take ~24% (2026-08 soak).
+    explore_cap = float(getattr(config, "PORTFOLIO_EXPLORE_MAX_WEIGHT", 0.06))
+    explore_budget = float(getattr(config, "PORTFOLIO_EXPLORE_TOTAL_BUDGET", 0.12))
+    explorers = [
+        n for n in free_names
+        if (not (metrics.get(n) or {}).get("ready"))
+        or _is_new_generation_bot(n, metrics.get(n))
+    ]
+    veterans = [n for n in free_names if n not in explorers]
+    explore_mass = min(explore_budget, free_mass) if explorers else 0.0
+    # Per-explorer equal slice, each ≤ explore_cap
+    if explorers and explore_mass > 0:
+        per = min(explore_cap, explore_mass / len(explorers))
+        explore_mass = per * len(explorers)
+        for n in explorers:
+            auto_weights[n] = per
+    veteran_mass = max(0.0, free_mass - explore_mass)
+
+    if veterans and veteran_mass > 0:
+        scores = _raw_scores(method, {n: metrics[n] for n in veterans}, corr)
         scores = apply_regime_tilt(
             scores, regime_edges,
             max_tilt=float(getattr(config, "REGIME_ALLOC_MAX_TILT", 0.25)),
             min_weight=float(getattr(config, "REGIME_ALLOC_MIN_WEIGHT", 0.05)),
         )
-        # Normalize free bots onto a unit simplex with min/max scaled so that
-        # after multiplying by free_mass the absolute floors/caps still hold.
-        n_free = len(free_names)
-        free_min = min(min_w / free_mass, 1.0 / n_free) if free_mass > 0 else 0.0
-        free_max = min(max_w / free_mass, 1.0) if free_mass > 0 else 1.0
+        # If all veterans score 0 (everyone briefly red), fall back to equal
+        # so we do not leave capital unallocated.
+        if sum(max(0.0, float(scores.get(n, 0.0))) for n in veterans) <= 1e-15:
+            scores = {n: 1.0 for n in veterans}
+        n_v = len(veterans)
+        free_min = min(min_w / veteran_mass, 1.0 / n_v) if veteran_mass > 0 else 0.0
+        free_max = min(max_w / veteran_mass, 1.0) if veteran_mass > 0 else 1.0
         free_w = _normalize(scores, min_w=free_min, max_w=free_max)
-        auto_weights = {n: free_w.get(n, 0.0) * free_mass for n in free_names}
-    elif free_names:
-        auto_weights = {n: 0.0 for n in free_names}
+        for n in veterans:
+            auto_weights[n] = free_w.get(n, 0.0) * veteran_mass
+    elif veterans:
+        for n in veterans:
+            auto_weights.setdefault(n, 0.0)
+    elif explorers and free_mass > explore_mass:
+        # Only explorers on free roster — scale their equal share to free_mass
+        # without exceeding per-bot cap.
+        per = min(explore_cap, free_mass / len(explorers))
+        for n in explorers:
+            auto_weights[n] = per
 
     weights = {**auto_weights, **locked}
-    # Ensure every bot present
     for n in names:
         weights.setdefault(n, 0.0)
+
+    # Proven floor: gen0 / high-n bots with non-catastrophic long PnL keep a
+    # minimum weight so a short dip does not zero the best directional
+    # (2026-08: hybrid-v1 at weight 0 while cold makers took 48%).
+    proven_floor = float(getattr(config, "PORTFOLIO_PROVEN_FLOOR", 0.06))
+    proven_min_n = int(getattr(config, "PORTFOLIO_PROVEN_MIN_TRADES", 25))
+    if proven_floor > 0 and free_names:
+        need_boost: dict[str, float] = {}
+        for n in free_names:
+            if n in explorers:
+                continue
+            m = metrics.get(n) or {}
+            n_tr = int(m.get("n") or 0)
+            total_pnl = float(m.get("total_pnl") or 0.0)
+            if n_tr >= proven_min_n and total_pnl >= 0:
+                if float(weights.get(n, 0.0)) < proven_floor:
+                    need_boost[n] = proven_floor - float(weights.get(n, 0.0))
+        if need_boost:
+            boost_sum = sum(need_boost.values())
+            # Take from over-weight free bots (not locked, not under floor)
+            donors = [
+                n for n in free_names
+                if n not in need_boost
+                and float(weights.get(n, 0.0)) > proven_floor + 1e-9
+            ]
+            donor_extra = sum(
+                max(0.0, float(weights[n]) - proven_floor) for n in donors
+            )
+            if donor_extra > 1e-9 and boost_sum > 0:
+                take = min(boost_sum, donor_extra)
+                for n in donors:
+                    extra = max(0.0, float(weights[n]) - proven_floor)
+                    cut = take * (extra / donor_extra)
+                    weights[n] = float(weights[n]) - cut
+                for n, need in need_boost.items():
+                    weights[n] = float(weights[n]) + take * (need / boost_sum)
+
     s = sum(weights.values()) or 1.0
     weights = {k: round(v / s, 6) for k, v in weights.items()}
 

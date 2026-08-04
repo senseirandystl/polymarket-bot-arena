@@ -72,6 +72,36 @@ def test_session_scopes_to_session_start(db):
     assert db.get_dashboard_stats()["all_time"]["trades"] == 3
 
 
+def test_current_bots_excludes_retired_roster(db):
+    """Current Bots = all-time stats for active bots only (not retired)."""
+    with db.get_conn() as conn:
+        conn.execute(
+            """INSERT INTO bot_configs
+               (bot_name, strategy_type, generation, params, active)
+               VALUES ('live-a', 'momentum', 0, '{}', 1)"""
+        )
+        conn.execute(
+            """INSERT INTO bot_configs
+               (bot_name, strategy_type, generation, params, active, retired_at)
+               VALUES ('dead-b', 'hybrid', 0, '{}', 0, '2026-07-12 12:00:00')"""
+        )
+    _insert(db, "live-a", "win", 5.0, "2026-07-12 10:00:00", "2026-07-12 10:05:00")
+    _insert(db, "live-a", "loss", -1.0, "2026-07-12 11:00:00", "2026-07-12 11:05:00")
+    _insert(db, "dead-b", "loss", -20.0, "2026-07-12 10:30:00", "2026-07-12 10:35:00")
+    _insert(db, "dead-b", None, None, "2026-07-12 11:30:00")  # pending retired
+
+    stats = db.get_dashboard_stats()
+    cur = stats["current_bots"]
+    assert cur["trades"] == 2
+    assert cur["pending"] == 0
+    assert cur["pnl"] == pytest.approx(4.0)
+    assert cur["wins"] == 1
+    assert cur["losses"] == 1
+    # All-time still includes the retired bot.
+    assert stats["all_time"]["trades"] == 3
+    assert stats["all_time"]["pnl"] == pytest.approx(-16.0)
+
+
 def test_recent_trades_orders_pending_first(db):
     # Many resolved trades, then a couple pending ones placed earlier in time.
     for i in range(30):

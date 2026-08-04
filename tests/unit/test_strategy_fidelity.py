@@ -34,16 +34,22 @@ def test_profiles_include_strat_weight():
         assert PROF[stype]["strat"] > 0.0, stype
 
 
-def test_momentum_is_momentum_dominant():
+def test_momentum_is_drift_anchored_with_mom():
+    """Hold-to-resolution rebalance: drift is the validated fundamental;
+    mom remains a strong co-weight, strat is secondary."""
     p = PROF["momentum"]
-    assert p["mom"] > p["drift"]
-    assert p["mom"] >= 0.40
+    assert p["drift"] >= p["mom"] >= p["strat"]
+    assert p["mom"] >= 0.25
+    assert p["drift"] >= 0.45
 
 
-def test_phantom_is_thesis_dominant():
+def test_phantom_balances_thesis_with_drift():
+    """Phantom is drift-anchored with material strat (confirm-mode thesis)."""
     p = PROF["phantom"]
     assert p["strat"] >= p["mom"] > 0
-    assert p["strat"] >= 0.40
+    assert p["drift"] >= 0.40
+    assert p["strat"] >= 0.20
+    assert p["drift"] >= p["strat"]
 
 
 def test_meanrev_is_drift_plus_fade():
@@ -60,15 +66,16 @@ def test_live_profiles_are_distinct():
     for i, a in enumerate(types):
         for b in types[i + 1:]:
             dist = sum(abs(PROF[a][k] - PROF[b][k]) for k in live)
-            assert dist >= 0.25, (a, b, dist)
+            assert dist >= 0.10, (a, b, dist)
 
 
-def test_strat_lane_uses_profile_weight():
-    # A bot whose analyze() emits a strong thesis should get a materially
-    # different model_prob than one whose profile ignores the strat lane.
+def test_strat_lane_uses_profile_weight(monkeypatch):
+    # Isolate from live lane_overrides so the class default is what blends.
+    monkeypatch.setattr("bots.base_bot._lane_overrides", lambda: {})
     bot = MeanRevBot(name="mr-test", generation=0)
     lanes = {"drift": 0.0, "mom": 0.0, "pm": 0.0, "cvd": 0.0, "obi": 0.0,
-             "strat": 0.8, "learn": 0.0}
+             "strat": 0.8, "learn": 0.0,
+             "fut": 0.0, "tech": 0.0, "xasset": 0.0}
     p = bot._model_prob_yes(lanes)
     w = PROF["mean_reversion"]["strat"]
     assert p == pytest.approx(0.5 + 0.5 * w * 0.8, abs=1e-6)

@@ -105,6 +105,31 @@ def test_tournament_selects_fittest():
     assert winner["fitness"] == 9
 
 
+def test_tournament_select_pair_prefers_distinct():
+    rng = random.Random(0)
+    pop = [
+        {"fitness": 0.9, "name": "a", "params": {"x": 1}},
+        {"fitness": 0.5, "name": "b", "params": {"x": 2}},
+        {"fitness": 0.3, "name": "c", "params": {"x": 3}},
+    ]
+    for _ in range(20):
+        p1, p2, self_pair = ops.tournament_select_pair(pop, k=2, rng=rng)
+        assert not self_pair
+        assert p1["name"] != p2["name"]
+
+
+def test_tournament_select_pair_self_when_monoculture():
+    pop = [
+        {"fitness": 0.9, "name": "phantom-v1", "params": {"ema_fast": 9}},
+        # Gene-bank clone shares the same name → same identity
+        {"fitness": 0.9, "name": "phantom-v1", "params": {"ema_fast": 9},
+         "from_gene_bank": True},
+    ]
+    p1, p2, self_pair = ops.tournament_select_pair(pop, k=2, rng=random.Random(1))
+    assert self_pair is True
+    assert p1["name"] == p2["name"] == "phantom-v1"
+
+
 def test_elite_indices_top_n():
     fits = [0.1, 0.9, 0.5, 0.8]
     idx = ops.elite_indices(fits, 2)
@@ -306,7 +331,16 @@ def test_ga_cycle_replaces_loser_keeps_elite(monkeypatch):
     # Lineage present on spawn
     spawn = report["spawned"][0]
     assert spawn["parents"]
-    assert "crossover" in (spawn["operator"] or "") or spawn["operator"] == "fallback"
+    op = spawn["operator"] or ""
+    assert (
+        spawn.get("breed_mode") in (
+            "crossover+adaptive", "clone+mutate", "defaults+adaptive", "fallback",
+        )
+        or "crossover" in op
+        or "clone" in op
+        or "defaults" in op
+        or op == "fallback"
+    )
     assert spawn["lineage"]
     # Gene bank recorded the elite
     assert report.get("gene_bank_size", 0) >= 1
@@ -523,6 +557,131 @@ def test_type_alloc_disabled_returns_dead(monkeypatch):
     from evolution.type_alloc import pick_strategy_type
     monkeypatch.setattr(config, "GA_TYPE_ALLOC_ENABLED", False, raising=False)
     assert pick_strategy_type("sniper", [{"strategy_type": "hybrid", "fitness": 1}], []) == "sniper"
+
+
+def test_type_alloc_exclude_types(monkeypatch):
+    from evolution.type_alloc import pick_strategy_type
+    monkeypatch.setattr(config, "GA_TYPE_ALLOC_ENABLED", True, raising=False)
+    monkeypatch.setattr(config, "GA_TYPE_STICKINESS", 0.0, raising=False)
+    monkeypatch.setattr(config, "GA_TYPE_ALLOC_TEMPERATURE", 0.2, raising=False)
+    # Strong hybrid fitness — but hybrid excluded → never pick hybrid
+    inds = [
+        {"strategy_type": "hybrid", "fitness": 1.0},
+        {"strategy_type": "momentum", "fitness": 0.2},
+    ]
+    rng = random.Random(0)
+    picks = [
+        pick_strategy_type(
+            "momentum", inds, [], rng=rng, exclude_types={"hybrid"},
+        )
+        for _ in range(40)
+    ]
+    assert "hybrid" not in picks
+
+
+def test_ga_cross_type_uses_defaults_not_foreign_params(monkeypatch):
+    """Phantom monoculture must not write min_confidence into hybrid children."""
+    monkeypatch.setattr(config, "MIN_TRADES_FOR_JUDGMENT", 10, raising=False)
+    monkeypatch.setattr(config, "GA_ELITE_COUNT", 1, raising=False)
+    monkeypatch.setattr(config, "EVOLUTION_BE_GAP_MIN", 0.03, raising=False)
+    monkeypatch.setattr(config, "GA_TYPE_ALLOC_ENABLED", False, raising=False)
+    monkeypatch.setattr(config, "GA_BACKTEST_GATE_ENABLED", False, raising=False)
+    monkeypatch.setattr(config, "GA_RECENCY_WEIGHTING", False, raising=False)
+    monkeypatch.setattr(config, "GA_ADAPTIVE_MUTATION", False, raising=False)
+    monkeypatch.setattr(config, "GA_MUTATION_RATE", 0.0, raising=False)
+    monkeypatch.setattr(config, "GA_MAX_PER_TYPE_PER_CYCLE", 2, raising=False)
+
+    from bots.bot_hybrid import DEFAULT_PARAMS as HYBRID_DEFAULTS
+
+    elite = FakeBot(
+        "phantom-v1", "phantom",
+        {"pnl": 40.0, "wr": 0.65, "trades": 40, "gap": 0.12},
+        params={
+            "ema_fast": 9, "ema_slow": 26, "atr_period": 10,
+            "breakout_lookback": 10, "min_atr_pct": 0.0002,
+            "max_atr_pct": 0.01, "position_size_pct": 0.06,
+            "min_confidence": 0.20, "regime_conf_weight": 0.3,
+        },
+    )
+    # Culled hybrid — type alloc off keeps hybrid type
+    loser = FakeBot(
+        "hybrid-v1", "hybrid",
+        {"pnl": -50.0, "wr": 0.40, "trades": 50, "gap": -0.10},
+        params=dict(HYBRID_DEFAULTS),
+    )
+    bots = [elite, loser]
+    _patch_ga_db(monkeypatch, bots)
+
+    def factory(strategy_type, name, params, generation, lineage):
+        b = SpawnBot(name, strategy_type,
+                     {"pnl": 0, "wr": 0, "trades": 0}, params=params,
+                     generation=generation)
+        b.lineage = lineage
+        return b
+
+    result, report = run_ga_cycle(
+        bots, cycle_number=4,
+        bot_factory=factory,
+        validate_fn=lambda b: True,
+        rng=random.Random(0),
+    )
+    spawn = report["spawned"][0]
+    assert spawn["strategy_type"] == "hybrid"
+    assert spawn.get("breed_mode") == "defaults+adaptive"
+    # min_confidence must stay at hybrid default (0.5), NOT phantom's 0.2
+    assert spawn["params"]["min_confidence"] == pytest.approx(
+        HYBRID_DEFAULTS["min_confidence"]
+    )
+    assert "defaults" in (spawn["lineage"] or "")
+
+
+def test_ga_caps_duplicate_types_per_cycle(monkeypatch):
+    """Two open slots must not both become hybrid when max_per_type=1."""
+    monkeypatch.setattr(config, "MIN_TRADES_FOR_JUDGMENT", 10, raising=False)
+    monkeypatch.setattr(config, "GA_ELITE_COUNT", 1, raising=False)
+    monkeypatch.setattr(config, "EVOLUTION_BE_GAP_MIN", 0.03, raising=False)
+    monkeypatch.setattr(config, "GA_TYPE_ALLOC_ENABLED", True, raising=False)
+    # High stickiness to hybrid would otherwise double-spawn hybrid
+    monkeypatch.setattr(config, "GA_TYPE_STICKINESS", 0.95, raising=False)
+    monkeypatch.setattr(config, "GA_BACKTEST_GATE_ENABLED", False, raising=False)
+    monkeypatch.setattr(config, "GA_RECENCY_WEIGHTING", False, raising=False)
+    monkeypatch.setattr(config, "GA_MAX_PER_TYPE_PER_CYCLE", 1, raising=False)
+
+    elite = FakeBot(
+        "phantom-v1", "phantom",
+        {"pnl": 40.0, "wr": 0.65, "trades": 40, "gap": 0.12},
+        params={"min_confidence": 0.2, "position_size_pct": 0.06,
+                "ema_fast": 9, "ema_slow": 26},
+    )
+    losers = [
+        FakeBot("hybrid-v1", "hybrid",
+                {"pnl": -40.0, "wr": 0.40, "trades": 40, "gap": -0.10}),
+        FakeBot("momentum-v1", "momentum",
+                {"pnl": -35.0, "wr": 0.42, "trades": 40, "gap": -0.08}),
+    ]
+    bots = [elite] + losers
+    _patch_ga_db(monkeypatch, bots)
+
+    def factory(strategy_type, name, params, generation, lineage):
+        b = SpawnBot(name, strategy_type,
+                     {"pnl": 0, "wr": 0, "trades": 0}, params=params or {},
+                     generation=generation)
+        b.lineage = lineage
+        return b
+
+    _, report = run_ga_cycle(
+        bots, cycle_number=5,
+        bot_factory=factory,
+        validate_fn=lambda b: True,
+        rng=random.Random(42),
+    )
+    types = [s["strategy_type"] for s in report["spawned"]]
+    assert len(types) == 2
+    # No strategy type may appear more than once among spawns (cap=1 and
+    # phantom already occupies the phantom slot as elite survivor).
+    from collections import Counter
+    counts = Counter(types)
+    assert max(counts.values()) <= 1, counts
 
 
 def test_frozen_genes_skip_volume_and_kelly():

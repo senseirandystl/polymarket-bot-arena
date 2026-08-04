@@ -59,3 +59,18 @@ def test_skips_flat_drift():
     }
     d = bot.make_decision(market, _signals(drift=0.02))
     assert d["action"] in ("skip", "hold")
+
+
+def test_skips_wide_ask_mid_spread():
+    """Mid looks lagging but ask has already re-priced — refuse the fill."""
+    bot = SniperBot(name="sniper-test")
+    market = {
+        "current_price": 0.54,   # mid still "lags"
+        "no_price": 0.46,
+        "yes_ask": 0.75,         # executable ask far above mid
+        "no_ask": 0.47,
+        "time_remaining_seconds": 120,
+    }
+    d = bot.make_decision(market, _signals(drift=0.40))
+    assert d["action"] in ("skip", "hold")
+    assert "ask gap" in (d.get("reasoning") or "").lower() or d["action"] != "buy"

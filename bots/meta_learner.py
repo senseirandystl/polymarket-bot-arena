@@ -183,8 +183,12 @@ class HybridMetaLearner:
                          AND bot_name LIKE ? AND reasoning LIKE '%meta(%'""",
                     (self.name_prefix + "%",)).fetchone()
                 pending_min = pending["mid"] if pending else None
+                # Hold-to-resolution + optional TP/SL exits: any resolved
+                # directional outcome teaches the learner. exit_tp/exit_sl
+                # count as win/loss of the held side.
                 q = """SELECT id, side, outcome, reasoning FROM trades
-                       WHERE id > ? AND outcome IN ('win', 'loss')
+                       WHERE id > ? AND outcome IN (
+                           'win', 'loss', 'exit_tp', 'exit_sl')
                          AND bot_name LIKE ? AND reasoning LIKE '%meta(%'"""
                 args = [last_id, self.name_prefix + "%"]
                 if pending_min is not None:
@@ -204,7 +208,11 @@ class HybridMetaLearner:
                 votes, bucket = parsed
                 if bucket not in BUCKETS:
                     bucket = "mixed"
-                market_up = (r["side"] == "yes") == (r["outcome"] == "win")
+                # Market went UP iff a YES trade won (or TP'd) or a NO trade lost.
+                side = (r["side"] or "").lower()
+                out = (r["outcome"] or "").lower()
+                won = out in ("win", "exit_tp")
+                market_up = (side == "yes") == won
                 for sub, vote in votes.items():
                     if abs(vote) < self.deadband:
                         continue  # this sub abstained
@@ -219,6 +227,9 @@ class HybridMetaLearner:
                         rec["correct"] += int(correct)
                 processed += 1
             if rows:
+                # Advance past the last *processed* id that had a parseable
+                # meta token; still advance to max scanned so unparseable
+                # rows don't permanently block the cursor.
                 state["last_trade_id"] = max(r["id"] for r in rows)
             if processed:
                 state["updated_at"] = time.strftime(

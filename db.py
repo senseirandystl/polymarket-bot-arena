@@ -646,13 +646,36 @@ def get_evolution_history(limit=20):
 
 
 def log_ga_generation(cycle_number: int, report: dict) -> None:
-    """Persist a full GA cycle report for dashboard / offline analysis."""
+    """Persist a full GA cycle report for dashboard / offline analysis.
+
+    Rank-normalized fitness means ~0.5 by construction; prefer raw composites
+    for the stored best/mean columns when present so history curves move.
+    """
     individuals = report.get("individuals") or []
-    best = max((i.get("fitness", 0.0) for i in individuals), default=0.0)
-    mean = (
-        sum(i.get("fitness", 0.0) for i in individuals) / len(individuals)
-        if individuals else 0.0
-    )
+    # Prefer raw composites when the report/persist path attached them.
+    if report.get("mean_raw_fitness") is not None:
+        mean = float(report["mean_raw_fitness"])
+        best = float(report.get("best_raw_fitness")
+                     or report.get("best_fitness") or 0.0)
+    else:
+        try:
+            from evolution.fitness import composite_from_raw
+            raws = []
+            for i in individuals:
+                comps = i.get("components") or {}
+                if comps:
+                    raws.append(float(composite_from_raw(comps)))
+            if raws:
+                mean = sum(raws) / len(raws)
+                best = max(raws)
+            else:
+                raise ValueError("no raw")
+        except Exception:
+            best = max((i.get("fitness", 0.0) for i in individuals), default=0.0)
+            mean = (
+                sum(i.get("fitness", 0.0) for i in individuals) / len(individuals)
+                if individuals else 0.0
+            )
     # Strip non-JSON-safe live bot refs if any leaked in
     safe_report = {
         k: v for k, v in report.items()
@@ -836,18 +859,37 @@ def get_dashboard_stats():
         # booted (session_start written to arena_state on startup) — which may
         # be shorter or longer than a calendar day; it is omitted when no
         # session has been recorded (e.g. arena never started this DB).
+        # "Current Bots" is all-time stats restricted to the live (active)
+        # roster — excludes retired bots still present in all-time totals.
         today_start = et_day_start_utc(0)
         week_start = et_day_start_utc(6)
         session_start = get_arena_state("session_start")
+        active_names = [
+            r["bot_name"] for r in conn.execute(
+                "SELECT bot_name FROM bot_configs WHERE active=1"
+            ).fetchall()
+            if r["bot_name"]
+        ]
 
         # `trades` counts only RESOLVED trades (win/loss/expired); `pending`
         # (outcome IS NULL) is reported separately so the dashboard can render
         # e.g. "229 +2". 1h-stale-expired trades (outcome='expired', pnl=0)
         # count as resolved — they are real paper trades Simmer could not
         # settle in time, contributing 0 to P&L and to neither win nor loss.
-        def _period(since):
-            clause = "WHERE created_at>=?" if since else ""
-            params = (since,) if since else ()
+        def _period(since=None, bot_names=None):
+            conds = []
+            params: list = []
+            if since:
+                conds.append("created_at>=?")
+                params.append(since)
+            if bot_names is not None:
+                if not bot_names:
+                    return {"trades": 0, "pending": 0, "pnl": 0.0,
+                            "wins": 0, "losses": 0}
+                placeholders = ",".join("?" * len(bot_names))
+                conds.append(f"bot_name IN ({placeholders})")
+                params.extend(bot_names)
+            clause = ("WHERE " + " AND ".join(conds)) if conds else ""
             row = conn.execute(f"""
                 SELECT
                     SUM(CASE WHEN outcome IS NOT NULL THEN 1 ELSE 0 END) as trades,
@@ -866,6 +908,7 @@ def get_dashboard_stats():
             "session": _period(session_start) if session_start else None,
             "today": _period(today_start),
             "week": _period(week_start),
+            "current_bots": _period(bot_names=active_names),
             "all_time": _period(None),
         }
 
