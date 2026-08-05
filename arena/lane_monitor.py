@@ -37,9 +37,14 @@ logger = logging.getLogger("arena.lane_monitor")
 
 # Raw candidate reads as logged by base_bot.make_decision. The reasoning
 # token for xasset is "xa" — map it back to the lane name.
+# Extended cand(...) token (2026-08): lag / ms / fd optional for back-compat.
 _CAND_RE = re.compile(
-    r"cand\(fut=([+-][\d.]+) tech=([+-][\d.]+) xa=([+-][\d.]+)\)")
-_LANE_GROUP = {"fut": 1, "tech": 2, "xasset": 3}
+    r"cand\(fut=([+-][\d.]+) tech=([+-][\d.]+) xa=([+-][\d.]+)"
+    r"(?: lag=([+-][\d.]+))?(?: ms=([+-][\d.]+))?(?: fd=([+-][\d.]+))?\)")
+_LANE_GROUP = {
+    "fut": 1, "tech": 2, "xasset": 3,
+    "lag": 4, "ms_mom": 5, "flow_decay": 6,
+}
 
 
 def _lane_accuracy(rows, lane: str, deadband: float) -> dict:
@@ -54,6 +59,8 @@ def _lane_accuracy(rows, lane: str, deadband: float) -> dict:
     direction and ``1 - entry_price`` as a proxy for the other side.
     """
     import polymarket_fills
+    if lane not in _LANE_GROUP:
+        return {"n": 0, "accuracy": None, "net_edge": None}
     group = _LANE_GROUP[lane]
     n = correct = 0
     edge_sum = 0.0
@@ -61,7 +68,13 @@ def _lane_accuracy(rows, lane: str, deadband: float) -> dict:
         m = _CAND_RE.search(r["reasoning"] or "")
         if not m:
             continue
-        reading = float(m.group(group))
+        try:
+            raw = m.group(group)
+        except IndexError:
+            continue
+        if raw is None:
+            continue
+        reading = float(raw)
         if abs(reading) < deadband:
             continue
         market_up = (r["side"] == "yes") == (r["outcome"] == "win")
@@ -106,9 +119,11 @@ def check_lanes() -> dict:
 
     min_trades = getattr(config, "LANE_MONITOR_MIN_TRADES", 50)
     min_acc = getattr(config, "LANE_MONITOR_MIN_ACCURACY", 0.53)
+    min_net = getattr(config, "LANE_MONITOR_MIN_NET_EDGE", 0.0)
     deadband = getattr(config, "LANE_MONITOR_DEADBAND", 0.05)
     fast_n = getattr(config, "LANE_MONITOR_FAST_DEMOTE_MIN_TRADES", 20)
     fast_acc = getattr(config, "LANE_MONITOR_FAST_DEMOTE_MAX_ACC", 0.45)
+    fast_net = getattr(config, "LANE_MONITOR_FAST_DEMOTE_MAX_NET_EDGE", -0.02)
 
     with db.get_conn() as conn:
         for lane, ov in enabled.items():
@@ -122,42 +137,64 @@ def check_lanes() -> dict:
                 since = ov.get("approved_at") or "1970-01-01"
                 dec = candidate_lane_attribution(
                     conn, lane, deadband, since=since)
+                # Prefer decision_events only when the lane has a column and
+                # samples; new lanes (lag/ms_mom/flow_decay) fall through to
+                # trade cand(...) parse until decision_events schema expands.
                 if (dec.get("n") or 0) > 0:
                     stats = dec
             except Exception:
                 stats = None
-            if stats is None:
+            if stats is None or (stats.get("n") or 0) == 0:
                 rows = conn.execute(
                     """SELECT side, outcome, reasoning, entry_price FROM trades
                        WHERE outcome IN ('win', 'loss') AND created_at >= ?
                          AND reasoning LIKE '%cand(%'""",
                     (ov.get("approved_at") or "1970-01-01",),
                 ).fetchall()
-                stats = _lane_accuracy(rows, lane, deadband)
+                parsed = _lane_accuracy(rows, lane, deadband)
+                if (parsed.get("n") or 0) > 0 or stats is None:
+                    stats = parsed
             verdict = "collecting"
+            acc = stats.get("accuracy")
+            net = stats.get("net_edge")
             if stats["n"] >= min_trades:
-                if stats["accuracy"] is not None and stats["accuracy"] >= min_acc:
+                # Demote if accuracy OR net edge fails (house rule: net edge).
+                acc_ok = acc is not None and acc >= min_acc
+                net_ok = net is None or float(net) > float(min_net)
+                if acc_ok and net_ok:
                     verdict = "healthy"
                 else:
                     verdict = "disabled"
-            elif (stats["n"] >= fast_n
-                  and stats["accuracy"] is not None
-                  and stats["accuracy"] < fast_acc):
-                # Catastrophic live accuracy — demote before the full sample.
-                verdict = "disabled"
-                stats = {**stats, "fast_demote": True}
+                    if not net_ok:
+                        stats = {**stats, "demote_reason": "net_edge"}
+                    elif not acc_ok:
+                        stats = {**stats, "demote_reason": "accuracy"}
+            elif stats["n"] >= fast_n:
+                bad_acc = acc is not None and acc < fast_acc
+                bad_net = net is not None and float(net) <= float(fast_net)
+                if bad_acc or bad_net:
+                    # Catastrophic live accuracy or EV — demote early.
+                    verdict = "disabled"
+                    stats = {**stats, "fast_demote": True,
+                             "demote_reason": "net_edge" if bad_net else "accuracy"}
             report[lane] = {**stats, "verdict": verdict,
                             "min_trades": min_trades, "min_accuracy": min_acc,
+                            "min_net_edge": min_net,
                             "fast_demote_n": fast_n, "fast_demote_acc": fast_acc}
 
     # Disabling writes arena_state — do it outside the read connection.
     for lane, r in report.items():
         if r["verdict"] == "disabled":
             db.disable_lane_override(lane)
+            acc_s = (f"{r['accuracy']:.1%}" if r.get("accuracy") is not None
+                     else "n/a")
+            net_s = (f"{r['net_edge']:+.4f}" if r.get("net_edge") is not None
+                     else "n/a")
             logger.warning(
-                f"Lane '{lane}' AUTO-DISABLED: live accuracy "
-                f"{r['accuracy']:.1%} over {r['n']} resolved trades "
-                f"(bar {r['min_accuracy']:.0%} after {r['min_trades']})"
+                f"Lane '{lane}' AUTO-DISABLED: acc={acc_s} net_edge={net_s} "
+                f"over {r['n']} resolved trades "
+                f"(acc bar {r['min_accuracy']:.0%} / net bar "
+                f"{r.get('min_net_edge', 0)}; reason={r.get('demote_reason')})"
             )
             try:
                 from arena.alerts import alert_lane_change

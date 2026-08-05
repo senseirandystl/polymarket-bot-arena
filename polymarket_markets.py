@@ -120,18 +120,23 @@ def _normalize(m: dict):
 # ---------------------------------------------------------------------------
 # Order book + fresh prices
 # ---------------------------------------------------------------------------
-def get_order_book(token_id: str | None) -> dict:
+def get_order_book(token_id: str | None, timeout: float | None = None) -> dict:
     """Fetch and NORMALIZE a token's CLOB order book.
 
     Polymarket returns bids ascending and asks descending (both worst→best), so
     ``bids[0]``/``asks[0]`` are the WORST prices — a trap the old client fell
     into. Here we sort explicitly: ``asks`` ascending (best/lowest first),
     ``bids`` descending (best/highest first), and expose ``best_bid``/``best_ask``.
+
+    ``timeout`` defaults to ``config.BOOK_FETCH_TIMEOUT_SEC`` (short) so the
+    warmer cannot stall for 15s on a hung CLOB; cold paths may pass longer.
     """
     if not token_id:
         return {"valid": False}
+    to = float(timeout if timeout is not None
+               else getattr(config, "BOOK_FETCH_TIMEOUT_SEC", 2.0))
     try:
-        resp = requests.get(f"{CLOB}/book", params={"token_id": token_id}, timeout=15)
+        resp = requests.get(f"{CLOB}/book", params={"token_id": token_id}, timeout=to)
         if resp.status_code != 200:
             return {"valid": False}
         b = resp.json()

@@ -24,8 +24,8 @@ from bots.bot_late_window_maker import LateWindowMakerBot
 from bots.bot_mean_rev import MeanRevBot
 from bots.bot_momentum import MomentumBot
 from bots.bot_phantom import PhantomBot
-from bots.bot_sentiment import SentimentBot
 from bots.bot_sniper import SniperBot
+from bots.bot_lag_residual import LagResidualBot
 
 
 def _check_contract(sig):
@@ -66,7 +66,6 @@ class TestStrategyDecisionBuilder:
 ALL_ANALYZE_BOTS = [
     (MomentumBot, "momentum"),
     (MeanRevBot, "meanrev"),
-    (SentimentBot, "sentiment"),
     (PhantomBot, "phantom"),
     (HybridBot, "hybrid"),
     (SniperBot, "sniper"),
@@ -74,6 +73,7 @@ ALL_ANALYZE_BOTS = [
     (BtcMakerBot, "btc-maker"),
     (LateWindowMakerBot, "lwm"),
     (FeeZoneMakerBot, "fzm"),
+    (LagResidualBot, "lag-residual"),
 ]
 
 
@@ -401,7 +401,7 @@ class TestHybridAttribution:
             vol_regime={"regime": "trending_up", "trend_score": 0.8}))
         _check_contract(sig)
         assert set(sig["signals"]["weights"]) == {
-            "momentum", "mean_rev", "sentiment", "phantom"}
+            "momentum", "mean_rev", "phantom"}
         assert sum(sig["signals"]["weights"].values()) == pytest.approx(1.0)
         if sig["action"] == "buy":
             assert sig["signals"]["votes"]  # at least one active sub

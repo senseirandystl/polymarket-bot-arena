@@ -409,10 +409,19 @@ def _mine_skip_soften(conn) -> dict[str, dict[str, Any]]:
            GROUP BY skip_reason"""
     ).fetchall()
 
+    never = frozenset(
+        str(x) for x in (getattr(config, "LEARNED_RULES_NEVER_SOFTEN", ()) or ())
+    )
+    require_pnl = bool(getattr(config, "LEARNED_RULES_SOFTEN_REQUIRE_PNL", True))
+    min_cf_pnl = float(getattr(config, "LEARNED_RULES_SOFTEN_MIN_CF_PNL", 0.0))
+
     out: dict[str, dict[str, Any]] = {}
     for r in rows:
         reason = (r["skip_reason"] or "").strip()
         if reason not in _SOFTENABLE_SKIPS:
+            continue
+        if reason in never:
+            # Hard block (dead_zone): never ease the largest historical $ leak.
             continue
         n = int(r["n"] or 0)
         if n < min_n:
@@ -420,8 +429,11 @@ def _mine_skip_soften(conn) -> dict[str, dict[str, Any]]:
         wins = int(r["wins"] or 0)
         cf_wr = wins / n if n else 0.0
         avg_hyp = float(r["avg_hyp"]) if r["avg_hyp"] is not None else 0.0
+        # Require positive counterfactual $ (hyp_pnl), not WR alone.
+        if require_pnl and avg_hyp <= min_cf_pnl and cf_wr >= high_cf:
+            continue
         # High CF WR + positive hyp → we incorrectly stood down → soften
-        if cf_wr >= high_cf and avg_hyp > 0:
+        if cf_wr >= high_cf and avg_hyp > min_cf_pnl:
             # Scale soften 0..max by how far above high_cf
             t = min(1.0, (cf_wr - high_cf) / max(1e-6, 0.20))
             soften = round(t * max_soften, 4)
@@ -861,6 +873,11 @@ def skip_softening(skip_reason: str | None) -> dict[str, Any]:
         return neutral
     reason = (skip_reason or "").strip()
     if not reason:
+        return neutral
+    never = frozenset(
+        str(x) for x in (getattr(config, "LEARNED_RULES_NEVER_SOFTEN", ()) or ())
+    )
+    if reason in never:
         return neutral
     try:
         global _soften_cache

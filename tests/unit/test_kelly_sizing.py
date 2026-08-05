@@ -48,9 +48,9 @@ def _decide(bankroll, yes, drift, fraction=0.25):
 
 def test_size_scales_with_bankroll():
     # Large bankrolls so size sits above POLYMARKET_MIN_SHARES floor.
-    # mid 0.60 is outside the coin-flip band so mid-band gate does not fire.
-    small = _decide(2000.0, 0.60, 0.5)
-    large = _decide(8000.0, 0.60, 0.5)
+    # mid 0.55: outside dead-zone, under extreme-drift lag ceiling (0.58).
+    small = _decide(2000.0, 0.55, 0.45)
+    large = _decide(8000.0, 0.55, 0.45)
     assert small["action"] == large["action"] == "buy", (
         small.get("reasoning"), large.get("reasoning"))
     assert large["suggested_amount"] > small["suggested_amount"] * 1.5
@@ -58,8 +58,8 @@ def test_size_scales_with_bankroll():
 
 def test_size_scales_with_edge_below_cap():
     # Stronger drift sizes bigger once above min-share floor.
-    weak = _decide(5000.0, 0.60, 0.35)
-    strong = _decide(5000.0, 0.60, 0.55)
+    weak = _decide(5000.0, 0.55, 0.30)
+    strong = _decide(5000.0, 0.55, 0.45)
     assert weak["action"] == strong["action"] == "buy", (
         weak.get("reasoning"), strong.get("reasoning"))
     assert strong["suggested_amount"] > weak["suggested_amount"]
@@ -68,7 +68,7 @@ def test_size_scales_with_edge_below_cap():
 def test_size_clamped_above_edge_cap():
     # Outsized raw edges get concave/capped sizing — not 1:1 with raw edge.
     from bots.edge_calibration import calibrated_sizing_edge
-    big = _decide(2000.0, 0.60, 0.9)
+    big = _decide(2000.0, 0.55, 0.45)
     assert big["action"] == "buy", big.get("reasoning")
     raw_edge = float(big["reasoning"].split("edge=")[1].split(" ")[0])
     se = calibrated_sizing_edge(raw_edge)
@@ -84,7 +84,7 @@ def test_kelly_fraction_math():
     from bots.edge_calibration import calibrated_sizing_edge
     bankroll = 2000.0
     fraction = 0.25
-    d = _decide(bankroll, 0.60, 0.9, fraction=fraction)
+    d = _decide(bankroll, 0.55, 0.45, fraction=fraction)
     assert d["action"] == "buy", d.get("reasoning")
     price = d["entry_price"]
     raw_edge = float(d["reasoning"].split("edge=")[1].split(" ")[0])
@@ -98,14 +98,14 @@ def test_size_uncapped_scales_past_old_per_trade_limit():
     # Caps removed 2026-07-17: with a big pool and strong edge the bet may
     # exceed the old $50 per-trade / 10%-of-balance limits (the paper venue's
     # shared-pool gate remains the only spend limit).
-    d = _decide(50000.0, 0.60, 0.95)
+    d = _decide(50000.0, 0.55, 0.45)
     assert d["action"] == "buy", d.get("reasoning")
     assert d["suggested_amount"] > config.PAPER_MAX_POSITION
 
 
 def test_kelly_fraction_scales_size_linearly():
-    quarter = _decide(5000.0, 0.60, 0.9, fraction=0.25)
-    full = _decide(5000.0, 0.60, 0.9, fraction=1.0)
+    quarter = _decide(5000.0, 0.55, 0.45, fraction=0.25)
+    full = _decide(5000.0, 0.55, 0.45, fraction=1.0)
     assert full["suggested_amount"] > 3.5 * quarter["suggested_amount"]
 
 

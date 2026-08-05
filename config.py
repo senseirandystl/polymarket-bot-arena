@@ -182,7 +182,7 @@ GA_REGIME_MATCH_BOOST = 1.5       # multiplier for trades stamped with live regi
 GA_ADAPTIVE_MUTATION = True       # tier-2: sample near elite cloud (TPE-ish)
 GA_ELITE_SAMPLE_RATE = 0.55       # P(sample from elite cloud vs local Gaussian)
 GA_BACKTEST_GATE_ENABLED = True   # promote only after offline backtest clears
-GA_BACKTEST_REQUIRED = False      # if True, reject spawn when history unavailable
+GA_BACKTEST_REQUIRED = True       # fail-closed: reject spawn when history unavailable
 GA_BACKTEST_MARKETS = 40          # recent resolved markets for the gate
 GA_BACKTEST_CACHE_SEC = 3600.0    # reuse fetched history within this TTL
 GA_BACKTEST_BEAT_BASELINE = True  # child must not be worse than replaced bot
@@ -405,7 +405,10 @@ NO_SIDE_STRATEGY_EDGE_MULT = {
     "mean_reversion": 1.05,
     "mean_reversion_tp": 1.15,
     "mean_reversion_sl": 1.15,
-    "sentiment": 1.25,
+    "lag_residual": 1.10,
+    "regime_specialist": 1.20,
+    "no_lag": 1.0,              # NO specialist — already NO-only
+    "true_maker": 1.20,
 }
 
 # --- Cheap underdog band (0.35–0.42): mild leak at 38% WR / −$23 ---
@@ -431,6 +434,16 @@ CVD_VOLUME_FLOOR = 200.0
 SIGNAL_WEIGHT_FUT = 0.0      # Binance perp funding/OI/taker delta (signals/futures_meta.py)
 SIGNAL_WEIGHT_TECH = 0.0     # MACD/Bollinger/multi-TF composite (signals/technicals.py)
 SIGNAL_WEIGHT_XASSET = 0.0   # ETH/SOL cross-asset confirmation (signals/cross_asset.py)
+# --- Expanded candidate lanes (2026-08 audit) — kill-switched until Lab ---
+# Logged in cand(...) and available via Signal Lab promote path. Same house
+# rule: no live weight without harness + live-shadow net edge.
+SIGNAL_WEIGHT_LAG = 0.0      # market-lag residual: drift-implied P − mid
+SIGNAL_WEIGHT_MS_MOM = 0.0   # multiscale 1m mom (signals/multiscale.py)
+SIGNAL_WEIGHT_FLOW_DECAY = 0.0  # time-decayed CVD (signals/flow.py)
+# Spread context (non-directional): widen min_edge when book is wide.
+SPREAD_EDGE_MULT_ENABLED = True
+SPREAD_EDGE_WIDE = 0.04      # spread fraction of mid above this → tax
+SPREAD_EDGE_MULT_MAX = 1.35  # max min_edge multiplier on very wide books
 # Macro-release caution (signals/macro_calendar.py) is NON-directional context:
 # above this smooth 0..1 caution score, directional takers stand down (same
 # philosophy as the session filter — "build the skip, default flat").
@@ -446,12 +459,16 @@ MACRO_CAUTION_SKIP = 0.75
 # carry adverse-selection and stale-mid optimism the live tape doesn't).
 LANE_MONITOR_MIN_TRADES = 50        # resolved readings before a verdict
 LANE_MONITOR_MIN_ACCURACY = 0.53    # live sign-vs-outcome accuracy to stay live
+# Demote when live shadow net edge is below this (even if accuracy is OK).
+# Matches the house rule: predictive but priced-in lanes must lose weight.
+LANE_MONITOR_MIN_NET_EDGE = 0.0     # ≤ 0¢/share after fee → demote at full sample
 LANE_MONITOR_DEADBAND = 0.05        # |reading| below this = no directional read
 LANE_MONITOR_INTERVAL_SEC = 1800    # check cadence (piggybacks the evolution loop)
 # Fast demote: don't wait for the full sample if a newly-live lane is clearly
 # anti-predictive (fut post-approval ran ~38% at n=21 while still "collecting").
 LANE_MONITOR_FAST_DEMOTE_MIN_TRADES = 20
 LANE_MONITOR_FAST_DEMOTE_MAX_ACC = 0.45
+LANE_MONITOR_FAST_DEMOTE_MAX_NET_EDGE = -0.02  # strongly negative EV early
 
 # --- Auto-validation scheduler (arena/validation_scheduler.py) ---
 # Runs tools/validate_signals.py --propose from inside the arena every
@@ -485,6 +502,10 @@ AUTO_APPROVE_MIN_ACCURACY = 0.55  # live sign-vs-outcome accuracy to auto-promot
 # accuracy — accuracy alone promoted fut at ~55% that later scored ~38% live.
 AUTO_APPROVE_MIN_NET_EDGE = 0.005  # +0.5¢/share on shadow follow-the-sign
 AUTO_APPROVE_MAX_ACTIVE = 3       # cap on simultaneously-enabled CANDIDATE lanes
+# Core-lane tuner apply toggle — SEPARATE from auto-approve so operators can
+# freeze promotions without freezing drift/mom/strat weight nudges (and vice
+# versa). Boot default; live value in arena_state ``auto_core_tune``.
+AUTO_CORE_TUNE_ENABLED = True
 
 # --- Core-lane auto-tuner (arena/core_lane_tuner.py) — the loop's core half ---
 # The candidate-lane loop above tunes fut/tech/xasset (which feed a few bots at
@@ -589,13 +610,9 @@ DRIFT_VETO_MIN = 0.05
 # FLOW_ONLY_DRIFT_FULL_TRUST, so the mid band pays a graduated tax instead of
 # a cliff-edge free pass. DRIFT_VETO_MIN (0.05) is unchanged — contradicting
 # even a small drift reading is still vetoed outright regardless of this scale.
-# 2026-07-21 (data-gathering): loosened 2.0 -> 1.5. The full 2.0x tax + the
-# fee-net MIN_EDGE floors + conviction scaling stacked into a ~6.5pt model-vs-ask
-# bar that produced ~63k no_edge skips per ~12 trades (run starved of evaluation
-# data). This partially reopens the moderate-drift band for measurement; the
-# drift-veto, dead-zone, consensus and book-sum guards are unchanged. Revert to
-# 2.0 once enough trades accumulate to judge per-drift-band P&L live.
-FLOW_ONLY_EDGE_MULT_MAX = 1.5
+# Re-tightened to 2.0 after data-gathering window (2026-08 audit): the
+# graduated mid-band tax is required; 1.5× left too much mid-drift noise.
+FLOW_ONLY_EDGE_MULT_MAX = 2.0
 # Full flow-only tax lifts only once |drift| reaches this. Live soak (2026-08):
 # profit concentrated at |drift| ≥ 0.20; 0.10–0.20 was barely BE. Was 0.30
 # conceptually; keep 0.25 as the practical full-trust floor (tax still
@@ -644,11 +661,9 @@ DRIFT_EXTREME_MAX_SIDE_MID = 0.58
 # leaving the validated market-lags-drift rule (+19.5c/share offline, model
 # lean >= 0.10) at full trust. 0.10 = the lean where trust saturates; a
 # drift-0.5 reading (lean 0.1125 on the momentum profile) keeps full trust.
-# 2026-07-21 (data-gathering): lowered 0.10 -> 0.06 so trust_eff saturates at a
-# moderate lean (0.06) instead of 0.10, giving moderate-conviction models real
-# edge instead of near-zero. Part of the loosening to un-starve the dataset (see
-# FLOW_ONLY_EDGE_MULT_MAX note); revert to 0.10 after the eval window.
-MODEL_CONVICTION_SCALE = 0.06
+# Full trust at lean ≥ 0.10 (validated market-lags-drift band). Re-tightened
+# from the 0.06 data-gathering value (2026-08 audit).
+MODEL_CONVICTION_SCALE = 0.10
 # Hard model-lean floor (BUG #27, 2026-07-17 evening run). Conviction-scaled
 # trust DAMPED weak models but still let them trade into large market
 # displacement (a trust_eff=0.03 trade is in the log). Below the floor the
@@ -944,6 +959,18 @@ ORDERFLOW_CACHE_SECONDS = 30      # (unused since Simmer removal; kept for compa
 # all trading-decision inputs — YES+NO prices, both books, OBI, CVD, PM
 # momentum — stay <=1s fresh. Lower = fresher but more HTTPS/sec to the CLOB.
 MARKET_DATA_INTERVAL_SEC = 1.0
+# CLOB book GET timeout (warmer path). Keep short so a hung CLOB cannot stall
+# the whole warm cycle; fail soft to last snapshot / invalid book.
+BOOK_FETCH_TIMEOUT_SEC = 2.0
+# Kill-switched feeds (CVD/PM) refresh on this slower cadence while their
+# global weights are 0 — frees the 1s cycle for books. When a lane is live
+# via override, warmer refreshes them every cycle again.
+SIGNAL_SLOW_REFRESH_SEC = 10.0
+# Trader skips the tick when warm data is older than this (or missing).
+# Never blocks the 1s tick on a cold refresh_price (15s timeout trap).
+WARM_MAX_AGE_SEC = 3.0
+# Shared-pool exposure headroom cache (invalidate on successful place).
+EXPOSURE_CACHE_TTL_SEC = 1.5
 
 # --- Hot-path DB caches ---
 # make_decision runs every 1s per bot and used to issue two SQLite queries each
@@ -958,6 +985,20 @@ BOT_MODE_CACHE_TTL_SEC = 3
 # guards only now — the warmer is effectively their sole caller and refreshes
 # every cycle, so their TTL is kept just under the warm interval.
 SIGNAL_CACHE_TTL_SEC = 0.8
+
+# --- Live ops ---
+# When any bot is live, require at least one alert channel (Telegram/Discord
+# webhook env or configured credentials). Fail-closed at startup so unattended
+# live never runs blind.
+LIVE_REQUIRE_ALERTS = True
+
+# --- Learned-rules skip bandit safety ---
+# Never soften dead-zone purely on counterfactual WR; require positive $ PnL
+# of the counterfactuals AND a non-flat drift band. Softening the largest
+# historical $ leak on WR alone re-opens BUG #31.
+LEARNED_RULES_SOFTEN_REQUIRE_PNL = True
+LEARNED_RULES_SOFTEN_MIN_CF_PNL = 0.0
+LEARNED_RULES_NEVER_SOFTEN = ("dead_zone",)  # hard block; drift gate is separate
 
 # Polymarket enforces a per-order minimum of 5 shares. Bet sizing floors the
 # spend so a trade always clears this (5 shares × price × buffer) — otherwise

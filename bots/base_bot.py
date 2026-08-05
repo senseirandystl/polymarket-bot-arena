@@ -60,6 +60,8 @@ def strategy_decision(action: str, side: str = "yes", *, edge: float = 0.0,
 _bankroll_cache: tuple = (0.0, 0.0)  # (ts, value)
 _kelly_cache: tuple = (0.0, 0.0)     # (ts, value)
 _lane_override_cache: tuple = (0.0, {})  # (ts, overrides dict)
+# Exposure headroom cache: (ts, {(market_id, side, mode): headroom})
+_exposure_cache: tuple = (0.0, {})
 
 
 def _lane_overrides() -> dict:
@@ -85,6 +87,12 @@ def _lane_overrides() -> dict:
 # bound), so the backtest runtime's isolation patch on `_lane_overrides`
 # reaches the lab too.
 get_lab().overrides_provider = lambda: _lane_overrides()
+
+
+def invalidate_exposure_cache() -> None:
+    """Bust exposure headroom cache after a successful place (all bots)."""
+    global _exposure_cache
+    _exposure_cache = (0.0, {})
 
 
 def _kelly_fraction() -> float:
@@ -181,7 +189,6 @@ class BaseBot(ABC):
         "mean_reversion_tp": 0.48,
         "sniper": 0.50,         # neutral — sniper uses its own rules
         "phantom": 0.52,        # trend-following
-        "sentiment": 0.50,      # neutral
         "hybrid": 0.50,         # neutral
     }
     # Per-strategy MODEL weight profile. Each lane arrives normalized to
@@ -214,36 +221,26 @@ class BaseBot(ABC):
     # (fut/tech/xasset are the 2026-07-18 candidate lanes — explicit 0.00 in
     # every profile so re-enabling a validated lane requires a DELIBERATE
     # per-strategy weight, never an accidental default-1.0 fallthrough.)
-    _DEAD_LANES = {"pm": 0.00, "cvd": 0.00, "obi": 0.00,
-                   "fut": 0.00, "tech": 0.00, "xasset": 0.00}
-    # momentum/hybrid REBALANCED (BUG #30, 2026-07-20): the 24h/279-trade run
-    # made momentum-v1 the worst-performing bot (-$31.85, 40.9% WR) and the
-    # hybrid family collectively negative across all 4 live generations
-    # (-$43 total) — both profiles lean heavily on the two lanes shown live to
-    # be currently harmful (mid-magnitude mom noise pushing model_prob into
-    # the toxic 0.10-0.30 drift band; high-confidence strat reads, see
-    # STRAT_LANE_CONF_CAP above). Shifted weight toward drift, the one lane
-    # that measured genuinely predictive at high magnitude (79.3% WR) and
-    # whose own conviction scaling (MODEL_CONVICTION_SCALE) already keeps it
-    # honest when uninformative — a smaller, conservative nudge, not a full
-    # re-derivation, pending a longer run to confirm the direction.
-    # Hold-to-resolution rebalance (2026-07-31 soak): intermediate candle
-    # patterns only help when they predict final BTC vs strike. Shift
-    # momentum/phantom toward drift (validated fundamental); cut strat
-    # weight so a noisy thesis cannot dominate; sentiment strat was only
-    # 56.7% live-acc at 0.9 tuner weight — lower default so tuner starts
-    # from a saner base.
-    # Strat weights lowered (2026-08): strat is confirmation-only (see
-    # config.STRAT_LANE_MODE), so profile mass shifts toward drift/mom.
+    _DEAD_LANES = {
+        "pm": 0.00, "cvd": 0.00, "obi": 0.00,
+        "fut": 0.00, "tech": 0.00, "xasset": 0.00,
+        "lag": 0.00, "ms_mom": 0.00, "flow_decay": 0.00,
+    }
+    # Strat is confirmation-only (config.STRAT_LANE_MODE); mass toward drift/mom.
+    # Sentiment strategy removed (2026-08 audit) — lanes stay kill-switched.
     STRATEGY_SIGNAL_PROFILE = {
         "momentum":          {"drift": 0.55, "mom": 0.30, "strat": 0.15, **_DEAD_LANES},
         "phantom":           {"drift": 0.50, "mom": 0.25, "strat": 0.25, **_DEAD_LANES},
         "mean_reversion":    {"drift": 0.75, "mom": 0.00, "strat": 0.25, **_DEAD_LANES},
         "mean_reversion_sl": {"drift": 0.75, "mom": 0.00, "strat": 0.25, **_DEAD_LANES},
         "mean_reversion_tp": {"drift": 0.75, "mom": 0.00, "strat": 0.25, **_DEAD_LANES},
-        "sentiment":         {"drift": 0.50, "mom": 0.00, "strat": 0.50, **_DEAD_LANES},
         "hybrid":            {"drift": 0.55, "mom": 0.20, "strat": 0.25, **_DEAD_LANES},
         "sniper":            {"drift": 0.55, "mom": 0.10, "strat": 0.10, **_DEAD_LANES},
+        # Menu-only strategies (not default slate)
+        "lag_residual":      {"drift": 0.70, "mom": 0.10, "strat": 0.20, **_DEAD_LANES},
+        "regime_specialist": {"drift": 0.60, "mom": 0.25, "strat": 0.15, **_DEAD_LANES},
+        "no_lag":            {"drift": 0.80, "mom": 0.00, "strat": 0.20, **_DEAD_LANES},
+        "true_maker":        {"drift": 0.60, "mom": 0.10, "strat": 0.10, **_DEAD_LANES},
     }
     DEFAULT_SIGNAL_PROFILE = {"drift": 0.55, "mom": 0.15, "strat": 0.15, **_DEAD_LANES}
     # How far fair value moves from the market mid toward the bot's own model.
@@ -257,8 +254,11 @@ class BaseBot(ABC):
         "mean_reversion_tp": 0.60,
         "sniper": 0.50,
         "phantom": 0.50,
-        "sentiment": 0.50,
         "hybrid": 0.50,
+        "lag_residual": 0.55,
+        "regime_specialist": 0.50,
+        "no_lag": 0.55,
+        "true_maker": 0.50,
     }
     # Minimum confidence to place a trade
     # (MIN_TRADE_CONFIDENCE removed 2026-07-17 — it was dead code: defined but
@@ -277,25 +277,25 @@ class BaseBot(ABC):
         "mean_reversion": 0.58,
         "mean_reversion_sl": 0.58,
         "mean_reversion_tp": 0.58,
-        # Overnight soak: momentum/phantom YES at high mids was a major leak;
-        # keep them on the same "market lags" side of the harness bar.
         "momentum": 0.62,
         "phantom": 0.62,
+        "lag_residual": 0.58,
+        "no_lag": 0.58,
+        "regime_specialist": 0.62,
     }
-    # 2026-07-21 (data-gathering): floors lowered (0.015->0.010, 0.02->0.012) to
-    # un-starve the evaluation dataset — the fee-net bar + flow tax + conviction
-    # scaling stacked into a ~6.5pt model-vs-ask requirement, yielding ~63k
-    # no_edge skips per ~12 trades. Safety guards (drift-veto, dead-zone,
-    # consensus, book-sum) are unchanged. Restore 0.015/0.02 after the window.
+    # Re-tightened after data-gathering (2026-08 audit) — fee-aware floors.
     MIN_EDGE = {
-        "momentum": 0.010,
-        "mean_reversion": 0.012,
-        "mean_reversion_sl": 0.012,
-        "mean_reversion_tp": 0.012,
-        "sniper": 0.012,
-        "phantom": 0.010,
-        "sentiment": 0.012,
-        "hybrid": 0.012,
+        "momentum": 0.015,
+        "mean_reversion": 0.020,
+        "mean_reversion_sl": 0.020,
+        "mean_reversion_tp": 0.020,
+        "sniper": 0.020,
+        "phantom": 0.015,
+        "hybrid": 0.020,
+        "lag_residual": 0.018,
+        "regime_specialist": 0.018,
+        "no_lag": 0.022,
+        "true_maker": 0.015,
     }
 
     def __init__(self, name, strategy_type, params, generation=0, lineage=None):
@@ -547,15 +547,10 @@ class BaseBot(ABC):
         except Exception:
             pass
 
-        # Stamp the structured market-context vector at decision time (Layer 1
-        # of the regime-discovery design — signals/context.py). Behavior-
-        # neutral: it is carried through to the trade row for later
-        # attribution and never feeds back into this decision. Never let a
-        # failure here block a trade.
-        try:
-            ctx_vec = build_context(sv.prices, signals, datetime.now(tz=timezone.utc))
-        except Exception:
-            ctx_vec = None
+        # Context vector is deferred until a buy is confirmed (CPU on skip path).
+        ctx_vec = None
+        # Hoist regime once for this decision (guards + reasoning reuse).
+        _regime_label = self.regime_context(signals).get("label")
         prior = self.STRATEGY_PRIORS.get(self.strategy_type, 0.5)
         learned_yes_bias = learning.get_learned_bias(self.name, features, prior)
         # Convert from 0-1 to -0.5 to +0.5
@@ -594,7 +589,7 @@ class BaseBot(ABC):
         try:
             from arena.regime_adapt import adjustments as _regime_adj
             _radj = _regime_adj(
-                self.regime_context(signals).get("label"),
+                _regime_label,
                 strategy_type=self.strategy_type,
             )
         except Exception:
@@ -650,7 +645,9 @@ class BaseBot(ABC):
                     "strat": strategy_signal, "model_prob": model_prob,
                     "fut": raw.get("fut_taker"), "tech": raw.get("tech_mtf"),
                     "xasset": raw.get("xasset"),
-                    "regime": self.regime_context(signals).get("label"),
+                    "lag": raw.get("lag"), "ms_mom": raw.get("ms_mom"),
+                    "flow_decay": raw.get("flow_decay"),
+                    "regime": _regime_label,
                 },
                 features=features,
                 entry_price=entry_price)
@@ -956,6 +953,18 @@ class BaseBot(ABC):
                     getattr(config, "NO_SIDE_UNDERDOG_EDGE_MULT", 1.35))
         if ud_lo <= side_mid_dz < ud_hi:
             min_edge *= float(getattr(config, "UNDERDOG_EDGE_MULT", 1.40))
+        # Wide-book size/skip tax: non-directional microstructure context.
+        if getattr(config, "SPREAD_EDGE_MULT_ENABLED", True):
+            try:
+                spread = float(raw.get("micro_spread") or sv.micro_spread or 0.0)
+                wide = float(getattr(config, "SPREAD_EDGE_WIDE", 0.04))
+                smax = float(getattr(config, "SPREAD_EDGE_MULT_MAX", 1.35))
+                if spread > wide and wide > 0:
+                    # Linear ramp from 1.0 at wide to smax at 2× wide.
+                    t = min(1.0, (spread - wide) / wide)
+                    min_edge *= 1.0 + (smax - 1.0) * t
+            except Exception:
+                pass
         try:
             from arena.learned_rules import skip_softening as _skip_soft
             _ne = _skip_soft("no_edge")
@@ -1013,7 +1022,7 @@ class BaseBot(ABC):
                 abs_drift=abs(float(drift_signal_val)),
                 side_mid=float(side_mid),
                 side=side,
-                regime_label=self.regime_context(signals).get("label"),
+                regime_label=_regime_label,
             )
         except Exception:
             confidence = min(0.95, max(0.0, float(chosen_edge)) * 3.0)
@@ -1087,16 +1096,24 @@ class BaseBot(ABC):
             f"of(obi={lanes['obi']:+.3f} cvd={lanes['cvd']:+.3f}) "
             # Raw candidate-lane reads (pre-kill-switch) — logged for the
             # offline validation dataset, they carry zero decision weight.
-            f"cand(fut={raw['fut_taker']:+.2f} "
-            f"tech={raw['tech_mtf']:+.2f} "
-            f"xa={raw['xasset']:+.2f}) "
+            f"cand(fut={raw.get('fut_taker', 0):+.2f} "
+            f"tech={raw.get('tech_mtf', 0):+.2f} "
+            f"xa={raw.get('xasset', 0):+.2f} "
+            f"lag={raw.get('lag', 0):+.2f} "
+            f"ms={raw.get('ms_mom', 0):+.2f} "
+            f"fd={raw.get('flow_decay', 0):+.2f}) "
             f"strat={strategy_signal:+.3f} "
             f"{target_shares:.2f}sh conf={confidence:.2f} "
-            f"reg={self.regime_context(signals).get('label', '?')} "
+            f"reg={_regime_label or '?'} "
             f"{blend.log_str()}"
         )
+        # Stamp context only on buys (deferred from skip path).
+        try:
+            ctx_vec = build_context(sv.prices, signals, datetime.now(tz=timezone.utc))
+        except Exception:
+            ctx_vec = None
         _meta_m = re.search(
-            r"meta\(mom=[+-][\d.]+ rev=[+-][\d.]+ sent=[+-][\d.]+ "
+            r"meta\(mom=[+-][\d.]+ rev=[+-][\d.]+ (?:sent=[+-][\d.]+ )?"
             r"ph=[+-][\d.]+ \| reg=\w+\)",
             raw_signal.get("reasoning") or "",
         )
@@ -1118,7 +1135,9 @@ class BaseBot(ABC):
                 # Raw candidate reads (pre kill-switch) for decision_events.
                 "fut": raw.get("fut_taker"), "tech": raw.get("tech_mtf"),
                 "xasset": raw.get("xasset"),
-                "regime": self.regime_context(signals).get("label"),
+                "lag": raw.get("lag"), "ms_mom": raw.get("ms_mom"),
+                "flow_decay": raw.get("flow_decay"),
+                "regime": _regime_label,
             },
             "suggested_amount": amount,
             "target_shares": target_shares,
@@ -1281,9 +1300,23 @@ class BaseBot(ABC):
 
         Long-term concentration control: correlation-weighted open exposure
         + hard max bots per (market, side) (MARKET_SIDE_MAX_BOTS).
+
+        Short TTL cache (EXPOSURE_CACHE_TTL_SEC) shared across bots on the
+        same tick; invalidated after every successful place.
         """
         if not market_id or side not in ("yes", "no"):
             return None
+        global _exposure_cache
+        now = time.time()
+        ttl = float(getattr(config, "EXPOSURE_CACHE_TTL_SEC", 1.5))
+        key = (str(market_id), side, mode, self.name)
+        cache_ts, cache_map = _exposure_cache
+        if (now - cache_ts) < ttl and key in cache_map:
+            return cache_map[key]
+        if (now - cache_ts) >= ttl:
+            cache_map = {}
+            cache_ts = now
+
         if mode == "live":
             cap_usd = 2.0 * config.LIVE_MAX_POSITION
         else:
@@ -1294,6 +1327,7 @@ class BaseBot(ABC):
             used = float(db.get_open_exposure(market_id, side, mode) or 0.0)
             n_bots = 0
         max_bots = int(getattr(config, "MARKET_SIDE_MAX_BOTS", 3) or 0)
+        headroom = cap_usd - used
         if max_bots > 0 and n_bots >= max_bots:
             # Already at thesis-cluster limit — no headroom for another bot
             # unless this bot already has a position (adding size).
@@ -1308,10 +1342,12 @@ class BaseBot(ABC):
                     ).fetchone()
                     mine = float((r["c"] if r else 0) or 0)
                 if mine <= 0:
-                    return 0.0
+                    headroom = 0.0
             except Exception:
-                return 0.0
-        return cap_usd - used
+                headroom = 0.0
+        cache_map[key] = headroom
+        _exposure_cache = (cache_ts, cache_map)
+        return headroom
 
     def _place_via_engine(self, signal, market, amount, mode) -> dict:
         """Delegate order placement to the paper or live venue engine.
@@ -1367,6 +1403,8 @@ class BaseBot(ABC):
             book=book,
             context=signal.get("context"),
         )
+        if res.success:
+            invalidate_exposure_cache()
         return {
             "success": res.success,
             "trade_id": res.trade_id,

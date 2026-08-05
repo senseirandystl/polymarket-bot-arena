@@ -828,6 +828,10 @@ def get_lane_proposals(_auth: str = Depends(verify_auth)):
         core_tuner = json.loads(db.get_arena_state("core_lane_tuner") or "{}")
     except (json.JSONDecodeError, TypeError):
         core_tuner = {}
+    try:
+        auto_core = db.get_auto_core_tune()
+    except Exception:
+        auto_core = db.get_auto_approve_lanes()
     return JSONResponse({
         "proposals": db.get_lane_proposals(),
         "overrides": db.get_lane_overrides(),
@@ -835,6 +839,7 @@ def get_lane_proposals(_auth: str = Depends(verify_auth)):
         "monitor": monitor,
         "core_tuner": core_tuner,
         "auto_approve": db.get_auto_approve_lanes(),
+        "auto_core_tune": auto_core,
     })
 
 
@@ -862,6 +867,63 @@ async def set_lane_auto_approve(request: Request,
     enabled = bool(body.get("enabled"))
     db.set_auto_approve_lanes(enabled)
     return JSONResponse({"success": True, "auto_approve": enabled})
+
+
+@app.post("/api/lane-auto-core-tune")
+async def set_lane_auto_core_tune(request: Request,
+                                  _auth: str = Depends(verify_auth)):
+    """Flip core-lane tuner apply (body: {"enabled": true}).
+
+    Separate from auto-approve: freeze promotions without freezing
+    drift/mom/strat weight nudges (and vice versa).
+    """
+    body = await request.json()
+    enabled = bool(body.get("enabled"))
+    db.set_auto_core_tune(enabled)
+    return JSONResponse({"success": True, "auto_core_tune": enabled})
+
+
+@app.get("/api/adaptation-health")
+def get_adaptation_health(_auth: str = Depends(verify_auth)):
+    """Single card: last validate, proposals, monitor, core, GA, regime, risk."""
+    try:
+        monitor = json.loads(db.get_arena_state("lane_monitor") or "{}")
+    except (json.JSONDecodeError, TypeError):
+        monitor = {}
+    try:
+        core_tuner = json.loads(db.get_arena_state("core_lane_tuner") or "{}")
+    except (json.JSONDecodeError, TypeError):
+        core_tuner = {}
+    try:
+        risk = json.loads(db.get_arena_state("risk") or "{}")
+    except (json.JSONDecodeError, TypeError):
+        risk = {}
+    try:
+        learned = json.loads(db.get_arena_state("learned_trade_rules") or "{}")
+    except (json.JSONDecodeError, TypeError):
+        learned = {}
+    proposals = db.get_lane_proposals() or []
+    pending = [p for p in proposals if (p.get("status") or "").upper() == "PENDING"]
+    last_run = db.get_latest_lane_run()
+    regime_map = {}
+    try:
+        regime_map = db.get_regime_map() or {}
+    except Exception:
+        pass
+    return JSONResponse({
+        "last_validation": last_run,
+        "pending_proposals": len(pending),
+        "proposals_total": len(proposals),
+        "monitor": monitor,
+        "core_tuner": core_tuner,
+        "auto_approve": db.get_auto_approve_lanes(),
+        "auto_core_tune": db.get_auto_core_tune(),
+        "warm_regime_cell": db.get_arena_state("warm_regime_cell"),
+        "regime_current_cell": regime_map.get("current_cell"),
+        "kill_switch": bool(risk.get("kill_switch")),
+        "learned_rules_n": len(learned.get("rules") or []),
+        "ga_last": db.get_arena_state("last_evolution") or db.get_arena_state("ga_last"),
+    })
 
 
 @app.get("/api/regime-map")

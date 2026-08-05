@@ -103,7 +103,7 @@ class CvdFeed:
     """
 
     def __init__(self) -> None:
-        self._cache: dict[str, dict] = {}   # cond -> {ts, cvd}
+        self._cache: dict[str, dict] = {}   # cond -> {ts, cvd, trades}
         self._lock = threading.Lock()
 
     def _fetch(self, condition_id: str) -> list:
@@ -138,8 +138,16 @@ class CvdFeed:
 
         cvd = cvd_from_trades(trades)
         with self._lock:
-            self._cache[condition_id] = {"ts": now, "cvd": cvd}
+            self._cache[condition_id] = {"ts": now, "cvd": cvd, "trades": trades}
         return cvd
+
+    def last_trades(self, condition_id: str) -> list:
+        """Most recently fetched tape for flow features (empty if never fetched)."""
+        if not condition_id:
+            return []
+        with self._lock:
+            cached = self._cache.get(condition_id) or {}
+            return list(cached.get("trades") or [])
 
     def clear(self, condition_id: str | None = None) -> None:
         with self._lock:

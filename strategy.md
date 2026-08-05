@@ -52,9 +52,10 @@ Per-strategy weights `w_i` come from `BaseBot.STRATEGY_SIGNAL_PROFILE`, optional
 |------|------|---------------------|
 | **drift** | BTC vs accurate window strike (time-scaled tanh) | Core (highest trust fundamental) |
 | **mom** | Short BTC candle momentum | Core |
-| **strat** | Strategy `analyze()` thesis | Core, **magnitude capped** (`STRAT_LANE_CONF_CAP` ≈ 0.30) |
+| **strat** | Strategy `analyze()` thesis | Core, **confirm-mode + capped** (`STRAT_LANE_CONF_CAP` 0.25) |
 | pm / cvd / obi | In-market / flow | Kill-switched 0 until revalidated |
 | fut / tech / xasset | Perp meta, technicals, cross-asset | Candidates; promote via Lab only |
+| lag / ms_mom / flow_decay | Lag residual, multiscale mom, decayed CVD | Candidates; promote via Lab only |
 | learn | Historical bias buckets | Off (`LEARNING_ENABLED=False`) |
 
 **Trust:** `trust_eff = trust × min(1, |P_model−0.5| / MODEL_CONVICTION_SCALE)` so near-coin-flip models cannot mint large “edge” from market displacement alone.
@@ -71,15 +72,19 @@ Buy `argmax edge_s` if that edge clears the strategy’s `MIN_EDGE` (after flow-
 
 ### 2.3 Default profiles (emphasis, not direction)
 
+Source of truth: `bots/base_bot.py` `STRATEGY_SIGNAL_PROFILE`.
+
 | Strategy | drift / mom / strat | Trust | Notes |
 |----------|---------------------|-------|-------|
-| momentum | 0.35 / 0.40 / 0.25 | 0.50 | Trend-following analyze() |
-| phantom | 0.20 / 0.30 / 0.50 | 0.50 | EMA/breakout thesis-heavy |
-| mean_reversion | 0.70 / 0 / 0.30 | 0.60 | Drift-gated fade; max mid ~0.58 |
-| hybrid | 0.50 / 0.20 / 0.30 | 0.50 | Meta over sub-bots |
-| sentiment | 0.30 / 0 / 0.70 | 0.50 | Flow thesis; not default slate |
+| momentum | 0.55 / 0.30 / 0.15 | 0.50 | Drift-heavy trend follower |
+| phantom | 0.50 / 0.25 / 0.25 | 0.50 | EMA 5/13 + breakout (5m retuned) |
+| mean_reversion | 0.75 / 0 / 0.25 | 0.60 | Drift-gated fade; max mid ~0.58 |
+| hybrid | 0.55 / 0.20 / 0.25 | 0.50 | Ensemble mom/meanrev/phantom (no sentiment) |
+| sniper | 0.55 / 0.10 / 0.10 | 0.50 | Overrides: pure drift-lag hunter (v3) |
 
-Sniper and makers **override** `make_decision` with zone/band logic but share drift-confirmation and many venue guards.
+**Menu-only (not default):** lag_residual, regime_specialist, no_lag, true_maker, meanrev-tp.
+
+Sniper and makers **override** `make_decision` with lag/zone logic but share drift-confirmation and many venue guards.
 
 ### 2.4 Arbitrage (separate path)
 

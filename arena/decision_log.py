@@ -45,7 +45,12 @@ _flusher_lock = threading.Lock()
 _last_rollup = 0.0
 
 _CAND_RE = re.compile(
-    r"cand\(fut=([+-][\d.]+) tech=([+-][\d.]+) xa=([+-][\d.]+)\)")
+    r"cand\(fut=([+-][\d.]+) tech=([+-][\d.]+) xa=([+-][\d.]+)"
+    r"(?: lag=([+-][\d.]+))?(?: ms=([+-][\d.]+))?(?: fd=([+-][\d.]+))?\)")
+_CAND_LANE_GROUP = {
+    "fut": 1, "tech": 2, "xasset": 3,
+    "lag": 4, "ms_mom": 5, "flow_decay": 6,
+}
 _LANE_RE = {
     "drift": re.compile(r"drift=([+-][\d.]+)"),
     "mom": re.compile(r"(?<![a-z])mom=([+-][\d.]+)"),

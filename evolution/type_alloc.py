@@ -23,24 +23,20 @@ ALLOCATABLE_TYPES = (
     "phantom",
     "hybrid",
     "sniper",
-    "sentiment",
+    "lag_residual",
+    "regime_specialist",
+    "no_lag",
 )
 
 
 def _dead_lane_types() -> frozenset[str]:
     """Types whose edge depends on kill-switched lanes — do not spawn them.
 
-    Sentiment's thesis is pm/cvd-heavy; until those kill-switches re-open,
-    spawning sentiment (2026-08: phantom→sentiment-g13) only adds noise.
+    Sentiment strategy removed (2026-08); kept as a hard block for any
+    lingering DB lineage that still carries strategy_type=sentiment.
     """
     blocked: set[str] = set(getattr(config, "GA_SPAWN_EXCLUDE_TYPES", ()) or ())
-    try:
-        pm = float(getattr(config, "SIGNAL_WEIGHT_PM", 0) or 0)
-        cvd = float(getattr(config, "SIGNAL_WEIGHT_CVD", 0) or 0)
-        if pm <= 0 and cvd <= 0:
-            blocked.add("sentiment")
-    except Exception:
-        blocked.add("sentiment")
+    blocked.add("sentiment")
     return frozenset(blocked)
 
 

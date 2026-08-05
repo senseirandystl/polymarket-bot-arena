@@ -92,7 +92,9 @@ def test_below_sample_floor_holds(tmp_db):
 
 
 def test_toggle_off_is_suggest_only(tmp_db):
-    db.set_auto_approve_lanes(False)
+    # Core-tune apply is separate from auto-approve (2026-08).
+    db.set_auto_core_tune(False)
+    db.set_auto_approve_lanes(True)
     _seed("momentum", config.CORE_TUNE_MIN_TRADES, drift_reading=0.30)
     report = clt.tune()
     # No override applied...

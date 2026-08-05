@@ -177,6 +177,53 @@ def build_combined_signals(
         "flow_score": market_regime.get("flow_score", 0.0),
     }
 
+    # Multiscale mom / rvol (pure local). Candidate directional: ms_mom_1m.
+    try:
+        from signals import multiscale
+        ms = multiscale.compute(btc_prices)
+    except Exception as e:
+        logger.debug(f"multiscale compute failed: {e}")
+        ms = {}
+
+    # Lag residual: drift-implied P − YES mid (signed; +ve = market cheap on YES).
+    # The sniper thesis as a continuous lane for shadow promotion.
+    yes_mid = 0.5
+    if market is not None:
+        try:
+            yes_mid = float(market.get("current_price") or 0.5)
+        except (TypeError, ValueError):
+            yes_mid = 0.5
+    implied_yes = 0.5 + 0.5 * float(btc_drift or 0.0)
+    lag_residual = max(-1.0, min(1.0, (implied_yes - yes_mid) * 2.0))
+
+    # Flow / microstructure from warm when available.
+    flow_cvd_decay = 0.0
+    flow_whale = 0.0
+    micro_spread = 0.0
+    micro_spread_score = 0.5
+    if warm is not None:
+        flow_cvd_decay = float(warm.get("flow_cvd_decay", 0.0) or 0.0)
+        flow_whale = float(warm.get("flow_whale", 0.0) or 0.0)
+        micro_spread = float(warm.get("micro_spread", 0.0) or 0.0)
+        micro_spread_score = float(warm.get("micro_spread_score", 0.5) or 0.5)
+    elif market is not None:
+        micro_spread = float(market.get("micro_spread", 0.0) or 0.0)
+        micro_spread_score = float(market.get("micro_spread_score", 0.5) or 0.5)
+
+    # Warm-path current regime cell for portfolio / core tuner (not last-resolved).
+    try:
+        import db as _db
+        rid = market_regime.get("regime_id") or market_regime.get("label")
+        if rid and rid != "unknown":
+            # Store a lightweight current cell stamp; map rebuild still owns
+            # full cell keys, but consumers can read "live" regime here.
+            _db.set_arena_state(
+                "warm_regime_cell",
+                f"{rid}|mid|{float(yes_mid):.2f}|{float(btc_drift or 0.0):+.2f}",
+            )
+    except Exception:
+        pass
+
     return {
         **price_signals,
         **sent_signals,
@@ -191,5 +238,12 @@ def build_combined_signals(
         "xasset": xasset.get("xasset_score", 0.0),
         "futures": futures,
         "macro_caution": macro_caution(),
+        "multiscale": ms,
+        "ms_mom_1m": float(ms.get("ms_mom_1m", 0.0) or 0.0),
+        "lag_residual": lag_residual,
+        "flow_cvd_decay": flow_cvd_decay,
+        "flow_whale": flow_whale,
+        "micro_spread": micro_spread,
+        "micro_spread_score": micro_spread_score,
         **pm_signals,
     }

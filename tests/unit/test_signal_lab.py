@@ -194,10 +194,10 @@ class TestPerfTilts:
                 "meanrev-v1": {"total_trades": 30, "wins": 9}}
         tilts = SignalLab.score_perf_tilts(
             perf, {"momentum": "momentum", "mean_rev": "meanrev",
-                   "sentiment": "sentiment"})
+                   "phantom": "phantom"})
         assert tilts["momentum"] > 1.0
         assert tilts["mean_rev"] < 1.0
-        assert tilts["sentiment"] == 1.0    # no data -> neutral
+        assert tilts["phantom"] == 1.0    # no data -> neutral
 
     def test_small_sample_damped(self):
         perf = {"momentum-v1": {"total_trades": 2, "wins": 2}}

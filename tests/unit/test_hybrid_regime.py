@@ -68,7 +68,7 @@ class TestPerfTilts:
             tilts = bot._perf_tilts()
         assert tilts["momentum"] > 1.0
         assert tilts["mean_rev"] < 1.0
-        assert tilts["sentiment"] == 1.0  # no data -> neutral
+        assert tilts["phantom"] == 1.0  # no data -> neutral
 
     def test_small_samples_barely_move(self):
         bot = _bot()

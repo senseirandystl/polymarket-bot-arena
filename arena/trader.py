@@ -24,15 +24,11 @@ list copy.  Bots that appear in the list at the start of a tick remain
 in scope for the whole tick — we don't churn mid-iteration.
 """
 
-import json
 import logging
 import threading
 import time
 from datetime import datetime, timezone
 
-import db
-import polymarket_markets
-from bots.base_bot import BaseBot
 from config import TRADE_LOOP_INTERVAL_SEC
 from arena import market_data
 from arena.market_utils import compute_time_remaining_seconds
@@ -84,12 +80,21 @@ class Trader(threading.Thread):
     def run(self) -> None:
         logger.info(f"Trader started (interval={TRADE_LOOP_INTERVAL_SEC}s)")
         while not self._stop_event.is_set():
+            t0 = time.perf_counter()
             try:
                 self._tick()
             except Exception as e:
                 log_event(logger, logging.ERROR, f"Trader tick error: {e}",
                           exc_info=True, event_type="error", where="trader_run")
-            self._stop_event.wait(TRADE_LOOP_INTERVAL_SEC)
+            # Deadline-based sleep: remain near 1 Hz under light load.
+            elapsed = time.perf_counter() - t0
+            remain = max(0.0, float(TRADE_LOOP_INTERVAL_SEC) - elapsed)
+            if elapsed > float(TRADE_LOOP_INTERVAL_SEC) * 1.5:
+                logger.warning(
+                    f"Trader tick slow: {elapsed*1000:.0f}ms "
+                    f"(budget {TRADE_LOOP_INTERVAL_SEC*1000:.0f}ms)"
+                )
+            self._stop_event.wait(remain)
         logger.info("Trader stopped")
 
     # ------------------------------------------------------------------
@@ -133,13 +138,20 @@ class Trader(threading.Thread):
         # market-data warmer refreshes YES+NO prices, both books, OBI, CVD and
         # PM momentum every ~1s into a shared warm cache. Lay mids, asks AND
         # full books onto the market so make_decision and paper fill share one
-        # snapshot (slippage path A). Fall back to a direct price fetch only
-        # until the warmer has primed this market.
+        # snapshot (slippage path A).
+        #
+        # Never block the tick on a cold refresh_price (15s timeout trap).
+        # Missing/stale warm → skip with warm_stale reason.
         warm = market_data.store().get(market_id)
-        if warm is not None:
-            market_data.lay_warm_onto_market(market, warm)
-        else:
-            polymarket_markets.refresh_price(market)
+        if not market_data.is_warm_fresh(warm):
+            self._state.note_skip("warm_stale")
+            logger.debug(
+                "Trader skip warm_stale market=%s age=%s",
+                str(market_id)[:12],
+                market_data.warm_age_sec(warm),
+            )
+            return
+        market_data.lay_warm_onto_market(market, warm)
 
         with self._bots_lock:
             bots = list(self._bots)
@@ -151,6 +163,8 @@ class Trader(threading.Thread):
             market,
             warm=warm,
         )
+        # Warm age for diagnostics / size context (never network).
+        combined_signals["warm_age_sec"] = market_data.warm_age_sec(warm)
 
         import config as _cfg
         slip_cd = float(getattr(_cfg, "SLIPPAGE_RETRY_COOLDOWN_SEC", 10.0))

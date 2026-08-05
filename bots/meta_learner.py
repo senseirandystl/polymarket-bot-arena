@@ -49,14 +49,16 @@ BUCKETS = ("trending", "ranging", "mixed", "chop")
 
 # sub-strategy name -> compact reasoning-token key (kept short: the token
 # rides in every hybrid trade's persisted reasoning).
-SUB_TOKENS = {"momentum": "mom", "mean_rev": "rev",
-              "sentiment": "sent", "phantom": "ph"}
+# Sentiment sub removed 2026-08; parser still accepts optional sent= for
+# historical hybrid trades so meta learning does not break on old rows.
+SUB_TOKENS = {"momentum": "mom", "mean_rev": "rev", "phantom": "ph"}
 
-# meta(mom=+0.42 rev=+0.00 sent=-0.10 ph=+0.30 | reg=trending)
+# New: meta(mom=+0.42 rev=+0.00 ph=+0.30 | reg=trending)
+# Legacy: meta(mom=… rev=… sent=… ph=… | reg=…)
 _META_RE = re.compile(
-    r"meta\(mom=([+-][\d.]+) rev=([+-][\d.]+) sent=([+-][\d.]+) "
-    r"ph=([+-][\d.]+) \| reg=(\w+)\)")
-_TOKEN_GROUP = {"momentum": 1, "mean_rev": 2, "sentiment": 3, "phantom": 4}
+    r"meta\(mom=([+-][\d.]+) rev=([+-][\d.]+) "
+    r"(?:sent=([+-][\d.]+) )?ph=([+-][\d.]+) \| reg=(\w+)\)")
+_TOKEN_GROUP = {"momentum": 1, "mean_rev": 2, "phantom": 4}
 
 
 def bucket_for(trend_score: Optional[float] = None,
@@ -97,6 +99,7 @@ def parse_token(reasoning: Optional[str]):
     if not m:
         return None
     votes = {sub: float(m.group(g)) for sub, g in _TOKEN_GROUP.items()}
+    # Group 5 is always the regime bucket (sent is optional group 3).
     return votes, m.group(5)
 
 

@@ -31,6 +31,7 @@ EVOLUTION_EXEMPT_TYPES = frozenset({
     "late_window_maker",
     "fee_zone_maker",
     "btc_maker",
+    "true_maker",
     "copy_trade",
 })
 
@@ -40,9 +41,11 @@ def _default_params_for(strategy_type: str) -> dict:
     from bots.bot_momentum import DEFAULT_PARAMS as MOMENTUM_DEFAULTS
     from bots.bot_mean_rev import DEFAULT_PARAMS as MEANREV_DEFAULTS
     from bots.bot_hybrid import DEFAULT_PARAMS as HYBRID_DEFAULTS
-    from bots.bot_sentiment import DEFAULT_PARAMS as SENTIMENT_DEFAULTS
     from bots.bot_sniper import DEFAULT_PARAMS as SNIPER_DEFAULTS
     from bots.bot_phantom import DEFAULT_PARAMS as PHANTOM_DEFAULTS
+    from bots.bot_lag_residual import DEFAULT_PARAMS as LAG_DEFAULTS
+    from bots.bot_regime_specialist import DEFAULT_PARAMS as REGIME_DEFAULTS
+    from bots.bot_no_lag import DEFAULT_PARAMS as NO_LAG_DEFAULTS
 
     mapping = {
         "momentum": MOMENTUM_DEFAULTS,
@@ -51,8 +54,10 @@ def _default_params_for(strategy_type: str) -> dict:
         "mean_reversion_tp": MEANREV_DEFAULTS,
         "sniper": SNIPER_DEFAULTS,
         "phantom": PHANTOM_DEFAULTS,
-        "sentiment": SENTIMENT_DEFAULTS,
         "hybrid": HYBRID_DEFAULTS,
+        "lag_residual": LAG_DEFAULTS,
+        "regime_specialist": REGIME_DEFAULTS,
+        "no_lag": NO_LAG_DEFAULTS,
     }
     base = mapping.get(strategy_type, MOMENTUM_DEFAULTS)
     return copy.deepcopy(base)
@@ -441,7 +446,8 @@ def run_ga_cycle(
                 unsaturated = [
                     t for t in (
                         "momentum", "mean_reversion", "mean_reversion_tp",
-                        "phantom", "hybrid", "sniper", "sentiment",
+                        "phantom", "hybrid", "sniper",
+                        "lag_residual", "regime_specialist", "no_lag",
                     )
                     if type_counts.get(t, 0) < max_per_type
                 ]

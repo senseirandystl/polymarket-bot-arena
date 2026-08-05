@@ -60,7 +60,7 @@ silently resumes the existing DB config (or seeds defaults on a fresh DB).
 - **Break-even gap** (WR − avg entry) judges survival, not a flat 65% WR bar.
 - **NO is first-class** — two-sided net edge (blanket NO ban removed, BUG #20).
 - **Consensus guard (0.35)** — fighting strong crowd historically 0–10% WR.
-- **Strat lane overconfidence loses** — `|strat|` capped (`STRAT_LANE_CONF_CAP` ~0.30).
+- **Strat lane overconfidence loses** — `|strat|` capped (`STRAT_LANE_CONF_CAP` 0.25) + confirm-mode.
 - **Regimes are context** — damp chop / tilt hybrid; not free direction.
 
 Older Simmer-era stats (confidence buckets, YES-only WR) are historical context
@@ -126,11 +126,9 @@ also carries ETH and exposes momentum/acceleration/multi-TF), and
 DIRECTIONAL candidate lanes are kill-switched at 0 pending harness validation;
 `vol_regime` context drives **HybridBot's regime-switching meta-learner**
 (dynamic sub-strategy weights: smooth trend-regime tilt × recent-live-WR
-logistic tilt, sub-analyzers now incl. phantom). The sentiment feed is **DISABLED**
-(`config.SENTIMENT_FEED_ENABLED = False` — `SentimentFeed.start()` no-ops, no
-polling thread, `get_signals()` returns `{}`); the LLM scorer scaffolding
-(Ollama-shaped, keyword fallback) stays in `signals/sentiment.py` for a future
-hosted-LLM (Claude/Grok) hookup. The momentum lane and the late-window boosts
+logistic tilt, sub-analyzers: momentum / meanrev / phantom — **SentimentBot removed**).
+The optional news/social sentiment feed remains **DISABLED**
+(`config.SENTIMENT_FEED_ENABLED = False`). The momentum lane and the late-window boosts
 (base + sniper) are smooth curves now (same calibration points, no cliffs).
 Default paper bankroll is **$200** (`PAPER_BANKROLL_DEFAULT`).
 
@@ -450,21 +448,19 @@ Both live signal lanes are harness-validated for net edge (drift +7.6¢, mom
 +10.2¢/share); the **strat** lane (`analyze()` thesis) is NOT yet
 harness-validated the same way — BUG #30/#31 found live WR falling as its own
 confidence rose (|strat| ≥ 0.6: 36.1–46% WR; the only profitable band was
-|strat| < 0.3 at +$41.23), so `config.STRAT_LANE_CONF_CAP` (**0.30**, lowered
-from 0.60 in BUG #31) clamps its magnitude to that band before the blend
-pending a proper offline validation of the lane. **momentum and hybrid
-profiles rebalanced toward drift (BUG #30)** — see below; both had been the
-worst live performers and the most exposed to the mom/strat lanes just shown
-harmful at high magnitude:
+|strat| < 0.3 at +$41.23), so `config.STRAT_LANE_CONF_CAP` (**0.25**) +
+`STRAT_LANE_MODE=confirm` clamp the thesis. Profiles (source of truth
+`bots/base_bot.py`):
 
 | Strategy | Live profile (drift/mom/strat) | Trust | Character |
 |----------|-------------------------------|-------|-----------|
-| momentum | .35/.40/.25 | 0.50 | trades the BTC short-term trend (mom lane + its trend analyze()) |
-| phantom  | .20/.30/.50 | 0.50 | EMA-crossover/breakout swing — analyze()-thesis-dominant |
-| mean_reversion (meanrev-v1, +tp) | .70/0/.30 | 0.60 | drift anchor + z-score fade, **drift-gated** (BUG #28: the fade only fires toward the side signed drift ≥ `min_drift` 0.10 already favors — drift picks the side, the z-score times the pullback; ungated it went 0/11) + max side mid 0.58 (`STRATEGY_MAX_SIDE_PRICE`, the harness's "market lags" rule) |
-| sentiment | .30/0/.70 | 0.50 | in-market flow reader (raw pm+cvd via analyze(); its lanes stay killed until validated) — not in the default slate |
-| hybrid | .50/.20/.30 | 0.50 | balanced ensemble of the sub-strategies |
-| arbitrage | n/a — **overrides** `make_decision`/`execute` (market-neutral, two-legged) | n/a | n/a |
+| momentum | .55/.30/.15 | 0.50 | drift-heavy short-term trend |
+| phantom  | .50/.25/.25 | 0.50 | EMA 5/13 + breakout swing |
+| mean_reversion (meanrev-v1, +tp) | .75/0/.25 | 0.60 | drift-gated fade + max mid 0.58 |
+| hybrid | .55/.20/.25 | 0.50 | ensemble of mom/meanrev/phantom (no sentiment) |
+| sniper | .55/.10/.10 | 0.50 | overrides: pure drift-lag hunter (v3) |
+| arbitrage | n/a — **overrides** (market-neutral, two-legged) | n/a | n/a |
+| lag_residual / regime_specialist / no_lag / true_maker | menu-only | — | not default slate |
 
 (pm/cvd/obi profile weights are all 0 while their kill-switches are 0. The
 old `meanrev-sl25-v1` is renamed **`meanrev-v1`** / `mean_reversion` — the

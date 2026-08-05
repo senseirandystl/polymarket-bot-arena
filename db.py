@@ -1163,6 +1163,24 @@ def set_auto_approve_lanes(enabled: bool):
     set_arena_state("auto_approve_lanes", "1" if enabled else "0")
 
 
+def get_auto_core_tune() -> bool:
+    """Whether the core-lane tuner may apply weight nudges (dashboard toggle).
+
+    Separate from auto-approve so operators can freeze promotions without
+    freezing drift/mom/strat tuning. Falls back to config.AUTO_CORE_TUNE_ENABLED.
+    """
+    raw = get_arena_state("auto_core_tune")
+    if raw is None:
+        return bool(getattr(
+            __import__("config"), "AUTO_CORE_TUNE_ENABLED", True))
+    return str(raw) == "1"
+
+
+def set_auto_core_tune(enabled: bool):
+    """Flip the auto core-tune toggle (dashboard Signal Lab)."""
+    set_arena_state("auto_core_tune", "1" if enabled else "0")
+
+
 def get_regime_conditioning() -> bool:
     """Whether Layer-3 controllers may act on the regime map (dashboard toggle).
 

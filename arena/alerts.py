@@ -104,7 +104,10 @@ _STRATEGY_BLURBS = {
     "mean_reversion": "Drift-gated z-score fade when market lags",
     "mean_reversion_sl": "Drift-gated mean reversion (legacy SL variant)",
     "mean_reversion_tp": "Drift-gated mean reversion with take-profit",
-    "sentiment": "In-market flow reader (pm/cvd via analyze)",
+    "lag_residual": "Pure market-lags-drift specialist",
+    "regime_specialist": "Trades only in allowed regimes",
+    "no_lag": "Strict NO-side lag specialist",
+    "true_maker": "Limit-first GTC passive maker",
     "hybrid": "Balanced ensemble of sub-strategies",
     "sniper": "Late/cheap/strong price zones + drift gate",
     "arbitrage": "Market-neutral two-legged book arb",
@@ -165,6 +168,12 @@ CRED_SMTP_TO = "alert_smtp_to"
 
 _lock = threading.Lock()
 _debounce: dict[str, float] = {}
+
+
+def alerts_configured() -> bool:
+    """True when at least one outbound alert channel has credentials."""
+    ch = _channel_configured()
+    return bool(ch.get("telegram") or ch.get("discord"))
 
 
 def _channel_configured() -> dict[str, bool]:

@@ -42,7 +42,10 @@ logger = logging.getLogger(__name__)
 
 # Lanes computed from MARKET-level signals (per-bot strat/learn lanes are
 # appended by the caller). Order matters only for logging.
-MARKET_LANES = ("drift", "mom", "pm", "cvd", "obi", "fut", "tech", "xasset")
+MARKET_LANES = (
+    "drift", "mom", "pm", "cvd", "obi", "fut", "tech", "xasset",
+    "lag", "ms_mom", "flow_decay",
+)
 
 # Regime-conditional lane damps — the regime-based half of dynamic weighting.
 # Keys accept BOTH legacy labels (quiet/normal/trending/volatile) and the
@@ -184,6 +187,26 @@ class SignalView(Mapping):
     @property
     def xasset(self) -> float:
         return float(self._d.get("xasset", 0.0) or 0.0)
+
+    @property
+    def lag_residual(self) -> float:
+        return float(self._d.get("lag_residual", 0.0) or 0.0)
+
+    @property
+    def ms_mom_1m(self) -> float:
+        return float(self._d.get("ms_mom_1m", 0.0) or 0.0)
+
+    @property
+    def flow_cvd_decay(self) -> float:
+        return float(self._d.get("flow_cvd_decay", 0.0) or 0.0)
+
+    @property
+    def micro_spread(self) -> float:
+        return float(self._d.get("micro_spread", 0.0) or 0.0)
+
+    @property
+    def micro_spread_score(self) -> float:
+        return float(self._d.get("micro_spread_score", 0.5) or 0.5)
 
     @property
     def macro_caution(self) -> float:
@@ -374,13 +397,31 @@ class SignalLab:
         xasset = max(-1.0, min(1.0, xa_raw)) * _mult(
             "xasset", getattr(config, "SIGNAL_WEIGHT_XASSET", 0.0))
 
+        # --- Expanded candidates (2026-08): lag residual, multiscale mom, flow ---
+        lag_raw = float(sv.lag_residual or 0.0)
+        lag = max(-1.0, min(1.0, lag_raw)) * _mult(
+            "lag", getattr(config, "SIGNAL_WEIGHT_LAG", 0.0))
+        ms_raw = float(sv.ms_mom_1m or 0.0)
+        ms_mom = max(-1.0, min(1.0, ms_raw)) * _mult(
+            "ms_mom", getattr(config, "SIGNAL_WEIGHT_MS_MOM", 0.0))
+        fd_raw = float(sv.flow_cvd_decay or 0.0)
+        flow_decay = max(-1.0, min(1.0, fd_raw)) * _mult(
+            "flow_decay", getattr(config, "SIGNAL_WEIGHT_FLOW_DECAY", 0.0))
+
         # --- drift: the validated fundamental (already bounded/time-scaled) ---
         drift = max(-1.0, min(1.0, sv.btc_drift))
 
-        lanes = {"drift": drift, "mom": mom, "pm": pm, "cvd": cvd,
-                 "obi": obi, "fut": fut, "tech": tech, "xasset": xasset}
-        raw = {"price_momentum": price_momentum, "fut_taker": fut_raw,
-               "tech_mtf": tech_raw, "xasset": xa_raw}
+        lanes = {
+            "drift": drift, "mom": mom, "pm": pm, "cvd": cvd,
+            "obi": obi, "fut": fut, "tech": tech, "xasset": xasset,
+            "lag": lag, "ms_mom": ms_mom, "flow_decay": flow_decay,
+        }
+        raw = {
+            "price_momentum": price_momentum, "fut_taker": fut_raw,
+            "tech_mtf": tech_raw, "xasset": xa_raw,
+            "lag": lag_raw, "ms_mom": ms_raw, "flow_decay": fd_raw,
+            "micro_spread": float(sv.micro_spread or 0.0),
+        }
 
         with self._lock:
             if len(self._lane_cache) > 16:

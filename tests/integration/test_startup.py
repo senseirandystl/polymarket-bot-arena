@@ -57,5 +57,6 @@ def test_default_slate_is_eight_bots_with_arbitrage_sniper_and_makers():
 
 
 def test_manual_selection_builds_exactly_chosen():
-    bots = startup._build_from_indices([1, 8])
+    # Indices: 1=momentum, 7=arbitrage (sentiment removed; menu renumbered).
+    bots = startup._build_from_indices([1, 7])
     assert [b.strategy_type for b in bots] == ["momentum", "arbitrage"]

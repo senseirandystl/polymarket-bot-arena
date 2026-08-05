@@ -142,7 +142,28 @@ def test_oos_rejects_train_only_signal(db, monkeypatch):
     assert state.get("oos", {}).get("rejected_oos", 0) >= 1 or not skips
 
 
-def test_skip_bandit_eases_dead_zone(db, monkeypatch):
+def test_skip_bandit_never_softens_dead_zone(db, monkeypatch):
+    """Dead-zone is hard-blocked from skip-bandit ease (2026-08 audit)."""
+    monkeypatch.setattr(config, "LEARNED_RULES_ENABLED", True, raising=False)
+    monkeypatch.setattr(config, "LEARNED_RULES_SKIP_BANDIT_ENABLED", True, raising=False)
+    monkeypatch.setattr(config, "LEARNED_RULES_SKIP_BANDIT_MIN_N", 10, raising=False)
+    monkeypatch.setattr(config, "LEARNED_RULES_SKIP_BANDIT_HIGH_CF", 0.55, raising=False)
+    monkeypatch.setattr(config, "LEARNED_RULES_OOS_ENABLED", False, raising=False)
+    monkeypatch.setattr(config, "LEARNED_RULES_PER_STRATEGY_AUTO", False, raising=False)
+    monkeypatch.setattr(config, "LEARNED_RULES_NEVER_SOFTEN", ("dead_zone",), raising=False)
+    for _ in range(12):
+        _ins(db, action="skip", side="yes", regime="low_vol_range",
+             entry=0.50, drift=0.08, would_win=True, hyp=0.03,
+             skip_reason="dead_zone")
+    state = learned_rules.mine_and_update()
+    soft = state.get("skip_soften") or {}
+    assert "dead_zone" not in soft
+    out = learned_rules.skip_softening("dead_zone")
+    assert out["factor"] == 1.0
+    assert out["soften"] == 0.0
+
+
+def test_skip_bandit_eases_no_edge_with_positive_pnl(db, monkeypatch):
     monkeypatch.setattr(config, "LEARNED_RULES_ENABLED", True, raising=False)
     monkeypatch.setattr(config, "LEARNED_RULES_SKIP_BANDIT_ENABLED", True, raising=False)
     monkeypatch.setattr(config, "LEARNED_RULES_SKIP_BANDIT_MIN_N", 10, raising=False)
@@ -150,15 +171,15 @@ def test_skip_bandit_eases_dead_zone(db, monkeypatch):
     monkeypatch.setattr(config, "LEARNED_RULES_OOS_ENABLED", False, raising=False)
     monkeypatch.setattr(config, "LEARNED_RULES_PER_STRATEGY_AUTO", False, raising=False)
     for _ in range(12):
-        _ins(db, action="skip", side="yes", regime="low_vol_range",
-             entry=0.50, drift=0.08, would_win=True, hyp=0.03,
-             skip_reason="dead_zone")
+        _ins(db, action="skip", side="yes", regime="high_vol_trend",
+             entry=0.48, drift=0.20, would_win=True, hyp=0.03,
+             skip_reason="no_edge")
     state = learned_rules.mine_and_update()
     soft = state.get("skip_soften") or {}
-    assert "dead_zone" in soft
-    assert soft["dead_zone"]["direction"] == "ease"
-    assert soft["dead_zone"]["soften"] > 0
-    out = learned_rules.skip_softening("dead_zone")
+    assert "no_edge" in soft
+    assert soft["no_edge"]["direction"] == "ease"
+    assert soft["no_edge"]["soften"] > 0
+    out = learned_rules.skip_softening("no_edge")
     assert out["factor"] < 1.0
 
 

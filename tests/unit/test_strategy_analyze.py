@@ -11,9 +11,10 @@ from tests.conftest import make_market, make_signals
 
 from bots.bot_momentum import MomentumBot
 from bots.bot_mean_rev import MeanRevBot
-from bots.bot_sentiment import SentimentBot
 from bots.bot_phantom import PhantomBot
 from bots.bot_hybrid import HybridBot
+from bots.bot_lag_residual import LagResidualBot
+from bots.bot_regime_specialist import RegimeSpecialistBot
 
 CONTRACT_KEYS = {"action", "side", "confidence", "reasoning"}
 
@@ -30,9 +31,10 @@ def _check_contract(sig):
 ALL_BOTS = [
     (MomentumBot, "momentum"),
     (MeanRevBot, "meanrev"),
-    (SentimentBot, "sentiment"),
     (PhantomBot, "phantom"),
     (HybridBot, "hybrid"),
+    (LagResidualBot, "lag-residual"),
+    (RegimeSpecialistBot, "regime-specialist"),
 ]
 
 
@@ -129,14 +131,17 @@ def test_meanrev_window_lookback_preferred_late_window():
     assert src2 == "continuous" and lb2 == 10
 
 
-def test_sentiment_direction_follows_flow():
-    bot = SentimentBot(name="sent-t", generation=0)
-    up = bot.analyze(make_market(), make_signals(pm_momentum=0.1, cvd=0.5))
-    dn = bot.analyze(make_market(), make_signals(pm_momentum=-0.1, cvd=-0.5))
-    flat = bot.analyze(make_market(), make_signals(pm_momentum=0.0, cvd=0.0))
-    assert up["action"] == "buy" and up["side"] == "yes"
-    assert dn["action"] == "buy" and dn["side"] == "no"
-    assert flat["action"] == "hold"
+def test_regime_specialist_holds_outside_allow_list():
+    bot = RegimeSpecialistBot(name="rs-t", generation=0)
+    sig = bot.analyze(
+        make_market(),
+        make_signals(
+            btc_drift=0.3,
+            vol_regime={"regime": "high_vol_chop", "trend_score": 0.2},
+            market_regime={"regime_id": "high_vol_chop", "confidence": 0.9},
+        ),
+    )
+    assert sig["action"] == "hold"
 
 
 def test_phantom_vol_gate_holds_on_dead_tape():

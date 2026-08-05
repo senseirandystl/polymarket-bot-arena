@@ -31,8 +31,10 @@ BOT_ALIASES = {
     "meanrev-tp": ("bots.bot_meanrev_tp", "MeanRevTPBot", "meanrev-tp-v1"),
     "sniper":     ("bots.bot_sniper", "SniperBot", "sniper-v1"),
     "phantom":    ("bots.bot_phantom", "PhantomBot", "phantom-v1"),
-    "sentiment":  ("bots.bot_sentiment", "SentimentBot", "sentiment-v1"),
     "hybrid":     ("bots.bot_hybrid", "HybridBot", "hybrid-v1"),
+    "lag":        ("bots.bot_lag_residual", "LagResidualBot", "lag-residual-v1"),
+    "regime":     ("bots.bot_regime_specialist", "RegimeSpecialistBot", "regime-specialist-v1"),
+    "no-lag":     ("bots.bot_no_lag", "NoLagBot", "no-lag-v1"),
 }
 DEFAULT_BOTS = ["momentum", "phantom", "meanrev", "hybrid", "sniper"]
 

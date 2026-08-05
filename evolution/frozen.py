@@ -57,10 +57,7 @@ _DEFAULT_EVOLVABLE: dict[str, frozenset[str]] = {
     }),
     "hybrid": frozenset({
         "min_confidence", "w_momentum", "w_mean_reversion",
-        "w_phantom", "w_sentiment",
-    }),
-    "sentiment": frozenset({
-        "min_confidence", "lookback_candles",
+        "w_phantom",
     }),
 }
 

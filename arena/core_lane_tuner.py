@@ -160,7 +160,11 @@ def tune() -> dict:
     if not getattr(config, "CORE_TUNE_ENABLED", True):
         return {}
 
-    apply = db.get_auto_approve_lanes()
+    # Separate toggle from lane auto-approve (2026-08 audit).
+    try:
+        apply = db.get_auto_core_tune()
+    except Exception:
+        apply = db.get_auto_approve_lanes()
     min_trades = getattr(config, "CORE_TUNE_MIN_TRADES", 40)
     high_acc = getattr(config, "CORE_TUNE_HIGH_ACC", 0.56)
     low_acc = getattr(config, "CORE_TUNE_LOW_ACC", 0.48)

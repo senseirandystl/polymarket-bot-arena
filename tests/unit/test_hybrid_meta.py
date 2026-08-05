@@ -25,8 +25,7 @@ from bots.meta_learner import HybridMetaLearner, bucket_for, format_token, parse
 
 class TestToken:
     def test_roundtrip(self):
-        votes = {"momentum": 0.42, "mean_rev": -0.31, "sentiment": 0.0,
-                 "phantom": 0.27}
+        votes = {"momentum": 0.42, "mean_rev": -0.31, "phantom": 0.27}
         token = format_token(votes, "trending")
         parsed = parse_token(f"Meta[trending_up] (2Y/1N) {token}: momentum[...]")
         assert parsed is not None
@@ -38,8 +37,17 @@ class TestToken:
     def test_missing_subs_default_zero(self):
         token = format_token({"momentum": 0.5}, "mixed")
         got, bucket = parse_token(token)
-        assert got["phantom"] == 0.0 and got["sentiment"] == 0.0
+        assert got["phantom"] == 0.0 and got["mean_rev"] == 0.0
         assert bucket == "mixed"
+
+    def test_legacy_sent_token_still_parses(self):
+        # Pre-removal hybrid rows had sent= in the meta token.
+        raw = "meta(mom=+0.40 rev=-0.30 sent=+0.00 ph=+0.20 | reg=trending)"
+        got, bucket = parse_token(raw)
+        assert bucket == "trending"
+        assert got["momentum"] == pytest.approx(0.40)
+        assert got["phantom"] == pytest.approx(0.20)
+        assert "sentiment" not in got
 
     def test_parse_none_on_plain_reasoning(self):
         assert parse_token("fair=0.55 model=0.62 => yes") is None
@@ -79,9 +87,9 @@ def _insert_trade(db_module, votes, bucket, side, outcome,
 class TestOnlineUpdate:
     def test_correct_vote_raises_wrong_vote_lowers(self, arena_db):
         # YES trade WON → market UP. momentum voted up (correct),
-        # mean_rev voted down (wrong), sentiment abstained (0.0).
+        # mean_rev voted down (wrong), phantom abstained (0.0).
         _insert_trade(arena_db,
-                      {"momentum": 0.4, "mean_rev": -0.3, "sentiment": 0.0},
+                      {"momentum": 0.4, "mean_rev": -0.3, "phantom": 0.0},
                       "trending", side="yes", outcome="win")
         learner = HybridMetaLearner()
         assert learner.update_from_trades() == 1
@@ -95,7 +103,7 @@ class TestOnlineUpdate:
         assert rev["overall"]["correct"] == 0 and rev["overall"]["n"] == 1
         # bucket record mirrors overall for this single trending trade
         assert mom["trending"]["mult"] == pytest.approx(mom["overall"]["mult"])
-        assert "sentiment" not in state["subs"]  # abstained → untouched
+        assert "phantom" not in state["subs"]  # abstained → untouched
 
     def test_no_trade_won_means_market_down(self, arena_db):
         # NO trade WON → market DOWN → a negative vote was CORRECT.
@@ -220,11 +228,11 @@ class TestHybridIntegration:
         with _neutral_perf(bot):
             with patch.object(bot._meta, "online_mults",
                               return_value={"momentum": 1.0, "mean_rev": 1.0,
-                                            "sentiment": 1.0, "phantom": 1.0}):
+                                            "phantom": 1.0}):
                 base = bot._dynamic_weights(sigs)
             with patch.object(bot._meta, "online_mults",
                               return_value={"momentum": 2.0, "mean_rev": 1.0,
-                                            "sentiment": 1.0, "phantom": 1.0}):
+                                            "phantom": 1.0}):
                 boosted = bot._dynamic_weights(sigs)
         assert boosted["momentum"] > base["momentum"]
         assert abs(sum(boosted.values()) - 1.0) < 1e-9
@@ -255,7 +263,7 @@ class TestHybridIntegration:
         votes, bucket = parsed
         assert bucket == "trending"
         assert any(abs(v) > 0 for v in votes.values())
-        assert "w[" in sig["reasoning"]        # effective weights visible
+        assert "[w=" in sig["reasoning"]       # effective weights visible
 
     def test_signals_expose_weights_online_and_bucket(self, arena_db):
         bot = HybridBot(name="hybrid-t")
@@ -329,7 +337,7 @@ class TestHybridIntegration:
         from bots.base_bot import BaseBot
         raw = analysis.get("reasoning") or ""
         m = re.search(
-            r"meta\(mom=[+-][\d.]+ rev=[+-][\d.]+ sent=[+-][\d.]+ "
+            r"meta\(mom=[+-][\d.]+ rev=[+-][\d.]+ (?:sent=[+-][\d.]+ )?"
             r"ph=[+-][\d.]+ \| reg=\w+\)",
             raw,
         )

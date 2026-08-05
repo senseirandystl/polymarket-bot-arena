@@ -185,7 +185,8 @@ _REGIME_STRATEGY_PRIORS: dict[str, dict[str, dict[str, float]]] = {
 # Directional strategy types subject to hard regime skip (not arb/makers).
 _DIRECTIONAL_TYPES = frozenset({
     "momentum", "mean_reversion", "mean_reversion_sl", "mean_reversion_tp",
-    "phantom", "hybrid", "sniper", "sentiment",
+    "phantom", "hybrid", "sniper",
+    "lag_residual", "regime_specialist", "no_lag",
 })
 
 

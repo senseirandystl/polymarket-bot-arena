@@ -2,19 +2,19 @@
 
 Only runs for TERMINAL launches (``sys.stdin.isatty()``). Under launchd / any
 non-interactive parent there is no tty, so the whole flow is skipped and the
-arena resumes its previous DB configuration silently — the service must never
+arena resumes its previous DB configuration silently ΓÇö the service must never
 block on a prompt.
 
 Flow (terminal only):
 
-    1. If a previous run left data → ask **Continue** or **Start fresh**.
-         • Continue  → resume exactly as it was (return None; caller loads the
+    1. If a previous run left data ΓåÆ ask **Continue** or **Start fresh**.
+         ΓÇó Continue  ΓåÆ resume exactly as it was (return None; caller loads the
                        existing DB slate).
-         • Fresh     → wipe DB + logs, then fall through to step 2.
+         ΓÇó Fresh     ΓåÆ wipe DB + logs, then fall through to step 2.
     2. Ask **Default** bots (Enter) or **Manual** selection.
-         • Default   → the 8 canonical bots (incl. arbitrage, sniper + makers).
-         • Manual    → show every strategy, accept a list/range like
-                       ``1,3,5`` or ``1-6`` (or a mix) → launch exactly those.
+         ΓÇó Default   ΓåÆ the 8 canonical bots (incl. arbitrage, sniper + makers).
+         ΓÇó Manual    ΓåÆ show every strategy, accept a list/range like
+                       ``1,3,5`` or ``1-6`` (or a mix) ΓåÆ launch exactly those.
 
 ``interactive_startup`` returns the bot list to launch, or ``None`` meaning
 "use the existing DB configuration" (continue / non-interactive).
@@ -31,11 +31,14 @@ from bots.bot_meanrev_sl import MeanRevSLBot
 from bots.bot_meanrev_tp import MeanRevTPBot
 from bots.bot_sniper import SniperBot
 from bots.bot_phantom import PhantomBot
-from bots.bot_sentiment import SentimentBot
 from bots.bot_hybrid import HybridBot
 from bots.bot_arbitrage import ArbitrageBot
 from bots.bot_late_window_maker import LateWindowMakerBot
 from bots.bot_fee_zone_maker import FeeZoneMakerBot
+from bots.bot_lag_residual import LagResidualBot
+from bots.bot_regime_specialist import RegimeSpecialistBot
+from bots.bot_no_lag import NoLagBot
+from bots.bot_true_maker import TrueMakerBot
 
 logger = logging.getLogger("arena.startup")
 
@@ -49,13 +52,17 @@ STRATEGY_MENU = [
     (MomentumBot,        "momentum-v1",     "Momentum — rides short-term price trend"),
     (MeanRevBot,         "meanrev-v1",      "Mean reversion — drift anchor + buy-the-dip fade"),
     (MeanRevTPBot,       "meanrev-tp-v1",   "Mean reversion + take-profit exit"),
-    (SniperBot,          "sniper-v1",       "Sniper — price-zone strike, drift-confirmed"),
+    (SniperBot,          "sniper-v1",       "Sniper — drift-lag hunter (v3)"),
     (PhantomBot,         "phantom-v1",      "Phantom — EMA trend + breakout follower"),
-    (SentimentBot,       "sentiment-v1",    "Sentiment — in-market repricing + flow"),
     (HybridBot,          "hybrid-v1",       "Hybrid — blended signal stack"),
     (ArbitrageBot,       "arbitrage-v1",    "Arbitrage — market-neutral YES+NO (fees-aware)"),
-    (LateWindowMakerBot, "late-window-maker-v1", "Late-window maker — final-150s drift-conviction entry"),
-    (FeeZoneMakerBot,    "fee-zone-maker-v1", "Fee-zone maker — 56-86¢ zone, drift-backed quoting"),
+    (LateWindowMakerBot, "late-window-maker-v1", "Late-window maker — final-120s drift-conviction entry"),
+    (FeeZoneMakerBot,    "fee-zone-maker-v1", "Fee-zone maker — 58-78¢ zone, drift-backed quoting"),
+    # Menu-only specialists (not in DEFAULT_INDICES)
+    (LagResidualBot,     "lag-residual-v1", "Lag residual — pure market-lags-drift"),
+    (RegimeSpecialistBot, "regime-specialist-v1", "Regime specialist — trades only allowed regimes"),
+    (NoLagBot,           "no-lag-v1",       "NO-lag specialist — strict NO-side lag trades"),
+    (TrueMakerBot,       "true-maker-v1",   "True maker — limit-first GTC passive quotes"),
 ]
 # (The old separate meanrev-sl25 menu entry is gone: with the stop-loss
 # removed it was byte-identical to the base meanrev bot. MeanRevSLBot stays
@@ -65,8 +72,8 @@ _ = MeanRevSLBot  # retained for legacy strategy_type resolution
 
 # The 8 default bots (1-based indices into STRATEGY_MENU): momentum, phantom,
 # arbitrage, meanrev, hybrid, sniper, and the two maker bots (2026-07-18
-# roster update — sniper promoted into the default slate).
-DEFAULT_INDICES = [1, 5, 8, 2, 7, 4, 9, 10]
+# roster update ΓÇö sniper promoted into the default slate).
+DEFAULT_INDICES = [1, 5, 7, 2, 6, 4, 8, 9]
 
 
 def build_default_bots() -> list:
@@ -83,7 +90,7 @@ def _build_from_indices(indices) -> list:
 
 
 def parse_selection(text: str, n: int) -> list:
-    """Parse ``"1,3,5"`` / ``"1-6"`` / ``"1-3,5"`` → ordered unique 1..n indices.
+    """Parse ``"1,3,5"`` / ``"1-6"`` / ``"1-3,5"`` ΓåÆ ordered unique 1..n indices.
 
     Raises ``ValueError`` on any non-numeric or out-of-range token so the caller
     can re-prompt with a clear message.
@@ -178,7 +185,7 @@ def _prompt_manual_selection() -> list:
     print("\nAvailable bot strategies:")
     for idx, (_, name, blurb) in enumerate(STRATEGY_MENU, start=1):
         print(f"  {idx}. {name:<18} {blurb}")
-    print("\nEnter the strategies to launch — e.g. '1,3,5' or '1-6' or '1-3,9'.")
+    print("\nEnter the strategies to launch ΓÇö e.g. '1,3,5' or '1-6' or '1-3,9'.")
     n = len(STRATEGY_MENU)
     while True:
         raw = input(f"  Selection (1-{n}): ").strip()

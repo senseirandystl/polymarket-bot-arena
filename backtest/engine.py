@@ -32,7 +32,7 @@ logger = logging.getLogger("backtest.engine")
 # Strategy types whose decision path is replayable offline.
 SUPPORTED_STRATEGIES = {
     "momentum", "mean_reversion", "mean_reversion_sl", "mean_reversion_tp",
-    "phantom", "sentiment", "hybrid", "sniper",
+    "phantom", "hybrid", "sniper", "lag_residual", "regime_specialist", "no_lag",
 }
 
 

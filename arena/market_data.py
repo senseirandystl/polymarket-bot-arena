@@ -20,12 +20,19 @@ with **zero network on their hot path**, and every trading-decision input stays
 Producer/consumer split: the warmer is the sole producer; the module-level
 store (``store()``) is the shared state everyone reads. Bots don't need a
 reference to the thread — they just read the store.
+
+2026-08 streamlining:
+  * Parallel YES/NO book fetches with short timeouts
+  * CVD/PM throttled while kill-switched (deadline-based cycle sleep)
+  * Fail soft: keep last snapshot fields when a fetch fails
 """
 
-import copy
+from __future__ import annotations
+
 import logging
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional
 
 import config
@@ -34,6 +41,9 @@ from signals import clean_tick, orderflow_signals
 from signals.strike import get_strike_registry
 
 logger = logging.getLogger("arena.market_data")
+
+# Shared tiny pool for parallel book GETs (warmer only).
+_book_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="warm-book")
 
 
 class MarketDataStore:
@@ -75,6 +85,37 @@ def store() -> MarketDataStore:
     return _store
 
 
+def warm_age_sec(warm: Optional[dict], now: float | None = None) -> float | None:
+    """Seconds since the warm snapshot was written, or None if unknown."""
+    if not warm:
+        return None
+    ts = warm.get("ts")
+    if ts is None:
+        return None
+    try:
+        return max(0.0, float(now if now is not None else time.time()) - float(ts))
+    except (TypeError, ValueError):
+        return None
+
+
+def is_warm_fresh(warm: Optional[dict], max_age: float | None = None,
+                  now: float | None = None) -> bool:
+    """True when warm has books/prices and is younger than max_age."""
+    if not warm:
+        return False
+    age = warm_age_sec(warm, now=now)
+    if age is None:
+        return False
+    limit = float(
+        max_age if max_age is not None
+        else getattr(config, "WARM_MAX_AGE_SEC", 3.0)
+    )
+    if age > limit:
+        return False
+    # Need at least one usable price to trade.
+    return warm.get("yes_price") is not None or warm.get("no_price") is not None
+
+
 def lay_warm_onto_market(market: dict, warm: Optional[dict]) -> None:
     """Lay warm prices/books onto a market snapshot (mutates ``market``).
 
@@ -107,6 +148,11 @@ def lay_warm_onto_market(market: dict, warm: Optional[dict]) -> None:
         **(market.get("orderflow") or {}),
         "obi": warm.get("obi", 0.0),
     }
+    # Microstructure context for spread tax / shadow lanes.
+    if warm.get("micro_spread") is not None:
+        market["micro_spread"] = warm["micro_spread"]
+    if warm.get("micro_spread_score") is not None:
+        market["micro_spread_score"] = warm["micro_spread_score"]
 
 
 def side_book(market: dict, side: str) -> Optional[dict]:
@@ -122,6 +168,27 @@ def side_book(market: dict, side: str) -> Optional[dict]:
     return None
 
 
+def _lane_live(lane: str) -> bool:
+    """True when a kill-switched lane has a live override (needs fresh feed)."""
+    try:
+        from bots.base_bot import _lane_overrides
+        ov = _lane_overrides().get(lane) or {}
+        return bool(ov.get("enabled"))
+    except Exception:
+        return False
+
+
+def _flow_needs_refresh() -> bool:
+    """CVD/PM are kill-switched unless a related override is live."""
+    if float(getattr(config, "SIGNAL_WEIGHT_CVD", 0.0) or 0.0) > 0:
+        return True
+    if float(getattr(config, "SIGNAL_WEIGHT_PM", 0.0) or 0.0) > 0:
+        return True
+    if float(getattr(config, "SIGNAL_WEIGHT_FLOW_DECAY", 0.0) or 0.0) > 0:
+        return True
+    return _lane_live("cvd") or _lane_live("pm") or _lane_live("flow_decay")
+
+
 class MarketDataWarmer(threading.Thread):
     """Refresh the live market's book/price/orderflow data every ~1s."""
 
@@ -132,6 +199,10 @@ class MarketDataWarmer(threading.Thread):
         self._cvd_feed = cvd_feed
         self._pm_feed = pm_feed
         self._interval = interval or config.MARKET_DATA_INTERVAL_SEC
+        self._last_flow_ts = 0.0
+        self._last_cvd = 0.0
+        self._last_pm: dict = {"momentum": 0.0, "prices": []}
+        self._last_cycle_ms = 0.0
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -139,12 +210,40 @@ class MarketDataWarmer(threading.Thread):
     def run(self) -> None:
         logger.info(f"Market-data warmer started (interval={self._interval}s)")
         while not self._stop_event.is_set():
+            t0 = time.perf_counter()
             try:
                 self._warm_once()
             except Exception as e:
                 logger.error(f"Market-data warm error: {e}")
-            self._stop_event.wait(self._interval)
+            elapsed = time.perf_counter() - t0
+            self._last_cycle_ms = elapsed * 1000.0
+            # Deadline-based sleep: stay near 1 Hz under light load.
+            remain = max(0.0, float(self._interval) - elapsed)
+            self._stop_event.wait(remain)
         logger.info("Market-data warmer stopped")
+
+    def _fetch_books_parallel(self, yes_tok: str, no_tok: str) -> tuple[dict, dict]:
+        timeout = float(getattr(config, "BOOK_FETCH_TIMEOUT_SEC", 2.0))
+        futs = {
+            _book_pool.submit(polymarket_markets.get_order_book, yes_tok,
+                              timeout=timeout): "yes",
+            _book_pool.submit(polymarket_markets.get_order_book, no_tok,
+                              timeout=timeout): "no",
+        }
+        yes_book: dict = {"valid": False}
+        no_book: dict = {"valid": False}
+        for fut in as_completed(futs, timeout=timeout + 0.5):
+            side = futs[fut]
+            try:
+                book = fut.result()
+            except Exception as e:
+                logger.debug(f"parallel book {side} failed: {e}")
+                book = {"valid": False}
+            if side == "yes":
+                yes_book = book
+            else:
+                no_book = book
+        return yes_book, no_book
 
     def _warm_once(self) -> None:
         market = self._discovery.current_market_snapshot()
@@ -156,30 +255,83 @@ class MarketDataWarmer(threading.Thread):
         if not market_id or not yes_tok or not no_tok:
             return
 
-        # One book per side — the source of price, depth and OBI.
-        yes_book = polymarket_markets.get_order_book(yes_tok)
-        no_book = polymarket_markets.get_order_book(no_tok)
+        prev = _store.get(market_id) or {}
+
+        # Parallel book GETs — critical path for decision freshness.
+        yes_book, no_book = self._fetch_books_parallel(yes_tok, no_tok)
+        # Fail soft: keep previous valid book if this fetch failed.
+        if not yes_book.get("valid") and (prev.get("yes_book") or {}).get("valid"):
+            yes_book = prev["yes_book"]
+        if not no_book.get("valid") and (prev.get("no_book") or {}).get("valid"):
+            no_book = prev["no_book"]
 
         yes_mid = polymarket_markets.midpoint(yes_book) if yes_book.get("valid") else None
         no_mid = polymarket_markets.midpoint(no_book) if no_book.get("valid") else None
-        # Clean-tick guard (reject implausible single-tick jumps / bad data),
-        # keyed per token so YES and NO are independent.
         yes_price = clean_tick.clean_price(yes_tok, yes_mid)
         no_price = clean_tick.clean_price(no_tok, no_mid)
+        if yes_price is None and prev.get("yes_price") is not None:
+            yes_price = prev["yes_price"]
+        if no_price is None and prev.get("no_price") is not None:
+            no_price = prev["no_price"]
 
-        obi = orderflow_signals.order_book_imbalance(yes_book) if yes_book.get("valid") else 0.0
+        obi = orderflow_signals.order_book_imbalance(yes_book) if yes_book.get("valid") else float(
+            prev.get("obi", 0.0) or 0.0)
 
-        # CVD (trade tape) + PM in-market momentum. Feeds coalesce within their
-        # sub-second TTL; here they refresh essentially every cycle.
+        # Microstructure context (pure, local).
+        micro_spread = 0.0
+        micro_spread_score = 0.5
+        try:
+            from signals import microstructure
+            micro = microstructure.compute(yes_book, no_book)
+            micro_spread = float(micro.get("micro_spread") or 0.0)
+            micro_spread_score = float(micro.get("micro_spread_score") or 0.5)
+        except Exception:
+            pass
+
+        # CVD + PM: throttle while kill-switched.
+        now = time.time()
+        slow = float(getattr(config, "SIGNAL_SLOW_REFRESH_SEC", 10.0))
+        need_flow = _flow_needs_refresh() or (now - self._last_flow_ts) >= slow
         cond = market.get("condition_id") or market_id
-        cvd = self._cvd_feed.get_cvd(cond) if cond else 0.0
-        pm = self._pm_feed.get_momentum(yes_tok)
+        flow_decay = float(prev.get("flow_cvd_decay", 0.0) or 0.0)
+        flow_whale = float(prev.get("flow_whale", 0.0) or 0.0)
+        if need_flow:
+            try:
+                cvd = self._cvd_feed.get_cvd(cond) if cond else 0.0
+            except Exception:
+                cvd = self._last_cvd
+            try:
+                pm = self._pm_feed.get_momentum(yes_tok) if yes_tok else {}
+            except Exception:
+                pm = self._last_pm
+            self._last_cvd = float(cvd or 0.0)
+            self._last_pm = pm if isinstance(pm, dict) else {"momentum": 0.0, "prices": []}
+            self._last_flow_ts = now
+            # Decayed/whale CVD from the same tape cache when available.
+            try:
+                from signals import flow as flow_mod
+                trades = (
+                    self._cvd_feed.last_trades(cond)
+                    if cond and hasattr(self._cvd_feed, "last_trades")
+                    else []
+                )
+                if trades:
+                    fc = flow_mod.compute(trades, now)
+                    flow_decay = float(fc.get("flow_cvd_decay") or 0.0)
+                    flow_whale = float(fc.get("flow_whale") or 0.0)
+            except Exception:
+                pass
+        else:
+            cvd = self._last_cvd if self._last_flow_ts else float(prev.get("cvd", 0.0) or 0.0)
+            pm = self._last_pm if self._last_flow_ts else {
+                "momentum": float(prev.get("pm_momentum", 0.0) or 0.0),
+                "prices": prev.get("pm_prices") or [],
+            }
 
-        # Accurate strike = Polymarket official openPrice (Chainlink at
-        # eventStartTime) — same value the website shows as Price to Beat.
-        # Fetched once per market off the hot path; None until available.
         strike = get_strike_registry().get_strike(
             market_id, market.get("event_start_time"))
+        if strike is None:
+            strike = prev.get("strike")
 
         _store.put(market_id, {
             "market_id": market_id,
@@ -188,10 +340,15 @@ class MarketDataWarmer(threading.Thread):
             "yes_book": yes_book,
             "no_book": no_book,
             "obi": obi,
-            "cvd": cvd,
+            "cvd": float(cvd or 0.0),
             "pm_momentum": float(pm.get("momentum", 0.0) or 0.0),
             "pm_prices": pm.get("prices", []) or [],
+            "flow_cvd_decay": flow_decay,
+            "flow_whale": flow_whale,
+            "micro_spread": micro_spread,
+            "micro_spread_score": micro_spread_score,
             "strike": strike,
             "ts": time.time(),
+            "warm_cycle_ms": self._last_cycle_ms,
         })
         _store.prune(keep_market_id=market_id)

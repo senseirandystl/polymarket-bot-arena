@@ -299,7 +299,7 @@ Interactive launch (or first non-interactive boot) starts **8 bots**:
 | `late-window-maker-v1` | Maker cadence | Final ~150s, side from drift |
 | `fee-zone-maker-v1` | Maker cadence | 56–86¢ zone, drift-backed |
 
-Also selectable: `meanrev-tp-v1`, `sentiment-v1`.  
+Also selectable: `meanrev-tp-v1`, `lag-residual-v1`, `regime-specialist-v1`, `no-lag-v1`, `true-maker-v1`.  
 **Evolution-exempt:** arbitrage + makers (and copy-trade if enabled).
 
 ---
@@ -420,7 +420,7 @@ Offline replay of **resolved** BTC 5-min markets through the **real** `make_deci
 | Flag | Purpose |
 |------|---------|
 | `--days` / `--from` `--to` / `--markets` / `--market-ids` | Market window |
-| `--bots` | Subset: `momentum,phantom,meanrev,meanrev-tp,sniper,sentiment,hybrid` |
+| `--bots` | Subset: `momentum,phantom,meanrev,meanrev-tp,sniper,hybrid,lag,regime,no-lag` |
 | `--walk-forward` | Train = slate selection (like evolution); test = OOS |
 | `--compound` | Size off growing pool (default is fixed bankroll for cleaner edge) |
 | `--json` / `--to-db` | Persist report |

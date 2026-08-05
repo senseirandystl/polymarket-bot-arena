@@ -47,7 +47,7 @@ PARAM_BOUNDS: dict[str, tuple[float, float]] = {
     "w_momentum": (0.0, 1.0),
     "w_mean_reversion": (0.0, 1.0),
     "w_phantom": (0.0, 1.0),
-    "w_sentiment": (0.0, 1.0),
+
 }
 
 # Relative half-width for unknown numeric keys: value ± RELATIVE_BAND * |value|

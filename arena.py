@@ -52,7 +52,6 @@ import db
 import learning
 from bots.bot_momentum import MomentumBot
 from bots.bot_mean_rev import MeanRevBot
-from bots.bot_sentiment import SentimentBot
 from bots.bot_hybrid import HybridBot
 from bots.bot_meanrev_sl import MeanRevSLBot
 from bots.bot_meanrev_tp import MeanRevTPBot
@@ -61,12 +60,17 @@ from bots.bot_phantom import PhantomBot
 from bots.bot_late_window_maker import LateWindowMakerBot
 from bots.bot_fee_zone_maker import FeeZoneMakerBot
 from bots.bot_arbitrage import ArbitrageBot
+from bots.bot_lag_residual import LagResidualBot
+from bots.bot_regime_specialist import RegimeSpecialistBot
+from bots.bot_no_lag import NoLagBot
+from bots.bot_true_maker import TrueMakerBot
 from signals.price_feed import get_feed as get_price_feed
 from signals.sentiment import get_feed as get_sentiment_feed
 from signals.polymarket_prices import get_feed as get_pm_price_feed
 
 from arena.discovery import MarketDiscovery
 from arena.market_data import MarketDataWarmer
+from arena.maker_thread import MakerThread
 from arena.trader import Trader
 from arena.resolver import TradeResolver
 from arena.position_monitor import PositionMonitorThread
@@ -85,9 +89,10 @@ maker_logger = logging.getLogger("arena.maker")
 
 
 # Strategy types that the trader loop should never try to evaluate —
-# the maker bots and copy-trade bots run on a separate cadence from
-# the discovery thread's on_cycle_complete hook.
-MAKER_TYPES = {"late_window_maker", "fee_zone_maker", "btc_maker", "copy_trade"}
+# the maker bots and copy-trade bots run on a separate MakerThread cadence.
+MAKER_TYPES = {
+    "late_window_maker", "fee_zone_maker", "btc_maker", "true_maker", "copy_trade",
+}
 
 TAKER_BOT_CLASSES = {
     "momentum": MomentumBot,
@@ -96,9 +101,11 @@ TAKER_BOT_CLASSES = {
     "mean_reversion_tp": MeanRevTPBot,
     "sniper": SniperBot,
     "phantom": PhantomBot,
-    "sentiment": SentimentBot,
     "hybrid": HybridBot,
     "arbitrage": ArbitrageBot,
+    "lag_residual": LagResidualBot,
+    "regime_specialist": RegimeSpecialistBot,
+    "no_lag": NoLagBot,
 }
 
 # Maker strategy types that have a concrete default instance. Used to rebuild
@@ -107,6 +114,7 @@ TAKER_BOT_CLASSES = {
 MAKER_BOT_CLASSES = {
     "late_window_maker": LateWindowMakerBot,
     "fee_zone_maker": FeeZoneMakerBot,
+    "true_maker": TrueMakerBot,
 }
 
 # EVOLUTION_EXEMPT_TYPES imported from evolution.ga — arbitrage (market-neutral)
@@ -239,7 +247,7 @@ def run_evolution(bots, cycle_number):
 
 # ----------------------------------------------------------------------
 # Secondary bots: maker section + copy-trade bots.
-# Run on the same 20s cadence as MarketDiscovery, in on_cycle_complete.
+# Run on MakerThread (~20s), decoupled from discovery Gamma scans.
 # ----------------------------------------------------------------------
 
 def _resolve_maker_bots(slate: list) -> list:
@@ -841,12 +849,15 @@ def main_loop(bots):
     pos_monitor.update_bots(trader_bots)
     pos_monitor.start()
 
-    discovery = MarketDiscovery(
-        on_cycle_complete=_make_secondary_hook(
-            maker_bots, copy_bots, signal_feeds, state,
-        )
-    )
+    # Discovery no longer hosts makers (would delay Gamma scan on paper fills).
+    discovery = MarketDiscovery(on_cycle_complete=None)
     discovery.start()
+
+    maker_thread = MakerThread(
+        discovery,
+        _make_secondary_hook(maker_bots, copy_bots, signal_feeds, state),
+    )
+    maker_thread.start()
 
     # Market-data warmer: single owner of all per-market network reads (YES+NO
     # books, prices, OBI, CVD, PM momentum) refreshed every ~1s into a shared
@@ -857,6 +868,25 @@ def main_loop(bots):
 
     resolver = TradeResolver()
     resolver.start()
+
+    # Live mode requires at least one alert channel (set-and-forget ops).
+    try:
+        any_live = any(
+            (getattr(b, "trading_mode", None) or db.get_bot_mode(b.name)) == "live"
+            for b in (trader_bots + maker_bots)
+        )
+        if any_live and getattr(config, "LIVE_REQUIRE_ALERTS", True):
+            from arena.alerts import alerts_configured
+            if not alerts_configured():
+                raise SystemExit(
+                    "LIVE_REQUIRE_ALERTS: configure Telegram/Discord alerts "
+                    "before running any bot in live mode "
+                    "(TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID or DISCORD_WEBHOOK_URL)."
+                )
+    except SystemExit:
+        raise
+    except Exception as e:
+        logger.debug("live alert gate check failed: %s", e)
 
     try:
         from arena.alerts import alert_startup
@@ -896,7 +926,7 @@ def main_loop(bots):
     except KeyboardInterrupt:
         logger.info("Arena stopped by user")
     finally:
-        for w in (trader, resolver, discovery, warmer, pos_monitor):
+        for w in (trader, resolver, discovery, warmer, pos_monitor, maker_thread):
             w.stop()
         time.sleep(0.5)
         logger.info("All workers stopped.")

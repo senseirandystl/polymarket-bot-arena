@@ -20,12 +20,26 @@ validates exactly the code that would ship.
 | `signals/session_features.py` | `sess_tod_sin/cos`, `sess_dow_sin/cos`, `sess_label`, `sess_nyse_prox`, `sess_weekend` | context only |
 | `signals/regime.py` | `regime_trend_{10,30}`, `regime_trend`, `regime_chop` | context only |
 
-**None of these carry live weight.** House rule (validate-before-weighting)
+**None of these carry live weight by default.** House rule (validate-before-weighting)
 stands: directional candidates must show positive net edge in the harness AND
 survive live shadow attribution via the existing lane-proposal pipeline before
-any lane weight moves off zero. Book/flow features cannot be backfilled
-(historical books/tape are not archived), so their validation path is live
-`cand(...)` attribution, not the offline backfill.
+any lane weight moves off zero.
+
+### Wired candidate lanes (2026-08 audit)
+
+These now flow through `SignalLab` + `cand(...)` logging for live shadow:
+
+| Lane key | Source | Config kill-switch |
+|---|---|---|
+| `lag` | drift-implied P − YES mid residual | `SIGNAL_WEIGHT_LAG` |
+| `ms_mom` | `multiscale.ms_mom_1m` | `SIGNAL_WEIGHT_MS_MOM` |
+| `flow_decay` | `flow.flow_cvd_decay` | `SIGNAL_WEIGHT_FLOW_DECAY` |
+
+Spread context (`micro_spread`) taxes `min_edge` when books are wide
+(`SPREAD_EDGE_MULT_ENABLED`) — non-directional size/skip, not a side-picker.
+
+Book/flow features cannot be fully backfilled (historical books/tape are not
+archived), so their primary validation path is live `cand(...)` attribution.
 
 ### Expanded validation harness (`tools/`)
 

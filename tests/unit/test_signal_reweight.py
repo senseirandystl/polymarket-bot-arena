@@ -161,9 +161,9 @@ def test_drift_veto_allows_flow_trades_when_drift_flat(monkeypatch):
         lambda *_a, **_k: {"soften": 0.0, "factor": 1.0},
         raising=False,
     )
-    from bots.bot_sentiment import SentimentBot
+    from bots.bot_momentum import MomentumBot
     # Outside underdog (0.35–0.42) and dead-zone (0.42–0.58): use 0.60 mid.
-    d = SentimentBot(name="s").make_decision(
+    d = MomentumBot(name="s").make_decision(
         _market(yes=0.60, tr=150),
         _sig(cvd=0.8, prices=[100.0, 100.4], latest=100.4),
     )
@@ -181,8 +181,8 @@ def test_dead_zone_gate_blocks_flat_drift_coinflip():
     # |drift| < 0.10) was 59 trades, 39% WR, -$77.83 — gated flat now.
     # With strat-confirm mode, weak lean may fire first when CVD alone cannot
     # move P_model far from 0.5; either skip is correct "sit flat" behaviour.
-    from bots.bot_sentiment import SentimentBot
-    d = SentimentBot(name="s").make_decision(
+    from bots.bot_momentum import MomentumBot
+    d = MomentumBot(name="s").make_decision(
         _market(yes=0.50, tr=150), _sig(cvd=0.8))
     assert d["action"] == "skip"
     reason = d["reasoning"].lower()

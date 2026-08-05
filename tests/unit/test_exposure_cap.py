@@ -47,15 +47,18 @@ def test_open_exposure_sums_pending_only(db):
 
 def test_exposure_headroom_clamps_and_skips(db, monkeypatch):
     from bots.bot_momentum import MomentumBot
+    from bots.base_bot import invalidate_exposure_cache
     monkeypatch.setattr(db, "get_paper_pool_gross", lambda: 100.0)
     bot = MomentumBot(name="momentum-test", generation=0)
     cap_usd = config.MARKET_SIDE_EXPOSURE_CAP * 100.0
     # Pool already holds cap - 2 on this side: a $5 request clamps to ~$2.
     _open_trade(db, "other-bot", amount=cap_usd - 2.0)
+    invalidate_exposure_cache()
     allowed = bot._exposure_headroom("mkt-1", "yes", "paper")
     assert allowed == pytest.approx(2.0)
     # At/over the cap: no headroom.
     _open_trade(db, "third-bot", amount=2.0)
+    invalidate_exposure_cache()
     assert bot._exposure_headroom("mkt-1", "yes", "paper") <= 0.0
 
 
