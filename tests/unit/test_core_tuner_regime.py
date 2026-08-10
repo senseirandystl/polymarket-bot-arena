@@ -14,13 +14,22 @@ def test_tune_respects_conditioning_toggle(monkeypatch):
     captured = {}
     monkeypatch.setattr(core_lane_tuner.db, "get_regime_conditioning", lambda: False)
 
-    def spy(conn, deadband, *, cell_filter=None):
+    def spy(conn, deadband, *, cell_filter=None, regime_id=None, lanes=None):
         captured["cell_filter"] = cell_filter
+        captured["regime_id"] = regime_id
+        captured["lanes"] = lanes
         return {}
 
     monkeypatch.setattr(core_lane_tuner, "compute_core_attribution", spy)
     monkeypatch.setattr(core_lane_tuner.config, "CORE_TUNE_ENABLED", True,
                         raising=False)
+    # Disable live-regime path so we exercise cell_filter=None global path
+    monkeypatch.setattr(
+        "arena.regime_settings.get_bool",
+        lambda name: False if name == "profile_adapt" else True,
+    )
+    monkeypatch.setattr(core_lane_tuner.config, "REGIME_PROFILE_ADAPT_ENABLED",
+                        False, raising=False)
     core_lane_tuner.tune()
     assert captured.get("cell_filter") is None
 
@@ -33,8 +42,15 @@ def test_tune_passes_current_cell_when_conditioning_on(monkeypatch):
     monkeypatch.setattr(core_lane_tuner.db, "get_regime_conditioning", lambda: True)
     monkeypatch.setattr(core_lane_tuner.db, "get_regime_map",
                         lambda: {"current_cell": ["low_vol_range", 2, 3, "us", 0, 0]})
+    # Force cell_filter path (not live detector regime_id path)
+    monkeypatch.setattr(
+        "arena.regime_settings.get_bool",
+        lambda name: False if name == "profile_adapt" else True,
+    )
+    monkeypatch.setattr(core_lane_tuner.config, "REGIME_PROFILE_ADAPT_ENABLED",
+                        False, raising=False)
 
-    def spy(conn, deadband, *, cell_filter=None):
+    def spy(conn, deadband, *, cell_filter=None, regime_id=None, lanes=None):
         calls.append(cell_filter)
         # Enough samples so fallback is not required.
         if cell_filter is not None:

@@ -77,6 +77,52 @@ def test_max_bots_per_side_blocks_new_bot(db, monkeypatch):
     assert bot_a._exposure_headroom("mkt-1", "yes", "paper") > 0
 
 
+def test_pilein_ev_gate_blocks_second_bot(db, monkeypatch):
+    """After a peer is open, a new bot with weak edge is blocked."""
+    from bots.bot_momentum import MomentumBot
+    from bots.base_bot import invalidate_exposure_cache
+    monkeypatch.setattr(db, "get_paper_pool_gross", lambda: 1000.0)
+    monkeypatch.setattr(config, "PILEIN_EV_GATE_ENABLED", True, raising=False)
+    monkeypatch.setattr(config, "PILEIN_EV_MIN_EDGE", 0.04, raising=False)
+    monkeypatch.setattr(config, "PILEIN_EV_EDGE_STEP", 0.02, raising=False)
+    monkeypatch.setattr(config, "PILEIN_EV_CONF_BYPASS", 0.85, raising=False)
+    monkeypatch.setattr(config, "MARKET_SIDE_MAX_BOTS", 10, raising=False)
+    _open_trade(db, "peer-bot", amount=5.0)
+    invalidate_exposure_cache()
+    bot = MomentumBot(name="momentum-test", generation=0)
+    # Weak edge + mid conf → blocked
+    msg = bot._pilein_ev_block(
+        "mkt-1", "yes",
+        {"edge": 0.02, "confidence": 0.60},
+        "paper",
+    )
+    assert msg is not None
+    assert "Pile-in EV gate" in msg
+    # High conf bypass
+    assert bot._pilein_ev_block(
+        "mkt-1", "yes",
+        {"edge": 0.02, "confidence": 0.90},
+        "paper",
+    ) is None
+    # Strong edge clears
+    assert bot._pilein_ev_block(
+        "mkt-1", "yes",
+        {"edge": 0.05, "confidence": 0.50},
+        "paper",
+    ) is None
+
+
+def test_pilein_ev_gate_toggle_off(db, monkeypatch):
+    from bots.bot_momentum import MomentumBot
+    monkeypatch.setattr(config, "PILEIN_EV_GATE_ENABLED", False, raising=False)
+    _open_trade(db, "peer-bot", amount=5.0)
+    bot = MomentumBot(name="momentum-test", generation=0)
+    monkeypatch.setattr(db, "get_pilein_ev_gate", lambda: False)
+    assert bot._pilein_ev_block(
+        "mkt-1", "yes", {"edge": 0.01, "confidence": 0.4}, "paper"
+    ) is None
+
+
 def test_corr_aware_weights_high_rho_peers(db, monkeypatch):
     """ρ≈1 peers nearly fully share the concentration budget."""
     from bots.bot_momentum import MomentumBot

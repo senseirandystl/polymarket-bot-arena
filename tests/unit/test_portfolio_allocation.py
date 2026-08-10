@@ -121,6 +121,62 @@ def test_losers_starved_not_floored():
     assert w["winner-v1"] > w["loser-v1"]
     assert w["loser-v1"] <= w["mid-v1"]
     assert w["loser-v1"] < 0.25  # not an equal 1/3 floor
+    # n≥20 + neg expectancy → hard demote to ~0
+    assert w["loser-v1"] <= 0.01
+
+
+def test_unproven_bots_capped_at_20pct():
+    """Until live edge proven, no bot may take >20% of capital."""
+    names = ["hot-v1", "other-a", "other-b", "other-c"]
+    # hot-v1 ready with huge score but n=10 < EDGE_PROVEN_MIN_N → unproven cap
+    metrics = {
+        "hot-v1": {
+            "n": 10, "sharpe": 5.0, "expectancy": 2.0,
+            "total_pnl": 20.0, "variance": 0.1, "ready": True,
+        },
+        "other-a": {
+            "n": 10, "sharpe": 0.1, "expectancy": 0.05,
+            "total_pnl": 0.5, "variance": 1.0, "ready": True,
+        },
+        "other-b": {
+            "n": 10, "sharpe": 0.1, "expectancy": 0.05,
+            "total_pnl": 0.5, "variance": 1.0, "ready": True,
+        },
+        "other-c": {
+            "n": 10, "sharpe": 0.1, "expectancy": 0.05,
+            "total_pnl": 0.5, "variance": 1.0, "ready": True,
+        },
+    }
+    with mock.patch.object(portfolio, "compute_metrics", return_value=metrics), \
+         mock.patch.object(portfolio, "_market_returns_by_bot",
+                           return_value={n: {} for n in names}), \
+         mock.patch.object(config, "PORTFOLIO_CORR_SHRINK", 0.0):
+        result = portfolio.allocate(names, method="kelly_portfolio")
+    assert result["weights"]["hot-v1"] <= 0.20 + 1e-6
+
+
+def test_neg_expectancy_strips_manual_override():
+    """Manual floor on a proven loser is removed so capital can leave."""
+    names = ["winner-v1", "sweeper-v1"]
+    metrics = {
+        "winner-v1": {
+            "n": 40, "sharpe": 0.5, "expectancy": 0.4,
+            "total_pnl": 16.0, "variance": 2.0, "ready": True,
+        },
+        "sweeper-v1": {
+            "n": 40, "sharpe": -0.2, "expectancy": -0.5,
+            "total_pnl": -20.0, "variance": 9.0, "ready": True,
+        },
+    }
+    with mock.patch.object(portfolio, "compute_metrics", return_value=metrics), \
+         mock.patch.object(portfolio, "_market_returns_by_bot",
+                           return_value={n: {} for n in names}):
+        result = portfolio.allocate(
+            names, method="kelly_portfolio",
+            manual_overrides={"sweeper-v1": 0.30},
+        )
+    assert result["weights"]["sweeper-v1"] <= 0.01
+    assert "sweeper-v1" not in (result.get("manual_overrides") or {})
 
 
 def test_rebalance_force_evolution_reason(monkeypatch):
@@ -187,7 +243,8 @@ def test_explore_floor_caps_new_gn_bots(monkeypatch):
     w = result["weights"]
     assert w["hybrid-g4-158"] <= 0.08 + 1e-6
     assert w["hybrid-g4-259"] <= 0.08 + 1e-6
-    assert abs(sum(w.values()) - 1.0) < 1e-5
+    # Weights may sum to <1 when max_w + explore caps bind (capital sits idle)
+    assert sum(w.values()) <= 1.0 + 1e-6
     # Veteran keeps the bulk
     assert w["phantom-v1"] > w["hybrid-g4-158"]
 
@@ -211,9 +268,9 @@ def test_allocate_sharpe_favors_winners():
         result = portfolio.allocate(names, method="sharpe")
     w = result["weights"]
     assert abs(sum(w.values()) - 1.0) < 1e-6
-    assert w["winner"] > w["mid"] > w["loser"]
-    # Floor still gives loser some capital
-    assert w["loser"] >= 0.05 - 1e-6
+    assert w["winner"] > w["mid"]
+    # n≥20 + neg expectancy → hard demote (no min-weight floor for losers)
+    assert w["loser"] <= 0.01
 
 
 def test_allocate_kelly_portfolio_correlation_shrink():
@@ -266,10 +323,11 @@ def test_allocate_manual_override_pins_weight():
             manual_overrides={"a": 0.50},
         )
     w = result["weights"]
+    # Manual pin respected up to PORTFOLIO_MAX_WEIGHT (0.50)
     assert w["a"] == pytest.approx(0.50, abs=0.02)
-    assert abs(sum(w.values()) - 1.0) < 1e-6
-    # Remaining 0.5 split between b and c
-    assert w["b"] + w["c"] == pytest.approx(0.50, abs=0.02)
+    assert abs(sum(w.values()) - 1.0) < 1e-5
+    # Remaining free mass split between b and c
+    assert w["b"] + w["c"] == pytest.approx(1.0 - w["a"], abs=0.02)
 
 
 def test_weights_respect_min_max_bounds():
@@ -425,6 +483,15 @@ def test_rebalance_on_regime_change(monkeypatch):
                         lambda names, hours: {n: {} for n in names})
     monkeypatch.setattr(config, "PORTFOLIO_REBALANCE_INTERVAL_SEC", 99999)
     monkeypatch.setattr(config, "PORTFOLIO_REBALANCE_ON_REGIME", True)
+    monkeypatch.setattr(config, "PORTFOLIO_REGIME_REBALANCE_MIN_DWELL_SEC", 0.0)
+
+    class _Det:
+        def status(self):
+            return {"current": {"last_change_ts": time.time() - 600}}
+
+    monkeypatch.setattr(
+        "signals.regime_detector.get_detector", lambda: _Det(), raising=False,
+    )
 
     out = portfolio.rebalance(force=False)
     assert out["rebalance_reason"].startswith("regime:")

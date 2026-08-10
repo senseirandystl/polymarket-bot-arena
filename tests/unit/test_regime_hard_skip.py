@@ -6,35 +6,58 @@ from arena.regime_adapt import RegimeAdjust, _hard_block_map, adjustments
 from bots.bot_momentum import MomentumBot
 
 
-def test_hard_block_enters_and_clears_with_hysteresis():
-    # Enter when WR low + neg PnL
+def test_hard_block_enters_and_clears_with_hysteresis(monkeypatch):
+    import config
+    monkeypatch.setattr(config, "REGIME_HARD_SKIP_ENABLED", True)
+    monkeypatch.setattr(config, "REGIME_HARD_SKIP_EMERGENCY_ONLY", True)
+    monkeypatch.setattr(config, "REGIME_HARD_SKIP_MIN_TRADES", 80)
+    monkeypatch.setattr(config, "REGIME_HARD_SKIP_WR", 0.38)
+    monkeypatch.setattr(config, "REGIME_HARD_SKIP_CLEAR_WR", 0.48)
+    monkeypatch.setattr(
+        "arena.regime_settings.get_bool",
+        lambda name: True if name == "hard_skip" else False,
+    )
+    # Enter when WR low + neg PnL with full emergency sample
     with mock.patch("arena.regime_adapt._load_perf", return_value={
-        "low_vol_trend": {"n": 30, "wins": 8, "pnl": -40.0},
+        "low_vol_trend": {"n": 100, "wins": 30, "pnl": -40.0},  # WR=30%
     }):
         blocks = _hard_block_map({})
         assert blocks.get("low_vol_trend") is True
 
+    # Thin sample must NOT enter hard-skip in emergency mode
+    with mock.patch("arena.regime_adapt._load_perf", return_value={
+        "low_vol_trend": {"n": 30, "wins": 8, "pnl": -40.0},
+    }):
+        blocks = _hard_block_map({})
+        assert not blocks.get("low_vol_trend")
+
     # Stay blocked while WR still under clear bar
     with mock.patch("arena.regime_adapt._load_perf", return_value={
-        "low_vol_trend": {"n": 40, "wins": 18, "pnl": -10.0},  # WR=45%
+        "low_vol_trend": {"n": 100, "wins": 40, "pnl": -10.0},  # WR=40%
     }):
         blocks = _hard_block_map({"low_vol_trend": True})
         assert blocks.get("low_vol_trend") is True
 
     # Clear when WR recovers
     with mock.patch("arena.regime_adapt._load_perf", return_value={
-        "low_vol_trend": {"n": 50, "wins": 28, "pnl": 5.0},  # WR=56%
+        "low_vol_trend": {"n": 100, "wins": 55, "pnl": 5.0},  # WR=55%
     }):
         blocks = _hard_block_map({"low_vol_trend": True})
         assert blocks.get("low_vol_trend") is False
 
 
-def test_adjustments_block_directional_sets_size_zero():
+def test_adjustments_block_directional_sets_size_zero(monkeypatch):
+    import config
+    monkeypatch.setattr(config, "REGIME_HARD_SKIP_ENABLED", True)
+    monkeypatch.setattr(
+        "arena.regime_settings.get_bool",
+        lambda name: True if name in ("hard_skip", "adapt_enabled") else False,
+    )
     with mock.patch("arena.regime_adapt._refresh_cache"), \
          mock.patch("arena.regime_adapt._cache", (
              0.0,
-             {"low_vol_trend": 0.35},
-             {"low_vol_trend": {"n": 30, "wins": 8, "pnl": -40}},
+             {"low_vol_trend": 0.85},
+             {"low_vol_trend": {"n": 100, "wins": 30, "pnl": -40}},
              {"low_vol_trend": True},
          )):
         a = adjustments("low_vol_trend", "momentum")

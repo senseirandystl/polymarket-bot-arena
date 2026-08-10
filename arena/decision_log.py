@@ -80,33 +80,80 @@ def _flush_loop() -> None:
             logger.debug("decision_log flush error: %s", e)
 
 
-def classify_skip_reason(reasoning: str | None) -> Optional[str]:
-    """Match trader.py skip buckets for consistent telemetry."""
+def classify_skip_reason(
+    reasoning: str | None,
+    *,
+    explicit: str | None = None,
+) -> Optional[str]:
+    """Map reasoning (and optional explicit skip_reason) to a stable bucket.
+
+    Prefer an explicit ``skip_reason`` on the signal when present. Otherwise
+    parse the human reasoning string. Keep buckets coarse enough for
+    dashboards but specific enough that overnight soaks are explainable
+    (generic ``skip`` should be rare).
+    """
+    if explicit and str(explicit).strip():
+        return str(explicit).strip().lower().replace(" ", "_")[:48]
     why = (reasoning or "").lower()
     if not why:
         return "skip"
+    # Order matters: more specific phrases before generic tokens.
+    if "pile-in" in why or "pilein" in why:
+        return "pilein_ev_gate"
     if "dead-zone" in why or "dead zone" in why:
         return "dead_zone"
     if "extreme-drift" in why or "extreme drift" in why:
         return "extreme_drift"
+    if "mid-band lag" in why or "mid-band" in why:
+        return "mid_band"
+    if "underdog band" in why or "underdog" in why:
+        return "underdog"
+    if "no-side drift" in why or "no-side lag" in why:
+        return "no_side_gate"
+    if "drift dual-gate" in why or "dual-gate" in why:
+        return "drift_dual_gate"
+    if "drift veto" in why:
+        return "drift_veto"
     if "macro-release" in why or "macro" in why:
         return "macro"
     if "consensus" in why:
         return "consensus"
-    if "high-price" in why:
+    if "high-price" in why or "high price" in why:
         return "high_price"
     if "model lean" in why or "weak lean" in why:
         return "weak_lean"
-    if "no edge" in why:
+    if "no edge" in why or "no_edge" in why:
         return "no_edge"
-    if "book inconsistency" in why:
+    if "book inconsistency" in why or "book sum" in why:
         return "book"
     if "exposure" in why:
         return "exposure_cap"
     if "learned_skip" in why or "learned skip" in why:
         return "learned_skip"
-    if "ask gap" in why:
+    if "style-skip" in why or "style skip" in why:
+        return "style_skip"
+    if "hard-skip" in why or "hard skip" in why or "regime hard-skip" in why:
+        return "regime_hard_skip"
+    if "side-skip" in why or "side skip" in why:
+        return "side_skip"
+    if "twap not locked" in why or "pre_settle cert" in why or "twap_cert" in why:
+        return "twap_certainty"
+    if "sweeper: waiting" in why or (
+        "sweeper" in why and "window=" in why
+    ):
+        return "sweeper_window"
+    if "no lock" in why:
+        return "no_lock"
+    if "ask gap" in why or "ask quality" in why:
         return "ask_quality"
+    if "session" in why and "skip" in why:
+        return "session"
+    if "slippage" in why:
+        return "slippage"
+    if "conf " in why and "<" in why:
+        return "low_confidence"
+    if "priced in" in why:
+        return "priced_in"
     return "skip"
 
 
@@ -206,7 +253,10 @@ def enqueue(
         side = None
     skip_reason = None
     if action != "buy":
-        skip_reason = classify_skip_reason(signal.get("reasoning"))
+        skip_reason = classify_skip_reason(
+            signal.get("reasoning"),
+            explicit=signal.get("skip_reason"),
+        )
 
     feats = signal.get("features")
     if feats is not None and not isinstance(feats, str):
@@ -481,7 +531,7 @@ def rollup() -> dict[str, Any]:
         core = core_lane_attribution(conn, deadband)
         candidates = {
             lane: candidate_lane_attribution(conn, lane, deadband)
-            for lane in ("fut", "tech", "xasset")
+            for lane in ("fut", "tech", "xasset", "lag", "ms_mom", "flow_decay")
         }
         # Skip-reason counterfactual: among skips with a side, what WR?
         skip_cf = {}

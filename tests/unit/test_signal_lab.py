@@ -69,10 +69,13 @@ class TestComputeLanes:
         assert lanes["drift"] == 1.0
 
     def test_momentum_from_candles_and_fallback(self):
+        from signals.drift_scale import reset_drift_scale_estimator
+        reset_drift_scale_estimator()  # cold → MOM_SCALE_PRIOR
         lanes, raw = _lab().compute_lanes(
             {"id": "m"}, _signals(prices=[100.0, 100.2], latest=0.0))
         assert raw["price_momentum"] == pytest.approx(0.002)
-        assert lanes["mom"] > 0.7   # tanh(1) at the 0.2% saturation point
+        # Cold adaptive scale ≈ 0.002 prior → soft_saturate(0.002) ≈ 0.76
+        assert lanes["mom"] > 0.55
         # Single candle + live price falls back to latest-vs-candle.
         lanes2, raw2 = _lab().compute_lanes(
             {"id": "m2"}, _signals(prices=[100.0], latest=100.1))
@@ -234,7 +237,11 @@ class TestMakeDecisionIntegration:
                   "time_remaining_seconds": 60}
         signals = {"prices": [100.0, 100.4], "latest": 100.4,
                    "orderflow": {}, "pm_momentum": 0.0, "obi": 0.0,
-                   "cvd": 0.0, "btc_drift": drift}
+                   "cvd": 0.0, "btc_drift": drift,
+                   # Dual-gate needs real moneyness (not only z-score).
+                   "btc_drift_pct": 0.001 if drift > 0 else -0.001,
+                   "drift_vol_scale": 0.0022,
+                   "btc_strike": 100000.0, "btc_now": 100100.0}
         return bot.make_decision(market, signals)
 
     def test_buy_reasoning_contains_contract_tokens(self, monkeypatch):

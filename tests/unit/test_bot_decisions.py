@@ -199,17 +199,19 @@ def _sniper_market():
 class TestSniper:
     def test_buys_cheap_zone_with_drift_backing(self, arena_db):
         bot = SniperBot(name="sniper-t", generation=0)
-        sig = bot.make_decision(_sniper_market(), make_signals(btc_drift=0.20))
+        # TWAP dual-gate floors sniper at min_drift = max(0.15, 0.35, 0.40) = 0.40.
+        sig = bot.make_decision(_sniper_market(), make_signals(btc_drift=0.45))
         _check_contract(sig)
         assert sig["action"] == "buy" and sig["side"] == "yes"
         assert sig["edge"] > 0
-        assert sig["signals"]["drift"] == pytest.approx(0.20)
+        assert sig["signals"]["drift"] == pytest.approx(0.45)
 
     def test_quiet_regime_raises_drift_bar(self, arena_db):
         bot = SniperBot(name="sniper-t", generation=0)
-        base_min = bot.strategy_params["min_drift"]
         bump = bot.strategy_params["quiet_drift_bump"]
-        drift = base_min + bump / 2.0  # clears base bar, not the quiet bar
+        # TWAP dual-gate floors sniper at 0.40. Use drift just above the
+        # floor so the quiet bump (0.05) pushes the bar above it.
+        drift = 0.42  # clears 0.40 dual-gate; quiet bar = 0.40+0.05=0.45
         quiet = bot.make_decision(_sniper_market(), make_signals(
             btc_drift=drift, vol_regime={"regime": "quiet", "trend_score": 0.2}))
         normal = bot.make_decision(_sniper_market(), make_signals(

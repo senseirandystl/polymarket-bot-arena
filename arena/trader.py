@@ -187,22 +187,15 @@ class Trader(threading.Thread):
                 if signal.get("action") == "skip":
                     # Do NOT mark traded — re-evaluate next tick. Skip is a
                     # first-class outcome; tally it so runs are explainable.
-                    # Classify coarse reason from reasoning for skip-storm
-                    # diagnostics (dead-zone was historically the largest leak).
-                    why = (signal.get("reasoning") or "").lower()
-                    if "dead-zone" in why or "dead zone" in why:
-                        skip_bucket = "dead_zone"
-                    elif "macro-release" in why or "macro" in why:
-                        skip_bucket = "macro"
-                    elif "consensus" in why:
-                        skip_bucket = "consensus"
-                    elif "high-price" in why:
-                        skip_bucket = "high_price"
-                    elif "model lean" in why:
-                        skip_bucket = "weak_lean"
-                    elif "no edge" in why:
-                        skip_bucket = "no_edge"
-                    else:
+                    # Shared classifier with decision_log (explicit skip_reason
+                    # wins; otherwise parse reasoning for a specific bucket).
+                    try:
+                        from arena.decision_log import classify_skip_reason
+                        skip_bucket = classify_skip_reason(
+                            signal.get("reasoning"),
+                            explicit=signal.get("skip_reason"),
+                        ) or "skip"
+                    except Exception:
                         skip_bucket = "skip"
                     self._state.note_skip(skip_bucket)
                     # Counterfactual log (throttled): skips still carry lane

@@ -79,8 +79,10 @@ class TestAttachCandidates:
         samples = [_sample(tr=240.0)]
         lc.attach_candidates(samples, 1000.0, {})
         sig = samples[0].signals
-        for k in lc.CANDIDATE_KEYS:
-            assert sig[k] is None
+        # Keys that attach_candidates always writes (ms_mom_1m needs features).
+        for k in ("fut_taker", "fut_funding", "fut_oi",
+                  "tech_mtf", "tech_macd", "tech_bb", "xasset", "lag"):
+            assert sig.get(k) is None
 
 
 # ---------------------------------------------------------------------------
@@ -88,10 +90,10 @@ class TestAttachCandidates:
 # ---------------------------------------------------------------------------
 
 class TestBuildProposals:
-    def _metrics(self, n=300, wr=0.60, ev=0.02):
-        return {"fut_taker": {"n": n, "follow_wr": wr, "net_n": n,
-                              "net_wr": wr, "avg_price": 0.55,
-                              "ev_per_share": ev}}
+    def _metrics(self, n=300, wr=0.60, ev=0.02, key="fut_taker"):
+        return {key: {"n": n, "follow_wr": wr, "net_n": n,
+                      "net_wr": wr, "avg_price": 0.55,
+                      "ev_per_share": ev}}
 
     def test_qualifying_lane_proposed_with_profile(self):
         props = lc.build_proposals(self._metrics())
@@ -99,6 +101,17 @@ class TestBuildProposals:
         assert props[0]["lane"] == "fut"
         assert props[0]["proposal"]["profile"] == lc.PROFILE_SUGGESTIONS["fut"]
         assert props[0]["metrics"]["signal_key"] == "fut_taker"
+
+    def test_lag_and_ms_mom_are_promotable_lanes(self):
+        """Expanded 2026-08 candidates must clear the same bar + have profiles."""
+        assert "lag" in lc.LIVE_LANE_KEYS
+        assert "ms_mom" in lc.LIVE_LANE_KEYS
+        assert "lag" in lc.PROFILE_SUGGESTIONS
+        assert "ms_mom" in lc.PROFILE_SUGGESTIONS
+        assert "flow_decay" in lc.PROFILE_SUGGESTIONS  # live-shadow only
+        m = {**self._metrics(key="lag"), **self._metrics(key="ms_mom_1m")}
+        props = {p["lane"] for p in lc.build_proposals(m)}
+        assert props == {"lag", "ms_mom"}
 
     def test_each_threshold_is_conjunctive(self):
         # This is the pm_mom lesson: high WR with negative EV must NOT pass.

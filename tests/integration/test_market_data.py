@@ -53,7 +53,7 @@ def test_warm_once_populates_store():
     )
     books = {"YES": _book(0.45), "NO": _book(0.50)}
     with mock.patch.object(polymarket_markets, "get_order_book",
-                           lambda tok: books[tok]):
+                           lambda tok, timeout=None: books[tok]):
         warmer._warm_once()
 
     snap = market_data.store().get("0xabc")
@@ -74,3 +74,80 @@ def test_build_combined_signals_warm_path_uses_warm_values():
     assert sig["obi"] == 0.3
     assert sig["cvd"] == -0.2
     assert sig["pm_momentum"] == 0.07
+
+
+def test_fetch_books_parallel_timeout_does_not_raise():
+    """Hung CLOB GETs must fail soft — never raise 'futures unfinished'."""
+    import time
+
+    def _slow_book(tok, timeout=None):
+        time.sleep(3.0)  # longer than BOOK_FETCH_TIMEOUT_SEC + wait slack
+        return _book(0.5)
+
+    warmer = market_data.MarketDataWarmer(
+        _FakeDiscovery({"id": "m"}), _FakeCvd(), _FakePm(),
+    )
+    with mock.patch.object(polymarket_markets, "get_order_book", _slow_book):
+        with mock.patch.object(market_data.config, "BOOK_FETCH_TIMEOUT_SEC", 0.15):
+            t0 = time.perf_counter()
+            yes_b, no_b = warmer._fetch_books_parallel("YES", "NO")
+            elapsed = time.perf_counter() - t0
+    # Returns invalid books, does not raise, does not wait the full sleep.
+    assert yes_b.get("valid") is False
+    assert no_b.get("valid") is False
+    assert elapsed < 1.5
+
+
+def test_fetch_books_parallel_partial_ok():
+    """One side completing still returns that book; the other is invalid."""
+    import time
+
+    def _mixed(tok, timeout=None):
+        if tok == "YES":
+            return _book(0.44)
+        time.sleep(2.0)
+        return _book(0.55)
+
+    warmer = market_data.MarketDataWarmer(
+        _FakeDiscovery({"id": "m"}), _FakeCvd(), _FakePm(),
+    )
+    with mock.patch.object(polymarket_markets, "get_order_book", _mixed):
+        with mock.patch.object(market_data.config, "BOOK_FETCH_TIMEOUT_SEC", 0.2):
+            yes_b, no_b = warmer._fetch_books_parallel("YES", "NO")
+    assert yes_b.get("valid") is True
+    assert yes_b.get("best_ask") == 0.44
+    assert no_b.get("valid") is False
+
+
+def test_warm_once_keeps_prev_books_on_fetch_timeout():
+    """Fail-soft: previous valid books survive a timed-out refresh."""
+    clean_tick.reset()
+    market = {
+        "id": "0xprev", "condition_id": "0xcond",
+        "polymarket_token_id": "YES", "polymarket_no_token_id": "NO",
+    }
+    warmer = market_data.MarketDataWarmer(
+        _FakeDiscovery(market), _FakeCvd(), _FakePm(),
+    )
+    # Seed a good snapshot.
+    with mock.patch.object(
+        polymarket_markets, "get_order_book",
+        lambda tok, timeout=None: _book(0.40 if tok == "YES" else 0.55),
+    ):
+        warmer._warm_once()
+    snap1 = market_data.store().get("0xprev")
+    assert snap1 and snap1["yes_book"]["valid"]
+
+    # Next cycle: both sides hang → keep previous books.
+    def _hang(tok, timeout=None):
+        import time
+        time.sleep(2.0)
+        return {"valid": False}
+
+    with mock.patch.object(polymarket_markets, "get_order_book", _hang):
+        with mock.patch.object(market_data.config, "BOOK_FETCH_TIMEOUT_SEC", 0.15):
+            warmer._warm_once()  # must not raise
+    snap2 = market_data.store().get("0xprev")
+    assert snap2 is not None
+    assert snap2["yes_book"]["valid"] is True
+    assert snap2["no_book"]["valid"] is True

@@ -67,13 +67,20 @@ def multi_timeframe_score(prices: list) -> float:
     """Alignment of 1m / 3m / 5m momentum: mean of per-horizon tanh reads."""
     if len(prices) < 6 or prices[-1] <= 0:
         return 0.0
+    try:
+        from signals.drift_scale import get_drift_scale_estimator
+        base = float(get_drift_scale_estimator().mom_saturate_scale())
+        # Map mom scale (~return) into MTF base; keep order of magnitude of MTF_SCALE.
+        base = max(MTF_SCALE * 0.7, min(MTF_SCALE * 2.5, base * 0.75))
+    except Exception:
+        base = MTF_SCALE
     scores = []
     for horizon in (1, 3, 5):
         if len(prices) > horizon and prices[-1 - horizon] > 0:
             move = (prices[-1] - prices[-1 - horizon]) / prices[-1 - horizon]
             # Longer horizons see proportionally larger moves; scale by sqrt(h)
             # so each horizon is judged against its own typical magnitude.
-            scores.append(soft_saturate(move, MTF_SCALE * (horizon ** 0.5)))
+            scores.append(soft_saturate(move, base * (horizon ** 0.5)))
     if not scores:
         return 0.0
     return sum(scores) / len(scores)

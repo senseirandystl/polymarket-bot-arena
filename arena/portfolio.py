@@ -530,13 +530,43 @@ def allocate(
         min_overlap=int(getattr(config, "PORTFOLIO_CORR_MIN_OVERLAP", 8)),
     )
 
+    # Proven losers: strip manual floors so capital can leave (overnight
+    # soak: sweeper kept ~29% via override floor while expectancy was deep red).
+    neg_n = int(getattr(config, "PORTFOLIO_NEG_EXP_MIN_N", 20))
+    for n in list(overrides.keys()):
+        m = metrics.get(n) or {}
+        if (
+            bool(m.get("ready"))
+            and int(m.get("n") or 0) >= neg_n
+            and float(m.get("expectancy") or 0.0) < 0
+            and not _is_arbitrage_bot(n)
+        ):
+            overrides.pop(n, None)
+
     # Pin arb at 1/N unless the operator already set a manual override.
+    # Audit 2a: when arb is idle (0 trades in ARB_DYNAMIC_IDLE_HOURS), reduce
+    # its fixed pin and reallocate freed capital to directional bots.
     n_roster = max(len(names), 1)
     equal_share = 1.0 / n_roster
     for n in names:
         if _is_arbitrage_bot(n) and n not in overrides:
             if bool(getattr(config, "PORTFOLIO_ARB_FIXED_EQUAL", True)):
-                overrides[n] = equal_share
+                if getattr(config, "PORTFOLIO_ARB_DYNAMIC_ENABLED", True):
+                    arb_m = metrics.get(n) or {}
+                    arb_n = int(arb_m.get("n") or 0)
+                    idle_h = float(getattr(
+                        config, "PORTFOLIO_ARB_DYNAMIC_IDLE_HOURS", 6.0))
+                    arb_min = float(getattr(
+                        config, "PORTFOLIO_ARB_DYNAMIC_MIN_WEIGHT", 0.04))
+                    # If arb has 0 fills in the lookback, scale toward min.
+                    if arb_n == 0 and hours >= idle_h:
+                        overrides[n] = max(arb_min, equal_share * 0.30)
+                    elif arb_n > 0:
+                        overrides[n] = max(arb_min, equal_share)
+                    else:
+                        overrides[n] = equal_share
+                else:
+                    overrides[n] = equal_share
 
     # Split locked (manual + arb staple) vs free bots
     locked = {k: overrides[k] for k in overrides}
@@ -604,9 +634,39 @@ def allocate(
     for n in names:
         weights.setdefault(n, 0.0)
 
+    # Audit 2b: minimum activity weight. Active directional bots with few
+    # recent fills keep at least PORTFOLIO_ACTIVE_MIN_WEIGHT so
+    # flat-market hysteresis doesn't zero their capital and prevent them
+    # from trading when volatility returns.
+    act_min_n = int(getattr(config, "PORTFOLIO_ACTIVE_MIN_TRADES", 3))
+    act_min_w = float(getattr(config, "PORTFOLIO_ACTIVE_MIN_WEIGHT", 0.05))
+    if act_min_w > 0 and free_names:
+        for n in free_names:
+            if n in explorers:
+                continue
+            m = metrics.get(n) or {}
+            n_tr = int(m.get("n") or 0)
+            if n_tr < act_min_n and float(weights.get(n, 0.0)) < act_min_w:
+                # Boost to activity floor; take from over-weight free bots.
+                need = act_min_w - float(weights.get(n, 0.0))
+                donors = [
+                    d for d in free_names
+                    if d != n and float(weights.get(d, 0.0)) > act_min_w + 1e-9
+                ]
+                donor_extra = sum(
+                    max(0.0, float(weights[d]) - act_min_w) for d in donors
+                )
+                if donor_extra > 1e-9:
+                    for d in donors:
+                        extra = max(0.0, float(weights[d]) - act_min_w)
+                        cut = min(need, extra) * (extra / donor_extra)
+                        weights[d] = float(weights[d]) - cut
+                    weights[n] = float(weights.get(n, 0.0)) + min(need, donor_extra)
+
     # Proven floor: gen0 / high-n bots with non-catastrophic long PnL keep a
     # minimum weight so a short dip does not zero the best directional
     # (2026-08: hybrid-v1 at weight 0 while cold makers took 48%).
+    # Negative-expectancy bots never get the floor.
     proven_floor = float(getattr(config, "PORTFOLIO_PROVEN_FLOOR", 0.06))
     proven_min_n = int(getattr(config, "PORTFOLIO_PROVEN_MIN_TRADES", 25))
     if proven_floor > 0 and free_names:
@@ -617,7 +677,12 @@ def allocate(
             m = metrics.get(n) or {}
             n_tr = int(m.get("n") or 0)
             total_pnl = float(m.get("total_pnl") or 0.0)
-            if n_tr >= proven_min_n and total_pnl >= 0:
+            exp = float(m.get("expectancy") or 0.0)
+            if (
+                n_tr >= proven_min_n
+                and total_pnl >= 0
+                and exp >= 0
+            ):
                 if float(weights.get(n, 0.0)) < proven_floor:
                     need_boost[n] = proven_floor - float(weights.get(n, 0.0))
         if need_boost:
@@ -640,8 +705,136 @@ def allocate(
                 for n, need in need_boost.items():
                     weights[n] = float(weights[n]) + take * (need / boost_sum)
 
-    s = sum(weights.values()) or 1.0
-    weights = {k: round(v / s, 6) for k, v in weights.items()}
+    # Per-bot caps (neg expectancy demote + unproven max + global max +
+    # explore budget). Locks stay absolute; free mass is re-filled among
+    # free bots under their caps without pumping explorers past budget.
+    neg_max = float(getattr(config, "PORTFOLIO_NEG_EXP_MAX_WEIGHT", 0.0))
+    unproven_max = float(getattr(config, "PORTFOLIO_UNPROVEN_MAX_WEIGHT", 0.20))
+    edge_n = int(getattr(config, "PORTFOLIO_EDGE_PROVEN_MIN_N", 20))
+    explore_set = set(explorers)
+
+    def _bot_cap(n: str) -> float:
+        m = metrics.get(n) or {}
+        proven = (
+            int(m.get("n") or 0) >= edge_n
+            and float(m.get("expectancy") or 0.0) > 0
+        )
+        cap = max_w if proven else min(
+            max_w, unproven_max if unproven_max > 0 else max_w
+        )
+        if (
+            bool(m.get("ready"))
+            and int(m.get("n") or 0) >= neg_n
+            and float(m.get("expectancy") or 0.0) < 0
+            and not _is_arbitrage_bot(n)
+        ):
+            cap = min(cap, neg_max)
+        if n in explore_set:
+            cap = min(cap, explore_cap)
+        return float(cap)
+
+    # Freeze locks (respect global max only)
+    locked_now = {
+        n: min(float(weights.get(n, 0.0)), max_w) for n in locked
+    }
+    locked_sum_now = sum(locked_now.values())
+    free_mass_now = max(0.0, 1.0 - locked_sum_now)
+
+    # Clip free bots to caps, then scale *veterans* to fill free mass
+    # (explorers keep their pre-cap allotment ≤ explore_cap).
+    for n in free_names:
+        weights[n] = min(float(weights.get(n, 0.0)), _bot_cap(n))
+    free_raw = {n: float(weights.get(n, 0.0)) for n in free_names}
+    vet_names = [n for n in free_names if n not in explore_set]
+    exp_sum = sum(free_raw[n] for n in free_names if n in explore_set)
+    # Explorers never exceed total explore budget after clip
+    if explorers and exp_sum > explore_mass + 1e-12:
+        sc_e = explore_mass / exp_sum
+        for n in free_names:
+            if n in explore_set:
+                free_raw[n] *= sc_e
+        exp_sum = explore_mass
+    vet_target = max(0.0, free_mass_now - exp_sum)
+    vet_sum = sum(free_raw[n] for n in vet_names)
+    if vet_names and vet_target > 0:
+        if vet_sum > 1e-15:
+            sc = vet_target / vet_sum
+            for n in vet_names:
+                weights[n] = free_raw[n] * sc
+        else:
+            # Veterans zeroed (all losers) — equal-split among those with cap>0
+            eligible = [n for n in vet_names if _bot_cap(n) > 1e-12]
+            if eligible:
+                per = vet_target / len(eligible)
+                for n in vet_names:
+                    weights[n] = per if n in eligible else 0.0
+            else:
+                for n in vet_names:
+                    weights[n] = 0.0
+        for n in free_names:
+            if n in explore_set:
+                weights[n] = free_raw[n]
+    elif free_names and free_mass_now > 0:
+        # Only explorers free — already clipped; scale to free mass under caps
+        e_sum = sum(free_raw[n] for n in free_names)
+        if e_sum > 1e-15:
+            sc = free_mass_now / e_sum
+            for n in free_names:
+                weights[n] = min(free_raw[n] * sc, _bot_cap(n))
+        else:
+            for n in free_names:
+                weights[n] = 0.0
+    else:
+        for n in free_names:
+            weights[n] = free_raw.get(n, 0.0)
+
+    # Clip veterans that scaled above cap; re-park overflow on under-cap veterans
+    for _ in range(5):
+        overflow = 0.0
+        under: list[str] = []
+        for n in vet_names:
+            cap = _bot_cap(n)
+            w = float(weights.get(n, 0.0))
+            if w > cap + 1e-12:
+                overflow += w - cap
+                weights[n] = cap
+            elif w + 1e-12 < cap:
+                under.append(n)
+        if overflow <= 1e-12 or not under:
+            break
+        headroom = {n: _bot_cap(n) - float(weights.get(n, 0.0)) for n in under}
+        head_sum = sum(max(0.0, h) for h in headroom.values()) or 1.0
+        for n in under:
+            add = overflow * (max(0.0, headroom[n]) / head_sum)
+            weights[n] = float(weights.get(n, 0.0)) + add
+
+    for n in locked:
+        weights[n] = locked_now[n]
+
+    # Residual free mass after veteran caps: fill explorers under their cap,
+    # then any free bot still under cap. Leaves capital unallocated only when
+    # every free bot is hard-capped (rare; max_w binds the roster).
+    s = sum(float(weights.get(n, 0.0)) for n in names)
+    residual = free_mass_now + locked_sum_now - s
+    if residual > 1e-6:
+        fill_order = (
+            [n for n in free_names if n in explore_set]
+            + [n for n in free_names if n not in explore_set]
+        )
+        for n in fill_order:
+            room = _bot_cap(n) - float(weights.get(n, 0.0))
+            if room <= 1e-12:
+                continue
+            add = min(room, residual)
+            weights[n] = float(weights.get(n, 0.0)) + add
+            residual -= add
+            if residual <= 1e-9:
+                break
+
+    # Ensure every name present
+    for n in names:
+        weights.setdefault(n, 0.0)
+    weights = {k: round(float(v), 6) for k, v in weights.items()}
 
     # Compact correlation for JSON (upper triangle pairs as "a|b")
     corr_pairs = {}
@@ -773,6 +966,26 @@ def rebalance(
         and regime != last_regime
         and regime not in ("unknown",)
     )
+    # Dwell gate: only rebalance on regime after the *new* regime has been
+    # held long enough. Quiet-tape boundary chatter was flipping every few
+    # minutes and thrashing weights (133 rebalances overnight).
+    if regime_changed:
+        dwell_need = float(
+            getattr(config, "PORTFOLIO_REGIME_REBALANCE_MIN_DWELL_SEC", 300.0)
+        )
+        change_ts = None
+        try:
+            from signals.regime_detector import get_detector
+            snap = get_detector().status().get("current") or {}
+            change_ts = snap.get("last_change_ts")
+        except Exception:
+            change_ts = None
+        try:
+            change_ts = float(change_ts) if change_ts is not None else None
+        except (TypeError, ValueError):
+            change_ts = None
+        if change_ts is None or (now - change_ts) < dwell_need:
+            regime_changed = False
 
     due_timer = (now - last_ts) >= interval
     if not force and not due_timer and not regime_changed:
@@ -804,6 +1017,34 @@ def rebalance(
             edges = edges_for_cell(tuple(cur_cell), rmap) if cur_cell else None
             if edges:
                 regime_edges = {b: e["shrunk_pnl"] for b, e in edges.items()}
+            # PLAN 2026-08-05: blend strategy-fit scores from regime_router so
+            # capital tilts toward strategies that fit the live detector
+            # regime even when the fine-grained map cell is thin.
+            try:
+                from arena.regime_router import score as _route_score
+                import db as _db
+                with _db.get_conn() as conn:
+                    rows = conn.execute(
+                        "SELECT bot_name, strategy_type FROM bot_configs "
+                        "WHERE active=1"
+                    ).fetchall()
+                blend = float(getattr(config, "REGIME_ROUTER_GA_BLEND", 0.35))
+                if regime is None or regime == "unknown":
+                    rid = None
+                else:
+                    rid = regime
+                if rid and blend > 0:
+                    regime_edges = dict(regime_edges or {})
+                    for r in rows:
+                        st = r["strategy_type"]
+                        sc = _route_score(st, rid)
+                        # Map score ~[0,1.5] to a mild edge proxy in USD space
+                        proxy = (sc - 0.65) * 8.0
+                        name = r["bot_name"]
+                        prev = float(regime_edges.get(name, 0.0) or 0.0)
+                        regime_edges[name] = (1.0 - blend) * prev + blend * proxy
+            except Exception:
+                pass
     except Exception:
         regime_edges = None
 

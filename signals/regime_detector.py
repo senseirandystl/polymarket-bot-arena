@@ -155,11 +155,16 @@ def compute_features(
         realized_vol = float(realized_vol or 0.0)
 
     # --- Momentum intensity: |1-candle return| soft-scaled at 0.2% ---
+    # Also keep signed trend_sign in YES-frame (BTC up → positive) for
+    # side attribution: which way the tape is grinding, not just how hard.
     mom = 0.0
+    trend_sign = 0.0
     if len(clean) >= 2 and clean[-2] > 0:
         ret = (clean[-1] - clean[-2]) / clean[-2]
         # soft saturate: 0.002 (~p97) → ~0.76; map to 0..1 via tanh
-        mom = abs(math.tanh(ret / 0.002))
+        signed = math.tanh(ret / 0.002)
+        mom = abs(signed)
+        trend_sign = float(signed)
 
     # --- Order-flow intensity: mean absolute CVD/OBI (already ~[-1,1]) ---
     flow = _clip01(0.5 * (abs(float(cvd)) + abs(float(obi))))
@@ -182,29 +187,147 @@ def compute_features(
     else:
         volume_score = _clip01(float(volume_score))
 
-    return {
-        "vol": _clip01(vol_score),  # volatility (name kept for API stability)
+    # Multi-horizon path structure (context + directionality axis)
+    chop = 0.5
+    ms_mom_align = 0.5
+    try:
+        from signals import regime as regime_mod
+        from signals import multiscale
+        reg_feats = regime_mod.compute(clean)
+        chop = float(reg_feats.get("regime_chop", 0.5) or 0.5)
+        # Prefer multi-window trend mean when available
+        if reg_feats.get("regime_trend") is not None:
+            trend_score = float(reg_feats["regime_trend"])
+        ms = multiscale.compute(clean)
+        m1 = float(ms.get("ms_mom_1m") or 0.0)
+        m5 = float(ms.get("ms_mom_5m") or 0.0)
+        if abs(m1) > 0.05 and abs(m5) > 0.05:
+            ms_mom_align = 1.0 if (m1 > 0) == (m5 > 0) else 0.0
+        elif abs(m1) <= 0.05 and abs(m5) <= 0.05:
+            ms_mom_align = 0.5
+        else:
+            ms_mom_align = 0.5
+        # Blend short + medium signed mom for stabler trend-side stamp
+        if abs(m5) > 1e-9 or abs(m1) > 1e-9:
+            blend = 0.4 * m1 + 0.6 * m5
+            # multiscale moms are already roughly in [-1,1]
+            trend_sign = float(max(-1.0, min(1.0, blend)))
+    except Exception:
+        pass
+
+    feats = {
+        "vol": _clip01(vol_score),  # volatility (abs score; may be replaced by rel)
+        "vol_abs": _clip01(vol_score),
         "trend": _clip01(trend_score),
         "mom": _clip01(mom),
         "flow": _clip01(flow),
         "volume": volume_score,  # activity — NOT the same as vol
         "flow_align": _clip01(flow_align),
         "realized_vol": float(realized_vol),
+        "chop": _clip01(chop),
+        "ms_mom_align": _clip01(ms_mom_align),
+        # Signed YES-frame direction of the tape ∈ [-1, 1]
+        "trend_sign": float(max(-1.0, min(1.0, trend_sign))),
     }
+    feats["direction"] = directionality(feats)
+
+    # Relative calibration (percentile of raw realized_vol / trend / chop)
+    try:
+        from arena.regime_settings import get_bool as _reg_bool
+        _use_rel = bool(_reg_bool("use_relative"))
+    except Exception:
+        _use_rel = bool(getattr(config, "REGIME_USE_RELATIVE", True))
+    if _use_rel:
+        try:
+            from signals.regime_calibration import get_calibrator
+            cal = get_calibrator()
+            cal.update(
+                realized_vol=float(realized_vol),
+                trend_eff=float(trend_score),
+                chop=float(chop),
+                mom_abs=float(mom),
+            )
+            vol_rel = cal.percentile(
+                "realized_vol", float(realized_vol),
+                fallback=_clip01(vol_score),
+            )
+            trend_rel = cal.percentile(
+                "trend_eff", float(trend_score),
+                fallback=_clip01(trend_score),
+            )
+            chop_rel = cal.percentile(
+                "chop", float(chop), fallback=_clip01(chop),
+            )
+            feats["vol_rel"] = vol_rel
+            feats["trend_rel"] = trend_rel
+            feats["chop_rel"] = chop_rel
+            # Classifier uses relative vol as primary "vol" axis when relative on
+            feats["vol"] = vol_rel
+            # Direction uses relative trend in the composite when available
+            feats["trend"] = 0.5 * float(trend_score) + 0.5 * trend_rel
+            feats["direction"] = directionality(feats)
+            feats["calibration"] = 1.0 if cal.ready("realized_vol") else 0.0
+        except Exception:
+            feats["vol_rel"] = feats["vol"]
+            feats["calibration"] = 0.0
+    else:
+        feats["vol_rel"] = feats["vol"]
+        feats["calibration"] = 0.0
+
+    return feats
+
+
+def directionality(features: dict[str, float]) -> float:
+    """Composite directionality in [0, 1]: trend + anti-chop + multi-scale align.
+
+    Used as the second axis of the regime grid (alongside vol). High =
+    efficient directional tape; low = range / churn.
+    """
+    t = float(features.get("trend", 0.5) or 0.5)
+    chop = float(features.get("chop", 0.5) or 0.5)
+    align = float(features.get("ms_mom_align", 0.5) or 0.5)
+    return _clip01(0.45 * t + 0.35 * (1.0 - chop) + 0.20 * align)
 
 
 def classify_rules(features: dict[str, float],
                    *,
-                   vol_hi: float = 0.55,
-                   vol_lo: float = 0.35,
-                   trend_hi: float = 0.50,
-                   trend_lo: float = 0.35) -> tuple[str, float]:
+                   vol_hi: float | None = None,
+                   vol_lo: float | None = None,
+                   trend_hi: float | None = None,
+                   trend_lo: float | None = None) -> tuple[str, float]:
     """Rule-based regime id + confidence from a feature dict.
+
+    When relative calibration is on, ``vol`` should already be a relative
+    score and thresholds default to REGIME_CLASSIFY_VOL_* / DIR_*.
+    Falls back to classic absolute thresholds when relative mode is off.
 
     Returns (regime_id, confidence in 0..1).
     """
-    v = float(features.get("vol", 0.0))
-    t = float(features.get("trend", 0.0))
+    try:
+        from arena.regime_settings import get_bool as _reg_bool
+        use_rel = bool(_reg_bool("use_relative"))
+    except Exception:
+        use_rel = bool(getattr(config, "REGIME_USE_RELATIVE", True))
+    if use_rel:
+        vol_hi = float(vol_hi if vol_hi is not None
+                       else getattr(config, "REGIME_CLASSIFY_VOL_HI", 0.70))
+        vol_lo = float(vol_lo if vol_lo is not None
+                       else getattr(config, "REGIME_CLASSIFY_VOL_LO", 0.30))
+        trend_hi = float(trend_hi if trend_hi is not None
+                         else getattr(config, "REGIME_CLASSIFY_DIR_HI", 0.55))
+        trend_lo = float(trend_lo if trend_lo is not None
+                         else getattr(config, "REGIME_CLASSIFY_DIR_LO", 0.40))
+        # Prefer relative vol when present
+        v = float(features.get("vol_rel", features.get("vol", 0.0)) or 0.0)
+        t = float(features.get("direction", directionality(features)) or 0.0)
+    else:
+        vol_hi = float(vol_hi if vol_hi is not None else 0.55)
+        vol_lo = float(vol_lo if vol_lo is not None else 0.35)
+        trend_hi = float(trend_hi if trend_hi is not None else 0.50)
+        trend_lo = float(trend_lo if trend_lo is not None else 0.35)
+        v = float(features.get("vol", 0.0))
+        t = float(features.get("trend", 0.0))
+
     m = float(features.get("mom", 0.0))
     f = float(features.get("flow", 0.0))
 
@@ -283,11 +406,11 @@ class RegimeDetector:
         )
         self.hold_ticks = int(
             hold_ticks if hold_ticks is not None
-            else getattr(config, "REGIME_HOLD_TICKS", 3)
+            else getattr(config, "REGIME_HOLD_TICKS", 20)
         )
         self.switch_margin = float(
             switch_margin if switch_margin is not None
-            else getattr(config, "REGIME_SWITCH_MARGIN", 0.08)
+            else getattr(config, "REGIME_SWITCH_MARGIN", 0.12)
         )
         self.use_centroids = bool(
             use_centroids if use_centroids is not None
@@ -583,6 +706,37 @@ class RegimeDetector:
             self._candidate_ticks = 0
             self._last_change_ts = time.time()
             return True
+
+        # Absolute-confidence escape hatch: when a regime candidate is very
+        # confident (>0.75) and the current regime is weak (<0.45), avoid the
+        # slow-drift deadlock where gradually rising confidence never clears
+        # switch_margin (EMA-smoothed features drift too slowly for the margin
+        # check to fire on consecutive ticks).
+        if (
+            candidate != self._regime
+            and conf > 0.75
+            and self._confidence < 0.45
+            and self._candidate_ticks >= max(1, self.hold_ticks // 2)
+        ):
+            prev = self._regime
+            self._last_change_from = prev
+            self._regime = candidate
+            # Blend in a fraction of the old confidence so a single fleeting
+            # spike cannot fully determine the new confidence.
+            self._confidence = 0.5 * self._confidence + 0.5 * conf
+            self._candidate = None
+            self._candidate_ticks = 0
+            self._last_change_ts = time.time()
+            logger.info(
+                "REGIME FAST TRANSITION %s -> %s conf=%.2f "
+                "(absolute-confidence escape: old_conf=%.2f margin=%.2f "
+                "blended=%.2f)",
+                prev, candidate, conf,
+                self._confidence, self.switch_margin,
+                self._confidence,
+            )
+            return True
+
         return False
 
     def _log_transition_unlocked(self, snap: dict) -> None:
@@ -691,6 +845,16 @@ class RegimeDetector:
     def _snapshot_unlocked(self) -> dict[str, Any]:
         feats = dict(self._last_features)
         rid = self._regime
+        try:
+            tsign = float(feats.get("trend_sign") or 0.0)
+        except (TypeError, ValueError):
+            tsign = 0.0
+        if tsign > 0.15:
+            trend_side = "yes"
+        elif tsign < -0.15:
+            trend_side = "no"
+        else:
+            trend_side = "flat"
         return {
             "regime_id": rid,
             "regime": legacy_label(rid),          # legacy quiet/normal/...
@@ -702,6 +866,8 @@ class RegimeDetector:
             "trend_score": float(feats.get("trend", 0.0)),
             "mom_score": float(feats.get("mom", 0.0)),
             "flow_score": float(feats.get("flow", 0.0)),
+            "trend_sign": tsign,
+            "trend_side": trend_side,             # yes | no | flat
             "meta_bucket": meta_bucket(rid, feats.get("trend")),
             "known": rid != "unknown" and bool(feats),
             "ticks": self._ticks,

@@ -618,13 +618,34 @@ def evaluate(bot_names: Optional[Sequence[str]] = None,
             status = "paused"
             reason = f"bot_max_drawdown:{dd:.2%}>= {bot_max_dd:.0%}"
             size_mult = 0.0
-        # Underperformance
+        # Underperformance — graduated taper (audit 1e): replace binary
+        # pause with progressive size reduction so a bot never fully stops.
         elif under_total <= under_pnl and len(u_series) >= int(
                 getattr(config, "RISK_UNDERPERFORM_MIN_TRADES", 15)):
-            status = "paused"
-            reason = (f"underperform:{under_total:.2f}<={under_pnl:.2f}"
-                      f"/{under_hours:.0f}h")
-            size_mult = 0.0
+            if getattr(config, "RISK_UNDERPERFORM_GRADUATED", True):
+                tiers = getattr(config, "RISK_UNDERPERFORM_GRADUATED_TIERS",
+                                ((-20.0, 0.75), (-30.0, 0.50), (-40.0, 0.25)))
+                # Walk tiers from worst (most negative) to best;
+                # first match sets the mult.
+                grad_mult = 1.0
+                for floor, mult in sorted(tiers):
+                    if under_total <= float(floor):
+                        grad_mult = float(mult)
+                        break
+                size_mult = min(size_mult, grad_mult)
+                if grad_mult < 1.0:
+                    status = "reduced"
+                    reason = (f"underperform:{under_total:.2f}≤"
+                              f"graduated tier ×{grad_mult:.2f}"
+                              f"/{under_hours:.0f}h")
+                else:
+                    status = "active"
+                    reason = f"underperform:{under_total:.2f}>tiers"
+            else:
+                status = "paused"
+                reason = (f"underperform:{under_total:.2f}<={under_pnl:.2f}"
+                          f"/{under_hours:.0f}h")
+                size_mult = 0.0
         elif size_mult < 0.999:
             status = "reduced"
             reason = f"drawdown_taper:dd={dd:.2%}/max={bot_max_dd:.0%}"

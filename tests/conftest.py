@@ -111,6 +111,8 @@ def thin_order_book():
 # ---------------------------------------------------------------------------
 
 def make_signals(**overrides):
+    # btc_drift_pct required by the TWAP dual drift gate (min 0.00030).
+    # 0.001 = 0.1% moneyness at $100k BTC, well above the floor.
     base = {
         "prices": [100_000.0] * 60,
         "latest": 100_000.0,
@@ -120,6 +122,7 @@ def make_signals(**overrides):
         "obi": 0.0,
         "cvd": 0.0,
         "btc_drift": 0.0,
+        "btc_drift_pct": 0.001,
     }
     base.update(overrides)
     return base

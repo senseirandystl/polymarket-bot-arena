@@ -64,6 +64,7 @@ EVENT_TYPES = (
     "core_lane_tune",
     "skip_storm",
     "resolver_stuck",
+    "regime_frequency",
     "portfolio_rebalance",
     "startup",
     "error",
@@ -89,6 +90,7 @@ EVENT_LABELS: dict[str, str] = {
     "core_lane_tune": "Core-lane tune",
     "skip_storm": "Skip storm",
     "resolver_stuck": "Resolver stuck",
+    "regime_frequency": "Regime frequency",
     "portfolio_rebalance": "Portfolio rebalance",
     "startup": "Startup",
     "error": "Error",
@@ -107,6 +109,7 @@ _STRATEGY_BLURBS = {
     "lag_residual": "Pure market-lags-drift specialist",
     "regime_specialist": "Trades only in allowed regimes",
     "no_lag": "Strict NO-side lag specialist",
+    "sweeper": "Buy locked outcomes still under $1 (fee-curve extreme)",
     "true_maker": "Limit-first GTC passive maker",
     "hybrid": "Balanced ensemble of sub-strategies",
     "sniper": "Late/cheap/strong price zones + drift gate",
@@ -1408,13 +1411,61 @@ def publish_price_feed_status() -> dict[str, Any]:
                 is_stale = True
             if latest <= 0 and last_up <= 0:
                 is_stale = True
-            status["symbols"][sym] = {
+            entry = {
                 "latest": latest, "stale": is_stale,
                 "age_sec": round(age, 1) if age is not None else None,
                 "source": sig.get("source") or (
                     "chainlink" if sym == "btc" else "binance"
                 ),
             }
+            # BTC TWAP resolution path (30s lookback for 5m markets).
+            # Polymarket UI "Current Price" + Price to Beat use TWAP; spot stays
+            # on ``latest`` for mom/regime forecasting only.
+            if sym == "btc":
+                twap = float(sig.get("twap") or 0)
+                twap_stale = bool(sig.get("twap_stale", True))
+                # Age of TWAP observation (local receive wall clock)
+                twap_age = None
+                try:
+                    twap_wall = float(getattr(feed, "_btc_twap_wall", 0) or 0)
+                    if twap_wall > 0:
+                        twap_age = time.time() - twap_wall
+                except Exception:
+                    pass
+                entry["twap"] = twap if twap > 0 else None
+                entry["twap_stale"] = twap_stale if twap > 0 else True
+                entry["twap_window_sec"] = sig.get("twap_window_sec")
+                entry["twap_age_sec"] = (
+                    round(twap_age, 1) if twap_age is not None else None
+                )
+                entry["resolution_source"] = sig.get("resolution_source")
+                entry["resolution_price"] = sig.get("resolution_price")
+                # Display price = TWAP when healthy (dashboard / ops parity).
+                if twap > 0 and not twap_stale:
+                    entry["display_price"] = twap
+                    entry["display_source"] = "twap"
+                elif latest > 0:
+                    entry["display_price"] = latest
+                    entry["display_source"] = "spot"
+                else:
+                    entry["display_price"] = None
+                    entry["display_source"] = "none"
+                # If TWAP resolution is enabled and TWAP is missing/stale while
+                # we expected it, surface as degraded (not hard-fail on spot).
+                try:
+                    if (
+                        bool(getattr(config, "TWAP_RESOLUTION_ENABLED", True))
+                        and bool(getattr(config, "TWAP_USE_FOR_DRIFT", True))
+                        and (twap <= 0 or twap_stale)
+                    ):
+                        entry["twap_degraded"] = True
+                except Exception:
+                    pass
+                # Stale for ops: prefer TWAP freshness when resolution uses it.
+                if twap > 0:
+                    if twap_stale:
+                        any_stale = True
+            status["symbols"][sym] = entry
             any_stale = any_stale or is_stale
         status["stale"] = any_stale
     except Exception as e:
@@ -1785,6 +1836,48 @@ def maybe_alert_resolver_stuck() -> Optional[dict]:
     return {"count": len(rows)}
 
 
+def maybe_alert_regime_frequency_collapse() -> Optional[dict]:
+    """0 fills for 2h while mid-band decision opportunities exist.
+
+    Distinguishes 'guards correctly flat' from 'adapt stack starved trading'.
+    """
+    hours = float(getattr(config, "ALERT_REGIME_FREQ_HOURS", 2.0))
+    min_mid = int(getattr(config, "ALERT_REGIME_FREQ_MIN_MIDBAND", 20))
+    cutoff = (
+        datetime.now(timezone.utc) - timedelta(hours=hours)
+    ).strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        with db.get_conn() as conn:
+            n_buys = conn.execute(
+                """SELECT COUNT(*) c FROM trades WHERE created_at >= ?""",
+                (cutoff,),
+            ).fetchone()["c"]
+            if int(n_buys or 0) > 0:
+                return None
+            # Mid-band decisions with a model (opportunities)
+            n_mid = conn.execute(
+                """SELECT COUNT(*) c FROM decision_events
+                   WHERE created_at >= ?
+                     AND entry_price BETWEEN 0.35 AND 0.72
+                     AND model_prob IS NOT NULL""",
+                (cutoff,),
+            ).fetchone()["c"]
+    except Exception:
+        return None
+    if int(n_mid or 0) < min_mid:
+        return None
+    notify(
+        "regime_frequency",
+        f"Frequency collapse · 0 fills in {hours:.0f}h",
+        f"No trades in {hours:.0f}h but {n_mid} mid-band decisions existed. "
+        f"Check regime profiles / guards (PLAN adapt-not-throttle).",
+        level="warn",
+        key=f"regime_freq:{cutoff[:13]}",
+        detail={"hours": hours, "midband_decisions": int(n_mid)},
+    )
+    return {"midband_decisions": int(n_mid), "hours": hours}
+
+
 def alert_portfolio_rebalance(
     reason: str,
     weights: dict[str, float],
@@ -1893,6 +1986,7 @@ def run_periodic_alerts() -> dict[str, Any]:
         ("feed_stale", maybe_alert_feed_stale),
         ("skip_storm", maybe_alert_skip_storm),
         ("resolver_stuck", maybe_alert_resolver_stuck),
+        ("regime_frequency", maybe_alert_regime_frequency_collapse),
     ):
         try:
             r = fn()

@@ -49,7 +49,11 @@ def _type_scores(
     individuals: list[dict],
     bank_parents: list[dict],
 ) -> dict[str, float]:
-    """Mean fitness per strategy_type (live + bank)."""
+    """Mean fitness per strategy_type (live + bank).
+
+    When regime routing is available, blend toward strategies that fit the
+    live detector regime (PLAN 2026-08-05 frequency-stable adapt).
+    """
     buckets: dict[str, list[float]] = defaultdict(list)
     for ind in list(individuals) + list(bank_parents or []):
         st = ind.get("strategy_type")
@@ -63,6 +67,15 @@ def _type_scores(
     for st, vals in buckets.items():
         if st in scores and vals:
             scores[st] = prior + sum(vals) / len(vals)
+    # Regime-router blend
+    try:
+        from signals.regime_detector import get_detector
+        rid = get_detector().status().get("current", {}).get("regime_id")
+        if rid and rid != "unknown":
+            from arena.regime_router import boost_type_alloc_scores
+            scores = boost_type_alloc_scores(scores, rid)
+    except Exception:
+        pass
     return scores
 
 

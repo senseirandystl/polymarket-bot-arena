@@ -3,11 +3,14 @@
 
 Uses REAL data, writes nothing to the runtime DB:
   * resolved BTC 5-min markets from Polymarket Gamma (window times + true outcome)
-  * BTC price trajectory from Binance 1m klines (Chainlink-proxy; basis ~0.005%)
+  * BTC price trajectory from Binance 1m klines (proxy for ranking only)
 
-The accurate "price to beat" (strike) is the Binance open at the market's
-``eventStartTime`` (the exact window open) — NOT a mid-window "first sighting",
-which is the bug that made the live drift signal read inverted (BUG #23).
+Live resolution (2026-08-07+) is Chainlink **30s TWAP** at open vs close, not a
+single Binance print. This harness still reconstructs strike as the Binance open
+at ``eventStartTime`` and trajectories from 1m klines — fine for *ordering*
+signals and relative net-edge, **not** absolute live P&L. Never use mid-window
+"first sighting" as strike (BUG #23). For production moneyness see
+``signals/strike.py`` + ``signals/twap.py``.
 
 Run:
     .venv/bin/python3 tools/validate_signals.py --markets 200
@@ -254,9 +257,10 @@ def main() -> int:
         if args.candidates and series:
             from tools import lane_candidates as lc
             lc.attach_candidates(mkt_samples, _ms(mkt["start"]) / 1000.0, series)
-            if args.rank:
-                lc.attach_features(mkt_samples, _ms(mkt["start"]) / 1000.0,
-                                   series)
+            # Always attach multiscale/session features in candidate mode so
+            # ms_mom (and lag dual-path) can clear the promotion bar — not
+            # only under --rank.
+            lc.attach_features(mkt_samples, _ms(mkt["start"]) / 1000.0, series)
         all_samples.extend(mkt_samples)
         if use_cache and i % 25 == 0:
             _save_cache(cache)

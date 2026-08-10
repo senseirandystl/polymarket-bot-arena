@@ -106,8 +106,19 @@ class MomentumBot(BaseBot):
 
         # Drift alignment gate: only lean toward the side strike already favors
         # (or flat drift with strong multi-candle trend). Prevents fading PTB.
+        # btc_drift is TWAP moneyness; 1m spot mom is damped in settlement by
+        # SignalLab (settlement_policy.mom_damp).
         drift = float(sv.btc_drift or 0.0)
         min_align = float(self.strategy_params.get("min_drift_align", 0.05))
+        try:
+            pol = sv.settlement_policy or {}
+            if pol.get("block_fade") or (
+                sv.in_settlement_window
+                and float(pol.get("certainty") or 0) >= 0.55
+            ):
+                min_align = max(min_align, 0.08)
+        except Exception:
+            pol = {}
 
         contributing = {
             "pct_change": pct_change,
@@ -116,6 +127,7 @@ class MomentumBot(BaseBot):
             "drift": drift,
             "regime": regime["label"],
             "regime_factor": regime_factor,
+            "market_phase": getattr(sv, "market_phase", "unknown"),
         }
 
         if abs(pct_change) < threshold:

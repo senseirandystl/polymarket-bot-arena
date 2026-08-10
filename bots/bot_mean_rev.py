@@ -164,7 +164,8 @@ class MeanRevBot(BaseBot):
         amount = config.get_max_position() * p["position_size_pct"]
 
         strike = sv.btc_strike
-        btc_now = float(sv.latest or 0.0) or (
+        # Resolution-path BTC (TWAP / nowcast), not spot — matches PTB frame.
+        btc_now = float(sv.btc_now or 0.0) or float(sv.latest or 0.0) or (
             float(prices[-1]) if prices else 0.0
         )
 
@@ -174,8 +175,23 @@ class MeanRevBot(BaseBot):
         fade_no_ok = drift <= -min_drift
         fade_yes_ok = drift >= min_drift
 
-        # PTB mean gate (P0): reversion target must support the binary outcome.
-        # Missing strike → fail closed (cannot verify path vs Price-to-Beat).
+        # Audit 1d: MIN_FADE_DRIFT guard — in strong trends the drift-heavy
+        # profile pushes P_model toward the trend side, making the bot a
+        # duplicate trend follower instead of a mean-reversion fade. At
+        # |drift| ≥ this floor it's not fading — it's chasing. Stand down.
+        _min_fade_floor = float(getattr(config, "MEANREV_MIN_FADE_DRIFT", 0.40))
+        if abs(drift) >= _min_fade_floor:
+            return strategy_decision(
+                "hold",
+                signals={"drift": drift, "zscore": zscore, "mean": mean},
+                reasoning=(
+                    f"Meanrev identity guard: |drift|={abs(drift):.3f}"
+                    f">={_min_fade_floor:.2f} — strong trend, not fading;"
+                    f" stand down to avoid duplicate trend-following"
+                ),
+            )
+
+        # TWAP settlement: do not fade against a high-certainty TWAP side.
         mean_no_ok = strike is not None and mean <= strike
         mean_yes_ok = strike is not None and mean >= strike
 

@@ -32,25 +32,31 @@ from signals.futures_meta import (
 from signals.cross_asset import XASSET_SCALE
 
 # Live lane -> the sample signal key that matches its production definition.
+# fut/tech/xasset: Binance-derived candidates. lag/ms_mom: expanded 2026-08
+# suite (production keys in signals/lab.py MARKET_LANES). flow_decay needs
+# tape history the venue doesn't archive — live shadow only (still listed
+# so PROFILE/labels exist; harness never files a proposal for it).
 LIVE_LANE_KEYS = {
     "fut": "fut_taker",      # live fut lane consumes taker_delta
     "tech": "tech_mtf",      # live tech lane consumes mtf_score
     "xasset": "xasset",
+    "lag": "lag",            # market-lag residual: drift-implied P − mid
+    "ms_mom": "ms_mom_1m",   # multiscale 1m mom (signals/multiscale.py)
 }
 # All candidate keys reported (the extra ones are informational context that
 # may motivate a redefinition of a live lane later).
 CANDIDATE_KEYS = ["fut_taker", "fut_funding", "fut_oi",
-                  "tech_mtf", "tech_macd", "tech_bb", "xasset"]
+                  "tech_mtf", "tech_macd", "tech_bb", "xasset",
+                  "lag", "ms_mom_1m"]
 
 # Expanded feature-suite keys (signals/multiscale.py, signals/regime.py,
 # signals/session_features.py — attached by attach_features). DIRECTIONAL
 # keys are side-pickers ranked by the harness scorecard; CONTEXT keys are
-# non-directional conditioners used for the regime-split analysis. Neither
-# set is part of the fut/tech/xasset promotion pipeline — a directional
-# feature that ranks well graduates by being wired as a lane and re-proposed,
-# never by skipping the pipeline.
+# non-directional conditioners used for the regime-split analysis. lag and
+# ms_mom_1m are dual-listed: scored as CANDIDATE_KEYS for promotion AND
+# available as features for the --rank scorecard.
 FEATURE_DIRECTIONAL_KEYS = ["ms_mom_1m", "ms_mom_3m", "ms_mom_5m",
-                            "ms_mom_15m"]
+                            "ms_mom_15m", "lag"]
 FEATURE_CONTEXT_KEYS = ["ms_rvol_5m", "ms_rvol_15m", "ms_rvol_30m",
                         "ms_atr_5m", "ms_vol_ratio",
                         "regime_trend", "regime_trend_10", "regime_trend_30",
@@ -70,9 +76,13 @@ DEADBAND = 0.05               # |lane| below this = no directional reading
 # starters on the strategies whose character the lane fits (trend/flow lanes
 # don't belong in the drift-pure meanrev book). Evolution tunes from there.
 PROFILE_SUGGESTIONS = {
-    "fut":    {"momentum": 0.10, "phantom": 0.10, "hybrid": 0.10},
-    "tech":   {"momentum": 0.10, "phantom": 0.10, "hybrid": 0.10},
-    "xasset": {"momentum": 0.10, "hybrid": 0.10},
+    "fut":        {"momentum": 0.10, "phantom": 0.10, "hybrid": 0.10},
+    "tech":       {"momentum": 0.10, "phantom": 0.10, "hybrid": 0.10},
+    "xasset":     {"momentum": 0.10, "hybrid": 0.10},
+    "lag":        {"sniper": 0.10, "mean_reversion": 0.10, "hybrid": 0.10,
+                   "lag_residual": 0.15},
+    "ms_mom":     {"momentum": 0.10, "phantom": 0.10, "hybrid": 0.10},
+    "flow_decay": {"momentum": 0.10, "hybrid": 0.10, "phantom": 0.10},
 }
 
 
@@ -153,6 +163,19 @@ def attach_candidates(samples: list, open_ts: float, series: dict) -> None:
                                            XASSET_SCALE))
         s.signals["xasset"] = (sum(peers) / len(peers)) if peers else None
 
+        # Lag residual (production: arena/signals.py): drift-implied P − mid.
+        # Uses the sample's already-computed drift_prod + PM YES mid so the
+        # harness measures the same continuous sniper thesis the live lane
+        # shadows. No series I/O required.
+        drift = s.signals.get("drift_prod")
+        mid = s.pm_yes
+        if drift is None or mid is None:
+            s.signals["lag"] = None
+        else:
+            implied_yes = 0.5 + 0.5 * float(drift)
+            s.signals["lag"] = max(
+                -1.0, min(1.0, (implied_yes - float(mid)) * 2.0))
+
 
 def attach_features(samples: list, open_ts: float, series: dict) -> None:
     """Compute the expanded feature suite into each sample's ``signals`` dict.
@@ -185,6 +208,18 @@ def attach_features(samples: list, open_ts: float, series: dict) -> None:
         sess = session_features.compute(
             datetime.fromtimestamp(ts, tz=timezone.utc))
         for key in FEATURE_DIRECTIONAL_KEYS + FEATURE_CONTEXT_KEYS:
+            if key == "lag":
+                # Already attached in attach_candidates; don't clobber.
+                if "lag" not in s.signals or s.signals.get("lag") is None:
+                    drift = s.signals.get("drift_prod")
+                    mid = s.pm_yes
+                    if drift is not None and mid is not None:
+                        implied_yes = 0.5 + 0.5 * float(drift)
+                        s.signals["lag"] = max(
+                            -1.0, min(1.0, (implied_yes - float(mid)) * 2.0))
+                    else:
+                        s.signals["lag"] = None
+                continue
             if key.startswith("sess_"):
                 s.signals[key] = sess.get(key)
             else:

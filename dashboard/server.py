@@ -372,15 +372,19 @@ def get_markets():
             "is_current_window": tr is not None and 0 < tr <= 300,
             "url": None,
             "strike": None,                           # price-to-beat (PM openPrice)
+            "strike_source": None,                    # openPrice | latch | None
         }
         if with_strike and event_start and shaped["id"]:
             try:
                 from signals.strike import get_strike_registry
-                shaped["strike"] = get_strike_registry().get_strike(
+                reg = get_strike_registry()
+                shaped["strike"] = reg.get_strike(
                     shaped["id"], event_start,
                 )
+                shaped["strike_source"] = reg.get_source(shaped["id"])
             except Exception:
                 shaped["strike"] = None
+                shaped["strike_source"] = None
         with db.get_conn() as conn:
             rows = conn.execute(
                 "SELECT bot_name, side, amount, shares_bought, entry_price, "
@@ -391,16 +395,29 @@ def get_markets():
         shaped["trades"] = [dict(r) for r in rows]
         return shaped
 
-    # Live BTC from arena price_feed_status (shared SQLite); fallback None.
+    # Live BTC from arena price_feed_status (shared SQLite).
+    # Display / Polymarket parity: Chainlink **TWAP** (30s for 5m markets).
+    # Spot remains available for forecasting context (mom/regime), not UI PTB delta.
     btc_price = None
     btc_stale = True
+    btc_spot = None
+    btc_source = None
     try:
         import json as _json
         raw = db.get_arena_state("price_feed_status")
         pf = _json.loads(raw) if raw else {}
         btc = ((pf or {}).get("symbols") or {}).get("btc") or {}
-        btc_price = btc.get("latest")
-        btc_stale = bool(btc.get("stale") or (pf or {}).get("stale"))
+        btc_spot = btc.get("latest")
+        # Prefer TWAP / resolution_price for "BTC now" (matches Polymarket UI).
+        twap = btc.get("twap") or btc.get("resolution_price")
+        if twap is not None and float(twap) > 0:
+            btc_price = float(twap)
+            btc_stale = bool(btc.get("twap_stale") or btc.get("twap_degraded"))
+            btc_source = "twap"
+        else:
+            btc_price = btc_spot
+            btc_stale = bool(btc.get("stale") or (pf or {}).get("stale"))
+            btc_source = "spot"
     except Exception:
         pass
 
@@ -411,8 +428,10 @@ def get_markets():
         "next": upcoming_s[0] if upcoming_s else None,
         "upcoming_count": len(upcoming_s),
         "upcoming": upcoming_s,
-        "btc_price": btc_price,
+        "btc_price": btc_price,           # TWAP-preferred (Polymarket "Current Price")
         "btc_stale": btc_stale,
+        "btc_spot": btc_spot,             # Chainlink spot (forecasting only)
+        "btc_source": btc_source,         # "twap" | "spot"
     })
 
 
@@ -597,6 +616,29 @@ async def set_bankroll(request: Request, _auth: str = Depends(verify_auth)):
         "bankroll": db.get_paper_bankroll(),
         "available": db.get_paper_available(),
     })
+
+
+@app.get("/api/settings/pilein-ev-gate")
+def get_pilein_ev_gate(_auth: str = Depends(verify_auth)):
+    """Progressive EV pile-in gate (extra edge bar after peers fill same side)."""
+    return JSONResponse({
+        "enabled": db.get_pilein_ev_gate(),
+        "default": bool(getattr(config, "PILEIN_EV_GATE_ENABLED", True)),
+        "edge_step": float(getattr(config, "PILEIN_EV_EDGE_STEP", 0.025)),
+        "min_edge": float(getattr(config, "PILEIN_EV_MIN_EDGE", 0.035)),
+        "conf_bypass": float(getattr(config, "PILEIN_EV_CONF_BYPASS", 0.85)),
+    })
+
+
+@app.post("/api/settings/pilein-ev-gate")
+async def set_pilein_ev_gate(request: Request, _auth: str = Depends(verify_auth)):
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    enabled = bool((body or {}).get("enabled", True))
+    db.set_pilein_ev_gate(enabled)
+    return JSONResponse({"success": True, "enabled": db.get_pilein_ev_gate()})
 
 
 @app.get("/api/settings/kelly")
@@ -951,7 +993,58 @@ async def set_regime_conditioning_toggle(request: Request,
     body = await request.json()
     enabled = bool(body.get("enabled"))
     db.set_regime_conditioning(enabled)
+    try:
+        from arena.regime_settings import set_bool as _reg_set
+        _reg_set("conditioning", enabled)
+    except Exception:
+        pass
     return JSONResponse({"success": True, "conditioning_enabled": enabled})
+
+
+@app.get("/api/settings/regime")
+def get_regime_settings(_auth: str = Depends(verify_auth)):
+    """All dashboard-editable regime control flags + adapt primary mode."""
+    from arena.regime_settings import snapshot
+    return JSONResponse(snapshot())
+
+
+@app.post("/api/settings/regime")
+async def set_regime_settings(request: Request,
+                              _auth: str = Depends(verify_auth)):
+    """Update regime flags and/or adapt primary.
+
+    Body examples:
+      {"flag": "continuous_blend", "enabled": true}
+      {"flags": {"continuous_blend": true, "hard_skip": false}}
+      {"adapt_primary": "style"}
+    """
+    from arena import regime_settings as rs
+    body = await request.json()
+    updated: dict = {}
+    if "flag" in body:
+        name = str(body.get("flag") or "").strip()
+        enabled = bool(body.get("enabled"))
+        try:
+            updated[name] = rs.set_bool(name, enabled)
+        except ValueError as e:
+            return JSONResponse({"error": str(e)}, status_code=400)
+    flags = body.get("flags")
+    if isinstance(flags, dict):
+        for name, enabled in flags.items():
+            try:
+                updated[str(name)] = rs.set_bool(str(name), bool(enabled))
+            except ValueError as e:
+                return JSONResponse({"error": str(e)}, status_code=400)
+    if "adapt_primary" in body:
+        try:
+            updated["adapt_primary"] = rs.set_adapt_primary(
+                str(body.get("adapt_primary")))
+        except ValueError as e:
+            return JSONResponse({"error": str(e)}, status_code=400)
+    snap = rs.snapshot()
+    snap["updated"] = updated
+    snap["success"] = True
+    return JSONResponse(snap)
 
 
 @app.post("/api/lane-proposals/{proposal_id}/decide")
@@ -1070,6 +1163,142 @@ async def run_soak_report(request: Request, _auth: str = Depends(verify_auth)):
         return JSONResponse(result)
     except Exception as e:
         return JSONResponse({"success": False, "error": str(e)}, status_code=500)
+
+
+@app.get("/api/bots/catalog")
+def get_bots_catalog():
+    """All launchable strategies + which strategy_types are already active.
+
+    Powers the Bots-tab mid-run deploy modal (multi-select).
+    """
+    from arena.startup import strategy_catalog
+
+    catalog = strategy_catalog()
+    active = db.get_active_bots()
+    active_types = {c["strategy_type"] for c in active}
+    active_by_type: dict = {}
+    for c in active:
+        active_by_type.setdefault(c["strategy_type"], []).append(c["bot_name"])
+
+    items = []
+    for entry in catalog:
+        st = entry["strategy_type"]
+        items.append({
+            **entry,
+            "active": st in active_types,
+            "active_bots": active_by_type.get(st, []),
+        })
+
+    pending = None
+    last = None
+    try:
+        raw_p = db.get_arena_state("pending_bot_deploys")
+        if raw_p:
+            pending = json.loads(raw_p) if isinstance(raw_p, str) else raw_p
+    except Exception:
+        pending = None
+    try:
+        raw_l = db.get_arena_state("last_bot_deploy")
+        if raw_l:
+            last = json.loads(raw_l) if isinstance(raw_l, str) else raw_l
+    except Exception:
+        last = None
+
+    return JSONResponse({
+        "strategies": items,
+        "pending": pending,
+        "last_deploy": last,
+    })
+
+
+@app.post("/api/bots/deploy")
+async def deploy_bots(request: Request):
+    """Queue one or more strategies for mid-run deploy into the live arena.
+
+    Body: ``{"strategies": ["phantom", "hybrid"]}`` (strategy_type strings).
+
+    The arena coordinator drains ``pending_bot_deploys`` within ~30s, creates
+    bot_configs, and folds instances into the trader or maker loop without
+    restart. Already-active strategy_types are rejected at queue time.
+    """
+    from arena.startup import strategy_catalog
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    requested = body.get("strategies") or body.get("strategy_types") or []
+    if isinstance(requested, str):
+        requested = [requested]
+    if not isinstance(requested, list) or not requested:
+        return JSONResponse(
+            {"success": False, "error": "strategies must be a non-empty list"},
+            status_code=400,
+        )
+
+    catalog = {e["strategy_type"]: e for e in strategy_catalog()}
+    active_types = {c["strategy_type"] for c in db.get_active_bots()}
+
+    # Merge with any still-pending queue so rapid double-clicks don't clobber.
+    pending_list: list = []
+    try:
+        raw_p = db.get_arena_state("pending_bot_deploys")
+        if raw_p:
+            prev = json.loads(raw_p) if isinstance(raw_p, str) else raw_p
+            if isinstance(prev, dict):
+                pending_list = list(prev.get("strategies") or [])
+    except Exception:
+        pending_list = []
+
+    queued: list[str] = []
+    skipped: list[dict] = []
+    seen = set(pending_list)
+
+    for st in requested:
+        if not isinstance(st, str) or not st.strip():
+            skipped.append({"strategy_type": st, "reason": "invalid"})
+            continue
+        st = st.strip()
+        if st not in catalog:
+            skipped.append({"strategy_type": st, "reason": "unknown_strategy"})
+            continue
+        if st in active_types:
+            skipped.append({"strategy_type": st, "reason": "already_active"})
+            continue
+        if st in seen:
+            skipped.append({"strategy_type": st, "reason": "already_queued"})
+            continue
+        pending_list.append(st)
+        seen.add(st)
+        queued.append(st)
+
+    if not queued and not pending_list:
+        return JSONResponse({
+            "success": False,
+            "error": "nothing to deploy",
+            "queued": [],
+            "skipped": skipped,
+        }, status_code=400)
+
+    payload = {
+        "strategies": pending_list,
+        "queued_at": time.time(),
+        "source": "dashboard",
+    }
+    db.set_arena_state("pending_bot_deploys", json.dumps(payload))
+
+    return JSONResponse({
+        "success": True,
+        "queued": queued,
+        "pending": pending_list,
+        "skipped": skipped,
+        "message": (
+            f"Queued {len(queued)} strateg{'y' if len(queued) == 1 else 'ies'}; "
+            "arena applies within ~30s"
+            if queued else
+            "No new strategies queued"
+        ),
+    })
 
 
 @app.get("/api/bots")

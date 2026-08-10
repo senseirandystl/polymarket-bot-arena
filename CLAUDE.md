@@ -9,10 +9,11 @@ before touching resolver, strike/drift, P&L, or learning.
 ## What This Is
 
 An automated trading bot arena on **Polymarket BTC 5-minute up/down** markets.
-The **default slate is 8 bots** (momentum, phantom, meanrev, hybrid, sniper,
-market-neutral **arbitrage**, late-window maker, fee-zone maker). Terminal
-launches can pick any subset (see **Startup flow**). Makers run on the
-discovery-cycle cadence, not the 1s trader tick.
+The **default slate is 6 bots** (momentum, meanrev, sniper, **hybrid**,
+market-neutral **arbitrage**, **sweeper**). Correlated clones (phantom,
+makers) are menu-only or deployable mid-run from the dashboard Bots tab.
+Terminal launches can pick any subset (see **Startup flow**). Makers run on
+the discovery-cycle cadence, not the 1s trader tick.
 
 **Paper mode** simulates against real Polymarket order books (discovery,
 depth-walked fills, fees, resolution — everything except order submission).
@@ -40,10 +41,12 @@ remain alternatives.
 On an interactive tty, `arena/startup.py` runs before the threads boot. If the
 DB holds a previous run it asks **Continue** (resume the exact prior slate) or
 **Start fresh** (wipe DB rows via `db.wipe_all()` + truncate `logs/*.log`, then
-choose bots). Bot choice is **Default** (Enter → the 8-bot slate incl. sniper +
-both makers) or **Manual** (numbered strategy menu; accepts `1,3,5`, `1-6`, or
-a mix). Under launchd / Docker / any non-tty parent there is no prompt — it
-silently resumes the existing DB config (or seeds defaults on a fresh DB).
+choose bots). Bot choice is **Default** (Enter → lean 6: mom / meanrev /
+sniper / hybrid / arb / sweeper) or **Manual** (numbered strategy menu; accepts
+`1,3,5`, `1-6`, or a mix). Mid-run: dashboard **Bots → Deploy bots** queues
+strategies into the live arena (~30s). Under launchd / Docker / any non-tty
+parent there is no prompt — it silently resumes the existing DB config (or
+seeds defaults on a fresh DB).
 
 ## Current State (2026-07)
 
@@ -52,7 +55,7 @@ silently resumes the existing DB config (or seeds defaults on a fresh DB).
 ### Load-bearing insights (do not re-break)
 - **Edge = model vs executable ask after fees** — not mid + narrative tilt (BUG #24).
 - **Predictive ≠ profitable** — e.g. `pm_mom` ~70% follow-WR with negative net edge → kill-switch.
-- **`btc_drift` needs the true window-open strike** (Binance 1m open at `eventStartTime`). Wrong strike blew the account (BUG #23).
+- **`btc_drift` needs the true window-open strike** (official Polymarket `openPrice` / Chainlink **TWAP** at `eventStartTime` since 2026-08-07). Wrong strike blew the account (BUG #23).
 - **Harness nominates; live shadow promotes/demotes** — tech harness ~75% WR → live ~52% → auto-demoted.
 - **Dead-zone** (mid ~0.42–0.58 + flat drift) was the largest $ leak; drift-conditional skip stays.
 - **Shared-pool exposure cap** stops tandem bots from 4× one candle (BUG #27).
@@ -75,7 +78,7 @@ only; recompute from the live DB after paper soaks.
 | **Terminal** | `./bin/arena` — interactive slate; auto-spawns dashboard unless `ARENA_NO_DASHBOARD=1` |
 
 - **Dashboard:** FastAPI port **8501**, HTTP Basic (`DASHBOARD_USER` / `DASHBOARD_PASS`; default password warns in logs — change before public expose). Unauthenticated **`/healthz`** for probes (arena log age + kill switch).
-- **Price feed:** Binance WebSocket BTC/ETH 1m candles (+ futures meta background thread when candidates enabled).
+- **Price feed:** Polymarket RTDS Chainlink BTC **spot** (mom/regime candles) + **30s TWAP** (Price to Beat, live BTC display, drift moneyness — same as Polymarket UI) + Binance ETH/SOL 1m and BTC volume-only (+ futures meta background thread when candidates enabled). Dashboard "Bitcoin (TWAP)" / "BTC now (TWAP)" subscribe to `crypto_prices_twap_thirty`, not spot.
 - **DB:** SQLite `bot_arena.db` (or `ARENA_DB_PATH` / Docker `/data/bot_arena.db`), WAL mode for dual-process access.
 
 > **launchd note:** plists in `~/Library/LaunchAgents/` should be **symlinks** to the repo so `git pull` updates them. Logs under `~/Library/Logs/`. See [launchd Services](#launchd-services).
@@ -281,19 +284,43 @@ WR — no favorite premium exists at taker prices). The net-edge harness
 best. The tilt (`K_TILT`/`FAVORITE_EDGE_CAP`) and `MARKET_PRICE_AGGRESSION`
 are gone; drift's time-damping now naturally keeps bots flat in the noisy
 first minute instead of a hard time ban.
-**`btc_drift` (`signals/strike.py`) is the validated fundamental.** Each window
-resolves UP iff BTC closes ≥ its price at the window OPEN. The **strike** ("price
-to beat") is fetched accurately as the **Binance BTCUSDT 1m open at the market's
-`eventStartTime`** (Polymarket does not expose the strike directly; `eventStartTime`
-+ the BTC feed reconstruct it, Chainlink basis ~0.005%) — once per market, off
-the hot path in the warmer, cached in `StrikeRegistry`. `drift = tanh(z)`,
-`z = (btc_now − strike)/(DRIFT_VOL_SCALE·√frac-remaining)` — bounded, regime-agnostic
-(YES above strike, NO below), time-scaled (more decisive near expiry). **It was
-first shipped with a MISCALCULATED strike (mid-window "first sighting") and blew
-up the account (BUG #23); with the accurate strike the offline harness measures
-it ~76% predictive.** Side selection is explicit **per-side** — each side scored
-on its own book price + fee (own edge, own confidence), same `MIN_EDGE` bar, no
-hardcoded bias.
+**`btc_drift` (`signals/strike.py` + TWAP path) is the validated fundamental.**
+Each window resolves UP iff Chainlink **TWAP** at CLOSE ≥ TWAP at OPEN (Price
+to Beat). Effective **2026-08-07 00:00 UTC**, both open and settlement use the
+30-second TWAP feed for 5-minute markets (60s for 15m/4h) — not a single spot
+snapshot. Spec: https://docs.polymarket.com/market-data/chainlink-twap
+
+The **strike** is the Chainlink **30s TWAP at window open** (RTDS
+`crypto_prices_twap_thirty` latched at `eventStartTime`, sticky source
+`twap_open`). That is what Polymarket’s UI shows as Price to Beat. REST
+`/api/crypto/crypto-price` `openPrice` is a **fallback only** — live soak
+found it can diverge ~$2–3 from the UI/TWAP feed. Spot latch is last resort.
+Live never uses Binance for strike.
+
+Live ``btc_now`` for moneyness (`arena/signals.py` → `signals/twap.py`):
+1. **Settlement nowcast** inside the final 30s (local ticks over
+   `[expiry−W, now]`, remaining filled with last price) when coverage is OK
+2. Else official **rolling RTDS TWAP**
+3. Else spot Chainlink fallback
+
+**Settlement-window policy** (`signals/twap.settlement_adjustments`,
+`TWAP_SETTLEMENT_POLICY`): market phases `open` / `mid` / `pre_settle` /
+`settlement`. In the final 30s, `twap_certainty` (elapsed fraction × coverage
+× |drift|) drives:
+- **High cert** → slightly easier min_edge, modest size boost, conf structure boost
+- **Low cert** → much harder min_edge, size cut (noisy partial TWAP)
+- **Mom damp** (spot 1m lane) in settlement/pre_settle (not the resolution object)
+- **Block fade** for mean-rev when cert high and |drift| large
+Wired into `base_bot.make_decision`, SignalLab, sniper/sweeper/lwm/momentum.
+
+`drift = tanh(z)`, `z = (btc_now − strike)/(DRIFT_VOL_SCALE·√frac-remaining)`
+with a soft `TWAP_DRIFT_VOL_MULT` damp (TWAP is smoother than spot) — bounded,
+regime-agnostic (YES above strike, NO below), time-scaled (more decisive near
+expiry). **It was first shipped with a MISCALCULATED strike (mid-window "first
+sighting") and blew up the account (BUG #23); with the accurate strike the
+offline harness measures it ~76% predictive.** Side selection is explicit
+**per-side** — each side scored on its own book price + fee, same `MIN_EDGE`
+bar, no hardcoded bias.
 
 **Signal-validation harness (`tools/validate_signals.py`).** Offline check of any
 candidate signal on REAL data (resolved Gamma markets + Binance 1m klines + the
@@ -457,10 +484,10 @@ confidence rose (|strat| ≥ 0.6: 36.1–46% WR; the only profitable band was
 | momentum | .55/.30/.15 | 0.50 | drift-heavy short-term trend |
 | phantom  | .50/.25/.25 | 0.50 | EMA 5/13 + breakout swing |
 | mean_reversion (meanrev-v1, +tp) | .75/0/.25 | 0.60 | drift-gated fade + max mid 0.58 |
-| hybrid | .55/.20/.25 | 0.50 | ensemble of mom/meanrev/phantom (no sentiment) |
+| hybrid | .55/.20/.25 | 0.50 | ensemble of mom/meanrev/phantom (default slate) |
 | sniper | .55/.10/.10 | 0.50 | overrides: pure drift-lag hunter (v3) |
 | arbitrage | n/a — **overrides** (market-neutral, two-legged) | n/a | n/a |
-| lag_residual / regime_specialist / no_lag / true_maker | menu-only | — | not default slate |
+| phantom / makers / lag_residual / regime_specialist / no_lag / true_maker | menu / mid-run deploy | — | not default slate |
 
 (pm/cvd/obi profile weights are all 0 while their kill-switches are 0. The
 old `meanrev-sl25-v1` is renamed **`meanrev-v1`** / `mean_reversion` — the
@@ -496,12 +523,39 @@ is short-TTL cached.
   `RISK_KILL_SWITCH_FILE` (under `LOG_DIR` / Docker `data/logs/KILL_SWITCH`)
 - Events in `risk_events` + arena_state snapshot; `/healthz` surfaces kill flag
 
-## Regime detector (`signals/regime_detector.py`)
+## Regime detector + adapt-not-throttle (PLAN 2026-08-05)
 
 Continuous classification on the warm path: `high_vol_trend`, `low_vol_trend`,
-`high_vol_chop`, `low_vol_range`, `normal`, `unknown`. Context only — hybrid
-meta-learner, mom/strat chop damps, GA regime robustness, trade feature stamps.
-Hysteresis: `REGIME_HOLD_TICKS`, `REGIME_SWITCH_MARGIN`.
+`high_vol_chop`, `low_vol_range`, `normal`, `unknown`.
+
+**Relative features (default `REGIME_USE_RELATIVE=True`):** vol/trend/chop are
+percentile-calibrated over a rolling reservoir (`signals/regime_calibration.py`)
+so “high vol” means high *for recent BTC*, not a fixed absolute scale. Absolute
+`vol_abs` / `realized_vol` remain for logging and risk. Directionality blends
+trend efficiency, anti-chop, and multi-scale mom alignment.
+
+**Policy (style, not starve):** Prefer **reweighting lanes and capital** over
+hard-skips / deep size cuts when a regime prints weak WR.
+- Hard directional skip **off** by default (`REGIME_HARD_SKIP_ENABLED=False`);
+  emergency bar is high-n / very low WR when re-enabled.
+- Size mult floor **0.85** (was 0.35).
+- Per-regime × strategy **seeds** apply until `by_regime` is *earned* on
+  regime-local samples (`by_regime_meta`); unearned clones of global weights
+  no longer shadow seeds (soak 2026-08-06 fix).
+- Core tuner: regime-local attribution only writes `by_regime`; **P&L gate**
+  blocks UP when strategy×regime $ is red (`CORE_TUNE_PNL_GATE`).
+- **Strategy×regime style-skip** (`REGIME_STYLE_SKIP_*`, Settings `style_skip`):
+  toxic strategy stands down in that regime only (hysteresis); others keep trading.
+- Live NO-side tax + mid-band floors when side/regime stats are toxic.
+- Tandem: `MARKET_SIDE_MAX_BOTS_BAD_REGIME=1` / `_CHOP=2` when data says so.
+- Portfolio / GA blend strategy-fit scores (`arena/regime_router.py`).
+- Optional continuous residual `w0 + B·F` (`REGIME_CONTINUOUS_BLEND`, default off).
+- Lab quiet/chop **mom** damps (`REGIME_LANE_DAMP`) + partial style-mode prior
+  scales when regime is live-toxic.
+
+Context still feeds hybrid meta-learner, GA robustness, and trade feature stamps.
+Hysteresis: `REGIME_HOLD_TICKS`, `REGIME_SWITCH_MARGIN`. Full plan:
+`docs/superpowers/plans/2026-08-05-regime-adapt-frequency-PLAN.md`.
 
 ## Backtesting (`backtest/`)
 
@@ -530,7 +584,9 @@ bots/base_bot.py         # make_decision blend + Kelly + execute → venue
 bots/meta_learner.py     # Hybrid online regime-bucket weights
 bots/bot_*.py            # Per-strategy implementations
 evolution/               # GA fitness, operators, bounds
-signals/strike.py        # Accurate strike + btc_drift
+signals/strike.py        # Accurate strike (TWAP open) + btc_drift
+signals/twap.py          # TWAP math, settlement nowcast, resolution btc_now
+signals/price_feed.py    # Chainlink spot + TWAP RTDS, Binance xasset/vol
 signals/regime_detector.py
 venues/paper.py | live.py
 backtest/                # Offline replay CLI (`python -m backtest`)

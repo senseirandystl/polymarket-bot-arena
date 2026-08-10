@@ -352,15 +352,95 @@ def refresh_price(market: dict) -> dict:
 # ---------------------------------------------------------------------------
 # Resolution
 # ---------------------------------------------------------------------------
+# Extreme outcomePrices mean the book has effectively decided. Gamma sometimes
+# leaves ``closed=false`` for many minutes after endDate (CLOB tokens[].winner
+# stays false too) — those markets never appear in ``closed=true`` series
+# pages, which is how trades got stuck as "resolver stuck" for 15m+ while the
+# prices sat at 0.9995 / 0.0005.
+_RESOLVED_PRICE = 0.99
+# Only accept de-facto (not-yet-closed) outcomes this many seconds after end.
+_DEFACTO_GRACE_SEC = 120.0
+
+
+def outcome_from_prices(prices) -> bool | None:
+    """Map outcomePrices → True (Up) / False (Down) / None (not decided).
+
+    Accepts list or JSON string. Requires an extreme book (one side ≥ 0.99,
+    the other ≤ 0.01) so we never treat a live mid-window favorite as settled.
+    """
+    prices = _as_list(prices)
+    if not prices or len(prices) < 2:
+        return None
+    try:
+        up, down = float(prices[0]), float(prices[1])
+    except (TypeError, ValueError):
+        return None
+    if up >= _RESOLVED_PRICE and down <= (1.0 - _RESOLVED_PRICE):
+        return True
+    if down >= _RESOLVED_PRICE and up <= (1.0 - _RESOLVED_PRICE):
+        return False
+    return None
+
+
+def _end_is_past(end_iso, now: datetime | None = None,
+                 grace_sec: float = _DEFACTO_GRACE_SEC) -> bool:
+    end = _parse_iso(end_iso)
+    if end is None:
+        return False
+    if end.tzinfo is None:
+        end = end.replace(tzinfo=timezone.utc)
+    now = now or datetime.now(timezone.utc)
+    return (now - end).total_seconds() >= float(grace_sec)
+
+
+def fetch_market_outcome(condition_id: str,
+                         *, allow_defacto: bool = True) -> bool | None:
+    """Direct Gamma lookup for one condition_id → Up/Down/None.
+
+    Used as a fallback when a pending trade's market is missing from the
+    closed-events bulk map (Gamma lag: extreme prices but still
+    ``closed=false``). Safe for live markets: without extreme prices, or
+    before endDate + grace, returns None.
+    """
+    if not condition_id:
+        return None
+    try:
+        resp = http_client.get(
+            f"{GAMMA}/markets",
+            params={"condition_ids": condition_id},
+            timeout=15,
+        )
+        if resp.status_code != 200:
+            return None
+        rows = resp.json()
+    except Exception as e:
+        logger.debug(f"fetch_market_outcome failed for {condition_id[:14]}…: {e}")
+        return None
+    if not isinstance(rows, list) or not rows:
+        return None
+    m = rows[0]
+    outcome = outcome_from_prices(m.get("outcomePrices"))
+    if outcome is None:
+        return None
+    # Officially closed → trust extreme prices immediately.
+    if m.get("closed") is True:
+        return outcome
+    # De-facto: past end + extreme prices (the stuck-resolver class).
+    if allow_defacto and _end_is_past(m.get("endDate") or m.get("end_date_iso")):
+        return outcome
+    return None
+
+
 def recent_resolutions(limit: int = 100) -> dict:
     """Map ``condition_id -> True|False`` for recently resolved markets.
 
     ``True`` = Up won, ``False`` = Down won. Built from the series' closed
     events (Gamma ``outcomePrices`` — ``["1","0"]`` → Up, ``["0","1"]`` → Down),
-    which is authoritative. Gamma's ``/markets`` endpoint cannot filter by
-    condition id and the CLOB ``tokens[].winner`` flag is unreliable, so the
-    resolver builds this map once per cycle and matches pending trades against
-    it rather than doing per-market lookups.
+    which is authoritative for markets that have flipped ``closed=true``.
+
+    Gamma can leave a market at extreme prices for a long time without
+    setting ``closed``; those never appear here. The resolver falls back to
+    :func:`fetch_market_outcome` for any still-pending market_id.
     """
     try:
         resp = http_client.get(
@@ -385,15 +465,9 @@ def recent_resolutions(limit: int = 100) -> dict:
     for ev in events or []:
         for m in ev.get("markets", []) or []:
             cond = m.get("conditionId")
-            prices = _as_list(m.get("outcomePrices"))
-            if not cond or not prices or len(prices) < 2:
+            if not cond:
                 continue
-            try:
-                up, down = float(prices[0]), float(prices[1])
-            except (TypeError, ValueError):
-                continue
-            if up >= 0.99 and down <= 0.01:
-                out[cond] = True
-            elif down >= 0.99 and up <= 0.01:
-                out[cond] = False
+            outcome = outcome_from_prices(m.get("outcomePrices"))
+            if outcome is not None:
+                out[cond] = outcome
     return out

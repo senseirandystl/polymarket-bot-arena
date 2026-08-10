@@ -12,9 +12,9 @@ Flow (terminal only):
                        existing DB slate).
          ΓÇó Fresh     ΓåÆ wipe DB + logs, then fall through to step 2.
     2. Ask **Default** bots (Enter) or **Manual** selection.
-         ΓÇó Default   ΓåÆ the 8 canonical bots (incl. arbitrage, sniper + makers).
-         ΓÇó Manual    ΓåÆ show every strategy, accept a list/range like
-                       ``1,3,5`` or ``1-6`` (or a mix) ΓåÆ launch exactly those.
+         · Default   → lean 6 (momentum, meanrev, sniper, hybrid, arb, sweeper).
+         · Manual    → show every strategy, accept a list/range like
+                       ``1,3,5`` or ``1-6`` (or a mix) → launch exactly those.
 
 ``interactive_startup`` returns the bot list to launch, or ``None`` meaning
 "use the existing DB configuration" (continue / non-interactive).
@@ -38,6 +38,7 @@ from bots.bot_fee_zone_maker import FeeZoneMakerBot
 from bots.bot_lag_residual import LagResidualBot
 from bots.bot_regime_specialist import RegimeSpecialistBot
 from bots.bot_no_lag import NoLagBot
+from bots.bot_sweeper import SweeperBot
 from bots.bot_true_maker import TrueMakerBot
 
 logger = logging.getLogger("arena.startup")
@@ -62,6 +63,7 @@ STRATEGY_MENU = [
     (LagResidualBot,     "lag-residual-v1", "Lag residual — pure market-lags-drift"),
     (RegimeSpecialistBot, "regime-specialist-v1", "Regime specialist — trades only allowed regimes"),
     (NoLagBot,           "no-lag-v1",       "NO-lag specialist — strict NO-side lag trades"),
+    (SweeperBot,         "sweeper-v1",      "Sweeper — buy locked outcomes still under $1 (fee-curve extreme)"),
     (TrueMakerBot,       "true-maker-v1",   "True maker — limit-first GTC passive quotes"),
 ]
 # (The old separate meanrev-sl25 menu entry is gone: with the stop-loss
@@ -70,15 +72,53 @@ STRATEGY_MENU = [
 # meanrev-v1 / mean_reversion.)
 _ = MeanRevSLBot  # retained for legacy strategy_type resolution
 
-# The 8 default bots (1-based indices into STRATEGY_MENU): momentum, phantom,
-# arbitrage, meanrev, hybrid, sniper, and the two maker bots (2026-07-18
-# roster update ΓÇö sniper promoted into the default slate).
-DEFAULT_INDICES = [1, 5, 7, 2, 6, 4, 8, 9]
+# Lean default slate (1-based indices into STRATEGY_MENU): trend, drift-fade,
+# lag, hybrid ensemble, market-neutral arb, sweeper. Correlated clones
+# (phantom, fee-zone / late-window makers) stay menu-only for mid-run deploy
+# or manual selection.
+DEFAULT_INDICES = [1, 2, 4, 6, 7, 13]  # mom, meanrev, sniper, hybrid, arb, sweeper
 
 
 def build_default_bots() -> list:
-    """The canonical default slate (8 bots incl. arbitrage, sniper + both makers)."""
+    """Canonical default slate: mom, meanrev, sniper, hybrid, arb, sweeper."""
     return _build_from_indices(DEFAULT_INDICES)
+
+
+def strategy_catalog() -> list[dict]:
+    """All launchable strategies for dashboard mid-run deploy UI.
+
+    Returns dicts: strategy_type, default_name, blurb, menu_index (1-based).
+    """
+    out = []
+    for idx, (cls, name, blurb) in enumerate(STRATEGY_MENU, start=1):
+        st = getattr(cls, "strategy_type", None)
+        if not isinstance(st, str) or not st:
+            st = cls(name=name, generation=0).strategy_type
+        out.append({
+            "strategy_type": st,
+            "default_name": name,
+            "blurb": blurb,
+            "menu_index": idx,
+        })
+    return out
+
+
+def instantiate_strategy(strategy_type: str, *, name: str | None = None):
+    """Build a fresh bot instance for ``strategy_type`` from the menu.
+
+    Raises ``ValueError`` if the type is not in STRATEGY_MENU.
+    """
+    for cls, default_name, _blurb in STRATEGY_MENU:
+        st = getattr(cls, "strategy_type", None)
+        if not isinstance(st, str) or not st:
+            st = cls(name=default_name, generation=0).strategy_type
+        if st == strategy_type:
+            return cls(
+                name=name or default_name,
+                generation=0,
+                lineage=f"deploy:{strategy_type}",
+            )
+    raise ValueError(f"unknown strategy_type: {strategy_type}")
 
 
 def _build_from_indices(indices) -> list:

@@ -8,10 +8,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from bots.bot_sniper import SniperBot
 
 
-def _signals(drift=0.40, prices=None):
+def _signals(drift=0.50, prices=None, d_pct=None):
     prices = prices or [100.0, 100.1, 100.2]
+    if d_pct is None:
+        d_pct = 0.0008 if drift >= 0 else -0.0008
     return {
         "btc_drift": drift,
+        "btc_drift_pct": d_pct,
+        "btc_strike": 100000.0,
+        "btc_now": 100000.0 * (1.0 + d_pct),
         "prices": prices,
         "orderflow": {},
         "regime": {"label": "normal", "known": True, "vol_score": 0.5},
@@ -28,7 +33,7 @@ def test_snipes_when_market_lags_drift():
         "no_ask": 0.56,
         "time_remaining_seconds": 120,
     }
-    d = bot.make_decision(market, _signals(drift=0.40))
+    d = bot.make_decision(market, _signals(drift=0.50, d_pct=0.0008))
     assert d["action"] == "buy"
     assert d["side"] == "yes"
     assert d["edge"] > 0
@@ -44,7 +49,7 @@ def test_skips_when_priced_in():
         "no_ask": 0.26,
         "time_remaining_seconds": 60,
     }
-    d = bot.make_decision(market, _signals(drift=0.80))
+    d = bot.make_decision(market, _signals(drift=0.80, d_pct=0.0015))
     assert d["action"] in ("skip", "hold")
 
 

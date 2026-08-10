@@ -35,6 +35,7 @@ BOT_ALIASES = {
     "lag":        ("bots.bot_lag_residual", "LagResidualBot", "lag-residual-v1"),
     "regime":     ("bots.bot_regime_specialist", "RegimeSpecialistBot", "regime-specialist-v1"),
     "no-lag":     ("bots.bot_no_lag", "NoLagBot", "no-lag-v1"),
+    "sweeper":    ("bots.bot_sweeper", "SweeperBot", "sweeper-v1"),
 }
 DEFAULT_BOTS = ["momentum", "phantom", "meanrev", "hybrid", "sniper"]
 

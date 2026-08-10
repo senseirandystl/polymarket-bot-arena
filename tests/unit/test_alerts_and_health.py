@@ -6,7 +6,12 @@ from unittest import mock
 import pytest
 
 from arena import alerts, health
-from arena.ops_snapshot import recent_signal_contributions, ops_snapshot
+from arena.ops_snapshot import (
+    recent_signal_contributions,
+    lane_health_matrix,
+    ops_snapshot,
+    _parse_lane_readings,
+)
 
 
 def test_alerts_config_roundtrip(monkeypatch):
@@ -478,10 +483,108 @@ def test_signal_contributions_parse(monkeypatch):
     assert lanes["drift"]["mean"] > 0
 
 
+def test_parse_lane_readings_core_and_cand():
+    text = (
+        "fair=0.55 model=0.60 trust=0.50x1.00=0.50 "
+        "=> yes edge=+0.05 "
+        "drift=+0.40 mom=-0.20 pm=+0.00 "
+        "of(obi=+0.00 cvd=+0.00) "
+        "cand(fut=+0.96 tech=+0.25 xa=-0.33 lag=+0.10 ms=+0.05 fd=-0.02) "
+        "strat=+0.15 "
+        "P=0.60[drift=+0.22 mom=-0.04]"
+    )
+    r = _parse_lane_readings(text)
+    assert r["drift"] == pytest.approx(0.40)
+    assert r["mom"] == pytest.approx(-0.20)
+    assert r["strat"] == pytest.approx(0.15)
+    assert r["fut"] == pytest.approx(0.96)
+    assert r["tech"] == pytest.approx(0.25)
+    assert r["xasset"] == pytest.approx(-0.33)
+    assert r["lag"] == pytest.approx(0.10)
+    assert r["ms_mom"] == pytest.approx(0.05)
+    assert r["flow_decay"] == pytest.approx(-0.02)
+
+
+def test_lane_health_matrix_follow_and_trade(monkeypatch):
+    # Two YES wins with +drift (correct UP lean), one YES loss with +drift
+    # (incorrect), one NO win with -mom (correct DOWN lean).
+    rows = [
+        {
+            "reasoning": "drift=+0.40 mom=+0.00 strat=+0.00 cand(fut=+0.00 tech=+0.00 xa=+0.00)",
+            "side": "yes", "outcome": "win", "entry_price": 0.45, "bot_name": "a",
+        },
+        {
+            "reasoning": "drift=+0.35 mom=+0.00 strat=+0.00 cand(fut=+0.00 tech=+0.00 xa=+0.00)",
+            "side": "yes", "outcome": "win", "entry_price": 0.50, "bot_name": "b",
+        },
+        {
+            "reasoning": "drift=+0.30 mom=+0.00 strat=+0.00 cand(fut=+0.00 tech=+0.00 xa=+0.00)",
+            "side": "yes", "outcome": "loss", "entry_price": 0.55, "bot_name": "c",
+        },
+        {
+            "reasoning": "drift=+0.00 mom=-0.40 strat=+0.00 cand(fut=+0.00 tech=+0.00 xa=+0.00)",
+            "side": "no", "outcome": "win", "entry_price": 0.40, "bot_name": "d",
+        },
+        # Deadband — ignored
+        {
+            "reasoning": "drift=+0.01 mom=+0.00 strat=+0.00",
+            "side": "yes", "outcome": "win", "entry_price": 0.50, "bot_name": "e",
+        },
+    ]
+
+    class FakeConn:
+        def execute(self, *a, **k):
+            return self
+        def fetchall(self):
+            return rows
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            return False
+
+    import arena.ops_snapshot as ops
+    monkeypatch.setattr(ops.db, "get_conn", lambda: FakeConn())
+    monkeypatch.setattr(ops.db, "get_lane_overrides", lambda: {})
+    out = lane_health_matrix(hours=12, deadband=0.05, min_n=1)
+    assert out["kind"] == "lane_health"
+    assert out["default_mode"] == "follow"
+    follow = {l["lane"]: l for l in out["modes"]["follow"]["lanes"]}
+    trade = {l["lane"]: l for l in out["modes"]["trade"]["lanes"]}
+
+    # drift: 3 UP leans → 2 correct (WR 2/3), no DOWN leans
+    assert "drift" in follow
+    assert follow["drift"]["status"] == "live"
+    assert follow["drift"]["up"]["n"] == 3
+    assert follow["drift"]["up"]["wr"] == pytest.approx(2 / 3, abs=1e-3)
+    assert follow["drift"]["down"]["n"] == 0
+    assert follow["drift"]["n"] == 3
+    assert follow["drift"]["be_gap"] is not None
+    assert follow["drift"]["net_cents"] is not None
+
+    # mom: one DOWN lean, market went DOWN (NO win) → correct
+    assert "mom" in follow
+    assert follow["mom"]["down"]["n"] == 1
+    assert follow["mom"]["down"]["wr"] == pytest.approx(1.0)
+
+    # trade mode: only when bot side matches lean — all three +drift YES trades match
+    assert trade["drift"]["up"]["n"] == 3
+    assert trade["drift"]["up"]["wr"] == pytest.approx(2 / 3, abs=1e-3)
+    # mom lean DOWN + NO trade matches
+    assert trade["mom"]["down"]["n"] == 1
+
+
 def test_ops_snapshot_smoke(monkeypatch):
-    monkeypatch.setattr("arena.ops_snapshot.recent_signal_contributions",
-                        lambda **k: {"lanes": [], "trades_scanned": 0,
-                                     "trades_with_blend": 0, "hours": 6})
+    monkeypatch.setattr(
+        "arena.ops_snapshot.lane_health_matrix",
+        lambda **k: {
+            "kind": "lane_health", "hours": 12, "deadband": 0.05, "min_n": 5,
+            "default_mode": "follow", "trades_scanned": 0, "trades_with_lanes": 0,
+            "modes": {
+                "follow": {"label": "Follow", "hint": "", "lanes": []},
+                "trade": {"label": "Trade", "hint": "", "lanes": []},
+            },
+        },
+    )
     monkeypatch.setattr("arena.ops_snapshot.db.get_paper_available", lambda: 200.0)
     monkeypatch.setattr("arena.ops_snapshot.db.get_paper_bankroll", lambda: 200.0)
     monkeypatch.setattr("arena.ops_snapshot.db.get_kelly_fraction", lambda: 0.25)
@@ -493,3 +596,4 @@ def test_ops_snapshot_smoke(monkeypatch):
     assert "risk" in snap
     assert "sizing" in snap
     assert snap["sizing"]["kelly_fraction"] == 0.25
+    assert snap["signals"]["kind"] == "lane_health"

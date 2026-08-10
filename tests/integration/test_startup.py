@@ -44,16 +44,23 @@ def test_parse_non_numeric_raises():
 
 # --- default slate ----------------------------------------------------------
 
-def test_default_slate_is_eight_bots_with_arbitrage_sniper_and_makers():
+def test_default_slate_includes_hybrid_and_sweeper():
+    """Default: mom / meanrev / sniper / hybrid / arb / sweeper."""
     bots = startup.build_default_bots()
-    assert len(bots) == 8
-    types = {b.strategy_type for b in bots}
-    assert "arbitrage" in types
-    # The directional defaults (meanrev is the plain mean_reversion bot
-    # since the sl25 rename) + the sniper (promoted 2026-07-18).
-    assert {"momentum", "phantom", "mean_reversion", "hybrid", "sniper"} <= types
-    # Both maker bots are now first-class members of the default lineup.
-    assert {"late_window_maker", "fee_zone_maker"} <= types
+    assert len(bots) == 6
+    types = [b.strategy_type for b in bots]
+    assert types == [
+        "momentum",
+        "mean_reversion",
+        "sniper",
+        "hybrid",
+        "arbitrage",
+        "sweeper",
+    ]
+    # Explicitly not on the default slate (menu-only / mid-run deploy).
+    assert "phantom" not in types
+    assert "late_window_maker" not in types
+    assert "fee_zone_maker" not in types
 
 
 def test_manual_selection_builds_exactly_chosen():

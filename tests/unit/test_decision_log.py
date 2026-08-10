@@ -167,3 +167,22 @@ def test_classify_skip_reason():
     assert decision_log.classify_skip_reason("Dead-zone gate: ...") == "dead_zone"
     assert decision_log.classify_skip_reason("No edge: yes edge=...") == "no_edge"
     assert decision_log.classify_skip_reason("Model lean too weak") == "weak_lean"
+    assert decision_log.classify_skip_reason(
+        "Regime style-skip: momentum toxic in low_vol_trend"
+    ) == "style_skip"
+    assert decision_log.classify_skip_reason(
+        "Extreme-drift lag gate: |drift|=0.6"
+    ) == "extreme_drift"
+    assert decision_log.classify_skip_reason(
+        "Mid-band lag gate: yes mid=0.55"
+    ) == "mid_band"
+    assert decision_log.classify_skip_reason(
+        "Pile-in EV gate: 1 peer(s) already on yes"
+    ) == "pilein_ev_gate"
+    assert decision_log.classify_skip_reason(
+        "sweeper: waiting (rem=60s, window=45s)"
+    ) == "sweeper_window"
+    assert decision_log.classify_skip_reason(
+        "ignored", explicit="style_skip"
+    ) == "style_skip"
+    assert decision_log.classify_skip_reason("something opaque") == "skip"

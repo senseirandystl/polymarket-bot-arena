@@ -63,6 +63,7 @@ from bots.bot_arbitrage import ArbitrageBot
 from bots.bot_lag_residual import LagResidualBot
 from bots.bot_regime_specialist import RegimeSpecialistBot
 from bots.bot_no_lag import NoLagBot
+from bots.bot_sweeper import SweeperBot
 from bots.bot_true_maker import TrueMakerBot
 from signals.price_feed import get_feed as get_price_feed
 from signals.sentiment import get_feed as get_sentiment_feed
@@ -106,6 +107,7 @@ TAKER_BOT_CLASSES = {
     "lag_residual": LagResidualBot,
     "regime_specialist": RegimeSpecialistBot,
     "no_lag": NoLagBot,
+    "sweeper": SweeperBot,
 }
 
 # Maker strategy types that have a concrete default instance. Used to rebuild
@@ -154,8 +156,7 @@ def create_default_bots():
             # part of the DEFAULT slate — it is not force-injected here, so a
             # manually-selected slate that excluded it stays excluded on restart.
             return bots
-    # First-run fallback (empty DB, non-interactive): canonical 5-bot default
-    # slate (the four directional defaults + the arbitrage bot).
+    # First-run fallback (empty DB, non-interactive): lean 6 default slate.
     from arena import startup
     return startup.build_default_bots()
 
@@ -470,7 +471,7 @@ def _run_maker_section(maker_bot, market: dict, signals: dict, state) -> bool:
 # Evolution check on the main coordinator thread
 # ----------------------------------------------------------------------
 
-def _evolution_check_loop(bots, state, pos_monitor, trader):
+def _evolution_check_loop(bots, state, pos_monitor, trader, maker_bots=None):
     """Main-thread periodic evolution check.
 
     Runs every 30s (the trader thread is already at 1s, so we don't need
@@ -486,20 +487,30 @@ def _evolution_check_loop(bots, state, pos_monitor, trader):
     (arena/validation_scheduler.py — spawns the harness every
     AUTO_VALIDATE_EVERY_MARKETS windows so Signal Lab proposals appear
     without any manual run).
+
+    ``maker_bots`` is the live maker list held by reference for MakerThread;
+    mid-run deploys may append to it in place.
     """
     from arena import lane_monitor, lane_promoter, core_lane_tuner, portfolio
     from arena import regime_map
     from arena import risk_engine
     from arena.validation_scheduler import ValidationScheduler
 
+    if maker_bots is None:
+        maker_bots = []
+
     evolution_interval = config.EVOLUTION_INTERVAL_HOURS * 3600
     ga_min_interval = float(getattr(config, "GA_MIN_INTERVAL_SEC", 1800))
     validation_scheduler = ValidationScheduler()
     lane_monitor_interval = getattr(config, "LANE_MONITOR_INTERVAL_SEC", 1800)
+    # Core / live-lane tuner on a faster cadence so weights track 5m tape
+    # (style-skip uses regime_stats 15s cache; tuner was stuck on 30m host).
+    core_tune_interval = float(getattr(config, "CORE_TUNE_INTERVAL_SEC", 300))
     portfolio_interval = float(
         getattr(config, "PORTFOLIO_REBALANCE_INTERVAL_SEC", 1800))
     regime_map_interval = float(getattr(config, "REGIME_MAP_INTERVAL_SEC", 900))
     last_lane_check = 0.0
+    last_core_tune = 0.0
     last_portfolio_check = 0.0
     last_regime_map_check = 0.0
     last_pool_pnl = None  # for performance-trigger drop detection
@@ -521,6 +532,27 @@ def _evolution_check_loop(bots, state, pos_monitor, trader):
         logger.info("No saved evolution state, starting fresh timer (persisted)")
 
     while True:
+        # Dashboard mid-run deploy queue (Bots tab) — fold into live slate.
+        try:
+            from arena.deploy import process_pending_deploys
+            bots, maker_bots, deploy_result = process_pending_deploys(
+                bots, maker_bots, trader, pos_monitor,
+                maker_types=MAKER_TYPES,
+            )
+            if deploy_result and deploy_result.get("deployed"):
+                log_event(
+                    logger, logging.INFO,
+                    f"Mid-run deploy: {[d['bot_name'] for d in deploy_result['deployed']]}",
+                    event_type="deploy",
+                    deployed=deploy_result.get("deployed"),
+                    skipped=deploy_result.get("skipped"),
+                )
+        except Exception as e:
+            log_event(
+                logger, logging.ERROR, f"Mid-run deploy error (caught): {e}",
+                exc_info=True, event_type="error", where="mid_run_deploy",
+            )
+
         try:
             now = time.time()
             elapsed = now - last_evolution
@@ -604,20 +636,15 @@ def _evolution_check_loop(bots, state, pos_monitor, trader):
                 # Demote live candidate lanes that decayed, then judge pending
                 # proposals against live shadow evidence (auto-approve when the
                 # toggle is on). Order matters: demotion frees an active-lane
-                # slot before the promoter checks the concentration cap. Finally
-                # the core-lane tuner nudges drift/mom/strat per strategy on live
-                # attribution (same toggle: OFF = suggest-only).
+                # slot before the promoter checks the concentration cap.
                 lane_monitor.check_lanes()
                 lane_promoter.check_proposals()
-                core_lane_tuner.tune()
                 # Offline rollup of decision_events (skips + buys) for
                 # counterfactual lane/strategy fine-tuning.
                 try:
                     from arena.decision_log import maybe_rollup, flush
                     flush()
                     maybe_rollup()
-                    # Mine decision_events into auto skip/go rules (data-driven
-                    # regime×price×drift cells — not hardcoded gates).
                     try:
                         from arena.learned_rules import mine_and_update
                         mine_and_update()
@@ -627,8 +654,17 @@ def _evolution_check_loop(bots, state, pos_monitor, trader):
                     logger.debug("decision rollup: %s", e)
                 last_lane_check = time.time()
         except Exception as e:
-            log_event(logger, logging.ERROR, f"Lane monitor/promoter/tuner error (caught): {e}",
+            log_event(logger, logging.ERROR, f"Lane monitor/promoter error (caught): {e}",
                       exc_info=True, event_type="error", where="lane_pipeline")
+
+        try:
+            # Core + live-candidate weight nudges (faster than demote loop).
+            if time.time() - last_core_tune >= core_tune_interval:
+                core_lane_tuner.tune()
+                last_core_tune = time.time()
+        except Exception as e:
+            log_event(logger, logging.ERROR, f"Core-lane tuner error (caught): {e}",
+                      exc_info=True, event_type="error", where="core_lane_tuner")
 
         try:
             # Regime discovery (Layer 2): recompute the per-bot context
@@ -922,7 +958,11 @@ def main_loop(bots):
     try:
         # Evolution only culls/mutates the directional trader bots; makers (and
         # the arbitrage bot, via EVOLUTION_EXEMPT_TYPES) are left untouched.
-        _evolution_check_loop(trader_bots, state, pos_monitor, trader)
+        # maker_bots is the same list MakerThread holds — mid-run deploys append
+        # in place so makers appear without restart.
+        _evolution_check_loop(
+            trader_bots, state, pos_monitor, trader, maker_bots=maker_bots,
+        )
     except KeyboardInterrupt:
         logger.info("Arena stopped by user")
     finally:

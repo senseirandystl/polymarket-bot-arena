@@ -1,7 +1,11 @@
 """LateWindowMaker — late-window drift lag sniper (taker fills today).
 
-Thesis: near expiry, BTC direction is largely locked; buy the lagging side
-when drift is strong and the book still underprices it.
+Thesis: near expiry, BTC **TWAP** direction is largely locked; buy the lagging
+side when drift is strong and the book still underprices it.
+
+Under TWAP resolution (2026-08-07+) the last 30s are an averaging window, not
+a single print race — enter before/through that window on TWAP moneyness
+(``btc_drift``), not last-tick snipes.
 
 2026-08 redesign:
   * Mid/ask integrity gate (no more mid=0.90 ask=0.49 fantasy edges).
@@ -9,6 +13,7 @@ when drift is strong and the book still underprices it.
   * Tighter price band [0.55, 0.80] — above ~0.80 BE gap is brutal as taker.
   * Size via calibrated Kelly; conf from structure.
   * Slightly shorter window (120s) so entries aren't early-window noise.
+  * TWAP certainty boost inside the settlement window.
 """
 
 from __future__ import annotations
@@ -22,6 +27,7 @@ from bots.maker_utils import maker_kelly_amount, mid_ask_gap_ok, resolve_side_ex
 from signals.lab import SignalView
 
 DEFAULT_PARAMS = {
+    # Cover pre-TWAP lock-in + full 30s settlement averaging window.
     "entry_window_sec": 120,
     "min_drift": 0.28,
     "min_momentum": 0.0004,     # momentum must not contradict drift
@@ -144,6 +150,23 @@ class LateWindowMakerBot(BaseBot):
         )
         # Mild urgency boost to conf only (not size-from-conf).
         conf = min(0.92, conf + 0.08 * time_weight)
+        # TWAP settlement policy: conf boost when averaging window is locking.
+        pol = sv.settlement_policy or {}
+        twap_cert = float(pol.get("certainty") or sv.twap_certainty or 0.0)
+        if pol.get("policy_active") and float(pol.get("conf_boost") or 0) > 0:
+            conf = min(0.95, conf + float(pol["conf_boost"]))
+        elif sv.in_settlement_window and twap_cert > 0:
+            conf = min(0.95, conf + 0.10 * twap_cert)
+        # Low-certainty settlement: demand more edge (spot spikes are noise).
+        if pol.get("policy_active"):
+            e_mult = float(pol.get("edge_mult") or 1.0)
+            if e_mult > 1.0:
+                min_edge = float(p.get("min_edge", 0.03)) * e_mult
+                if lwm_edge < min_edge:
+                    return _hold(
+                        f"lwm: TWAP settle edge {lwm_edge:+.3f} < {min_edge:.3f} "
+                        f"(phase={pol.get('phase')} cert={twap_cert:.2f})"
+                    )
         if conf < float(p.get("min_confidence", 0.22)):
             return _hold(f"lwm: conf {conf:.3f} too low")
 
@@ -187,6 +210,9 @@ class LateWindowMakerBot(BaseBot):
                 "drift": drift, "momentum": momentum,
                 "implied_p": implied_p, "time_weight": time_weight,
                 "inventory_usd": inventory,
+                "twap_certainty": twap_cert,
+                "in_settlement_window": bool(sv.in_settlement_window),
+                "resolution_source": sv.resolution_source,
             },
             suggested_amount=amount,
             entry_price=round(float(side_exec), 4),

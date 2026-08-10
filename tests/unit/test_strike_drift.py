@@ -87,58 +87,67 @@ def test_fetch_open_at_no_binance_fallback():
         bin_f.assert_not_called()
 
 
-def test_registry_upgrades_provisional_latch_to_open_price():
-    """A latch must not stick for the whole window if openPrice arrives later."""
-    calls = {"n": 0}
-
-    def open_price(est):
-        calls["n"] += 1
-        # First call(s): unavailable; then official appears
-        if calls["n"] < 2:
-            return None
-        return 63895.49
-
+def test_registry_prefers_twap_open_over_rest_open_price():
+    """TWAP-at-open is UI PTB; REST must not win once TWAP open is known."""
     reg = strike.StrikeRegistry(fetcher=None)
-    with patch("signals.strike._fetch_polymarket_open_price", side_effect=open_price), \
-         patch("signals.strike._fetch_chainlink_feed_latch_strict", return_value=63903.51):
-        # First: provisional latch
-        s1 = reg.get_strike("m-new", "2026-07-29T01:05:00Z")
-        assert s1 == 63903.51
-        assert reg.get_source("m-new") == "latch"
-        # Force refresh window to expire
-        with reg._lock:
-            reg._strikes["m-new"]["ts"] = 0.0
-        s2 = reg.get_strike("m-new", "2026-07-29T01:05:00Z")
-        assert s2 == 63895.49
-        assert reg.get_source("m-new") == "openPrice"
-        # Official is sticky
-        s3 = reg.get_strike("m-new", "2026-07-29T01:05:00Z")
-        assert s3 == 63895.49
+    with patch("signals.strike._twap_open_from_feed", return_value=64250.59), \
+         patch("signals.strike._fetch_polymarket_open_price", return_value=64248.01):
+        s1 = reg.get_strike("m-new", "2026-08-07T04:10:00Z")
+        assert s1 == 64250.59
+        assert reg.get_source("m-new") == "twap_open"
+        # Sticky — REST not re-consulted as authority
+        s2 = reg.get_strike("m-new", "2026-08-07T04:10:00Z")
+        assert s2 == 64250.59
+
+
+def test_registry_corrects_rest_when_twap_open_appears():
+    """REST fallback first, then correct to TWAP-at-open (live $2.58 bug)."""
+    reg = strike.StrikeRegistry(fetcher=None)
+    twap = {"v": None}
+
+    def _twap(est, **kwargs):
+        return twap["v"]
+
+    with patch("signals.strike._twap_open_from_feed", side_effect=_twap), \
+         patch("signals.strike._fetch_polymarket_open_price", return_value=64248.01), \
+         patch("signals.strike._spot_open_from_feed", return_value=None), \
+         patch("signals.strike._load_persisted_strike", return_value=None), \
+         patch("signals.strike._persist_strike", return_value=None):
+        s1 = reg.get_strike("m-fix", "2026-08-07T04:10:00Z")
+        assert s1 == 64248.01
+        assert reg.get_source("m-fix") == "openPrice"
+        twap["v"] = 64250.59
+        s2 = reg.get_strike("m-fix", "2026-08-07T04:10:00Z")
+        assert s2 == 64250.59
+        assert reg.get_source("m-fix") == "twap_open"
 
 
 def test_drift_positive_when_btc_above_strike():
-    assert strike.drift_signal(100000.0, 100200.0, 60) > 0
+    # Fixed vol_scale keeps tests independent of adaptive EMA state.
+    assert strike.drift_signal(100000.0, 100200.0, 60, vol_scale=0.0015) > 0
 
 
 def test_drift_negative_when_btc_below_strike():
-    assert strike.drift_signal(100000.0, 99800.0, 60) < 0
+    assert strike.drift_signal(100000.0, 99800.0, 60, vol_scale=0.0015) < 0
 
 
 def test_drift_zero_at_the_strike():
-    assert strike.drift_signal(100000.0, 100000.0, 60) == 0.0
+    assert strike.drift_signal(100000.0, 100000.0, 60, vol_scale=0.0015) == 0.0
 
 
 def test_drift_bounded():
-    hi = strike.drift_signal(100000.0, 110000.0, 15)
-    lo = strike.drift_signal(100000.0, 90000.0, 15)
+    hi = strike.drift_signal(100000.0, 110000.0, 15, vol_scale=0.0015)
+    lo = strike.drift_signal(100000.0, 90000.0, 15, vol_scale=0.0015)
     assert -1.0 <= lo < 0 < hi <= 1.0
 
 
 def test_drift_more_decisive_near_expiry():
-    early = strike.drift_signal(100000.0, 100100.0, time_remaining=280)
-    late = strike.drift_signal(100000.0, 100100.0, time_remaining=30)
+    early = strike.drift_signal(
+        100000.0, 100100.0, time_remaining=280, vol_scale=0.0015)
+    late = strike.drift_signal(
+        100000.0, 100100.0, time_remaining=30, vol_scale=0.0015)
     assert abs(late) > abs(early)
 
 
 def test_drift_zero_without_strike():
-    assert strike.drift_signal(None, 100000.0, 60) == 0.0
+    assert strike.drift_signal(None, 100000.0, 60, vol_scale=0.0015) == 0.0

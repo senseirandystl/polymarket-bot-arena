@@ -32,7 +32,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, wait
 from typing import Optional
 
 import config
@@ -42,8 +42,15 @@ from signals.strike import get_strike_registry
 
 logger = logging.getLogger("arena.market_data")
 
-# Shared tiny pool for parallel book GETs (warmer only).
-_book_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="warm-book")
+# Shared pool for parallel book GETs (warmer only). Sized >2 so a straggler
+# pair from a slow CLOB cycle cannot starve the next tick's submits (the old
+# as_completed(timeout=) path raised TimeoutError mid-cycle, abandoned the
+# two in-flight futures, and left max_workers=2 fully occupied → cascade of
+# "N (of 2) futures unfinished" every second until the hung GETs returned).
+_book_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="warm-book")
+
+# Rate-limit book-timeout warnings (one line per cluster, not one per tick).
+_last_book_timeout_log = 0.0
 
 
 class MarketDataStore:
@@ -223,7 +230,18 @@ class MarketDataWarmer(threading.Thread):
         logger.info("Market-data warmer stopped")
 
     def _fetch_books_parallel(self, yes_tok: str, no_tok: str) -> tuple[dict, dict]:
+        """Fetch YES+NO books in parallel; never raise on partial timeout.
+
+        Uses ``wait`` (not ``as_completed``) so a slow/hung CLOB response does
+        not raise ``TimeoutError: N (of 2) futures unfinished`` out of the
+        warmer cycle. Incomplete sides return ``valid=False`` and the caller
+        fail-softs to the previous snapshot.
+        """
+        global _last_book_timeout_log
         timeout = float(getattr(config, "BOOK_FETCH_TIMEOUT_SEC", 2.0))
+        # Bound total wait slightly above the per-request timeout so both
+        # parallel GETs can finish under load without abandoning early.
+        wait_timeout = timeout + 0.75
         futs = {
             _book_pool.submit(polymarket_markets.get_order_book, yes_tok,
                               timeout=timeout): "yes",
@@ -232,12 +250,31 @@ class MarketDataWarmer(threading.Thread):
         }
         yes_book: dict = {"valid": False}
         no_book: dict = {"valid": False}
-        for fut in as_completed(futs, timeout=timeout + 0.5):
+        done, not_done = wait(list(futs.keys()), timeout=wait_timeout)
+        unfinished = len(not_done)
+        if unfinished:
+            now = time.time()
+            # Log at most once per 15s — during a blip this used to print every
+            # 1s cycle and drown the real signal.
+            if now - _last_book_timeout_log >= 15.0:
+                _last_book_timeout_log = now
+                logger.warning(
+                    "Book fetch partial/timeout: %d of %d sides unfinished "
+                    "(fail-soft to last snapshot; CLOB lag or pool pressure)",
+                    unfinished, len(futs),
+                )
+            # Best-effort cancel of not-yet-started work; running GETs will
+            # finish on the extra pool workers without blocking this cycle.
+            for fut in not_done:
+                fut.cancel()
+        for fut in done:
             side = futs[fut]
             try:
-                book = fut.result()
+                book = fut.result(timeout=0)
             except Exception as e:
                 logger.debug(f"parallel book {side} failed: {e}")
+                book = {"valid": False}
+            if not isinstance(book, dict):
                 book = {"valid": False}
             if side == "yes":
                 yes_book = book

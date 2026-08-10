@@ -288,8 +288,15 @@ class HybridBot(BaseBot):
 
         confidence = abs(weighted_score)
         if agreement:
-            confidence = min(1.0, confidence + self.strategy_params.get(
-                "agreement_bonus", 0.15))
+            # Scale the agreement bonus by STRAT_LANE_CONF_CAP so the hybrid's
+            # internal confidence does not exceed what the shared model blend
+            # will actually use (strat lane is capped at 0.25 downstream).
+            strat_cap = float(getattr(config, "STRAT_LANE_CONF_CAP", 0.25))
+            bonus = self.strategy_params.get("agreement_bonus", 0.15)
+            # Full bonus only when weighted_score already in the cap's useful
+            # range; scale down when near or above cap to avoid over-confidence.
+            scale = max(0.3, 1.0 - abs(weighted_score) / max(strat_cap * 2.0, 1e-6))
+            confidence = min(1.0, confidence + bonus * scale)
 
         if confidence < self.strategy_params.get("confidence_threshold", 0.15):
             return strategy_decision(

@@ -410,6 +410,23 @@ tbody tr:hover{background:rgba(0,255,156,.035)}
 .confirm-box{background:linear-gradient(180deg,var(--panel),#08120b);border:1px solid var(--neg2);border-radius:8px;padding:32px;max-width:420px;text-align:center;box-shadow:0 0 40px rgba(255,59,92,.2)}
 .confirm-box h3{color:var(--neg);margin-bottom:16px;letter-spacing:.04em}
 .confirm-box p{margin-bottom:20px;color:var(--muted)}
+.confirm-box.deploy-box{max-width:520px;text-align:left;border-color:var(--line-hot);box-shadow:0 0 40px rgba(0,255,156,.12)}
+.confirm-box.deploy-box h3{color:var(--grn);text-align:center}
+.confirm-box.deploy-box p{text-align:center}
+.deploy-list{max-height:340px;overflow:auto;margin:0 0 16px;border:1px solid var(--line);border-radius:6px;background:var(--inset)}
+.deploy-row{display:flex;align-items:flex-start;gap:10px;padding:10px 12px;border-bottom:1px solid var(--line);cursor:pointer}
+.deploy-row:last-child{border-bottom:none}
+.deploy-row:hover{background:rgba(0,255,156,.04)}
+.deploy-row.active-type{opacity:.55;cursor:not-allowed}
+.deploy-row input{margin-top:3px;accent-color:var(--grn)}
+.deploy-row .d-name{color:var(--hi);font-weight:600;font-size:13px}
+.deploy-row .d-type{color:var(--dim);font-size:10px;letter-spacing:.06em;margin-left:6px}
+.deploy-row .d-blurb{color:var(--muted);font-size:11px;margin-top:2px}
+.deploy-row .d-badge{margin-left:auto;font-size:10px;color:var(--amb);white-space:nowrap}
+.deploy-actions{display:flex;gap:10px;justify-content:center;flex-wrap:wrap}
+.deploy-status{font-size:12px;color:var(--muted);text-align:center;min-height:1.2em;margin-top:8px}
+.bots-toolbar{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:10px;flex-wrap:wrap}
+.bots-toolbar .section-title{margin:0}
 
 /* ops chips (KPI readouts) */
 .ops-strip{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:10px}
@@ -432,6 +449,24 @@ tbody tr:hover{background:rgba(0,255,156,.035)}
 .contrib-bar .bar-track{flex:1;height:8px;background:var(--inset);border-radius:2px;overflow:hidden}
 .contrib-bar .bar-fill{height:100%;border-radius:2px;background:var(--grn);min-width:2px;box-shadow:0 0 6px rgba(0,255,156,.4)}
 .contrib-bar .bar-fill.neg{background:var(--neg);box-shadow:0 0 6px rgba(255,59,92,.4)}
+/* Lane health matrix (Overview) */
+.lane-health-wrap{font-size:11px}
+.lane-health-toolbar{display:flex;align-items:center;gap:8px;margin-bottom:6px;flex-wrap:wrap}
+.lane-health-toolbar .mode-btn{
+  background:var(--inset);border:1px solid var(--line);color:var(--text);
+  border-radius:3px;padding:2px 8px;font-size:10px;cursor:pointer;font-family:inherit
+}
+.lane-health-toolbar .mode-btn.active{border-color:var(--grn-soft);color:var(--grn);background:rgba(0,255,156,.1)}
+.lane-health-table{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums}
+.lane-health-table th{color:#5f9c78;font-weight:500;text-align:right;padding:2px 4px;font-size:9px;letter-spacing:.02em}
+.lane-health-table th:first-child,.lane-health-table td:first-child{text-align:left}
+.lane-health-table td{padding:3px 4px;border-top:1px solid rgba(95,156,120,.15)}
+.lane-health-table .muted{color:#5f9c78;opacity:.75}
+.lane-health-table .wr-good{color:var(--grn)}
+.lane-health-table .wr-mid{color:var(--amb)}
+.lane-health-table .wr-bad{color:var(--neg)}
+.lane-health-table .wr-low{color:#5f9c78;opacity:.55}
+.lane-health-foot{margin-top:5px;color:#5f9c78;font-size:10px;line-height:1.35}
 .health-rec{background:var(--inset);border-left:2px solid var(--amb);padding:8px 12px;margin-bottom:6px;border-radius:0 5px 5px 0;font-size:12px}
 .health-rec.crit{border-left-color:var(--neg)}
 
@@ -710,8 +745,8 @@ tbody tr:hover{background:rgba(0,255,156,.035)}
     <div class="tab-content" id="tab-overview">
         <!-- Ops ribbon: live BTC + system KPIs -->
         <div class="ov-ribbon">
-            <div class="btc-chip" id="btc-strip" title="Chainlink BTC/USD via Polymarket RTDS (same oracle as Price to Beat)">
-                <div class="btc-lbl">Bitcoin (live)</div>
+            <div class="btc-chip" id="btc-strip" title="Chainlink BTC/USD 30s TWAP via Polymarket RTDS — same as Polymarket Current Price and Price to Beat">
+                <div class="btc-lbl">Bitcoin (TWAP)</div>
                 <div class="btc-px" id="btc-price-val">—</div>
                 <div class="btc-sub" id="btc-price-sub">connecting…</div>
             </div>
@@ -763,7 +798,7 @@ tbody tr:hover{background:rgba(0,255,156,.035)}
                 </table>
             </div>
             <div class="card dense" id="ov-signals-card" style="border-left:3px solid #00ff9c">
-                <h2>Signal contributions <span style="font-weight:normal">6h |blend|</span></h2>
+                <h2 id="ov-signals-title">Lane health <span style="font-weight:normal">12h</span></h2>
                 <div id="ov-signals-body" style="color:#5f9c78;font-size:11px">—</div>
             </div>
             <div class="card dense" id="ov-alloc-card" style="border-left:3px solid #35ff87">
@@ -823,7 +858,11 @@ tbody tr:hover{background:rgba(0,255,156,.035)}
 
     <!-- ===== BOTS TAB ===== -->
     <div class="tab-content hidden" id="tab-bots">
-        <div class="section-title">Active Bots</div>
+        <div class="bots-toolbar">
+            <div class="section-title">Active Bots</div>
+            <button type="button" class="chip-btn primary" id="deploy-bots-btn" onclick="openDeployModal()">+ Deploy bots</button>
+        </div>
+        <div class="deploy-status" id="deploy-status-line"></div>
         <div class="grid" id="bots-grid"></div>
 
         <div class="section-title" id="copy-section" style="display:none">Copy Bots</div>
@@ -1049,6 +1088,25 @@ tbody tr:hover{background:rgba(0,255,156,.035)}
         </div>
 
         <div class="settings-section">
+            <h3>Pile-in EV gate</h3>
+            <div class="settings-blurb">
+                After one bot already holds a (market, side), additional bots must clear a
+                <b>higher edge bar</b> (progressive EV) before adding exposure — unless
+                confidence is very high (≥ conf bypass). Not a hard bot-count ban.
+                Default ON. Knobs: min edge / step / conf bypass in config.
+            </div>
+            <div class="cred-row">
+                <label>Enabled<small>Current: <span id="pilein-ev-current">&mdash;</span></small></label>
+                <select id="pilein-ev-enabled" style="background:#050806;color:#bff0d2;border:1px solid #16301f;border-radius:6px;padding:8px 10px;font-family:inherit">
+                    <option value="1">On</option>
+                    <option value="0">Off</option>
+                </select>
+                <button class="btn btn-primary" onclick="savePileinEvGate()">Save</button>
+            </div>
+            <div class="test-result" id="pilein-ev-result" style="margin-top:6px;font-size:11px;color:#8fd4a8"></div>
+        </div>
+
+        <div class="settings-section">
             <h3>Risk Engine Limits</h3>
             <div class="settings-blurb">
                 Editable risk thresholds. Changes apply within ~15s (or immediately via <b>Save limits</b> / Re-eval on Overview).
@@ -1210,6 +1268,33 @@ tbody tr:hover{background:rgba(0,255,156,.035)}
         </div>
 
         <div class="settings-section">
+            <h3>Regime Control</h3>
+            <div class="settings-blurb">
+                Live toggles for the adapt-not-throttle regime stack. Values persist in
+                <code>arena_state</code> (picked up within a few seconds — no restart).
+                Defaults come from <code>config.py</code> until you flip a switch.
+                <b>Continuous residual blend</b> is the main experimental weight path
+                (<code>w₀ + B·F</code>); leave off until the soak has sample mass.
+            </div>
+            <div id="regime-settings-rows" style="display:flex;flex-direction:column;gap:10px;margin:10px 0">
+                <div style="color:#5f9c78;font-size:12px">Loading regime settings…</div>
+            </div>
+            <div class="cred-row" style="margin-top:8px">
+                <label>Adapt primary<small>style vs legacy throttle</small></label>
+                <select id="regime-adapt-primary" onchange="saveRegimeAdaptPrimary()"
+                        style="background:#050806;color:#bff0d2;border:1px solid #16301f;border-radius:6px;padding:8px 10px;font-family:inherit">
+                    <option value="style">style — reweight lanes / capital</option>
+                    <option value="throttle">throttle — size cuts + higher bars</option>
+                </select>
+                <span id="regime-adapt-primary-status" style="color:#5f9c78;font-size:12px"></span>
+            </div>
+            <div class="test-result" id="regime-settings-result"></div>
+            <div class="actions-row">
+                <button class="btn btn-secondary" onclick="loadRegimeSettings()">Reload</button>
+            </div>
+        </div>
+
+        <div class="settings-section">
             <h3>Portfolio Capital Allocation</h3>
             <div class="settings-blurb">
                 Split the shared bankroll across active bots. <b>Default: On</b> — each bot Kelly-sizes against
@@ -1344,6 +1429,20 @@ tbody tr:hover{background:rgba(0,255,156,.035)}
         <p>This bot will start trading with real USDC on Polymarket. Other bots remain unchanged.</p>
         <button class="btn btn-danger" onclick="confirmBotLive()">YES &mdash; Go Live</button>
         <button class="btn btn-cancel" onclick="cancelBotModal()">Cancel</button>
+    </div>
+</div>
+
+<!-- Mid-run multi-select deploy modal -->
+<div class="confirm-modal" id="deploy-modal">
+    <div class="confirm-box deploy-box">
+        <h3>Deploy bots mid-run</h3>
+        <p>Select one or more strategies not already on the roster. The arena folds them in within ~30s (no restart).</p>
+        <div class="deploy-list" id="deploy-list"></div>
+        <div class="deploy-actions">
+            <button type="button" class="btn btn-primary" id="deploy-confirm-btn" onclick="confirmDeployBots()">Deploy selected</button>
+            <button type="button" class="btn btn-cancel" onclick="closeDeployModal()">Cancel</button>
+        </div>
+        <div class="deploy-status" id="deploy-modal-status"></div>
     </div>
 </div>
 
@@ -1576,7 +1675,93 @@ function dismissBanner() {
 }
 
 // ---------- Settings tab ----------
+const REGIME_FLAG_ORDER = [
+    'continuous_blend', 'use_relative', 'profile_adapt', 'profile_seeds',
+    'hard_skip', 'adapt_enabled', 'freq_target', 'conditioning',
+];
+
+async function loadRegimeSettings() {
+    const host = document.getElementById('regime-settings-rows');
+    const result = document.getElementById('regime-settings-result');
+    if (!host) return;
+    try {
+        const data = await fetchJSON('/api/settings/regime');
+        const flags = data.flags || {};
+        const labels = data.labels || {};
+        const blurb = data.blurb || {};
+        host.innerHTML = REGIME_FLAG_ORDER.map(name => {
+            const on = !!flags[name];
+            const title = labels[name] || name;
+            const help = blurb[name] || '';
+            return `<div class="cred-row" style="align-items:flex-start">
+                <label style="min-width:200px">${title}
+                    <small style="display:block;max-width:360px;font-weight:normal;color:#5f9c78;margin-top:2px">${help}</small>
+                </label>
+                <label style="display:flex;align-items:center;gap:8px;cursor:pointer;white-space:nowrap;margin-top:4px">
+                    <input type="checkbox" id="regime-flag-${name}" ${on ? 'checked' : ''}
+                           onchange="saveRegimeFlag('${name}', this.checked)"
+                           style="width:18px;height:18px;cursor:pointer">
+                    <span id="regime-flag-lbl-${name}" style="font-weight:600;color:${on ? '#35ff87' : '#5f9c78'}">${on ? 'ON' : 'OFF'}</span>
+                </label>
+            </div>`;
+        }).join('');
+        const sel = document.getElementById('regime-adapt-primary');
+        if (sel && data.adapt_primary) sel.value = data.adapt_primary;
+        if (result) result.textContent = '';
+    } catch (e) {
+        host.innerHTML = `<div style="color:#ff3b5c">Failed to load regime settings: ${e}</div>`;
+    }
+}
+
+async function saveRegimeFlag(name, enabled) {
+    const lbl = document.getElementById('regime-flag-lbl-' + name);
+    const result = document.getElementById('regime-settings-result');
+    try {
+        const data = await postJSON('/api/settings/regime', { flag: name, enabled: !!enabled });
+        if (data.error) throw new Error(data.error);
+        if (lbl) {
+            lbl.textContent = enabled ? 'ON' : 'OFF';
+            lbl.style.color = enabled ? '#35ff87' : '#5f9c78';
+        }
+        if (result) {
+            result.style.color = '#35ff87';
+            result.textContent = `Saved ${name} → ${enabled ? 'ON' : 'OFF'}`;
+        }
+    } catch (e) {
+        if (result) {
+            result.style.color = '#ff3b5c';
+            result.textContent = `Failed: ${e.message || e}`;
+        }
+        // revert checkbox on failure
+        const cb = document.getElementById('regime-flag-' + name);
+        if (cb) cb.checked = !enabled;
+    }
+}
+
+async function saveRegimeAdaptPrimary() {
+    const sel = document.getElementById('regime-adapt-primary');
+    const st = document.getElementById('regime-adapt-primary-status');
+    const result = document.getElementById('regime-settings-result');
+    if (!sel) return;
+    try {
+        const data = await postJSON('/api/settings/regime', { adapt_primary: sel.value });
+        if (data.error) throw new Error(data.error);
+        if (st) { st.style.color = '#35ff87'; st.textContent = 'saved'; }
+        if (result) {
+            result.style.color = '#35ff87';
+            result.textContent = `Adapt primary → ${sel.value}`;
+        }
+    } catch (e) {
+        if (st) { st.style.color = '#ff3b5c'; st.textContent = 'error'; }
+        if (result) {
+            result.style.color = '#ff3b5c';
+            result.textContent = `Failed: ${e.message || e}`;
+        }
+    }
+}
+
 async function refreshSettings() {
+    loadRegimeSettings();
     try {
         const data = await fetchJSON('/api/credentials/status');
         document.getElementById('storage-info').innerHTML = `
@@ -1599,6 +1784,7 @@ async function refreshSettings() {
     }
     loadBankroll();
     loadKelly();
+    loadPileinEvGate();
     loadPortfolio();
     loadAlerts();
 }
@@ -1768,28 +1954,120 @@ function updateOps(ops) {
         updateBtcPrice(ops.prices.btc, ops.prices.btc_stale, 'arena');
     }
 
-    // Signal contributions
-    const sig = ops.signals || {};
+    // Lane health matrix (sign accuracy by lean side)
+    updateLaneHealth(ops.signals || {});
+}
+
+/** @type {{mode: string, payload: object|null}} */
+let _laneHealthUI = { mode: 'follow', payload: null };
+
+function _wrClass(wr, n, minN) {
+    if (wr == null || n < minN) return 'wr-low';
+    if (wr >= 0.55) return 'wr-good';
+    if (wr >= 0.50) return 'wr-mid';
+    return 'wr-bad';
+}
+
+function _fmtWr(wr, n, minN) {
+    if (wr == null || !n) return '—';
+    const pct = (wr * 100).toFixed(0) + '%';
+    if (n < minN) return pct;
+    return pct;
+}
+
+function _fmtCents(c) {
+    if (c == null || Number.isNaN(Number(c))) return '—';
+    const n = Number(c);
+    return (n >= 0 ? '+' : '') + n.toFixed(1) + '¢';
+}
+
+function _fmtGap(g) {
+    if (g == null || Number.isNaN(Number(g))) return '—';
+    const n = Number(g);
+    return (n >= 0 ? '+' : '') + (n * 100).toFixed(0) + '¢';
+}
+
+function updateLaneHealth(sig) {
     const body = document.getElementById('ov-signals-body');
-    if (body) {
-        const lanes = sig.lanes || [];
-        if (!lanes.length) {
-            body.textContent = sig.error || 'No blend attributions in recent trades yet.';
-        } else {
-            const maxAbs = Math.max(...lanes.map(l => l.mean_abs || 0), 1e-6);
-            body.innerHTML = lanes.slice(0, 8).map(l => {
-                const pct = Math.min(100, (l.mean_abs / maxAbs) * 100);
-                const neg = (l.mean || 0) < 0;
-                return `<div class="contrib-bar">
-                    <span style="width:44px">${l.lane}</span>
-                    <div class="bar-track"><div class="bar-fill${neg ? ' neg' : ''}" style="width:${pct}%"></div></div>
-                    <span style="width:56px;text-align:right;color:${neg ? '#ff3b5c' : '#35ff87'}">${Number(l.mean).toFixed(3)}</span>
-                    <span style="color:#5f9c78;width:32px;text-align:right">n=${l.n}</span>
-                </div>`;
-            }).join('') +
-            `<div style="margin-top:4px;color:#5f9c78;font-size:10px">${sig.trades_with_blend || 0}/${sig.trades_scanned || 0} trades · last ${sig.hours || 6}h · green=UP lean, red=DOWN lean (signed mean)</div>`;
-        }
+    const title = document.getElementById('ov-signals-title');
+    if (!body) return;
+
+    // Backward-compat: old mean-contribution payload (no modes)
+    if (sig && Array.isArray(sig.lanes) && !sig.modes) {
+        body.textContent = 'Lane health requires a dashboard refresh (new API).';
+        return;
     }
+    if (sig && sig.error && !(sig.modes && (sig.modes.follow || sig.modes.trade))) {
+        body.textContent = sig.error;
+        return;
+    }
+
+    _laneHealthUI.payload = sig || null;
+    const mode = _laneHealthUI.mode || (sig && sig.default_mode) || 'follow';
+    _laneHealthUI.mode = mode;
+    const hours = (sig && sig.hours) != null ? sig.hours : 12;
+    const deadband = (sig && sig.deadband) != null ? sig.deadband : 0.05;
+    const minN = (sig && sig.min_n) != null ? sig.min_n : 5;
+    const modeBlock = (sig && sig.modes && sig.modes[mode]) || { lanes: [], label: mode, hint: '' };
+    const lanes = modeBlock.lanes || [];
+
+    if (title) {
+        title.innerHTML = `Lane health <span style="font-weight:normal">${hours}h · ${mode === 'trade' ? 'traded-with' : 'follow'}</span>`;
+    }
+
+    if (!lanes.length) {
+        body.innerHTML = `<div class="lane-health-wrap">${sig && sig.error ? sig.error : 'No resolved lane reads in window yet.'}
+            <div class="lane-health-foot">Need resolved trades with drift=/mom=/strat=/cand(...) in reasoning · last ${hours}h · |lane| ≥ ${deadband}</div></div>`;
+        return;
+    }
+
+    const rows = lanes.slice(0, 12).map(l => {
+        const shadow = l.status === 'shadow';
+        const name = shadow
+            ? `${l.lane}<sup style="color:#5f9c78">∅</sup>`
+            : l.lane;
+        const up = l.up || {};
+        const down = l.down || {};
+        const upCls = _wrClass(up.wr, up.n || 0, minN);
+        const dnCls = _wrClass(down.wr, down.n || 0, minN);
+        const allCls = _wrClass(l.wr, l.n || 0, minN);
+        const net = l.net_cents;
+        const netCls = (net == null || (l.n || 0) < minN) ? 'wr-low'
+            : (net > 0.5 ? 'wr-good' : (net < -0.5 ? 'wr-bad' : 'wr-mid'));
+        const gapCls = (l.be_gap == null || (l.n || 0) < minN) ? 'wr-low'
+            : (l.be_gap >= 0.03 ? 'wr-good' : (l.be_gap < 0 ? 'wr-bad' : 'wr-mid'));
+        return `<tr title="${shadow ? 'shadow (kill-switched / not live-weighted)' : 'live lane'}">
+            <td style="opacity:${shadow ? 0.75 : 1}">${name}</td>
+            <td class="muted">${up.n || 0}</td>
+            <td class="${upCls}">${_fmtWr(up.wr, up.n || 0, minN)}</td>
+            <td class="muted">${down.n || 0}</td>
+            <td class="${dnCls}">${_fmtWr(down.wr, down.n || 0, minN)}</td>
+            <td class="${gapCls}">${_fmtGap(l.be_gap)}</td>
+            <td class="${netCls}">${_fmtCents(net)}</td>
+        </tr>`;
+    }).join('');
+
+    body.innerHTML = `<div class="lane-health-wrap">
+        <div class="lane-health-toolbar">
+            <button type="button" class="mode-btn${mode === 'follow' ? ' active' : ''}" data-lh-mode="follow">Follow</button>
+            <button type="button" class="mode-btn${mode === 'trade' ? ' active' : ''}" data-lh-mode="trade">Traded-with</button>
+            <span class="muted" style="font-size:10px">${modeBlock.hint || ''}</span>
+        </div>
+        <table class="lane-health-table">
+            <thead><tr>
+                <th>Lane</th><th>n↑</th><th>WR↑</th><th>n↓</th><th>WR↓</th><th>BE</th><th>net</th>
+            </tr></thead>
+            <tbody>${rows}</tbody>
+        </table>
+        <div class="lane-health-foot">${sig.trades_with_lanes || 0}/${sig.trades_scanned || 0} trades w/ lanes · last ${hours}h · |lane|≥${deadband} · grey n&lt;${minN} · ∅=shadow · BE=WR−avg cost · net=¢/share after fee</div>
+    </div>`;
+
+    body.querySelectorAll('[data-lh-mode]').forEach(btn => {
+        btn.addEventListener('click', () => {
+            _laneHealthUI.mode = btn.getAttribute('data-lh-mode') || 'follow';
+            updateLaneHealth(_laneHealthUI.payload || sig);
+        });
+    });
 }
 
 function updateHealth(h) {
@@ -2216,6 +2494,46 @@ async function loadKelly() {
         const cur = document.getElementById('kelly-current');
         if (cur) cur.textContent = Number(k.kelly_fraction).toFixed(2);
     } catch (e) { console.error('loadKelly error:', e); }
+}
+
+async function loadPileinEvGate() {
+    try {
+        const p = await fetchJSON('/api/settings/pilein-ev-gate');
+        const sel = document.getElementById('pilein-ev-enabled');
+        if (sel) sel.value = p.enabled ? '1' : '0';
+        const cur = document.getElementById('pilein-ev-current');
+        if (cur) {
+            cur.textContent = p.enabled
+                ? `On (min_edge=${Number(p.min_edge).toFixed(3)}, step=${Number(p.edge_step).toFixed(3)}, bypass conf≥${Number(p.conf_bypass).toFixed(2)})`
+                : 'Off';
+        }
+    } catch (e) { console.error('loadPileinEvGate error:', e); }
+}
+
+async function savePileinEvGate() {
+    const sel = document.getElementById('pilein-ev-enabled');
+    const resultEl = document.getElementById('pilein-ev-result');
+    const enabled = sel && sel.value === '1';
+    try {
+        const resp = await postJSON('/api/settings/pilein-ev-gate', { enabled });
+        if (resp && resp.error) {
+            if (resultEl) {
+                resultEl.textContent = 'Save failed: ' + resp.error;
+                resultEl.style.color = '#ff3b5c';
+            }
+            return;
+        }
+        if (resultEl) {
+            resultEl.textContent = enabled ? 'Pile-in EV gate ON.' : 'Pile-in EV gate OFF.';
+            resultEl.style.color = '#3dff9a';
+        }
+        await loadPileinEvGate();
+    } catch (e) {
+        if (resultEl) {
+            resultEl.textContent = String(e);
+            resultEl.style.color = '#ff3b5c';
+        }
+    }
 }
 
 async function saveKelly() {
@@ -3073,7 +3391,9 @@ function _fmtUsd(n) {
 
 /**
  * Update live BTC display (header chip + Current Market BTC now / delta).
- * source: 'ws' (Polymarket RTDS Chainlink) | 'arena' (SQLite Chainlink feed) | other.
+ * Prefer **Chainlink 30s TWAP** — same number Polymarket shows as Current Price
+ * and uses for Price to Beat / settlement (not spot).
+ * source: 'ws' (browser RTDS TWAP) | 'arena' (SQLite TWAP from arena) | other.
  */
 function updateBtcPrice(price, stale, source) {
     const strip = document.getElementById('btc-strip');
@@ -3096,15 +3416,15 @@ function updateBtcPrice(price, stale, source) {
                 strip.classList.toggle('live', (source === 'ws' || source === 'arena') && !stale);
             }
             if (sub) {
-                if (stale) sub.textContent = 'Chainlink feed stale / delayed';
-                else if (source === 'ws') sub.textContent = 'Chainlink · RTDS';
-                else if (source === 'arena') sub.textContent = 'Chainlink · arena';
-                else sub.textContent = 'Chainlink BTC/USD';
+                if (stale) sub.textContent = 'TWAP feed stale / delayed';
+                else if (source === 'ws') sub.textContent = 'TWAP 30s · RTDS';
+                else if (source === 'arena') sub.textContent = 'TWAP 30s · arena';
+                else sub.textContent = 'Chainlink TWAP 30s';
             }
             _patchMarketBtcDeltas();
         }
     } else if (sub && !liveBtcPrice) {
-        sub.textContent = 'waiting for Chainlink…';
+        sub.textContent = 'waiting for TWAP…';
     }
 }
 
@@ -3133,13 +3453,12 @@ function _patchMarketBtcDeltas() {
 }
 
 /**
- * Browser-side Polymarket RTDS Chainlink BTC/USD — same oracle as Price to Beat
- * and market resolution. Never Binance (basis ~$60–80 vs Polymarket UI).
+ * Browser-side Polymarket RTDS Chainlink **30s TWAP** — same oracle Polymarket
+ * shows as Current Price / Price to Beat / settlement (post 2026-08-07).
+ * Never Binance; never spot for this UI number (spot stays in arena for mom).
  *
- * Polymarket RTDS typically delivers one ~60s 1Hz snapshot on subscribe and
- * few/no follow-up update frames. We force-reconnect after BTC_RTDS_REFRESH_MS
- * of silence (same strategy as signals/price_feed.py) so "BTC now" stays fresh.
- * Falls back to arena SQLite (also Chainlink) when the socket is down or idle.
+ * Topic: crypto_prices_twap_thirty (filters must be compact JSON, no spaces).
+ * Quiet-reconnect after BTC_RTDS_REFRESH_MS; arena SQLite TWAP is fallback.
  */
 function startChainlinkBtcFeed() {
     if (_btcWs) {
@@ -3161,18 +3480,35 @@ function startChainlinkBtcFeed() {
             _btcWsQuietClose = true;
             try { ws.close(); } catch (e) { /* ignore */ }
         };
+        /** Parse TWAP (or legacy spot) payload value → positive float or NaN. */
+        const _parseTwapPx = (p) => {
+            if (!p || typeof p !== 'object') return NaN;
+            // Prefer full_accuracy_value (E18 fixed-point string) when present.
+            if (p.full_accuracy_value != null && String(p.full_accuracy_value).trim() !== '') {
+                try {
+                    const n = Number(p.full_accuracy_value);
+                    if (Number.isFinite(n) && n > 0) {
+                        // E18 integer → dollars; if already human-scale leave as-is.
+                        return n > 1e12 ? n / 1e18 : n;
+                    }
+                } catch (e) { /* fall through */ }
+            }
+            const px = parseFloat(p.value);
+            return px;
+        };
         ws.onopen = () => {
             _btcWsLive = true;
             _btcWsRetry = 0;
             lastMsgMs = Date.now();
             const sub = document.getElementById('btc-price-sub');
-            if (sub && !liveBtcPrice) sub.textContent = 'Chainlink · connected';
-            // Same subscription Polymarket's UI / arena price_feed use.
+            if (sub && !liveBtcPrice) sub.textContent = 'TWAP · connected';
+            // Official 30s TWAP for 5-min markets (Polymarket Current Price).
+            // filters: compact JSON, no spaces — RTDS requirement.
             ws.send(JSON.stringify({
                 action: 'subscribe',
                 subscriptions: [{
-                    topic: 'crypto_prices_chainlink',
-                    type: '*',
+                    topic: 'crypto_prices_twap_thirty',
+                    type: 'update',
                     filters: JSON.stringify({ symbol: 'btc/usd' }),
                 }],
             }));
@@ -3190,24 +3526,26 @@ function startChainlinkBtcFeed() {
             lastMsgMs = Date.now();
             try {
                 const msg = JSON.parse(ev.data);
-                const p = msg.payload || {};
-                // Snapshot: ~60s of 1Hz history — use last point as live price
+                if (msg.error) {
+                    // Pre-launch / topic issues — let quiet refresh / arena fallback work
+                    return;
+                }
+                const p = msg.payload || msg;
+                // Snapshot-style list if ever present
                 if (Array.isArray(p.data) && p.data.length) {
                     const last = p.data[p.data.length - 1];
-                    const px = parseFloat(last && last.value);
+                    const px = _parseTwapPx(last);
                     if (px > 0) {
                         _btcLastTickMs = Date.now();
                         updateBtcPrice(px, false, 'ws');
                     }
                     return;
                 }
-                // Live update frame
-                if (p.value != null) {
-                    const px = parseFloat(p.value);
-                    if (px > 0) {
-                        _btcLastTickMs = Date.now();
-                        updateBtcPrice(px, false, 'ws');
-                    }
+                // Live TWAP update frame
+                const px = _parseTwapPx(p);
+                if (px > 0) {
+                    _btcLastTickMs = Date.now();
+                    updateBtcPrice(px, false, 'ws');
                 }
             } catch (e) { /* bad frame */ }
         };
@@ -3221,8 +3559,8 @@ function startChainlinkBtcFeed() {
             const sub = document.getElementById('btc-price-sub');
             if (sub) {
                 sub.textContent = quiet
-                    ? 'Chainlink · refreshing…'
-                    : 'Chainlink RTDS reconnecting…';
+                    ? 'TWAP · refreshing…'
+                    : 'TWAP RTDS reconnecting…';
             }
             // Quiet snapshot refresh: reconnect immediately. Real errors: backoff.
             const delay = quiet ? 300 : Math.min(30000, 1000 * Math.pow(1.6, _btcWsRetry++));
@@ -3454,14 +3792,19 @@ function renderMarketCard(market, bodyId, kind) {
         } else {
             deltaHtml = `<span class="ptb-delta" id="mkt-btc-delta"></span>`;
         }
+        const src = market.strike_source || '';
+        // twap_open = RTDS TWAP at window open (matches Polymarket UI PTB)
+        const srcNote = src && src !== 'twap_open'
+            ? ` <span class="ptb-k" title="Fallback source — prefer TWAP-at-open when RTDS buffer has the open tick">(${src})</span>`
+            : '';
         ptbHtml = `<div class="mkt-ptb">
-            <span class="ptb-item ptb-left"><span class="ptb-k">Price to beat</span><span class="ptb-v">${_fmtUsd(strike)}</span></span>
-            <span class="ptb-item ptb-right"><span class="ptb-k">BTC now</span><span class="ptb-v" id="mkt-btc-now">${btc != null ? _fmtUsd(btc) : '—'}</span>${deltaHtml}</span>
+            <span class="ptb-item ptb-left"><span class="ptb-k">Price to beat</span><span class="ptb-v">${_fmtUsd(strike)}</span>${srcNote}</span>
+            <span class="ptb-item ptb-right"><span class="ptb-k">BTC now (TWAP)</span><span class="ptb-v" id="mkt-btc-now">${btc != null ? _fmtUsd(btc) : '—'}</span>${deltaHtml}</span>
         </div>`;
     } else {
         ptbHtml = `<div class="mkt-ptb">
             <span class="ptb-item ptb-left"><span class="ptb-k">Price to beat</span><span class="ptb-v neutral">fetching…</span></span>
-            <span class="ptb-item ptb-right"><span class="ptb-k">BTC now</span><span class="ptb-v" id="mkt-btc-now">${btc != null ? _fmtUsd(btc) : '—'}</span><span class="ptb-delta" id="mkt-btc-delta"></span></span>
+            <span class="ptb-item ptb-right"><span class="ptb-k">BTC now (TWAP)</span><span class="ptb-v" id="mkt-btc-now">${btc != null ? _fmtUsd(btc) : '—'}</span><span class="ptb-delta" id="mkt-btc-delta"></span></span>
         </div>`;
     }
 
@@ -3596,6 +3939,152 @@ function cancelBotModal() {
     document.getElementById('bot-confirm-modal').classList.remove('active');
 }
 
+// ---------- Mid-run bot deploy (Bots tab) ----------
+let _deployCatalog = null;
+let _deployPollTimer = null;
+
+async function openDeployModal() {
+    const modal = document.getElementById('deploy-modal');
+    const list = document.getElementById('deploy-list');
+    const status = document.getElementById('deploy-modal-status');
+    if (!modal || !list) return;
+    status.textContent = 'Loading strategies…';
+    list.innerHTML = '';
+    modal.classList.add('active');
+    try {
+        const data = await fetchJSON('/api/bots/catalog');
+        _deployCatalog = data;
+        const strategies = data.strategies || [];
+        if (!strategies.length) {
+            status.textContent = 'No strategies available.';
+            return;
+        }
+        list.innerHTML = strategies.map(s => {
+            const active = !!s.active;
+            const disabled = active ? 'disabled' : '';
+            const cls = active ? 'deploy-row active-type' : 'deploy-row';
+            const badge = active
+                ? `<span class="d-badge">active${(s.active_bots && s.active_bots[0]) ? ': ' + s.active_bots[0] : ''}</span>`
+                : '';
+            return `<label class="${cls}">
+                <input type="checkbox" value="${s.strategy_type}" ${disabled} ${active ? '' : ''}/>
+                <div style="flex:1;min-width:0">
+                    <div><span class="d-name">${s.default_name}</span><span class="d-type">${s.strategy_type}</span></div>
+                    <div class="d-blurb">${s.blurb || ''}</div>
+                </div>
+                ${badge}
+            </label>`;
+        }).join('');
+        const pending = (data.pending && data.pending.strategies) || [];
+        if (pending.length) {
+            status.textContent = `Already queued: ${pending.join(', ')} — applying within ~30s`;
+        } else {
+            status.textContent = 'Select one or more available strategies.';
+        }
+    } catch (e) {
+        status.textContent = 'Failed to load catalog: ' + (e.message || e);
+    }
+}
+
+function closeDeployModal() {
+    const modal = document.getElementById('deploy-modal');
+    if (modal) modal.classList.remove('active');
+}
+
+async function confirmDeployBots() {
+    const list = document.getElementById('deploy-list');
+    const status = document.getElementById('deploy-modal-status');
+    const btn = document.getElementById('deploy-confirm-btn');
+    if (!list) return;
+    const selected = [...list.querySelectorAll('input[type=checkbox]:checked:not(:disabled)')]
+        .map(el => el.value);
+    if (!selected.length) {
+        status.textContent = 'Select at least one strategy that is not already active.';
+        return;
+    }
+    if (btn) btn.disabled = true;
+    status.textContent = `Queueing ${selected.length}…`;
+    try {
+        const res = await postJSON('/api/bots/deploy', { strategies: selected });
+        if (!res.success && !(res.queued && res.queued.length)) {
+            status.textContent = res.error || res.message || 'Deploy failed';
+            if (btn) btn.disabled = false;
+            return;
+        }
+        const q = res.queued || [];
+        const sk = (res.skipped || []).map(s => `${s.strategy_type} (${s.reason})`).join(', ');
+        status.textContent = (res.message || `Queued: ${q.join(', ')}`)
+            + (sk ? ` · skipped: ${sk}` : '');
+        const line = document.getElementById('deploy-status-line');
+        if (line) {
+            line.textContent = q.length
+                ? `Deploy queued: ${q.join(', ')} — live within ~30s`
+                : (res.message || '');
+            line.style.color = q.length ? 'var(--grn)' : 'var(--amb)';
+        }
+        // Close shortly so user sees confirmation; poll until bots appear.
+        setTimeout(() => closeDeployModal(), 900);
+        _startDeployPoll(q);
+    } catch (e) {
+        status.textContent = 'Deploy request failed: ' + (e.message || e);
+    } finally {
+        if (btn) btn.disabled = false;
+    }
+}
+
+function _startDeployPoll(expectedTypes) {
+    if (_deployPollTimer) clearInterval(_deployPollTimer);
+    if (!expectedTypes || !expectedTypes.length) {
+        refresh();
+        return;
+    }
+    let tries = 0;
+    _deployPollTimer = setInterval(async () => {
+        tries += 1;
+        try {
+            await refresh();
+            const cat = await fetchJSON('/api/bots/catalog');
+            const active = new Set(
+                (cat.strategies || []).filter(s => s.active).map(s => s.strategy_type)
+            );
+            const pending = (cat.pending && cat.pending.strategies) || [];
+            const allIn = expectedTypes.every(t => active.has(t));
+            const line = document.getElementById('deploy-status-line');
+            if (allIn) {
+                if (line) {
+                    line.textContent = `Deployed: ${expectedTypes.join(', ')}`;
+                    line.style.color = 'var(--grn)';
+                }
+                clearInterval(_deployPollTimer);
+                _deployPollTimer = null;
+                return;
+            }
+            if (!pending.length && tries > 2) {
+                // Queue drained; show last_deploy result if any.
+                const last = cat.last_deploy || {};
+                const names = (last.deployed || []).map(d => d.bot_name || d.strategy_type);
+                if (line) {
+                    line.textContent = names.length
+                        ? `Deployed: ${names.join(', ')}`
+                        : 'Deploy finished (check Active Bots).';
+                    line.style.color = 'var(--grn)';
+                }
+                clearInterval(_deployPollTimer);
+                _deployPollTimer = null;
+            }
+        } catch (_) { /* ignore poll errors */ }
+        if (tries >= 12) {
+            clearInterval(_deployPollTimer);
+            _deployPollTimer = null;
+            const line = document.getElementById('deploy-status-line');
+            if (line) {
+                line.textContent = 'Deploy still pending — ensure the arena process is running.';
+                line.style.color = 'var(--amb)';
+            }
+        }
+    }, 5000);
+}
+
 function updateCopyBots(wallets) {
     const section = document.getElementById('copy-section');
     const grid = document.getElementById('copy-grid');
@@ -3723,6 +4212,9 @@ const LANE_LABELS = {
     fut: 'Futures taker delta (perp aggression)',
     tech: 'Technicals multi-TF (MACD/BB context)',
     xasset: 'Cross-asset (ETH+SOL confirmation)',
+    lag: 'Market-lag residual (drift-implied P − mid)',
+    ms_mom: 'Multiscale 1m momentum',
+    flow_decay: 'Time-decayed CVD flow',
 };
 
 function fmtMetric(m) {

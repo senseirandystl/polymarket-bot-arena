@@ -234,6 +234,39 @@ def check_disk() -> dict:
         return _check("disk", True, message=f"disk check n/a ({e})")
 
 
+def check_regime_calibration() -> dict:
+    """Relative regime calibrator present and optionally warm."""
+    try:
+        try:
+            from arena.regime_settings import get_bool as _reg_bool
+            use_rel = bool(_reg_bool("use_relative"))
+        except Exception:
+            import config as _cfg
+            use_rel = bool(getattr(_cfg, "REGIME_USE_RELATIVE", True))
+        if not use_rel:
+            return _check(
+                "regime_calibration", True,
+                message="Relative calibration disabled (absolute mode)",
+            )
+        from signals.regime_calibration import get_calibrator
+        st = get_calibrator().status()
+        n = int((st.get("counts") or {}).get("realized_vol") or 0)
+        ready = bool((st.get("ready") or {}).get("realized_vol"))
+        if n == 0:
+            return _check(
+                "regime_calibration", True, level="ok",
+                message="Calibrator cold (will warm on tape)",
+                detail=st,
+            )
+        msg = f"n={n} ready={ready}"
+        return _check("regime_calibration", True, message=msg, detail=st)
+    except Exception as e:
+        return _check(
+            "regime_calibration", True,
+            message=f"calibrator n/a ({e})",
+        )
+
+
 def run_health_checks() -> dict[str, Any]:
     """Full authenticated health report for the dashboard."""
     checks = [
@@ -245,6 +278,7 @@ def run_health_checks() -> dict[str, Any]:
         check_session(),
         check_price_feed(),
         check_disk(),
+        check_regime_calibration(),
     ]
     critical = [c for c in checks if not c["ok"] and c["level"] == "critical"]
     warns = [c for c in checks if not c["ok"] and c["level"] == "warn"]

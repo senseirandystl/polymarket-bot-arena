@@ -43,9 +43,11 @@ def _market(yes=0.52, no=None, tr=180, **extra):
 
 
 def _sig(**over):
+    # btc_drift_pct required by the TWAP dual drift gate (min 0.00030).
+    # 0.001 = 0.1% moneyness at ~$100 BTC, well above the floor.
     base = {"prices": [100.0, 100.0], "latest": 100.0, "orderflow": {},
             "pm_momentum": 0.0, "obi": 0.0, "cvd": 0.0, "btc_drift": 0.0,
-            "btc_strike": 100.0}
+            "btc_strike": 100.0, "btc_drift_pct": 0.001}
     base.update(over)
     return base
 

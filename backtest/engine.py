@@ -33,6 +33,7 @@ logger = logging.getLogger("backtest.engine")
 SUPPORTED_STRATEGIES = {
     "momentum", "mean_reversion", "mean_reversion_sl", "mean_reversion_tp",
     "phantom", "hybrid", "sniper", "lag_residual", "regime_specialist", "no_lag",
+    "sweeper",
 }
 
 
@@ -145,8 +146,15 @@ def run_backtest(bots: list, data: HistoricalData,
                 pm_mom = 0.0
                 if len(past) >= 2:
                     pm_mom = float(past[-1][1]) - float(past[-2][1])
-                drift = drift_signal(strike, btc_now, time_rem)
                 prices = data.btc_closes.closes_until(ts, 60)
+                # Keep adaptive drift scale in step with replay tape (same as
+                # live build_combined_signals).
+                try:
+                    from signals.drift_scale import get_drift_scale_estimator
+                    get_drift_scale_estimator().update_from_prices(prices or [])
+                except Exception:
+                    pass
+                drift = drift_signal(strike, btc_now, time_rem)
                 tick_dt = datetime.fromtimestamp(ts, tz=timezone.utc)
                 signals = _build_signals(prices, btc_now, drift, strike,
                                          pm_mom, tick_dt)

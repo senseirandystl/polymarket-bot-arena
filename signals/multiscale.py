@@ -33,12 +33,22 @@ VOL_WINDOWS = (5, 15, 30)
 VOL_RATIO_SCALE = 0.7       # |ln(vol_5m / vol_30m)| of 0.7 (2x ratio) reads ~0.76
 
 
+def _base_mom_scale() -> float:
+    """Adaptive 1m soft-sat scale when live estimator is warm; else prior."""
+    try:
+        from signals.drift_scale import get_drift_scale_estimator
+        return float(get_drift_scale_estimator().mom_saturate_scale())
+    except Exception:
+        return float(MOM_BASE_SCALE)
+
+
 def momentum_score(prices: list, horizon: int) -> float:
     """Tanh-bounded return over ``horizon`` closed candles (0.0 if too short)."""
     if len(prices) <= horizon or prices[-1 - horizon] <= 0:
         return 0.0
     move = (prices[-1] - prices[-1 - horizon]) / prices[-1 - horizon]
-    return soft_saturate(move, MOM_BASE_SCALE * (horizon ** 0.5))
+    # Scale grows with √horizon; base tracks live 1m vol (2026-08-07).
+    return soft_saturate(move, _base_mom_scale() * (horizon ** 0.5))
 
 
 def realized_vol(prices: list, window: int) -> float:

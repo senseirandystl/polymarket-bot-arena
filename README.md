@@ -286,21 +286,21 @@ Paper and live share **identical** pricing, fee, guard, and Kelly math. Only the
 
 ## Default bot slate
 
-Interactive launch (or first non-interactive boot) starts **8 bots**:
+Interactive launch (or first non-interactive boot) starts the **lean 6**:
 
 | Bot | Type | Character |
 |-----|------|-----------|
 | `momentum-v1` | Directional | BTC short-term trend (mom-heavy blend) |
-| `phantom-v1` | Directional | EMA 9/26 + breakout swing (thesis-heavy) |
 | `meanrev-v1` | Directional | Drift anchor + z-score fade (drift-gated) |
-| `hybrid-v1` | Directional | Regime meta-learner over sub-strategies |
-| `sniper-v1` | Zone | Cheap/strong price zones, drift-confirmed |
+| `sniper-v1` | Lag | Drift-vs-price lag hunter |
+| `hybrid-v1` | Ensemble | Regime-aware blend of mom / meanrev / phantom |
 | `arbitrage-v1` | Market-neutral | Share-matched YES+NO when pair VWAP clears fees |
-| `late-window-maker-v1` | Maker cadence | Final ~150s, side from drift |
-| `fee-zone-maker-v1` | Maker cadence | 56–86¢ zone, drift-backed |
+| `sweeper-v1` | Certainty | Locked outcomes still offered under $1 (fee-curve extreme) |
 
-Also selectable: `meanrev-tp-v1`, `lag-residual-v1`, `regime-specialist-v1`, `no-lag-v1`, `true-maker-v1`.  
-**Evolution-exempt:** arbitrage + makers (and copy-trade if enabled).
+Also selectable (manual menu or dashboard **Deploy bots** mid-run): phantom,
+late-window / fee-zone makers, lag-residual, regime-specialist, no-lag,
+true-maker, meanrev-tp.  
+**Evolution-exempt:** arbitrage, sweeper, makers (and copy-trade if enabled).
 
 ---
 
@@ -315,7 +315,7 @@ trust_eff = trust · min(1, lean / CONVICTION_SCALE)
 edge_side = trust_eff · (P_side − ask_side) − taker_fee
 ```
 
-- **Live core lanes:** `drift` (BTC vs window strike), `mom` (1-candle), `strat` (`analyze()` thesis, magnitude-capped).
+- **Live core lanes:** `drift` (BTC **TWAP** vs window-open TWAP strike, 30s for 5m markets since 2026-08-07), `mom` (1-candle spot), `strat` (`analyze()` thesis, magnitude-capped).
 - **Kill-switched / candidates:** `pm`, `cvd`, `obi`, `fut`, `tech`, `xasset` — logged as `cand(...)` for shadow attribution; weight stays 0 until promoted.
 - **Two-sided:** each side scored on its own ask + fee; buy the larger positive edge above per-strategy `MIN_EDGE`.
 - **Sizing:** fractional Kelly `f* = edge/(1−price)`, bet = `KELLY_FRACTION × f* × bankroll` (paper pool shared; live hard-capped).
@@ -546,7 +546,7 @@ These are load-bearing — changing them without data re-opens known loss modes 
 
 1. **Edge = model vs *executable* price after fees**, not mid + narrative tilt.
 2. **Predictive ≠ profitable** — `pm_mom` ~70% follow-WR with negative net edge after price.
-3. **Drift is the fundamental** (BTC vs true window open strike). Wrong strike = account blow-up (BUG #23).
+3. **Drift is the fundamental** (BTC **TWAP** vs true window-open TWAP strike). Wrong strike = account blow-up (BUG #23). Spot snapshot resolution ended 2026-08-07.
 4. **Live shadow beats harness** for promotion; harness only nominates.
 5. **Coin-flip mids with flat drift are skips** (dead-zone) — largest historical dollar leak.
 6. **Shared-pool concentration** must be capped or tandem bots 4× one candle.

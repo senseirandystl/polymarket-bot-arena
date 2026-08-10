@@ -105,9 +105,21 @@ def trade_rate(trades: list, now: float,
 
 
 def compute(trades: list, now: float) -> dict:
-    """All flow features from a trade tape at explicit time ``now``."""
+    """All flow features from a trade tape at explicit time ``now``.
+
+    When the tape is dead (``flow_rate`` below a soft floor), directional
+    flow reads are zeroed — thin-tape sign(CVD) was a major false signal
+    (same class as unfloored CVD, BUG #27).
+    """
+    rate = trade_rate(trades, now)
+    cvd = decayed_cvd(trades, now)
+    whale = whale_delta(trades, now)
+    # Activity gate: below ~15% of "full" tape, directional flow is noise.
+    if rate < 0.15:
+        cvd = 0.0
+        whale = 0.0
     return {
-        "flow_cvd_decay": decayed_cvd(trades, now),
-        "flow_whale": whale_delta(trades, now),
-        "flow_rate": trade_rate(trades, now),
+        "flow_cvd_decay": cvd,
+        "flow_whale": whale,
+        "flow_rate": rate,
     }

@@ -7,8 +7,10 @@ result into ``bot.make_decision(market, signals)``.
 """
 
 import logging
+import time
 from typing import Optional
 
+import config
 from signals.price_feed import PriceFeed
 from signals.sentiment import SentimentFeed
 from signals.polymarket_prices import PolymarketPriceFeed
@@ -78,23 +80,6 @@ def build_combined_signals(
             if cond:
                 cvd = get_cvd_feed().get_cvd(cond)
 
-    # BTC drift from the window's "price to beat" (official Polymarket openPrice
-    # / Chainlink at eventStartTime). Warm path reads the strike the warmer fetched;
-    # cold path (maker) fetches via the registry (cached). Regime-agnostic
-    # fundamental; 0.0 until a strike is available.
-    btc_latest = float(price_signals.get("latest", 0.0) or 0.0)
-    btc_drift = 0.0
-    btc_strike = None
-    if market is not None and btc_latest > 0:
-        mkt_id = market.get("id") or market.get("market_id")
-        tr = market.get("time_remaining_seconds")
-        if warm is not None and warm.get("strike"):
-            btc_strike = warm.get("strike")
-        else:
-            btc_strike = get_strike_registry().get_strike(
-                mkt_id, market.get("event_start_time"))
-        btc_drift = drift_signal(btc_strike, btc_latest, tr)
-
     # --- Context + candidate lanes (all local compute or cached feeds) ---
     # Volatility regime + technicals + cross-asset ride the candle stream the
     # feed already holds (zero network); futures meta returns its background
@@ -104,6 +89,158 @@ def build_combined_signals(
     # non-directional context and are consumed directly (hybrid weighting,
     # selectivity).
     btc_prices = price_signals.get("prices", []) or []
+    # Adaptive drift scale: prefer TWAP ticks (same object as moneyness), else
+    # spot 1m closes (signals/drift_scale.py). Update *before* btc_drift.
+    drift_vol_scale = float(getattr(config, "DRIFT_VOL_SCALE", 0.0022) or 0.0022)
+    drift_scale_source = "prior"
+    try:
+        from signals.drift_scale import (
+            get_drift_scale_estimator, update_estimator_from_feeds,
+        )
+        twap_ticks = []
+        if price_feed is not None and hasattr(price_feed, "btc_twap_ticks"):
+            try:
+                twap_ticks = price_feed.btc_twap_ticks()
+            except Exception:
+                twap_ticks = []
+        drift_vol_scale = float(update_estimator_from_feeds(
+            twap_ticks=twap_ticks, spot_prices=btc_prices,
+        ))
+        drift_scale_source = get_drift_scale_estimator().last_source()
+    except Exception as e:
+        logger.debug(f"drift scale update failed: {e}")
+
+    # BTC drift from the window's "price to beat" (official Polymarket openPrice
+    # / TWAP at eventStartTime). Under TWAP resolution (2026-08-07+) both open
+    # and settlement are Chainlink 30s TWAP prints — so ``btc_now`` for
+    # moneyness is the official rolling TWAP (and a settlement nowcast inside
+    # the final 30s). Warm path reads the strike the warmer fetched; cold path
+    # fetches via the registry. Regime-agnostic fundamental; 0.0 until a strike
+    # is available. Vol scale is adaptive (slightly damped for TWAP smoothness).
+    btc_spot = float(price_signals.get("latest", 0.0) or 0.0)
+    btc_twap = float(price_signals.get("twap", 0.0) or 0.0)
+    btc_latest = btc_spot  # keep candle-path "latest" = spot for mom consumers
+    btc_drift = 0.0
+    btc_strike = None
+    btc_drift_pct = 0.0
+    resolution_meta: dict = {
+        "btc_now": 0.0,
+        "source": "none",
+        "rtds_twap": btc_twap if btc_twap > 0 else None,
+        "spot": btc_spot if btc_spot > 0 else None,
+        "nowcast": None,
+        "in_settlement_window": False,
+        "nowcast_coverage": 0.0,
+        "nowcast_frac_elapsed": 0.0,
+        "twap_certainty": 0.0,
+    }
+    if market is not None:
+        mkt_id = market.get("id") or market.get("market_id")
+        tr = market.get("time_remaining_seconds")
+        if warm is not None and warm.get("strike"):
+            btc_strike = warm.get("strike")
+        else:
+            btc_strike = get_strike_registry().get_strike(
+                mkt_id, market.get("event_start_time"))
+
+        # Build resolution btc_now (TWAP / nowcast / spot fallback).
+        try:
+            from signals import twap as twap_mod
+            now_epoch = time.time()
+            expiry_epoch = None
+            if tr is not None:
+                try:
+                    expiry_epoch = now_epoch + float(tr)
+                except (TypeError, ValueError):
+                    expiry_epoch = None
+            # Prefer resolves_at when present (more accurate than rem clock).
+            ra = market.get("resolves_at") or market.get("end_time")
+            if ra is not None:
+                try:
+                    if isinstance(ra, (int, float)):
+                        expiry_epoch = float(ra)
+                        if expiry_epoch > 1e12:
+                            expiry_epoch /= 1000.0
+                    else:
+                        from datetime import datetime, timezone
+                        expiry_epoch = datetime.fromisoformat(
+                            str(ra).replace("Z", "+00:00")
+                        ).timestamp()
+                except Exception:
+                    pass
+
+            ticks = []
+            if price_feed is not None and hasattr(price_feed, "btc_spot_ticks"):
+                try:
+                    ticks = price_feed.btc_spot_ticks()
+                except Exception:
+                    ticks = []
+
+            resolution_meta = twap_mod.resolution_btc_now(
+                rtds_twap=btc_twap if btc_twap > 0 else None,
+                spot=btc_spot if btc_spot > 0 else None,
+                time_remaining_sec=tr,
+                ticks=ticks,
+                now_epoch=now_epoch,
+                expiry_epoch=expiry_epoch,
+            )
+            # Only damp σ when adaptive scale came from *spot* (TWAP σ already
+            # matches the resolution object). Mult default is 1.0 for TWAP σ.
+            if resolution_meta.get("source") in (
+                "rtds_twap", "settlement_nowcast"
+            ):
+                if drift_scale_source == "spot":
+                    mult = float(getattr(
+                        config, "TWAP_DRIFT_VOL_MULT_SPOT_FALLBACK", 0.92) or 0.92)
+                    drift_vol_scale = float(drift_vol_scale) * mult
+                else:
+                    drift_vol_scale = twap_mod.soft_dampen_vol_scale(
+                        drift_vol_scale)
+        except Exception as e:
+            logger.debug(f"TWAP resolution_btc_now failed: {e}")
+            # Fallback: prefer twap then spot
+            if btc_twap > 0:
+                resolution_meta["btc_now"] = btc_twap
+                resolution_meta["source"] = "rtds_twap"
+            elif btc_spot > 0:
+                resolution_meta["btc_now"] = btc_spot
+                resolution_meta["source"] = "spot_fallback"
+
+        btc_now = float(resolution_meta.get("btc_now") or 0.0)
+        if btc_now > 0 and btc_strike:
+            from signals.strike import drift_pct as _drift_pct
+            btc_drift_pct = _drift_pct(btc_strike, btc_now)
+            btc_drift = drift_signal(
+                btc_strike, btc_now, tr, vol_scale=drift_vol_scale)
+        try:
+            from signals import twap as twap_mod
+            if resolution_meta.get("in_settlement_window"):
+                resolution_meta["twap_certainty"] = twap_mod.twap_certainty(
+                    float(resolution_meta.get("nowcast_frac_elapsed") or 0.0),
+                    float(resolution_meta.get("nowcast_coverage") or 0.0),
+                    abs(float(btc_drift or 0.0)),
+                )
+            _pol = twap_mod.settlement_adjustments(
+                time_remaining_sec=tr,
+                twap_certainty_val=float(
+                    resolution_meta.get("twap_certainty") or 0.0
+                ),
+                nowcast_frac_elapsed=float(
+                    resolution_meta.get("nowcast_frac_elapsed") or 0.0
+                ),
+                nowcast_coverage=float(
+                    resolution_meta.get("nowcast_coverage") or 0.0
+                ),
+                abs_drift=abs(float(btc_drift or 0.0)),
+                in_settlement=bool(
+                    resolution_meta.get("in_settlement_window")
+                ),
+            )
+            resolution_meta["settlement_policy"] = _pol
+            resolution_meta["market_phase"] = _pol.get("phase") or "unknown"
+        except Exception:
+            pass
+
     # Base vol/trend scores (pure, local) — still the continuous inputs
     # HybridBot and others read for tilt; the regime detector builds on them.
     vol_base = volatility_regime.compute(btc_prices)
@@ -185,15 +322,24 @@ def build_combined_signals(
         logger.debug(f"multiscale compute failed: {e}")
         ms = {}
 
-    # Lag residual: drift-implied P − YES mid (signed; +ve = market cheap on YES).
-    # The sniper thesis as a continuous lane for shadow promotion.
+    # Lag residual: market lag vs *raw* moneyness (not tanh(z)).
+    # Using z-score inherited time-scale blow-up and made lag anti-predictive
+    # when moderate false drifts fired (2026-08-07 soak). Map drift_pct through
+    # a fixed soft scale so lag does not explode with √(1/tr).
     yes_mid = 0.5
     if market is not None:
         try:
             yes_mid = float(market.get("current_price") or 0.5)
         except (TypeError, ValueError):
             yes_mid = 0.5
-    implied_yes = 0.5 + 0.5 * float(btc_drift or 0.0)
+    try:
+        from signals.curves import soft_saturate
+        # ~0.15% moneyness soft-sats; independent of remaining-time z.
+        _lag_scale = float(getattr(config, "LAG_MONEYNESS_SCALE", 0.0015) or 0.0015)
+        drift_for_lag = soft_saturate(float(btc_drift_pct or 0.0), _lag_scale)
+    except Exception:
+        drift_for_lag = float(btc_drift or 0.0)
+    implied_yes = 0.5 + 0.5 * float(drift_for_lag)
     lag_residual = max(-1.0, min(1.0, (implied_yes - yes_mid) * 2.0))
 
     # Flow / microstructure from warm when available.
@@ -231,7 +377,27 @@ def build_combined_signals(
         "obi": obi,
         "cvd": cvd,
         "btc_drift": btc_drift,
+        "btc_drift_pct": btc_drift_pct,
         "btc_strike": btc_strike,
+        "btc_now": float(resolution_meta.get("btc_now") or 0.0),
+        "btc_spot": btc_spot,
+        "drift_vol_scale": float(drift_vol_scale or 0.0),
+        "drift_scale_source": drift_scale_source,
+        "btc_twap": btc_twap,
+        "resolution_source": resolution_meta.get("source") or "none",
+        "resolution_nowcast": resolution_meta.get("nowcast"),
+        "in_settlement_window": bool(
+            resolution_meta.get("in_settlement_window")
+        ),
+        "twap_certainty": float(resolution_meta.get("twap_certainty") or 0.0),
+        "nowcast_coverage": float(
+            resolution_meta.get("nowcast_coverage") or 0.0
+        ),
+        "nowcast_frac_elapsed": float(
+            resolution_meta.get("nowcast_frac_elapsed") or 0.0
+        ),
+        "market_phase": resolution_meta.get("market_phase") or "unknown",
+        "settlement_policy": resolution_meta.get("settlement_policy") or {},
         "vol_regime": regime,
         "market_regime": market_regime,
         "technicals": tech,

@@ -150,6 +150,7 @@ def test_arbitrage_and_makers_are_exempt():
     assert "late_window_maker" in EVOLUTION_EXEMPT_TYPES
     assert "fee_zone_maker" in EVOLUTION_EXEMPT_TYPES
     assert "btc_maker" in EVOLUTION_EXEMPT_TYPES
+    assert "sweeper" in EVOLUTION_EXEMPT_TYPES
     assert "momentum" not in EVOLUTION_EXEMPT_TYPES
 
 

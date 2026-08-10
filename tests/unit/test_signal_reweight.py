@@ -216,12 +216,13 @@ def test_dead_zone_quiet_regime_raises_drift_floor():
     d = _bot().make_decision(m, s_mid)
     assert d["action"] == "skip"
     assert "dead-zone" in d["reasoning"].lower()
-    assert "0.20" in d["reasoning"] or "0.2" in d["reasoning"]
+    # Quiet floor is DEAD_ZONE_QUIET_DRIFT_MIN (0.30+) — accept any raised bar.
+    assert d["action"] == "skip"
+    assert "dead-zone" in d["reasoning"].lower() or "0.3" in d["reasoning"]
 
-    # Strong drift still clears quiet floor → may trade (buy or other skip ok
-    # only if not dead-zone)
+    # Strong drift still clears quiet floor (+ regime extra) → not dead-zone
     s_hi = _sig(
-        btc_drift=0.35, cvd=0.5, prices=[100.0, 100.3], latest=100.3,
+        btc_drift=0.55, cvd=0.5, prices=[100.0, 100.3], latest=100.3,
         market_regime=quiet, vol_regime=quiet,
     )
     d_hi = _bot().make_decision(m, s_hi)

@@ -67,12 +67,15 @@ def _chop_strat():
 
 
 REGIME_LANE_DAMP: dict = {
-    # Legacy
+    # Legacy — kept for backward compat with older vol_regime labels.
     "quiet": {"mom": _quiet_mom},
     "volatile": {"mom": _chop_mom},
-    # Robust detector ids
-    "low_vol_range": {"mom": _quiet_mom},
-    "low_vol_trend": {"mom": _quiet_mom},  # quiet tape: 1-candle mom is noise
+    # Robust detector ids — mom damp is now the single-authority
+    # regime_adapt mom_lane_scale (audit P1c: removed double-damp
+    # where lab.py's _quiet_mom ×0.5 stacked with regime_adapt's
+    # mom_lane_scale ×0.50-0.70, netting ×0.25-0.35).
+    "low_vol_range": {},   # regime_adapt mom_lane_scale=0.70 applies in make_decision
+    "low_vol_trend": {},   # regime_adapt mom_lane_scale=0.50 applies in make_decision
     "high_vol_chop": {"mom": _chop_mom, "strat": _chop_strat},
     "high_vol_trend": {},  # trend followers keep full mom weight
     "normal": {},
@@ -120,7 +123,52 @@ class SignalView(Mapping):
 
     @property
     def latest(self) -> float:
+        """Chainlink **spot** latest (1m candle path / mom consumers)."""
         return float(self._d.get("latest", 0.0) or 0.0)
+
+    @property
+    def btc_twap(self) -> float:
+        """Official Chainlink rolling TWAP (30s for 5m markets), or 0."""
+        return float(self._d.get("btc_twap") or self._d.get("twap") or 0.0)
+
+    @property
+    def btc_now(self) -> float:
+        """Resolution-path BTC level used for drift moneyness (TWAP/nowcast)."""
+        v = self._d.get("btc_now")
+        if v is not None:
+            try:
+                f = float(v)
+                if f > 0:
+                    return f
+            except (TypeError, ValueError):
+                pass
+        # Fallbacks: twap → spot latest
+        tw = self.btc_twap
+        if tw > 0:
+            return tw
+        return self.latest
+
+    @property
+    def in_settlement_window(self) -> bool:
+        return bool(self._d.get("in_settlement_window"))
+
+    @property
+    def twap_certainty(self) -> float:
+        """0–1 how locked settlement looks under TWAP (late-window helpers)."""
+        return float(self._d.get("twap_certainty", 0.0) or 0.0)
+
+    @property
+    def resolution_source(self) -> str:
+        return str(self._d.get("resolution_source") or "none")
+
+    @property
+    def market_phase(self) -> str:
+        return str(self._d.get("market_phase") or "unknown")
+
+    @property
+    def settlement_policy(self) -> dict:
+        p = self._d.get("settlement_policy")
+        return dict(p) if isinstance(p, dict) else {}
 
     # Fundamentals / flow --------------------------------------------------
     @property
@@ -128,8 +176,18 @@ class SignalView(Mapping):
         return float(self._d.get("btc_drift", 0.0) or 0.0)
 
     @property
+    def btc_drift_pct(self) -> float:
+        """Raw moneyness (btc_now − strike) / strike."""
+        return float(self._d.get("btc_drift_pct", 0.0) or 0.0)
+
+    @property
+    def drift_vol_scale(self) -> float:
+        """Full-window σ used for the z-score (adaptive or prior)."""
+        return float(self._d.get("drift_vol_scale", 0.0) or 0.0)
+
+    @property
     def btc_strike(self) -> Optional[float]:
-        """Window Price-to-Beat (Binance open @ eventStartTime), or None."""
+        """Window Price-to-Beat (official TWAP open / openPrice), or None."""
         v = self._d.get("btc_strike")
         if v is None:
             return None
@@ -355,7 +413,9 @@ class SignalLab:
                 return 1.0
             return config_switch
 
-        # --- mom: BTC 1-candle momentum, tanh at 0.2% (~p97; BUG #25) ---
+        # --- mom: BTC 1-candle momentum, adaptive soft-sat (was fixed 0.2%) ---
+        # High-vol tape was saturating every candle at |mom|≈1 (same disease as
+        # under-scaled drift). Scale tracks live σ_1m when MOM_ADAPTIVE_SCALE.
         prices = sv.prices
         btc_latest = sv.latest
         price_momentum = 0.0
@@ -363,7 +423,12 @@ class SignalLab:
             price_momentum = (prices[-1] - prices[-2]) / prices[-2]
         elif btc_latest > 0 and len(prices) >= 1 and prices[-1] > 0:
             price_momentum = (btc_latest - prices[-1]) / prices[-1]
-        mom = soft_saturate(price_momentum, 0.002)
+        try:
+            from signals.drift_scale import get_drift_scale_estimator
+            mom_scale = float(get_drift_scale_estimator().mom_saturate_scale())
+        except Exception:
+            mom_scale = float(getattr(config, "MOM_SCALE_PRIOR", 0.002) or 0.002)
+        mom = soft_saturate(price_momentum, mom_scale)
 
         # Regime-conditional damp (see REGIME_LANE_DAMP). Prefer rich id,
         # then legacy label so both detector and older vol_regime work.
@@ -375,6 +440,14 @@ class SignalLab:
             damps = dict(REGIME_LANE_DAMP.get(legacy, {}) or {})
         if "mom" in damps:
             mom *= damps["mom"]()
+        # TWAP settlement / pre-settle: 1m spot mom is not the resolution object
+        try:
+            pol = dict(sv.settlement_policy or {})
+            md = float(pol.get("mom_damp") or 1.0)
+            if 0.0 < md < 1.0:
+                mom *= md
+        except Exception:
+            pass
 
         # --- pm: PM in-market momentum (0.15 move saturates; kill-switched) ---
         pm = max(-1.0, min(1.0, sv.pm_momentum / 0.15))
@@ -436,29 +509,58 @@ class SignalLab:
     # ------------------------------------------------------------------
 
     def weights_for(self, strategy_type: str, lanes: dict, profile: dict,
-                    overrides: Optional[dict] = None) -> tuple:
+                    overrides: Optional[dict] = None,
+                    regime: Optional[str] = None,
+                    features: Optional[dict] = None) -> tuple:
         """Effective per-lane weights for one strategy: (weights, gated).
 
-        Priority per lane: an ENABLED override's per-strategy profile weight
-        (the tuner/promoter closed loop) beats the static profile; lanes the
-        profile doesn't name keep weight 1.0 (their value carries the weight
-        — the strat/learn convention). Lanes failing live validation are
-        zeroed last.
+        Priority per lane (PLAN 2026-08-05):
+          by_regime override → global override profile → regime seed →
+          class profile → 1.0. Continuous residual may then nudge core lanes.
+        Lanes failing live validation are zeroed last.
         """
         overrides = overrides if overrides is not None else self.overrides_provider()
         gated = self.gated_lanes()
+        # Resolve regime from argument or leave None (seeds only for known ids)
+        rid = regime
         weights = {}
         hit_gate = []
+        try:
+            from arena.regime_profiles import resolve_lane_weight
+            from arena.regime_settings import get_bool as _reg_bool
+            use_profiles = bool(
+                _reg_bool("profile_adapt") or _reg_bool("profile_seeds")
+            )
+        except Exception:
+            use_profiles = bool(
+                getattr(config, "REGIME_PROFILE_ADAPT_ENABLED", True)
+                or getattr(config, "REGIME_PROFILE_SEEDS_ENABLED", True)
+            )
+            resolve_lane_weight = None  # type: ignore
+
         for k in lanes:
-            ov = overrides.get(k)
-            if ov and ov.get("enabled"):
-                w = float(ov.get("profile", {}).get(strategy_type, 0.0))
+            if use_profiles and resolve_lane_weight is not None:
+                w = float(resolve_lane_weight(
+                    k, strategy_type, rid,
+                    profile=profile, overrides=overrides, default=1.0,
+                ))
             else:
-                w = profile.get(k, 1.0)
+                ov = overrides.get(k)
+                if ov and ov.get("enabled"):
+                    w = float(ov.get("profile", {}).get(strategy_type, 0.0))
+                else:
+                    w = float(profile.get(k, 1.0))
             if k in gated and w != 0.0:
                 w = 0.0
                 hit_gate.append(k)
             weights[k] = w
+
+        # Continuous residual (optional; flag via Settings / arena_state)
+        try:
+            from arena.regime_continuous import apply_residuals
+            weights = apply_residuals(weights, strategy_type, features)
+        except Exception:
+            pass
         return weights, tuple(hit_gate)
 
     @staticmethod
@@ -494,8 +596,21 @@ class SignalLab:
                 if k in adj_lanes:
                     adj_lanes[k] = adj_lanes[k] * float(mult)
 
-        weights, gated = self.weights_for(strategy_type, adj_lanes, profile,
-                                          overrides)
+        rid = None
+        feats = None
+        if signals is not None:
+            try:
+                sv = SignalView.of(signals)
+                rid = sv.regime_label or None
+                mr = sv.market_regime or {}
+                feats = dict(mr.get("features") or sv.vol_regime.get("features") or {})
+            except Exception:
+                rid = None
+                feats = None
+        weights, gated = self.weights_for(
+            strategy_type, adj_lanes, profile, overrides,
+            regime=rid, features=feats,
+        )
         contributions = {k: weights[k] * v for k, v in adj_lanes.items()}
         s = sum(contributions.values())
         prob = max(config.MODEL_PROB_MIN,

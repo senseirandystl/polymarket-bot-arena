@@ -1,4 +1,4 @@
-"""Sniper bot — drift-vs-price lag hunter (v3).
+"""Sniper bot — drift-vs-price lag hunter (v3, TWAP-aware).
 
 Previous versions used hand-tuned YES/NO price buckets from unverified
 third-party WR tables. Those buckets bit us live (expensive YES snipes,
@@ -6,11 +6,14 @@ near-flat P&L). v3 drops zone tables entirely.
 
 Thesis
 ------
-BTC 5-minute markets resolve from BTC vs the window-open strike. The
-validated edge is **"follow drift only when the market lags"** (harness +
-live soak). The sniper does only that:
+BTC 5-minute markets resolve from **Chainlink TWAP** at close vs TWAP at
+open (30s lookback, 2026-08-07+). Instant spot at expiry no longer decides
+the outcome — a last-second spike is diluted across the averaging window.
+``btc_drift`` is already moneyness on the TWAP path (RTDS TWAP / settlement
+nowcast). The validated edge remains **"follow drift only when the market
+lags"** (harness + live soak). The sniper does only that:
 
-1. Read signed ``btc_drift`` (YES-frame, in [-1, 1]).
+1. Read signed ``btc_drift`` (YES-frame, in [-1, 1]; TWAP-based).
 2. Convert to a drift-implied probability: ``p = 0.5 + 0.5 * signed_drift``.
 3. Score BOTH sides: ``edge = p_side - side_mid - fee`` (maker fee when
    limit-first passive mode is on).
@@ -20,9 +23,10 @@ live soak). The sniper does only that:
    * the chosen side's MID still **lags** (≤ max_side_mid, default 0.58),
    * model leans the same way as drift (no fade).
 
-No arbitrary cheap/strong price buckets. Optional late-window confidence
-ramp (direction locks in near expiry). Sizing uses fractional Kelly on the
-fee-adjusted edge, same as the directional stack.
+No arbitrary cheap/strong price buckets. Inside the final 30s, TWAP
+certainty can slightly boost confidence (partially observed settlement).
+Sizing uses fractional Kelly on the fee-adjusted edge, same as the
+directional stack.
 """
 
 from __future__ import annotations
@@ -81,7 +85,25 @@ class SniperBot(BaseBot):
         no_ask = market.get("no_ask") or no_mid
 
         drift = float(sv.btc_drift or 0.0)
+        try:
+            d_pct = float(sv.btc_drift_pct or 0.0)
+        except Exception:
+            d_pct = float(signals.get("btc_drift_pct") or 0.0)
         min_drift = float(p.get("min_drift", 0.15))
+        # Dual gate floors (shared with BaseBot) — sniper is pure lag hunter.
+        min_pct = float(getattr(config, "DRIFT_MIN_ABS_PCT", 0.00030) or 0.0)
+        min_z = float(getattr(config, "DRIFT_MIN_ABS_Z", 0.35) or 0.0)
+        # Sniper needs stronger z than generic directional (was free at 0.15).
+        min_drift = max(min_drift, min_z, 0.40)
+        if abs(d_pct) < min_pct or abs(drift) < min_drift:
+            return strategy_decision(
+                "skip",
+                reasoning=(
+                    f"sniper: dual-gate d_pct={d_pct:+.5f}"
+                    f" (need |≥{min_pct:.5f}) d_z={drift:+.3f}"
+                    f" (need |≥{min_drift:.2f})"
+                ),
+            )
         regime = self.regime_context(signals)
         # Data-driven hard stand-down when live regime is toxic.
         try:
@@ -95,9 +117,20 @@ class SniperBot(BaseBot):
                         f"({_radj.reason})"
                     ),
                 )
+            if getattr(_radj, "block_strategy", False):
+                return strategy_decision(
+                    "skip",
+                    reasoning=(
+                        f"sniper: regime style-skip {_radj.label} "
+                        f"({_radj.reason})"
+                    ),
+                )
             min_drift += float(getattr(_radj, "extra_drift_floor", 0.0) or 0.0)
+            # Continuous strategy×regime edge tax (data-driven).
+            min_edge_tax = float(getattr(_radj, "edge_mult", 1.0) or 1.0)
         except Exception:
             _radj = None
+            min_edge_tax = 1.0
         quiet = (
             regime.get("legacy") == "quiet"
             or regime.get("label") in ("low_vol_range", "low_vol_trend", "quiet")
@@ -106,7 +139,7 @@ class SniperBot(BaseBot):
         if quiet:
             min_drift += float(p.get("quiet_drift_bump", 0.05))
 
-        min_edge = float(p.get("min_edge", 0.02))
+        min_edge = float(p.get("min_edge", 0.02)) * float(min_edge_tax or 1.0)
         max_mid = float(p.get("max_side_mid", 0.58))
         min_mid = float(p.get("min_side_mid", 0.30))
         ext_abs = float(p.get("extreme_drift_abs",
@@ -231,6 +264,36 @@ class SniperBot(BaseBot):
                 signals=contributing, features=features,
             )
 
+        # Data-driven side skip / continuous side edge tax
+        if _radj is not None:
+            _bs = getattr(_radj, "block_side", None)
+            if _bs and side == str(_bs).lower():
+                return strategy_decision(
+                    "skip", side=side,
+                    reasoning=(
+                        f"sniper: regime side-skip {side} in "
+                        f"{_radj.label} ({_radj.reason})"
+                    ),
+                    signals=contributing, features=features,
+                )
+            try:
+                if hasattr(_radj, "side_edge_for"):
+                    min_edge *= float(_radj.side_edge_for(side) or 1.0)
+                else:
+                    _sm = getattr(_radj, "side_edge_mult", None) or {}
+                    min_edge *= float(_sm.get(side, 1.0) or 1.0)
+            except Exception:
+                pass
+            if side_edge < min_edge:
+                return strategy_decision(
+                    "skip", side=side,
+                    reasoning=(
+                        f"sniper: side edge tax e={side_edge:+.3f}"
+                        f"<{min_edge:.3f} ({_radj.reason})"
+                    ),
+                    signals=contributing, features=features,
+                )
+
         # Structure confidence (not edge × constant — inversion fix 2026-08).
         try:
             from bots.edge_calibration import quality_confidence
@@ -243,10 +306,38 @@ class SniperBot(BaseBot):
             )
         except Exception:
             confidence = min(0.85, 0.25 + 0.4 * abs(signed) + min(0.2, side_edge * 2))
+        # TWAP settlement policy: conf / size from certainty, not last-tick.
+        pol = sv.settlement_policy or {}
+        twap_cert = float(pol.get("certainty") or sv.twap_certainty or 0.0)
+        if pol.get("policy_active") and float(pol.get("conf_boost") or 0) > 0:
+            confidence = min(0.95, confidence + float(pol["conf_boost"]))
+        elif sv.in_settlement_window and twap_cert > 0:
+            confidence = min(0.95, confidence + 0.08 * twap_cert)
+        contributing["twap_certainty"] = twap_cert
+        contributing["resolution_source"] = sv.resolution_source
+        contributing["market_phase"] = sv.market_phase
+        contributing["settlement_edge_mult"] = float(pol.get("edge_mult") or 1.0)
+        # Inside noisy settlement (low cert): demand more edge before sniping
+        if pol.get("policy_active"):
+            min_edge *= float(pol.get("edge_mult") or 1.0)
+            # Re-check edge after tax (side already chosen)
+            if side_edge < min_edge:
+                return strategy_decision(
+                    "skip",
+                    reasoning=(
+                        f"sniper: TWAP settle edge tax "
+                        f"e={side_edge:+.3f}<{min_edge:.3f} "
+                        f"phase={pol.get('phase')} cert={twap_cert:.2f}"
+                    ),
+                    signals=contributing, features=features,
+                )
         time_rem = market.get("time_remaining_seconds")
         late = 0.0
         late_size = 1.0
-        if time_rem is not None and time_rem > 0 and abs(signed) >= 0.20:
+        if pol.get("policy_active"):
+            late_size = float(pol.get("size_mult") or 1.0)
+        elif time_rem is not None and time_rem > 0 and abs(signed) >= 0.20:
+            # Soft ramp into settlement window (rem=30), not to expiry print
             late = smooth_ramp(-float(time_rem), -90.0, -30.0)
             late_size = 1.0 + 0.10 * late
 

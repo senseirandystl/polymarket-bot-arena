@@ -32,12 +32,10 @@ def bot(monkeypatch):
 def _decide(bot, price, signals=None):
     market = {"current_price": price, "time_remaining_seconds": 200,
               "polymarket_token_id": "up", "polymarket_no_token_id": "dn"}
-    # btc_drift=0.2 (YES-favoring, matching the stub's YES thesis) keeps these
-    # sizing-math tests clear of the dead-zone gate at mid-book prices — the
-    # gate blocks flat-drift coin-flip trades, which is orthogonal to the
-    # shares-first invariant under test here.
+    # Strong enough drift to clear dead-zone + mid-band lag gates at mid
+    # prices (orthogonal to the shares-first invariant under test).
     sig = {"prices": [100.0, 101.0], "latest": 101.0, "obi": 1.0, "cvd": 1.0,
-           "btc_drift": 0.2}
+           "btc_drift": 0.45}
     if signals:
         sig.update(signals)
     return bot.make_decision(market, sig)

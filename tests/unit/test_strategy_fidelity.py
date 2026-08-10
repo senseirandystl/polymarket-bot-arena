@@ -91,8 +91,10 @@ def test_default_slate_uses_meanrev_v1():
     from arena.startup import build_default_bots
     names = [b.name for b in build_default_bots()]
     assert "meanrev-v1" in names
+    assert "hybrid-v1" in names
+    assert "sweeper-v1" in names
     assert not any("sl25" in n for n in names)
-    assert len(names) == 8
+    assert len(names) == 6
 
 
 def test_db_migration_renames_meanrev(tmp_path, monkeypatch):

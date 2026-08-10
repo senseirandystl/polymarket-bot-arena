@@ -46,7 +46,14 @@ class TradeResolver(threading.Thread):
         self._stop_event.set()
 
     def _do_resolution_cycle(self) -> None:
-        """Settle pending trades against Polymarket's resolved-markets map."""
+        """Settle pending trades against Polymarket outcomes.
+
+        Primary path: bulk map of recently *closed* series markets.
+        Fallback: per-``market_id`` Gamma lookup for markets that already
+        show extreme outcomePrices but are still ``closed=false`` (Gamma
+        lag — these never appear in the closed bulk page and used to sit
+        pending forever, firing resolver_stuck alerts).
+        """
         with db.get_conn() as conn:
             pending = conn.execute(
                 "SELECT id, market_id, bot_name, side, amount, shares_bought, "
@@ -55,7 +62,26 @@ class TradeResolver(threading.Thread):
         if not pending:
             return
 
-        resolved = polymarket_markets.recent_resolutions()
+        resolved = dict(polymarket_markets.recent_resolutions() or {})
+
+        # Direct lookup for any pending market missing from the closed map.
+        missing = {
+            t["market_id"] for t in pending
+            if t["market_id"] and t["market_id"] not in resolved
+        }
+        fallback_hits = 0
+        for mid in missing:
+            outcome = polymarket_markets.fetch_market_outcome(mid)
+            if outcome is not None:
+                resolved[mid] = outcome
+                fallback_hits += 1
+        if fallback_hits:
+            logger.info(
+                "Resolver fallback: settled outcomes for %d market(s) via "
+                "direct Gamma lookup (closed-map miss / defacto resolve)",
+                fallback_hits,
+            )
+
         if not resolved:
             return
 

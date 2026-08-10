@@ -219,8 +219,13 @@ def test_regime_context_exposes_rich_fields():
 
 
 def test_lab_regime_damps_quiet_and_chop():
-    assert "mom" in REGIME_LANE_DAMP["quiet"]
-    assert "mom" in REGIME_LANE_DAMP["low_vol_range"]
+    assert "mom" in REGIME_LANE_DAMP["quiet"]       # legacy label still damps
+    # low_vol_range / low_vol_trend mom damp moved to regime_adapt (P1c:
+    # single-authority mom_lane_scale, no double-damp with lab.py).
+    assert "low_vol_range" in REGIME_LANE_DAMP
+    assert REGIME_LANE_DAMP["low_vol_range"] == {}
+    assert "low_vol_trend" in REGIME_LANE_DAMP
+    assert REGIME_LANE_DAMP["low_vol_trend"] == {}
     assert "mom" in REGIME_LANE_DAMP["high_vol_chop"]
     assert "strat" in REGIME_LANE_DAMP["high_vol_chop"]
 

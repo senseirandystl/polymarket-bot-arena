@@ -1181,6 +1181,23 @@ def set_auto_core_tune(enabled: bool):
     set_arena_state("auto_core_tune", "1" if enabled else "0")
 
 
+def get_pilein_ev_gate() -> bool:
+    """Whether progressive EV pile-in gate is on (dashboard Settings).
+
+    After peers already hold (market, side), new bots need a higher edge
+    unless confidence is very high. Falls back to config.PILEIN_EV_GATE_ENABLED.
+    """
+    raw = get_arena_state("pilein_ev_gate")
+    if raw is None:
+        return bool(getattr(config, "PILEIN_EV_GATE_ENABLED", True))
+    return str(raw) in ("1", "true", "True", "yes", "on")
+
+
+def set_pilein_ev_gate(enabled: bool):
+    """Flip the pile-in EV gate toggle (dashboard Settings)."""
+    set_arena_state("pilein_ev_gate", "1" if enabled else "0")
+
+
 def get_regime_conditioning() -> bool:
     """Whether Layer-3 controllers may act on the regime map (dashboard toggle).
 

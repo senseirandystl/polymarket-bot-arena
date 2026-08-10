@@ -1,20 +1,22 @@
-"""Real-time crypto price data — Chainlink for BTC price, Binance for volume + xasset.
+"""Real-time crypto price data — Chainlink spot + TWAP for BTC, Binance xasset.
 
-**BTC price** resolves on Polymarket against **Chainlink BTC/USD**, so the live
-BTC level (latest, 1m candles for momentum/acceleration/mtf, drift ``btc_now``)
-comes from Polymarket RTDS ``crypto_prices_chainlink`` / symbol ``btc/usd``.
-That is the same oracle family as Price to Beat (``signals/strike.py``).
+**BTC resolution (2026-08-07+)** uses Chainlink **TWAP** (30s for 5-min
+markets). Both Price to Beat (open) and settlement (close) come from the
+TWAP feed. Live path:
+
+  * ``crypto_prices_twap_thirty`` / ``btc/usd`` → resolution ``btc_now`` /
+    strike latch (``signals/twap.py``, ``signals/strike.py``)
+  * ``crypto_prices_chainlink`` / ``btc/usd`` → 1m candles, momentum,
+    regime tape, settlement-nowcast tick buffer (spot path still useful)
 
 **BTC volume** is not on Chainlink. We subscribe to Binance ``btcusdt@kline_1m``
 **volume-only** (never overwrite Chainlink price) for regime activity /
-relative-volume context. Basis risk vs Chainlink is fine for volume.
+relative-volume context.
 
-**ETH / SOL** stay on Binance 1m klines for the cross-asset lane. One process
-runs both sockets.
+**ETH / SOL** stay on Binance 1m klines for the cross-asset lane.
 
-``get_signals`` keys are unchanged: ``prices``, ``volumes``, ``latest``,
-``stale``, ``momentum``, ``acceleration``, ``mtf``. For BTC, ``prices`` are
-Chainlink and ``volumes`` are Binance.
+``get_signals`` keys stay stable; BTC adds ``twap`` / ``twap_stale`` /
+``resolution_source`` without breaking consumers.
 """
 
 from __future__ import annotations
@@ -26,6 +28,7 @@ import time
 from collections import deque
 from typing import Deque, Optional
 
+import config
 from signals.curves import soft_saturate
 
 logger = logging.getLogger(__name__)
@@ -65,10 +68,22 @@ class PriceFeed:
         self._source: dict[str, str] = {
             "btc": "chainlink", "eth": "binance", "sol": "binance",
         }
-        # Chainlink tick ring: (epoch_sec, price) for strike latch + diagnostics
+        # Chainlink spot tick ring: (epoch_sec, price) for candles + nowcast
         self._btc_ticks: Deque[tuple[float, float]] = deque(maxlen=TICK_BUFFER_SEC + 60)
         self._btc_candle_open_min: Optional[int] = None  # floor(epoch/60)
         self._btc_candle_last: Optional[float] = None
+
+        # Official Chainlink TWAP (30s for 5m markets) — resolution path
+        self._btc_twap: float = 0.0
+        self._btc_twap_ts: float = 0.0          # observation epoch (sec)
+        self._btc_twap_wall: float = 0.0        # local receive time
+        self._btc_twap_window_s: int = int(
+            getattr(config, "TWAP_WINDOW_SEC", 30) or 30
+        )
+        # TWAP observation ring for open latch (epoch_sec, twap_value)
+        self._btc_twap_ticks: Deque[tuple[float, float]] = deque(
+            maxlen=TICK_BUFFER_SEC + 60
+        )
 
         self._running = False
         self._threads: list[threading.Thread] = []
@@ -82,16 +97,21 @@ class PriceFeed:
             target=self._run_chainlink_btc, name="price-feed-chainlink-btc",
             daemon=True,
         )
+        t_twap = threading.Thread(
+            target=self._run_chainlink_twap, name="price-feed-chainlink-twap",
+            daemon=True,
+        )
         t_bn = threading.Thread(
             target=self._run_binance_xasset, name="price-feed-binance-xasset",
             daemon=True,
         )
-        self._threads = [t_cl, t_bn]
+        self._threads = [t_cl, t_twap, t_bn]
         for t in self._threads:
             t.start()
         logger.info(
-            "Price feed started (BTC price=Chainlink RTDS, "
-            "BTC volume+ETH/SOL=Binance klines)"
+            "Price feed started (BTC spot+TWAP=Chainlink RTDS, "
+            "BTC volume+ETH/SOL=Binance klines; TWAP window=%ss)",
+            self._btc_twap_window_s,
         )
 
     def stop(self) -> None:
@@ -260,25 +280,225 @@ class PriceFeed:
                 self._btc_candle_last = price
 
     def price_at(self, epoch_sec: float, *, tol_sec: float = 2.0) -> Optional[float]:
-        """Nearest Chainlink BTC tick at/after ``epoch_sec`` (within ``tol_sec``).
+        """Nearest Chainlink BTC **spot** tick at/after ``epoch_sec``.
 
-        Used as a strike latch when the Polymarket openPrice REST call is down.
-        Prefer the first tick with ``ts >= epoch_sec``; if none, nearest within
-        tolerance.
+        Prefer TWAP latch via :meth:`twap_at` for resolution strike under
+        2026-08-07+ rules. Spot latch remains for diagnostics / fallback.
         """
         with self._lock:
             ticks = list(self._btc_ticks)
-        if not ticks:
-            return None
-        # Prefer first tick at or after window open (Chainlink sample after open).
-        after = [t for t in ticks if t[0] >= epoch_sec - 0.5]
-        if after:
-            return float(after[0][1])
-        # Nearest overall within tol
-        best = min(ticks, key=lambda t: abs(t[0] - epoch_sec))
-        if abs(best[0] - epoch_sec) <= tol_sec:
-            return float(best[1])
-        return None
+        return _nearest_tick(ticks, epoch_sec, tol_sec=tol_sec)
+
+    def twap_at(self, epoch_sec: float, *, tol_sec: float = 2.0) -> Optional[float]:
+        """Nearest official Chainlink **TWAP** observation at/after ``epoch_sec``.
+
+        Preferred strike latch under TWAP resolution (open PTB is a TWAP print).
+        """
+        with self._lock:
+            ticks = list(self._btc_twap_ticks)
+        return _nearest_tick(ticks, epoch_sec, tol_sec=tol_sec)
+
+    def latest_twap(self) -> tuple[float, float, int]:
+        """Return ``(twap_value, observation_epoch, window_seconds)`` or zeros."""
+        with self._lock:
+            return (
+                float(self._btc_twap or 0.0),
+                float(self._btc_twap_ts or 0.0),
+                int(self._btc_twap_window_s or 30),
+            )
+
+    def btc_spot_ticks(self) -> list[tuple[float, float]]:
+        """Copy of the Chainlink spot tick ring (for settlement nowcast)."""
+        with self._lock:
+            return list(self._btc_ticks)
+
+    def btc_twap_ticks(self) -> list[tuple[float, float]]:
+        """Copy of the official TWAP observation ring."""
+        with self._lock:
+            return list(self._btc_twap_ticks)
+
+    # -------------------------------------------------------------- TWAP RTDS
+    def _run_chainlink_twap(self) -> None:
+        """RTDS Chainlink BTC/USD 30s TWAP (resolution path for 5m markets).
+
+        Topic: ``crypto_prices_twap_thirty`` (see Polymarket chainlink-twap docs).
+        No snapshot/history/replay — reconnect + resubscribe on quiet/error.
+        Pre-launch ``topic not found`` is expected; keep retrying.
+        """
+        if not bool(getattr(config, "TWAP_RESOLUTION_ENABLED", True)):
+            logger.info("TWAP RTDS feed disabled (TWAP_RESOLUTION_ENABLED=False)")
+            return
+
+        import websocket
+
+        topic = str(
+            getattr(config, "TWAP_RTDS_TOPIC_30", "crypto_prices_twap_thirty")
+            or "crypto_prices_twap_thirty"
+        )
+        symbol = str(getattr(config, "TWAP_SYMBOL", "btc/usd") or "btc/usd")
+        backoff = 2.0
+        refresh_sec = 8.0
+        first_connect = True
+        after_error = False
+
+        while self._running:
+            ws = None
+            try:
+                ws = websocket.WebSocket()
+                ws.settimeout(1.0)
+                ws.connect(RTDS_WS)
+                # filters must be compact JSON, no spaces (Polymarket RTDS API)
+                sub = {
+                    "action": "subscribe",
+                    "subscriptions": [{
+                        "topic": topic,
+                        "type": "update",
+                        "filters": json.dumps(
+                            {"symbol": symbol}, separators=(",", ":")
+                        ),
+                    }],
+                }
+                ws.send(json.dumps(sub))
+                if first_connect or after_error:
+                    logger.info(
+                        "Connected to Polymarket RTDS TWAP %s %s%s",
+                        topic, symbol,
+                        " (recovered)" if after_error and not first_connect else "",
+                    )
+                    first_connect = False
+                    after_error = False
+                else:
+                    logger.debug("RTDS TWAP refresh reconnect %s", topic)
+                backoff = 2.0
+                last_ping = time.time()
+                last_msg = time.time()
+
+                while self._running:
+                    now = time.time()
+                    if now - last_ping >= 5.0:
+                        try:
+                            ws.send("PING")
+                        except Exception:
+                            break
+                        last_ping = now
+                    if now - last_msg >= refresh_sec:
+                        break
+                    try:
+                        raw = ws.recv()
+                    except Exception:
+                        continue
+                    if not raw or raw in ("PONG", "pong"):
+                        continue
+                    last_msg = time.time()
+                    try:
+                        msg = json.loads(raw)
+                    except Exception:
+                        continue
+                    # Topic-not-found / error frames before feed is live
+                    if isinstance(msg, dict) and msg.get("error"):
+                        err = str(msg.get("error") or msg)
+                        if "not found" in err.lower() or "topic" in err.lower():
+                            logger.warning(
+                                "RTDS TWAP topic not ready (%s) — retry in %.0fs",
+                                err[:160], backoff,
+                            )
+                            break
+                        logger.debug("RTDS TWAP message error: %s", err[:160])
+                        continue
+                    self._ingest_twap_message(msg)
+
+                try:
+                    ws.close()
+                except Exception:
+                    pass
+                if self._running:
+                    time.sleep(0.3)
+                    backoff = 2.0
+            except Exception as e:
+                after_error = True
+                logger.error(
+                    "Chainlink TWAP feed error: %s (retry in %.0fs)", e, backoff,
+                )
+                time.sleep(backoff)
+                backoff = min(60.0, backoff * 2)
+
+    def _ingest_twap_message(self, msg: dict) -> None:
+        """Handle RTDS TWAP update frames (and any snapshot-shaped payloads)."""
+        if not isinstance(msg, dict):
+            return
+        payload = msg.get("payload")
+        if not isinstance(payload, dict):
+            # Some envelopes put fields at top level
+            if "value" in msg and ("timestamp" in msg or "window_s" in msg):
+                payload = msg
+            else:
+                return
+
+        sym = str(
+            payload.get("symbol") or ""
+        ).lower().replace("-", "/")
+        if sym and sym not in ("btc/usd", "btc"):
+            return
+
+        # Snapshot-style list (if RTDS ever sends one)
+        data = payload.get("data")
+        if isinstance(data, list) and data:
+            for pt in data:
+                if isinstance(pt, dict):
+                    self._on_btc_twap_tick(pt)
+            return
+
+        if "value" in payload:
+            self._on_btc_twap_tick(payload)
+            return
+
+        inner = payload.get("update") or payload.get("price")
+        if isinstance(inner, dict):
+            self._on_btc_twap_tick(inner)
+
+    def _on_btc_twap_tick(self, pt: dict) -> None:
+        try:
+            # Prefer full_accuracy_value (E18 string) when present
+            raw_full = pt.get("full_accuracy_value")
+            val = pt.get("value")
+            if raw_full is not None and str(raw_full).strip() != "":
+                try:
+                    # E18 fixed-point integer string → float dollars
+                    as_int = int(str(raw_full).strip())
+                    price = as_int / 1e18
+                except (TypeError, ValueError):
+                    price = float(val) if val is not None else 0.0
+            elif val is not None:
+                price = float(val)
+            else:
+                return
+            if price <= 0:
+                return
+
+            ts_ms = pt.get("timestamp")
+            if ts_ms is None:
+                ts = time.time()
+            else:
+                ts = float(ts_ms) / 1000.0 if float(ts_ms) > 1e12 else float(ts_ms)
+
+            win = pt.get("window_s") or pt.get("windowSeconds") or pt.get(
+                "window_seconds"
+            )
+            window_s = int(win) if win else int(
+                getattr(config, "TWAP_WINDOW_SEC", 30) or 30
+            )
+        except (TypeError, ValueError):
+            return
+
+        with self._lock:
+            self._btc_twap = price
+            self._btc_twap_ts = ts
+            self._btc_twap_wall = time.time()
+            self._btc_twap_window_s = window_s
+            self._btc_twap_ticks.append((ts, price))
+            cutoff = ts - TICK_BUFFER_SEC
+            while self._btc_twap_ticks and self._btc_twap_ticks[0][0] < cutoff:
+                self._btc_twap_ticks.popleft()
 
     # -------------------------------------------------------------- Binance
     def _run_binance_xasset(self) -> None:
@@ -368,8 +588,16 @@ class PriceFeed:
             # consumers see a live level even before the minute rolls.
             if sym == "btc" and self._btc_candle_last and self._btc_candle_last > 0:
                 latest = self._btc_candle_last
+            twap = float(self._btc_twap or 0.0) if sym == "btc" else 0.0
+            twap_ts = float(self._btc_twap_ts or 0.0) if sym == "btc" else 0.0
+            twap_wall = float(self._btc_twap_wall or 0.0) if sym == "btc" else 0.0
+            twap_window = int(self._btc_twap_window_s or 30) if sym == "btc" else 0
 
         stale = (time.time() - last_up) > STALE_SEC if last_up else True
+        twap_stale_sec = float(getattr(config, "TWAP_STALE_SEC", 15.0) or 15.0)
+        twap_stale = True
+        if sym == "btc" and twap > 0 and twap_wall > 0:
+            twap_stale = (time.time() - twap_wall) > twap_stale_sec
 
         momentum = 0.0
         acceleration = 0.0
@@ -387,7 +615,7 @@ class PriceFeed:
                     (prices[-1] - prices[-1 - horizon]) / prices[-1 - horizon]
                 )
 
-        return {
+        out = {
             "prices": prices,
             "volumes": volumes,
             "latest": latest,
@@ -397,6 +625,48 @@ class PriceFeed:
             "mtf": mtf,
             "source": source,
         }
+        if sym == "btc":
+            out["twap"] = twap
+            out["twap_ts"] = twap_ts
+            out["twap_stale"] = twap_stale
+            out["twap_window_sec"] = twap_window
+            # Prefer TWAP for resolution-aware consumers; spot remains in latest.
+            if twap > 0 and not twap_stale:
+                out["resolution_price"] = twap
+                out["resolution_source"] = "rtds_twap"
+            elif latest > 0:
+                out["resolution_price"] = latest
+                out["resolution_source"] = "spot"
+            else:
+                out["resolution_price"] = 0.0
+                out["resolution_source"] = "none"
+        return out
+
+
+def _nearest_tick(
+    ticks: list[tuple[float, float]],
+    epoch_sec: float,
+    *,
+    tol_sec: float = 2.0,
+) -> Optional[float]:
+    """Tick nearest to ``epoch_sec``, only if within ``tol_sec``.
+
+    **Critical (BUG TWAP-PTB):** never return a tick just because it is the
+    first sample *after* ``epoch_sec``. After a mid-window restart the buffer
+    only has current ticks; treating those as the open strike invents a
+    false Price to Beat (dashboard ≠ Polymarket, drift inverted).
+    """
+    if not ticks:
+        return None
+    # Prefer the first tick at/after open, but only if it is still near open.
+    after = [t for t in ticks if t[0] >= epoch_sec - 0.5]
+    if after and (after[0][0] - epoch_sec) <= tol_sec:
+        return float(after[0][1])
+    # Otherwise nearest overall, still within tolerance.
+    best = min(ticks, key=lambda t: abs(t[0] - epoch_sec))
+    if abs(best[0] - epoch_sec) <= tol_sec:
+        return float(best[1])
+    return None
 
 
 # Singleton

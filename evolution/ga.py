@@ -33,6 +33,7 @@ EVOLUTION_EXEMPT_TYPES = frozenset({
     "btc_maker",
     "true_maker",
     "copy_trade",
+    "sweeper",  # structural fee-curve / settlement edge — not directional GA
 })
 
 
@@ -46,6 +47,7 @@ def _default_params_for(strategy_type: str) -> dict:
     from bots.bot_lag_residual import DEFAULT_PARAMS as LAG_DEFAULTS
     from bots.bot_regime_specialist import DEFAULT_PARAMS as REGIME_DEFAULTS
     from bots.bot_no_lag import DEFAULT_PARAMS as NO_LAG_DEFAULTS
+    from bots.bot_sweeper import DEFAULT_PARAMS as SWEEPER_DEFAULTS
 
     mapping = {
         "momentum": MOMENTUM_DEFAULTS,
@@ -58,6 +60,7 @@ def _default_params_for(strategy_type: str) -> dict:
         "lag_residual": LAG_DEFAULTS,
         "regime_specialist": REGIME_DEFAULTS,
         "no_lag": NO_LAG_DEFAULTS,
+        "sweeper": SWEEPER_DEFAULTS,
     }
     base = mapping.get(strategy_type, MOMENTUM_DEFAULTS)
     return copy.deepcopy(base)
@@ -261,9 +264,22 @@ def run_ga_cycle(
     n_elite = max(1, min(n_elite, len(individuals)))  # at least 1 elite safety net
 
     # Classify: immune (too few trades), replaceable (fails survival bar), rest
+    # Audit 3c: zombie check — a bot that is immune AND paused by the risk
+    # engine is dead weight (paused, unkillable). Force-replace it.
+    zombie_replaced = []
     for ind in individuals:
         if ind["trades"] < config.MIN_TRADES_FOR_JUDGMENT:
-            ind["status"] = "immune"
+            bot = ind.get("bot")
+            if bot is not None and getattr(bot, "_paused", False):
+                ind["status"] = "replaceable"
+                ind["zombie"] = True
+                zombie_replaced.append(ind["name"])
+                logger.warning(
+                    "  Zombie bot %s: immune (n=%d) + paused — auto-retiring",
+                    ind["name"], ind["trades"],
+                )
+            else:
+                ind["status"] = "immune"
         elif _survives_legacy_bar(ind):
             ind["status"] = "survivor"
         else:

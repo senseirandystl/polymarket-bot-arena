@@ -4,6 +4,12 @@ Each evolution cycle the top elite(s) are appended to a capped bank stored in
 ``arena_state['ga_gene_bank']``. Bank entries are never removed from the live
 roster; they only expand the parent pool for tournament / type allocation so
 good genomes survive beyond a single bad judgment window.
+
+Eviction (prevents tainting the parent pool with frozen bad elites):
+  * per-type + global caps (highest fitness kept)
+  * min-trades floor — tiny-sample elites are not deposited
+  * negative-PnL prune once an entry has enough trades
+  * fitness floor relative to bank median (optional config)
 """
 
 from __future__ import annotations
@@ -46,12 +52,54 @@ def _max_per_type() -> int:
     return max(1, int(getattr(config, "GA_GENE_BANK_MAX_PER_TYPE", 3)))
 
 
+def _min_trades_to_bank() -> int:
+    return max(1, int(getattr(config, "GA_GENE_BANK_MIN_TRADES", 5)))
+
+
+def _prune_underperformers(entries: list[dict]) -> list[dict]:
+    """Drop bank entries that are undersampled or clearly bad.
+
+    A frozen elite deposited on n=2 trades with high *rank* fitness but
+    negative PnL used to linger forever (no later elite of that type to
+    displace it). Rules:
+      * trades < min → drop (legacy undersampled deposits + deposit floor)
+      * trades ≥ min and pnl < 0 → drop (optional, default on)
+    """
+    min_t = _min_trades_to_bank()
+    drop_neg = bool(getattr(config, "GA_GENE_BANK_DROP_NEG_PNL", True))
+    kept = []
+    for e in entries:
+        try:
+            n = int(e.get("trades") or 0)
+            pnl = e.get("pnl")
+            pnl_f = float(pnl) if pnl is not None else None
+        except (TypeError, ValueError):
+            kept.append(e)
+            continue
+        if n < min_t:
+            logger.info(
+                "gene bank: dropping undersampled %s type=%s n=%s (min=%s)",
+                e.get("name"), e.get("strategy_type"), n, min_t,
+            )
+            continue
+        if drop_neg and pnl_f is not None and pnl_f < 0:
+            logger.info(
+                "gene bank: dropping underperformer %s type=%s n=%s pnl=%.2f",
+                e.get("name"), e.get("strategy_type"), n, pnl_f,
+            )
+            continue
+        kept.append(e)
+    return kept
+
+
 def apply_type_quotas(entries: list[dict]) -> list[dict]:
     """Keep at most N highest-fitness entries per strategy_type, then global cap.
 
     Prevents a single elite type (e.g. phantom) from filling the entire bank
-    and dominating every future tournament parent pool.
+    and dominating every future tournament parent pool. Also prunes
+    negative-PnL entries with enough sample mass.
     """
+    entries = _prune_underperformers(entries)
     per = _max_per_type()
     by_type: dict[str, list[dict]] = {}
     for e in entries:
@@ -81,6 +129,7 @@ def save_bank(entries: list[dict]) -> None:
             "entries": trimmed,
             "max_size": _max_size(),
             "max_per_type": _max_per_type(),
+            "min_trades": _min_trades_to_bank(),
         }))
     except Exception as e:
         logger.warning("gene_bank save failed: %s", e)
@@ -91,11 +140,24 @@ def record_elites(individuals: list[dict], cycle: int) -> list[dict]:
 
     Dedupes by (strategy_type, rounded params fingerprint) so identical elites
     don't flood the bank every 2h. Applies per-type quotas before persist.
+    Skips elites with fewer than ``GA_GENE_BANK_MIN_TRADES`` resolved trades
+    (rank-fitness on n=2 is noise and used to taint the parent pool).
     """
     bank = load_bank()
     existing_fps = {_fingerprint(e) for e in bank}
+    min_t = _min_trades_to_bank()
     for ind in individuals:
         if not ind.get("elite"):
+            continue
+        try:
+            n_trades = int(ind.get("trades") or 0)
+        except (TypeError, ValueError):
+            n_trades = 0
+        if n_trades < min_t:
+            logger.debug(
+                "gene bank: skip elite %s (n=%s < min_trades=%s)",
+                ind.get("name"), n_trades, min_t,
+            )
             continue
         entry = {
             "name": ind.get("name"),
