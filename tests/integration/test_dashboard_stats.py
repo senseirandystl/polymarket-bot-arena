@@ -102,6 +102,71 @@ def test_current_bots_excludes_retired_roster(db):
     assert stats["all_time"]["pnl"] == pytest.approx(-16.0)
 
 
+def test_core_vs_lockin_split(db):
+    """Performance card splits Core (directional) vs Lock-in (sweeper+arb)."""
+    _insert(db, "sniper-v1", "win", 10.0, "2026-07-12 10:00:00", "2026-07-12 10:05:00")
+    _insert(db, "hybrid-v1", "loss", -4.0, "2026-07-12 10:01:00", "2026-07-12 10:06:00")
+    _insert(db, "sweeper-v1", "win", 0.5, "2026-07-12 10:02:00", "2026-07-12 10:07:00")
+    _insert(db, "sweeper-v1", "win", 0.4, "2026-07-12 10:03:00", "2026-07-12 10:08:00")
+    _insert(db, "arbitrage-v1", "win", 1.5, "2026-07-12 10:04:00", "2026-07-12 10:09:00")
+
+    all_time = db.get_dashboard_stats()["all_time"]
+    assert all_time["trades"] == 5
+    assert all_time["pnl"] == pytest.approx(8.4)
+
+    # Core = sniper + hybrid
+    assert all_time["core_trades"] == 2
+    assert all_time["core_pnl"] == pytest.approx(6.0)
+    assert all_time["core_wins"] == 1
+    assert all_time["core_losses"] == 1
+    # Lock-in = sweeper + arb
+    assert all_time["lockin_trades"] == 3
+    assert all_time["lockin_pnl"] == pytest.approx(2.4)
+    assert all_time["lockin_wins"] == 3
+    assert all_time["lockin_losses"] == 0
+    # Legacy aliases still filled
+    assert all_time["directional_pnl"] == pytest.approx(6.0)
+    assert all_time["structural_pnl"] == pytest.approx(2.4)
+
+
+def test_graveyard_stats_for_retired_bots(db):
+    """Graveyard lists retired bots with lifetime P&L, worst first."""
+    with db.get_conn() as conn:
+        conn.execute(
+            """INSERT INTO bot_configs
+               (bot_name, strategy_type, generation, params, active, lineage)
+               VALUES ('live-ok', 'sniper', 0, '{}', 1, 'live')"""
+        )
+        conn.execute(
+            """INSERT INTO bot_configs
+               (bot_name, strategy_type, generation, params, active, retired_at, lineage)
+               VALUES ('momentum-v1', 'momentum', 0, '{"lookback_candles":5}', 0,
+                       '2026-07-12 12:00:00', 'defaults')"""
+        )
+        conn.execute(
+            """INSERT INTO bot_configs
+               (bot_name, strategy_type, generation, params, active, retired_at)
+               VALUES ('hybrid-g2', 'hybrid', 2, '{}', 0, '2026-07-12 14:00:00')"""
+        )
+    _insert(db, "live-ok", "win", 5.0, "2026-07-12 10:00:00", "2026-07-12 10:05:00")
+    _insert(db, "momentum-v1", "loss", -15.0, "2026-07-12 10:30:00", "2026-07-12 10:35:00")
+    _insert(db, "momentum-v1", "win", 2.0, "2026-07-12 11:00:00", "2026-07-12 11:05:00")
+    _insert(db, "hybrid-g2", "loss", -3.0, "2026-07-12 11:30:00", "2026-07-12 11:35:00")
+
+    gy = db.get_graveyard_stats()
+    names = [g["bot_name"] for g in gy]
+    assert "live-ok" not in names
+    assert names == ["momentum-v1", "hybrid-g2"]  # worst P&L first
+    mom = gy[0]
+    assert mom["strategy_type"] == "momentum"
+    assert mom["total_trades"] == 2
+    assert mom["wins"] == 1
+    assert mom["losses"] == 1
+    assert mom["total_pnl"] == pytest.approx(-13.0)
+    assert mom["win_rate"] == pytest.approx(0.5)
+    assert mom["retired_at"] is not None
+
+
 def test_recent_trades_orders_pending_first(db):
     # Many resolved trades, then a couple pending ones placed earlier in time.
     for i in range(30):

@@ -94,12 +94,19 @@ def evaluate_population(
     raw_components: list[dict] = []
     meta: list[dict] = []
 
+    recent_h = float(getattr(config, "GA_SURVIVAL_RECENCY_HOURS", 24.0) or 24.0)
     for bot in bots:
         trades = _resolved_trades(bot.name, hours)
         comps = multi_objective_fitness(trades)
         # Also pull summary fields the dashboard already shows
         perf = bot.get_performance(hours=hours)
-        raw_components.append(comps)
+        recent_pnl = None
+        if recent_h > 0 and recent_h < hours:
+            try:
+                rperf = bot.get_performance(hours=recent_h)
+                recent_pnl = rperf.get("total_pnl")
+            except Exception:
+                recent_pnl = None
         meta.append({
             "name": bot.name,
             "strategy_type": bot.strategy_type,
@@ -108,11 +115,13 @@ def evaluate_population(
             "params": copy.deepcopy(getattr(bot, "strategy_params", {}) or {}),
             "bot": bot,
             "pnl": perf.get("total_pnl", comps["pnl"]),
+            "recent_pnl": recent_pnl,
             "win_rate": perf.get("win_rate", 0.0),
             "trades": perf.get("total_trades", int(comps["n_trades"])),
             "be_gap": perf.get("breakeven_gap"),
             "components": comps,
         })
+        raw_components.append(comps)
 
     scored = rank_normalize_fitness(raw_components)
     individuals = []
@@ -127,20 +136,54 @@ def evaluate_population(
     return individuals
 
 
-def _survives_legacy_bar(ind: dict) -> bool:
+def _effective_survival_pnl(ind: dict) -> float:
+    """Blend long-window and recency P&L so recent bleeds are not buried."""
+    pnl = float(ind.get("pnl") or 0.0)
+    recent = ind.get("recent_pnl")
+    if recent is None:
+        return pnl
+    w = float(getattr(config, "GA_SURVIVAL_RECENCY_WEIGHT", 0.55) or 0.0)
+    w = max(0.0, min(1.0, w))
+    try:
+        recent_f = float(recent)
+    except (TypeError, ValueError):
+        return pnl
+    return (1.0 - w) * pnl + w * recent_f
+
+
+def _survives_legacy_bar(
+    ind: dict,
+    *,
+    cycle_number: int | None = None,
+) -> bool:
     """Who is *eligible for replacement* (not for ranking).
 
     2026-08 redesign: small negative P&L is noise, not a cull signal. Only
     replace bots that are clearly underwater on both P&L and BE gap after a
     full sample. Gen-0 founders get an extra loss floor so defaults are not
     swapped for cold mutants on a −$3 dip.
+
+    2026-08-11: early deep-red cull (n < MIN_TRADES but catastrophic),
+    recency-blended P&L, founder protect decays after N cycles.
     """
     n = int(ind.get("trades") or 0)
-    if n < int(config.MIN_TRADES_FOR_JUDGMENT):
-        return True  # immune — not enough data
-    pnl = float(ind.get("pnl") or 0.0)
+    min_n = int(config.MIN_TRADES_FOR_JUDGMENT)
+    pnl = _effective_survival_pnl(ind)
     gap = ind.get("be_gap")
     gap_f = float(gap) if gap is not None else None
+
+    # Thin sample: immune unless early deep-red cull fires
+    if n < min_n:
+        if (
+            bool(getattr(config, "GA_EARLY_CULL_ENABLED", True))
+            and n >= int(getattr(config, "GA_EARLY_CULL_MIN_TRADES", 15))
+        ):
+            early_pnl = float(getattr(config, "GA_EARLY_CULL_PNL", -15.0))
+            early_gap = float(getattr(config, "GA_EARLY_CULL_BE_GAP", -0.10))
+            gap_bad = gap_f is not None and gap_f <= early_gap
+            if pnl <= early_pnl and gap_bad:
+                return False  # replaceable despite thin n
+        return True  # immune — not enough data
 
     # Clear survival
     if pnl > 0:
@@ -153,9 +196,15 @@ def _survives_legacy_bar(ind: dict) -> bool:
     if pnl > cull_pnl:
         return True  # e.g. −$3 > −$12 → keep
 
-    # Founder / gen-0 protection: only cull when deeply bad
+    # Founder / gen-0 protection: only cull when deeply bad (decays after N cycles)
     gen = int(ind.get("generation") or 0)
-    if gen == 0 and bool(getattr(config, "GA_PROTECT_FOUNDERS", True)):
+    protect = bool(getattr(config, "GA_PROTECT_FOUNDERS", True))
+    max_cyc = int(getattr(config, "GA_FOUNDER_PROTECT_MAX_CYCLES", 20) or 0)
+    if (
+        protect
+        and gen == 0
+        and (max_cyc <= 0 or cycle_number is None or cycle_number < max_cyc)
+    ):
         founder_pnl = float(getattr(config, "GA_FOUNDER_CULL_PNL", -20.0))
         founder_gap = float(getattr(config, "GA_FOUNDER_CULL_BE_GAP", -0.02))
         if pnl > founder_pnl:
@@ -266,9 +315,12 @@ def run_ga_cycle(
     # Classify: immune (too few trades), replaceable (fails survival bar), rest
     # Audit 3c: zombie check — a bot that is immune AND paused by the risk
     # engine is dead weight (paused, unkillable). Force-replace it.
+    require_surv = bool(getattr(config, "GA_ELITE_REQUIRE_SURVIVAL", True))
     zombie_replaced = []
     for ind in individuals:
-        if ind["trades"] < config.MIN_TRADES_FOR_JUDGMENT:
+        survives = _survives_legacy_bar(ind, cycle_number=cycle_number)
+        n = int(ind.get("trades") or 0)
+        if n < config.MIN_TRADES_FOR_JUDGMENT and survives:
             bot = ind.get("bot")
             if bot is not None and getattr(bot, "_paused", False):
                 ind["status"] = "replaceable"
@@ -280,7 +332,7 @@ def run_ga_cycle(
                 )
             else:
                 ind["status"] = "immune"
-        elif _survives_legacy_bar(ind):
+        elif survives:
             ind["status"] = "survivor"
         else:
             ind["status"] = "replaceable"
@@ -293,24 +345,42 @@ def run_ga_cycle(
             individuals[0]["name"], individuals[0]["fitness"],
         )
 
-    # Elites = top-N by fitness among non-replaceable? No — elitism is
-    # absolute: the top-N by fitness are NEVER lost, even if the legacy bar
-    # would have culled them. That is the point of elitism.
-    fitnesses = [ind["fitness"] for ind in individuals]
-    elite_idx_set = set(elite_indices(fitnesses, n_elite))
+    # Elites = top-N by fitness among *survivors* (parents / gene bank).
+    # When GA_ELITE_REQUIRE_SURVIVAL, replaceable bots are never elite-protected
+    # — they remain in to_replace even if top-N fitness (2026-08-11).
+    if require_surv:
+        elite_pool_idx = [
+            i for i, ind in enumerate(individuals)
+            if ind["status"] in ("survivor", "immune")
+        ]
+    else:
+        elite_pool_idx = list(range(len(individuals)))
+    if elite_pool_idx:
+        pool_fits = [individuals[i]["fitness"] for i in elite_pool_idx]
+        local_elite = set(elite_indices(pool_fits, min(n_elite, len(pool_fits))))
+        elite_idx_set = {elite_pool_idx[j] for j in local_elite}
+    else:
+        elite_idx_set = set()
     for i, ind in enumerate(individuals):
         if i in elite_idx_set:
             ind["elite"] = True
-            if ind["status"] == "replaceable":
+            # Only protect replaceable elites when absolute elitism is on
+            if (not require_surv) and ind["status"] == "replaceable":
                 ind["status"] = "elite_protected"
         else:
             ind["elite"] = False
 
-    # Who gets replaced: non-elite + replaceable (failed bar) with enough trades
-    to_replace = [
-        ind for ind in individuals
-        if (not ind["elite"]) and ind["status"] == "replaceable"
-    ]
+    # Who gets replaced. With require_surv, elites are parents only — economic
+    # bar still culls. Without, elite_protected seats are immortal.
+    if require_surv:
+        to_replace = [
+            ind for ind in individuals if ind["status"] == "replaceable"
+        ]
+    else:
+        to_replace = [
+            ind for ind in individuals
+            if (not ind.get("elite")) and ind["status"] == "replaceable"
+        ]
     keep = [ind for ind in individuals if ind not in to_replace]
 
     logger.info(

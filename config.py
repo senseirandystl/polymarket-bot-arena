@@ -114,25 +114,41 @@ EVOLUTION_WINDOW_HOURS = 72        # 24→72 (audit: 24h overfits current regime
 # noisy 30-trade dips mid-run; mutants then bled the book. Need a fuller
 # window sample before a bot is eligible for replacement.
 MIN_TRADES_FOR_JUDGMENT = 40   # Fewer resolved trades in the window = immune
+# Deep-red early cull: bots with n in [GA_EARLY_CULL_MIN_TRADES, MIN_TRADES)
+# can still be replaceable when P&L and BE gap are catastrophically bad —
+# prevents "IMMUNE forever" while a bot bleeds mid-session (2026-08-11).
+GA_EARLY_CULL_ENABLED = True
+GA_EARLY_CULL_MIN_TRADES = 15
+GA_EARLY_CULL_PNL = -15.0
+GA_EARLY_CULL_BE_GAP = -0.10
 # Survival bar is the BREAK-EVEN GAP (win_rate - avg_entry_price), not a flat
 # WR threshold: 65% WR bought at 70c loses money while 55% bought at 45c
 # prints. A bot survives if its gap clears this floor OR its window P&L is
 # positive (good sizing can rescue a thin gap). The old MIN_WIN_RATE=0.65
 # would have culled every bot in the v5 run including the profitable ones
 # (best WR was 63.3%). Still used by the GA as the *replacement eligibility*
-# bar (elites are protected regardless).
+# bar. Elites must ALSO pass this bar (GA_ELITE_REQUIRE_SURVIVAL).
 EVOLUTION_BE_GAP_MIN = 0.03    # survive if WR beats avg entry by >= 3c
 # Soft P&L floor: small negative window P&L is noise, not a cull signal.
 # 2026-08: meanrev-v1 at −$3 was replaced by a worse mutant.
 EVOLUTION_PNL_CULL_MAX = -12.0  # only replaceable if window PnL ≤ this
+# Recency-weighted survival: blend long-window P&L with a short window so a
+# recent session bleed is not buried under earlier green (2026-08-11).
+GA_SURVIVAL_RECENCY_HOURS = 24.0
+GA_SURVIVAL_RECENCY_WEIGHT = 0.55   # weight on short-window pnl for cull bar
 # Gen-0 / default-lineage bots: only replace when deeply underwater (founders
-# carry the slate until a mutant clearly earns the seat).
+# carry the slate until a mutant clearly earns the seat). Decays after
+# GA_FOUNDER_PROTECT_MAX_CYCLES evolution cycles (0 = never decay).
 GA_PROTECT_FOUNDERS = True
 GA_FOUNDER_CULL_PNL = -20.0     # gen0 replaceable only if pnl ≤ this
 GA_FOUNDER_CULL_BE_GAP = -0.02  # or BE gap worse than −2¢ with enough n
+GA_FOUNDER_PROTECT_MAX_CYCLES = 20  # after this, founders use normal cull bar
 
 # --- Genetic Algorithm (replaces simple mutate-from-winner, 2026-07-23) ---
-GA_ELITE_COUNT = 2             # top-N by multi-obj fitness never replaced
+GA_ELITE_COUNT = 2             # top-N by multi-obj fitness preferred as parents
+# Elites are parents / gene-bank seeds, NOT immortal seats. When True, a bot
+# that fails the economic survival bar is replaceable even if top-N fitness.
+GA_ELITE_REQUIRE_SURVIVAL = True
 GA_TOURNAMENT_K = 3            # tournament selection size
 GA_MUTATION_RATE = 0.20        # per-gene probability of Gaussian noise
 GA_MUTATION_SIGMA = 0.12       # noise scale as fraction of param range
@@ -181,9 +197,19 @@ CORE_TUNE_MIN_TRADES_REGIME = 40
 CORE_TUNE_PNL_GATE = True
 CORE_TUNE_PNL_MIN_TRADES = 15
 CORE_TUNE_PNL_MIN_TRADES_REGIME = 5
-# Time-limit escape (audit 2c): a lane frozen by hold_pnl_gate for this many
-# hours receives a half-step UP nudge to re-test the water.
-CORE_TUNE_PNL_GATE_TIMEOUT_HOURS = 6.0
+# Primary objective: lane net EV (signed-agreement $), not sign accuracy alone.
+# Accuracy remains a filter (must clear HIGH_ACC); EV drives UP/DOWN.
+CORE_TUNE_EV_PRIMARY = True
+CORE_TUNE_EV_MIN_TRADES = 20
+CORE_TUNE_EV_UP_MIN = 0.0          # need mean attributed $ ≥ this to UP
+CORE_TUNE_EV_DOWN_MAX = -0.05      # mean attributed $ ≤ this → DOWN
+# Timeout UP disabled (was re-pumping red lanes after 6h of hold_pnl_gate).
+CORE_TUNE_PNL_GATE_TIMEOUT_HOURS = 0.0  # 0 = never timeout-up
+# Soften drift floor: allow collapse toward this when EV is red (was hard 0.15).
+CORE_TUNE_DRIFT_FLOOR = 0.10
+CORE_TUNE_DRIFT_FLOOR_WHEN_RED = 0.05
+# Renormalize each strategy profile to sum=1 after a tune step.
+CORE_TUNE_NORMALIZE_PROFILE = True
 # Continuous residual w = w0 + B·F (off until sample mass)
 REGIME_CONTINUOUS_BLEND = False
 REGIME_CONTINUOUS_MAX_DELTA = 0.08
@@ -192,6 +218,8 @@ REGIME_CONTINUOUS_ETA = 0.002
 # Strategy routing (capital / GA) — not hard-skip
 REGIME_ROUTER_MIN_TRADES = 12
 REGIME_ROUTER_GA_BLEND = 0.35
+# Blend TWAP path into regime trend/mom (0=spot only, 0.45 default)
+REGIME_TWAP_BLEND = 0.45
 # Soft frequency target (optional edge ease; default OFF)
 REGIME_FREQ_TARGET_ENABLED = False
 REGIME_FREQ_TARGET_FILLS_PER_HOUR = 4.0
@@ -468,7 +496,7 @@ STRAT_LANE_CONF_CAP = 0.25
 
 # Mean-reversion identity guard (audit 1d): at |drift| >= this floor the
 # drift-heavy profile makes the bot a duplicate trend follower. Stand down.
-MEANREV_MIN_FADE_DRIFT = 0.55  # only block extreme-drift (drift profile dominates everything)
+MEANREV_MIN_FADE_DRIFT = 0.40  # stand down earlier so meanrev ≠ pure trend chase
 
 # --- NO-side intelligence (2026-08 soak: YES +$245 / NO −$15) ---
 # Not a blanket NO ban. Prefer NO only when it is a true market-lag trade
@@ -678,7 +706,7 @@ DRIFT_MIN_ABS_Z = 0.35
 # strike (mid-window "first sighting"), not a bad signal. Live strike is
 # Polymarket's official openPrice (same /api/crypto/crypto-price endpoint the
 # website uses for "Price to Beat"). As of 2026-08-07 00:00 UTC both open PTB
-# and final settlement are Chainlink **TWAP** values (30s for 5m markets) —
+# and final settlement are Chainlink **TWAP** values (60s for 5m markets) —
 # not a single spot snapshot. See TWAP_* knobs below. Binance is NOT used live
 # (basis ~$60–80 / ~0.1% vs Chainlink — enough to flip near-strike drift); if
 # openPrice is briefly unavailable, drift stays 0 until the next fetch.
@@ -686,14 +714,16 @@ DRIFT_MIN_ABS_Z = 0.35
 # per-strategy inside STRATEGY_SIGNAL_PROFILE (bots/base_bot.py); it is the
 # anchor lane of every strategy's model.
 
-# --- Chainlink TWAP resolution (Polymarket 2026-08-07+) -------------------
+# --- Chainlink TWAP resolution (Polymarket 2026-08-07+; 5m window 60s) ------
 # Spec: https://docs.polymarket.com/market-data/chainlink-twap
 #        @PolymarketDevs — both open PTB and settlement from TWAP feed.
-# 5-min markets → 30s TWAP; 15-min / 4h → 60s TWAP (we trade 5m only).
-# RTDS topics (no credentials): crypto_prices_twap_thirty / _sixty.
+# 5-min markets → **60s TWAP** (was 30s at 2026-08-07 cutover; Polymarket
+# announced lengthening the 5m lookback to 60s — override with TWAP_WINDOW_SEC).
+# 15-min / 4h remain 60s. RTDS topics: crypto_prices_twap_thirty / _sixty.
+# Active topic is chosen from TWAP_WINDOW_SEC via signals.twap.rtds_topic().
 TWAP_RESOLUTION_ENABLED = True
-TWAP_WINDOW_SEC = 30              # lookback for 5-min BTC markets
-TWAP_WINDOW_SEC_15M = 60          # reserved if series expands
+TWAP_WINDOW_SEC = int(os.environ.get("TWAP_WINDOW_SEC") or "60")  # 5-min BTC
+TWAP_WINDOW_SEC_15M = int(os.environ.get("TWAP_WINDOW_SEC_15M") or "60")
 TWAP_RTDS_TOPIC_30 = "crypto_prices_twap_thirty"
 TWAP_RTDS_TOPIC_60 = "crypto_prices_twap_sixty"
 TWAP_SYMBOL = "btc/usd"
@@ -706,7 +736,8 @@ TWAP_NOWCAST_ENABLED = True
 # over the rolling RTDS TWAP alone (0–1).
 TWAP_NOWCAST_MIN_COVERAGE = 0.40
 # TWAP feed stale threshold (lookback windows ≠ publication cadence).
-TWAP_STALE_SEC = 15.0
+# Slightly looser for 60s lookback; cadence is still sub-second when live.
+TWAP_STALE_SEC = float(os.environ.get("TWAP_STALE_SEC") or "20.0")
 # When TWAP is unavailable, fall back to spot Chainlink for drift (noisy vs
 # true settlement — logged; prefer 0 drift if both missing).
 TWAP_FALLBACK_TO_SPOT = True
@@ -716,12 +747,13 @@ TWAP_FALLBACK_TO_SPOT = True
 TWAP_DRIFT_VOL_MULT = 1.0
 TWAP_DRIFT_VOL_MULT_SPOT_FALLBACK = 0.92  # mild damp only when σ from spot 1m
 # --- Settlement-window policy (final TWAP_WINDOW_SEC of each market) -------
-# Once rem ≤ 30s the settlement TWAP is partially observed: certainty rises
-# with elapsed fraction; last-tick spot spikes no longer flip the outcome.
-# Policy reweights edge floors, size, mom damp — not a hard ban on trading.
+# Once rem ≤ TWAP_WINDOW_SEC the settlement TWAP is partially observed:
+# certainty rises with elapsed fraction; last-tick spot spikes no longer flip
+# the outcome. Policy reweights edge floors, size, mom damp — not a hard ban.
 TWAP_SETTLEMENT_POLICY = True
-# rem in (TWAP_WINDOW, TWAP_WINDOW+lead] = pre-settlement (prepare, mild damp)
-TWAP_PRE_SETTLE_LEAD_SEC = 15
+# rem in (TWAP_WINDOW, TWAP_WINDOW+lead] = pre-settlement (prepare, mild damp).
+# ~1/3 of the averaging window (was 15s for 30s TWAP; 20s for 60s).
+TWAP_PRE_SETTLE_LEAD_SEC = int(os.environ.get("TWAP_PRE_SETTLE_LEAD_SEC") or "20")
 # Certainty thresholds (0–1 from twap_certainty())
 TWAP_SETTLE_CERT_HIGH = 0.55      # "mostly locked" — ease edge, allow size
 TWAP_SETTLE_CERT_LOW = 0.25       # noisy partial window — raise edge, cut size
@@ -912,6 +944,17 @@ PORTFOLIO_WINDOW_HOURS = 48.0         # primary (long) lookback
 PORTFOLIO_FAST_WINDOW_HOURS = 12.0    # short window for blend
 PORTFOLIO_LONG_WEIGHT = 0.65          # blend = long*W + fast*(1-W)
 PORTFOLIO_MIN_TRADES = 20             # sample floor before a bot's score counts
+# Dual-window ready: also ready if short window has enough consistent samples
+PORTFOLIO_FAST_READY_MIN_TRADES = 12
+PORTFOLIO_FAST_READY_ENABLED = True
+# When zero veterans, equal-split free capital (don't leave pool dark)
+PORTFOLIO_COLD_START_EQUAL = True
+# Strategy-family correlation priors (tandem risk) when market-overlap ρ is thin
+PORTFOLIO_FAMILY_CORR_PRIOR = 0.75
+PORTFOLIO_FAMILY_GROUPS = (
+    ("momentum", "hybrid", "phantom"),
+    ("mean_reversion", "mean_reversion_sl", "mean_reversion_tp"),
+)
 PORTFOLIO_MIN_WEIGHT = 0.0            # no forced floor — losers can go to 0
 PORTFOLIO_MAX_WEIGHT = 0.50           # hard cap even for proven winners
 # Until live edge is proven (n≥EDGE_PROVEN_MIN_N and expectancy>0), no bot
@@ -955,11 +998,11 @@ RISK_PORTFOLIO_DAILY_LOSS = None
 RISK_BOT_MAX_DRAWDOWN = 0.35         # pause bot at 35% peak-to-trough
 RISK_PORTFOLIO_MAX_DRAWDOWN = 0.40
 RISK_DRAWDOWN_WINDOW_HOURS = 24.0
-RISK_SIZE_REDUCE_DD_FRAC = 0.50      # start tapering size at 50% of max DD
+RISK_SIZE_REDUCE_DD_FRAC = 0.40      # start tapering earlier (was 0.50)
 RISK_SIZE_REDUCE_MIN_MULT = 0.25     # floor mult before hard pause
-RISK_UNDERPERFORM_PAUSE_PNL = -40.0  # window P&L ≤ this → pause
+RISK_UNDERPERFORM_PAUSE_PNL = -30.0  # was −40; catch mom-class bleed sooner
 RISK_UNDERPERFORM_WINDOW_HOURS = 12.0
-RISK_UNDERPERFORM_MIN_TRADES = 15
+RISK_UNDERPERFORM_MIN_TRADES = 12    # was 15; 5m markets need faster feedback
 # Graduated underperform taper (audit 1e): replace binary pause with size
 # reduction at intermediate loss thresholds.
 RISK_UNDERPERFORM_GRADUATED = True
@@ -1005,6 +1048,28 @@ ALERT_RESOLVER_STUCK_MIN_COUNT = 2
 ALERT_PORTFOLIO_REBALANCE_MIN_SHIFT = 0.08
 # Core-lane tuner: notify when applied |Δw| ≥ this (one step is 0.05)
 ALERT_CORE_LANE_MIN_SHIFT = 0.05
+# --- Inbound Telegram commands (arena/telegram_commands.py) ---
+# Long-poll loop hosted by the DASHBOARD process (it outlives the arena, so
+# `/status` still answers when the arena is the thing that died). Uses the same
+# alert_telegram_* credentials; an update from any chat other than the
+# configured alert_telegram_chat_id is dropped without a reply.
+TELEGRAM_COMMANDS_ENABLED = True
+# Control commands (/kill, /pause, /resume, /retire, /deploy). Turn OFF to make
+# the bot read-only — the token then only exposes reports, never trading state.
+TELEGRAM_COMMANDS_CONTROL_ENABLED = True
+# Sender allowlist. Empty tuple = only accept messages whose sender id equals
+# the chat id — i.e. the operator's own PRIVATE chat. Without this, pointing
+# alert_telegram_chat_id at a GROUP would hand /kill and /retire to every
+# current and future member of that group.
+TELEGRAM_COMMANDS_ALLOWED_USER_IDS: tuple = ()
+# Max age of a CONTROL command, measured from the message's own Telegram
+# timestamp. A /kill queued while the laptop slept is an instruction about a
+# moment that has passed — refuse it rather than fire it hours late. Reports
+# are side-effect free and ignore this.
+TELEGRAM_COMMANDS_MAX_AGE_SEC = 300
+TELEGRAM_COMMANDS_POLL_TIMEOUT_SEC = 30   # server-side long-poll hold
+TELEGRAM_COMMANDS_RATE_LIMIT_SEC = 3.0    # min seconds between same command
+
 ARENA_LOG_STALE_SEC = 300           # health /healthz stale threshold
 HEALTH_EVAL_INTERVAL_SEC = 60       # full health recompute on evolution loop
 
@@ -1039,10 +1104,11 @@ EXPOSURE_CORR_AWARE = True
 EXPOSURE_CORR_FLOOR = 0.35
 # Hard cap on distinct bots already open on the same (market, side) before
 # another directional bot is allowed in (arb exempt). Soft "one thesis" limit.
-MARKET_SIDE_MAX_BOTS = 3
+# 2026-08-11: default 1 — tandem mom+meanrev+hybrid was the session's $ bleed.
+MARKET_SIDE_MAX_BOTS = 1
 # Tighter tandem caps when live data says the regime/strategy is toxic
 MARKET_SIDE_MAX_BOTS_BAD_REGIME = 1
-MARKET_SIDE_MAX_BOTS_CHOP = 2
+MARKET_SIDE_MAX_BOTS_CHOP = 1
 # Progressive EV pile-in gate (togglable): after peers already hold (market,
 # side), a new bot must clear a higher edge bar — unless confidence is very
 # high. Not a hard bot-count ban; complementary to MARKET_SIDE_MAX_BOTS.
@@ -1051,6 +1117,49 @@ PILEIN_EV_EDGE_STEP = 0.025       # extra edge required per peer bot open
 PILEIN_EV_MIN_EDGE = 0.035        # absolute min edge when ≥1 peer is open
 PILEIN_EV_CONF_BYPASS = 0.85      # very high conf skips the extra bar
 PILEIN_EV_EXEMPT_TYPES = ("arbitrage",)  # market-neutral legs
+
+# --- One directional trade per evaluation (trader tick) ---
+# Phase-1: all bots make_decision; phase-2: only the best-edge directional
+# buy executes. Structural strategies (arb, sweeper, makers) stay exempt.
+ONE_TRADE_PER_TICK = True
+ONE_TRADE_PER_TICK_EXEMPT = (
+    "arbitrage", "sweeper", "late_window_maker", "fee_zone_maker",
+    "btc_maker", "true_maker", "copy_trade",
+)
+# Optional window lock: after any directional fill on a market, no other
+# directional bot may open that window. OFF by default; Settings toggle.
+DIRECTIONAL_WINDOW_LOCK = False
+DIRECTIONAL_WINDOW_LOCK_EXEMPT = ONE_TRADE_PER_TICK_EXEMPT
+
+# --- Lag-justified edge (all directionals; regime-agnostic) ---
+# Require drift-implied fair to beat side mid + fee by min residual before
+# buying. Continuous alternative to hard mid caps: high mids still trade when
+# |drift| is large enough that lag remains. Sniper/makers already enforce this
+# more strictly; this is the shared BaseBot floor.
+LAG_JUSTIFIED_ENABLED = True
+LAG_JUSTIFIED_MIN_EDGE = 0.02      # implied − mid − fee must clear this
+LAG_JUSTIFIED_EXEMPT = (
+    "arbitrage", "sweeper", "late_window_maker", "fee_zone_maker",
+    "btc_maker", "true_maker",
+)
+# Phase-aware drift trust: damp |lane drift contribution| in noisy open/mid
+# phases; full trust near settlement when TWAP certainty is high.
+DRIFT_PHASE_TRUST_ENABLED = True
+DRIFT_PHASE_TRUST = {
+    "open": 0.70,
+    "mid": 0.85,
+    "pre_settle": 0.95,
+    "settlement": 1.0,
+}
+# When strat is zeroed (confirm-mode fight), park weight as uncertainty that
+# lowers trust rather than redistributing into drift (2026-08-11 overconf).
+STRAT_FIGHT_UNCERTAINTY = True
+STRAT_FIGHT_TRUST_DAMP = 0.55  # trust_eff *= 1 − damp * uncertainty_share
+
+# Sticky risk taper: once reduced, stay reduced until DD recovers below
+# start_frac * recovery_ratio (stops reduced↔active flapping at the boundary).
+RISK_STICKY_TAPER = True
+RISK_STICKY_RECOVERY_RATIO = 0.75  # must recover to 75% of taper-start DD
 
 # --- Order execution: limit-first (maker fee = 0 when resting) ---
 # "limit" posts a buy limit; "market" keeps the legacy walk-the-asks path.
@@ -1111,6 +1220,12 @@ DECISION_ROLLUP_INTERVAL_SEC = 900     # offline rollup cadence (evolution loop)
 # over trade-only reasoning parses once enough resolved decisions exist.
 DECISION_LEARN_FROM_ALL = True
 DECISION_LEARN_MIN_RESOLVED = 30       # floor before replacing trade-only path
+# Hybrid meta-learner counterfactuals (bots/meta_learner.py): score sub-votes
+# from resolved decision_events skips (would-be trades), not only filled buys.
+# CF step is scaled by HYBRID_META_CF_ETA_SCALE so one skip ≠ one real trade.
+HYBRID_META_CF_ENABLED = True
+HYBRID_META_CF_ETA_SCALE = 0.25        # CF Hedge step = eta * this
+HYBRID_META_CF_MAX_PER_CYCLE = 200     # bound per maybe_update pass
 
 # --- Session-timing skip filter (arena/session_filter.py) ---
 # 'Build the skip': sit flat during high-flip session handovers. Defaults are

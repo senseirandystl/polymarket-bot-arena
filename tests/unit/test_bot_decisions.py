@@ -206,9 +206,22 @@ class TestSniper:
         assert sig["edge"] > 0
         assert sig["signals"]["drift"] == pytest.approx(0.45)
 
-    def test_quiet_regime_raises_drift_bar(self, arena_db):
+    def test_quiet_regime_raises_drift_bar(self, arena_db, monkeypatch):
         bot = SniperBot(name="sniper-t", generation=0)
-        bump = bot.strategy_params["quiet_drift_bump"]
+        # Isolate from live regime_adapt extra floors that can raise min_d
+        # above the dual-gate floor and flake this unit test.
+        class _Flat:
+            extra_drift_floor = 0.0
+            edge_mult = 1.0
+            label = "normal"
+            block_strategy = False
+            reason = ""
+
+        monkeypatch.setattr(
+            "arena.regime_adapt.adjustments",
+            lambda *a, **k: _Flat(),
+            raising=False,
+        )
         # TWAP dual-gate floors sniper at 0.40. Use drift just above the
         # floor so the quiet bump (0.05) pushes the bar above it.
         drift = 0.42  # clears 0.40 dual-gate; quiet bar = 0.40+0.05=0.45

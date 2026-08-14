@@ -5,7 +5,8 @@ Uses REAL data, writes nothing to the runtime DB:
   * resolved BTC 5-min markets from Polymarket Gamma (window times + true outcome)
   * BTC price trajectory from Binance 1m klines (proxy for ranking only)
 
-Live resolution (2026-08-07+) is Chainlink **30s TWAP** at open vs close, not a
+Live resolution (2026-08-07+) is Chainlink **TWAP** at open vs close (60s for
+5m markets), not a
 single Binance print. This harness still reconstructs strike as the Binance open
 at ``eventStartTime`` and trajectories from 1m klines — fine for *ordering*
 signals and relative net-edge, **not** absolute live P&L. Never use mid-window

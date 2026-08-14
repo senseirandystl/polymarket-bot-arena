@@ -35,6 +35,9 @@ class SharedArenaState:
         # (bot, market_id) -> unix time until which execute is suppressed after
         # a slippage reject (config.SLIPPAGE_RETRY_COOLDOWN_SEC).
         self._slippage_until: dict = {}
+        # Optional directional window lock: market_id set once any directional
+        # bot fills (DIRECTIONAL_WINDOW_LOCK; off by default, Settings toggle).
+        self._directional_locked: set = set()
 
     def is_traded(self, key: tuple) -> bool:
         with self._lock:
@@ -45,6 +48,14 @@ class SharedArenaState:
             self.traded.add(key)
             # A real fill ends any pending slippage cooldown for this pair.
             self._slippage_until.pop(key, None)
+
+    def is_directional_locked(self, market_id: str) -> bool:
+        with self._lock:
+            return str(market_id) in self._directional_locked
+
+    def mark_directional_lock(self, market_id: str) -> None:
+        with self._lock:
+            self._directional_locked.add(str(market_id))
 
     def is_slippage_cooling(self, key: tuple, now: float | None = None) -> bool:
         """True while this (bot, market) is in post-slippage backoff."""
@@ -100,3 +111,4 @@ class SharedArenaState:
         with self._lock:
             self.traded.clear()
             self._slippage_until.clear()
+            self._directional_locked.clear()

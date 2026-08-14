@@ -28,6 +28,7 @@ Competing trading bots on **Polymarket BTC 5-minute Up/Down** markets.
 9. [Setup & run](#setup--run)
 10. [Path to live trading](#path-to-live-trading)
 11. [Dashboard & ops](#dashboard--ops)
+12. [Telegram alerts & commands](#telegram-alerts--commands)
 
 ---
 
@@ -315,7 +316,7 @@ trust_eff = trust · min(1, lean / CONVICTION_SCALE)
 edge_side = trust_eff · (P_side − ask_side) − taker_fee
 ```
 
-- **Live core lanes:** `drift` (BTC **TWAP** vs window-open TWAP strike, 30s for 5m markets since 2026-08-07), `mom` (1-candle spot), `strat` (`analyze()` thesis, magnitude-capped).
+- **Live core lanes:** `drift` (BTC **TWAP** vs window-open TWAP strike, 60s lookback for 5m markets — `TWAP_WINDOW_SEC`), `mom` (1-candle spot), `strat` (`analyze()` thesis, magnitude-capped).
 - **Kill-switched / candidates:** `pm`, `cvd`, `obi`, `fut`, `tech`, `xasset` — logged as `cand(...)` for shadow attribution; weight stays 0 until promoted.
 - **Two-sided:** each side scored on its own ask + fee; buy the larger positive edge above per-strategy `MIN_EDGE`.
 - **Sizing:** fractional Kelly `f* = edge/(1−price)`, bet = `KELLY_FRACTION × f* × bankroll` (paper pool shared; live hard-capped).
@@ -402,7 +403,7 @@ Layered defenses (all paper/live unless noted):
 | **Risk engine** | Daily loss floors, max drawdown pause, size taper into DD, underperform pause, optional VaR, **kill switch** |
 | **Health** | `/healthz` (log age + kill flag), alerts hooks, Docker/launchd restarts |
 
-Kill switch: dashboard control, `arena_state`, or file `logs/KILL_SWITCH` (Docker: `data/logs/KILL_SWITCH`).
+Kill switch: dashboard control, Telegram `/kill`, `arena_state`, or file `logs/KILL_SWITCH` (Docker: `data/logs/KILL_SWITCH`).
 
 ---
 
@@ -510,8 +511,8 @@ Do **not** flip live until paper is boringly green. Checklist:
 - [ ] `LIVE_MAX_POSITION` and live daily loss limits reviewed in `config.py` (code-reviewed, not ambient env)
 - [ ] Start with **one** bot live at minimum size; rest stay paper
 - [ ] Compare live fill prices vs paper decision asks for a session (slippage / reject rate)
-- [ ] Document who can hit kill switch and how (dashboard / file / API)
-- [ ] Alerts enabled if you rely on unattended ops (`ALERTS_ENABLED` / dashboard)
+- [ ] Document who can hit kill switch and how (dashboard / Telegram `/kill` / file)
+- [ ] Alerts enabled if you rely on unattended ops (dashboard Settings → Telegram bot token + chat id)
 
 ### Phase D — Scale
 
@@ -525,7 +526,7 @@ Do **not** flip live until paper is boringly green. Checklist:
 
 ## Dashboard & ops
 
-Port **8501** (Basic auth). Tabs include P&L, per-bot stats, markets, trades, evolution, entry buckets, **Signal Lab**, risk, Settings (paper balance top-up, Kelly fraction, credentials).
+Port **8501** (Basic auth). Tabs include P&L, per-bot stats, markets, trades, evolution, entry buckets, **Signal Lab**, risk, Settings (paper balance top-up, Kelly fraction, credentials, Telegram).
 
 ```bash
 curl -s http://127.0.0.1:8501/healthz
@@ -537,6 +538,21 @@ curl -s http://127.0.0.1:8501/healthz
 | Docker | [`docs/docker.md`](./docs/docker.md) |
 | launchd | [`CLAUDE.md`](./CLAUDE.md) → launchd Services |
 | systemd | `deploy/systemd/` |
+
+## Telegram alerts & commands
+
+Same bot token and chat id, configured once in dashboard **Settings** (`alert_telegram_bot_token` / `alert_telegram_chat_id`).
+
+**Outbound alerts** (`arena/alerts.py`) push hour/day digests, kill-switch, health, and risk events to that chat (optional Discord/email too).
+
+**Inbound commands** (`arena/telegram_commands.py`) long-poll from the **dashboard** process so `/status` still answers if the arena has died. Any chat other than the configured one is dropped with no reply.
+
+| Kind | Commands |
+|------|----------|
+| Reports | `/hour [h]` `/day` `/week` `/status` `/bots` `/lanes` `/soak` `/help` |
+| Control | `/kill` `/unkill confirm` `/pause <bot\|all>` `/resume <bot\|all> confirm` `/retire <bot> confirm` `/deploy <strategy…>` |
+
+Control is gated by `TELEGRAM_COMMANDS_CONTROL_ENABLED`. `/retire` and `/resume` need the explicit `confirm` word. Backlogged updates are acked, not executed, on dashboard start — a `/kill` sent yesterday will not fire on today's restart. Restart the dashboard after enabling credentials so the poller starts.
 
 ---
 

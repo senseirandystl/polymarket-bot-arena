@@ -260,6 +260,7 @@ def init_db():
                 trust_eff REAL,
                 regime TEXT,
                 features TEXT,                   -- JSON feature list
+                meta_token TEXT,                 -- hybrid meta(mom=… | reg=…) for CF learning
                 trade_id INTEGER,                -- trades.id when filled
                 market_up INTEGER,               -- 1/0 once market resolved
                 would_win INTEGER,               -- side correct vs market_up
@@ -295,6 +296,8 @@ def init_db():
             # (signals/context.py). JSON; NULL on legacy rows. Layer 1 of the
             # regime-discovery design — attribution groups on context_cell(...).
             "ALTER TABLE trades ADD COLUMN context TEXT",
+            # Hybrid sub-vote token for counterfactual meta-learning on skips.
+            "ALTER TABLE decision_events ADD COLUMN meta_token TEXT",
         ]:
             try:
                 conn.execute(migration)
@@ -627,6 +630,58 @@ def get_active_bots():
         return [dict(r) for r in rows]
 
 
+def get_retired_bots():
+    """Inactive (evolved-out / manually retired) bot configs, newest first."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            """SELECT * FROM bot_configs
+               WHERE active=0
+               ORDER BY COALESCE(retired_at, created_at) DESC"""
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_graveyard_stats():
+    """Overview stats for every retired bot (all-time resolved performance).
+
+    Used by the Bots-tab Graveyard card under Elite Gene Bank.
+    """
+    retired = get_retired_bots()
+    out = []
+    for cfg in retired:
+        name = cfg.get("bot_name")
+        if not name:
+            continue
+        perf = get_bot_performance(name, hours=None)
+        params = cfg.get("params")
+        if isinstance(params, str):
+            try:
+                params = json.loads(params)
+            except (json.JSONDecodeError, TypeError):
+                params = {}
+        out.append({
+            "bot_name": name,
+            "strategy_type": cfg.get("strategy_type"),
+            "generation": cfg.get("generation") or 0,
+            "lineage": cfg.get("lineage"),
+            "params": params if isinstance(params, dict) else {},
+            "created_at": cfg.get("created_at"),
+            "retired_at": cfg.get("retired_at"),
+            "trading_mode": cfg.get("trading_mode") or "paper",
+            "total_trades": perf.get("total_trades") or 0,
+            "wins": perf.get("wins") or 0,
+            "losses": perf.get("losses") or 0,
+            "win_rate": perf.get("win_rate") or 0.0,
+            "total_pnl": perf.get("total_pnl") or 0.0,
+            "avg_pnl": perf.get("avg_pnl") or 0.0,
+            "avg_entry": perf.get("avg_entry"),
+            "breakeven_gap": perf.get("breakeven_gap"),
+        })
+    # Sort by lifetime P&L ascending (worst first — graveyard mood)
+    out.sort(key=lambda b: (b.get("total_pnl") or 0.0))
+    return out
+
+
 def log_evolution(cycle_number, survivors, replaced, new_bots, rankings):
     with get_conn() as conn:
         conn.execute(
@@ -876,6 +931,33 @@ def get_dashboard_stats():
         # e.g. "229 +2". 1h-stale-expired trades (outcome='expired', pnl=0)
         # count as resolved — they are real paper trades Simmer could not
         # settle in time, contributing 0 to P&L and to neither win nor loss.
+        # Lock-in bots (sweeper + arbitrage) inflate headline WR with near-certain
+        # late-window / market-neutral fills. Surface Core vs Lock-in so a
+        # directional bleed can't hide under sweeper 99¢ locks.
+        # "Core" = everything else (momentum / meanrev / sniper / hybrid / makers…).
+        _LOCKIN_PREFIXES = ("sweeper", "arbitrage", "arb-")
+        # Legacy alias kept for older callers / tests that still say "structural".
+        _STRUCTURAL_PREFIXES = _LOCKIN_PREFIXES + ("lwm", "fzm", "maker", "true-maker")
+
+        def _empty_period():
+            return {
+                "trades": 0, "pending": 0, "pnl": 0.0,
+                "wins": 0, "losses": 0,
+                "directional_trades": 0, "directional_pnl": 0.0,
+                "directional_wins": 0, "directional_losses": 0,
+                "structural_trades": 0, "structural_pnl": 0.0,
+                "structural_wins": 0, "structural_losses": 0,
+                # Explicit Core / Lock-in names for the Performance card.
+                "core_trades": 0, "core_pnl": 0.0,
+                "core_wins": 0, "core_losses": 0,
+                "lockin_trades": 0, "lockin_pnl": 0.0,
+                "lockin_wins": 0, "lockin_losses": 0,
+            }
+
+        def _is_lockin(bot_name: str) -> bool:
+            name = (bot_name or "").lower()
+            return any(name.startswith(p) for p in _LOCKIN_PREFIXES)
+
         def _period(since=None, bot_names=None):
             conds = []
             params: list = []
@@ -884,8 +966,7 @@ def get_dashboard_stats():
                 params.append(since)
             if bot_names is not None:
                 if not bot_names:
-                    return {"trades": 0, "pending": 0, "pnl": 0.0,
-                            "wins": 0, "losses": 0}
+                    return _empty_period()
                 placeholders = ",".join("?" * len(bot_names))
                 conds.append(f"bot_name IN ({placeholders})")
                 params.extend(bot_names)
@@ -902,6 +983,51 @@ def get_dashboard_stats():
             d = dict(row)
             for k in ("trades", "pending", "wins", "losses"):
                 d[k] = d[k] or 0
+            # Core vs Lock-in split (prefix list is small — post-filter in Python)
+            try:
+                q = f"SELECT bot_name, outcome, pnl FROM trades {clause}"
+                rows = conn.execute(q, params).fetchall()
+            except Exception:
+                rows = []
+            core_trades = core_wins = core_losses = 0
+            lock_trades = lock_wins = lock_losses = 0
+            core_pnl = lock_pnl = 0.0
+            for r in rows:
+                if r["outcome"] is None:
+                    continue
+                pnl = float(r["pnl"] or 0.0)
+                if _is_lockin(r["bot_name"]):
+                    lock_trades += 1
+                    lock_pnl += pnl
+                    if pnl > 0:
+                        lock_wins += 1
+                    elif pnl < 0:
+                        lock_losses += 1
+                else:
+                    core_trades += 1
+                    core_pnl += pnl
+                    if pnl > 0:
+                        core_wins += 1
+                    elif pnl < 0:
+                        core_losses += 1
+            # New names (Performance card)
+            d["core_trades"] = core_trades
+            d["core_pnl"] = core_pnl
+            d["core_wins"] = core_wins
+            d["core_losses"] = core_losses
+            d["lockin_trades"] = lock_trades
+            d["lockin_pnl"] = lock_pnl
+            d["lockin_wins"] = lock_wins
+            d["lockin_losses"] = lock_losses
+            # Backward-compatible aliases
+            d["directional_trades"] = core_trades
+            d["directional_pnl"] = core_pnl
+            d["directional_wins"] = core_wins
+            d["directional_losses"] = core_losses
+            d["structural_trades"] = lock_trades
+            d["structural_pnl"] = lock_pnl
+            d["structural_wins"] = lock_wins
+            d["structural_losses"] = lock_losses
             return d
 
         return {
@@ -1196,6 +1322,22 @@ def get_pilein_ev_gate() -> bool:
 def set_pilein_ev_gate(enabled: bool):
     """Flip the pile-in EV gate toggle (dashboard Settings)."""
     set_arena_state("pilein_ev_gate", "1" if enabled else "0")
+
+
+def get_directional_window_lock() -> bool:
+    """Whether one directional fill locks the market for other directionals.
+
+    OFF by default (config.DIRECTIONAL_WINDOW_LOCK). Dashboard Settings toggle.
+    """
+    raw = get_arena_state("directional_window_lock")
+    if raw is None:
+        return bool(getattr(config, "DIRECTIONAL_WINDOW_LOCK", False))
+    return str(raw) in ("1", "true", "True", "yes", "on")
+
+
+def set_directional_window_lock(enabled: bool):
+    """Flip the directional window-lock toggle (dashboard Settings)."""
+    set_arena_state("directional_window_lock", "1" if enabled else "0")
 
 
 def get_regime_conditioning() -> bool:

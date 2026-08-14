@@ -3,9 +3,9 @@
 Thesis: near expiry, BTC **TWAP** direction is largely locked; buy the lagging
 side when drift is strong and the book still underprices it.
 
-Under TWAP resolution (2026-08-07+) the last 30s are an averaging window, not
-a single print race — enter before/through that window on TWAP moneyness
-(``btc_drift``), not last-tick snipes.
+Under TWAP resolution the last ``TWAP_WINDOW_SEC`` (60s for 5m) are an
+averaging window, not a single print race — enter before/through that
+window on TWAP moneyness (``btc_drift``), not last-tick snipes.
 
 2026-08 redesign:
   * Mid/ask integrity gate (no more mid=0.90 ask=0.49 fantasy edges).
@@ -27,7 +27,7 @@ from bots.maker_utils import maker_kelly_amount, mid_ask_gap_ok, resolve_side_ex
 from signals.lab import SignalView
 
 DEFAULT_PARAMS = {
-    # Cover pre-TWAP lock-in + full 30s settlement averaging window.
+    # Cover pre-TWAP lock-in + full settlement averaging window (60s + lead).
     "entry_window_sec": 120,
     "min_drift": 0.28,
     "min_momentum": 0.0004,     # momentum must not contradict drift

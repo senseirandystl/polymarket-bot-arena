@@ -78,7 +78,19 @@ only; recompute from the live DB after paper soaks.
 | **Terminal** | `./bin/arena` — interactive slate; auto-spawns dashboard unless `ARENA_NO_DASHBOARD=1` |
 
 - **Dashboard:** FastAPI port **8501**, HTTP Basic (`DASHBOARD_USER` / `DASHBOARD_PASS`; default password warns in logs — change before public expose). Unauthenticated **`/healthz`** for probes (arena log age + kill switch).
-- **Price feed:** Polymarket RTDS Chainlink BTC **spot** (mom/regime candles) + **30s TWAP** (Price to Beat, live BTC display, drift moneyness — same as Polymarket UI) + Binance ETH/SOL 1m and BTC volume-only (+ futures meta background thread when candidates enabled). Dashboard "Bitcoin (TWAP)" / "BTC now (TWAP)" subscribe to `crypto_prices_twap_thirty`, not spot.
+- **Telegram commands:** `arena/telegram_commands.py` — inbound `getUpdates`
+  long-poll hosted by the **dashboard** process (it outlives an arena crash, so
+  `/status` still answers when the arena is what died). Same
+  `alert_telegram_*` credentials as outbound alerts; **auth is the chat-id
+  allowlist** — an update from any other chat is dropped with no reply.
+  Reports: `/hour [h]` `/day` `/week` `/status` `/bots` `/lanes` `/soak`
+  `/help`. Control (`TELEGRAM_COMMANDS_CONTROL_ENABLED`): `/kill` `/unkill`
+  `/pause <bot|all>` `/resume <bot|all> confirm` `/retire <bot> confirm`
+  `/deploy <strategy…>`. `/retire` needs the explicit `confirm` word; `/deploy`
+  writes the same `pending_bot_deploys` queue the dashboard button uses.
+  Backlogged updates are **acked, not executed**, on startup — a `/kill` sent
+  yesterday must not fire on today's restart.
+- **Price feed:** Polymarket RTDS Chainlink BTC **spot** (mom/regime candles) + **60s TWAP** (Price to Beat, Current Market BTC now, drift moneyness — same as Polymarket UI; `TWAP_WINDOW_SEC`) + Binance ETH/SOL 1m and BTC volume-only (+ futures meta background thread when candidates enabled). Dashboard top-left chip is **spot tick**; Current Market "BTC now (TWAP)" uses `crypto_prices_twap_sixty`.
 - **DB:** SQLite `bot_arena.db` (or `ARENA_DB_PATH` / Docker `/data/bot_arena.db`), WAL mode for dual-process access.
 
 > **launchd note:** plists in `~/Library/LaunchAgents/` should be **symlinks** to the repo so `git pull` updates them. Logs under `~/Library/Logs/`. See [launchd Services](#launchd-services).
@@ -287,26 +299,27 @@ first minute instead of a hard time ban.
 **`btc_drift` (`signals/strike.py` + TWAP path) is the validated fundamental.**
 Each window resolves UP iff Chainlink **TWAP** at CLOSE ≥ TWAP at OPEN (Price
 to Beat). Effective **2026-08-07 00:00 UTC**, both open and settlement use the
-30-second TWAP feed for 5-minute markets (60s for 15m/4h) — not a single spot
-snapshot. Spec: https://docs.polymarket.com/market-data/chainlink-twap
+**60-second TWAP** feed for 5-minute markets (`TWAP_WINDOW_SEC`; was 30s at
+2026-08-07 cutover) — not a single spot snapshot. Spec:
+https://docs.polymarket.com/market-data/chainlink-twap
 
-The **strike** is the Chainlink **30s TWAP at window open** (RTDS
-`crypto_prices_twap_thirty` latched at `eventStartTime`, sticky source
+The **strike** is the Chainlink **TWAP at window open** (RTDS
+`crypto_prices_twap_sixty` latched at `eventStartTime`, sticky source
 `twap_open`). That is what Polymarket’s UI shows as Price to Beat. REST
 `/api/crypto/crypto-price` `openPrice` is a **fallback only** — live soak
 found it can diverge ~$2–3 from the UI/TWAP feed. Spot latch is last resort.
 Live never uses Binance for strike.
 
 Live ``btc_now`` for moneyness (`arena/signals.py` → `signals/twap.py`):
-1. **Settlement nowcast** inside the final 30s (local ticks over
+1. **Settlement nowcast** inside the final `TWAP_WINDOW_SEC` (local ticks over
    `[expiry−W, now]`, remaining filled with last price) when coverage is OK
 2. Else official **rolling RTDS TWAP**
 3. Else spot Chainlink fallback
 
 **Settlement-window policy** (`signals/twap.settlement_adjustments`,
 `TWAP_SETTLEMENT_POLICY`): market phases `open` / `mid` / `pre_settle` /
-`settlement`. In the final 30s, `twap_certainty` (elapsed fraction × coverage
-× |drift|) drives:
+`settlement`. In the final TWAP window, `twap_certainty` (elapsed fraction ×
+coverage × |drift|) drives:
 - **High cert** → slightly easier min_edge, modest size boost, conf structure boost
 - **Low cert** → much harder min_edge, size cut (noisy partial TWAP)
 - **Mom damp** (spot 1m lane) in settlement/pre_settle (not the resolution object)
@@ -580,6 +593,7 @@ arena/lane_monitor.py    # Auto-demote candidate lanes
 arena/lane_promoter.py   # Live-shadow auto-approve
 arena/core_lane_tuner.py # Core drift/mom/strat weight nudges
 arena/startup.py         # Interactive continue/fresh + bot menu (tty only)
+arena/telegram_commands.py # Inbound /hour /kill /pause … (dashboard-hosted)
 bots/base_bot.py         # make_decision blend + Kelly + execute → venue
 bots/meta_learner.py     # Hybrid online regime-bucket weights
 bots/bot_*.py            # Per-strategy implementations

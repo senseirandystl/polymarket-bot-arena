@@ -6,6 +6,7 @@ import os
 import secrets
 import sys
 import time
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -52,7 +53,31 @@ def verify_auth(credentials: HTTPBasicCredentials = Depends(security)):
     return credentials.username
 
 
-app = FastAPI(title="Polymarket Bot Arena Dashboard", dependencies=[Depends(verify_auth)])
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    """Host the inbound Telegram command poller here, not in the arena.
+
+    The dashboard is the process that survives an arena crash — which is
+    exactly when ``/status`` from a phone is worth having. Idempotent and
+    fully optional: no bot token / chat id configured means no thread.
+    """
+    try:
+        from arena import telegram_commands
+        if telegram_commands.start_poller():
+            logger.info("Telegram command poller running (control=%s)",
+                        getattr(config, "TELEGRAM_COMMANDS_CONTROL_ENABLED", True))
+    except Exception:
+        logger.exception("Telegram command poller failed to start")
+    yield
+    try:
+        from arena import telegram_commands
+        telegram_commands.stop_poller()
+    except Exception:
+        pass
+
+
+app = FastAPI(title="Polymarket Bot Arena Dashboard",
+              dependencies=[Depends(verify_auth)], lifespan=_lifespan)
 
 
 @app.middleware("http")
@@ -396,11 +421,13 @@ def get_markets():
         return shaped
 
     # Live BTC from arena price_feed_status (shared SQLite).
-    # Display / Polymarket parity: Chainlink **TWAP** (30s for 5m markets).
-    # Spot remains available for forecasting context (mom/regime), not UI PTB delta.
-    btc_price = None
+    # Top-left chip wants **spot tick**; Current Market "BTC now" wants **TWAP**.
+    btc_price = None          # legacy: TWAP-preferred (Current Market)
     btc_stale = True
     btc_spot = None
+    btc_spot_stale = True
+    btc_twap = None
+    btc_twap_stale = True
     btc_source = None
     try:
         import json as _json
@@ -408,15 +435,17 @@ def get_markets():
         pf = _json.loads(raw) if raw else {}
         btc = ((pf or {}).get("symbols") or {}).get("btc") or {}
         btc_spot = btc.get("latest")
-        # Prefer TWAP / resolution_price for "BTC now" (matches Polymarket UI).
+        btc_spot_stale = bool(btc.get("stale") or (pf or {}).get("stale"))
         twap = btc.get("twap") or btc.get("resolution_price")
         if twap is not None and float(twap) > 0:
-            btc_price = float(twap)
-            btc_stale = bool(btc.get("twap_stale") or btc.get("twap_degraded"))
+            btc_twap = float(twap)
+            btc_twap_stale = bool(btc.get("twap_stale") or btc.get("twap_degraded"))
+            btc_price = btc_twap
+            btc_stale = btc_twap_stale
             btc_source = "twap"
         else:
             btc_price = btc_spot
-            btc_stale = bool(btc.get("stale") or (pf or {}).get("stale"))
+            btc_stale = btc_spot_stale
             btc_source = "spot"
     except Exception:
         pass
@@ -428,9 +457,12 @@ def get_markets():
         "next": upcoming_s[0] if upcoming_s else None,
         "upcoming_count": len(upcoming_s),
         "upcoming": upcoming_s,
-        "btc_price": btc_price,           # TWAP-preferred (Polymarket "Current Price")
+        "btc_price": btc_price,           # TWAP-preferred (Current Market "BTC now")
         "btc_stale": btc_stale,
-        "btc_spot": btc_spot,             # Chainlink spot (forecasting only)
+        "btc_spot": btc_spot,             # Chainlink live tick (top-left chip)
+        "btc_spot_stale": btc_spot_stale,
+        "btc_twap": btc_twap,             # explicit TWAP for Current Market
+        "btc_twap_stale": btc_twap_stale,
         "btc_source": btc_source,         # "twap" | "spot"
     })
 
@@ -639,6 +671,31 @@ async def set_pilein_ev_gate(request: Request, _auth: str = Depends(verify_auth)
     enabled = bool((body or {}).get("enabled", True))
     db.set_pilein_ev_gate(enabled)
     return JSONResponse({"success": True, "enabled": db.get_pilein_ev_gate()})
+
+
+@app.get("/api/settings/directional-window-lock")
+def get_directional_window_lock(_auth: str = Depends(verify_auth)):
+    """After one directional fill, lock market for other directionals (OFF default)."""
+    return JSONResponse({
+        "enabled": db.get_directional_window_lock(),
+        "default": bool(getattr(config, "DIRECTIONAL_WINDOW_LOCK", False)),
+        "one_trade_per_tick": bool(getattr(config, "ONE_TRADE_PER_TICK", True)),
+        "market_side_max_bots": int(getattr(config, "MARKET_SIDE_MAX_BOTS", 1)),
+    })
+
+
+@app.post("/api/settings/directional-window-lock")
+async def set_directional_window_lock(request: Request, _auth: str = Depends(verify_auth)):
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    enabled = bool((body or {}).get("enabled", False))
+    db.set_directional_window_lock(enabled)
+    return JSONResponse({
+        "success": True,
+        "enabled": db.get_directional_window_lock(),
+    })
 
 
 @app.get("/api/settings/kelly")
@@ -1524,6 +1581,12 @@ def get_ga():
     except Exception:
         gene_bank_entries = []
 
+    # Graveyard — retired bots with lifetime P&L / WR overview.
+    try:
+        graveyard = db.get_graveyard_stats()
+    except Exception:
+        graveyard = []
+
     return JSONResponse({
         "status": status,
         "generations": compact,
@@ -1532,6 +1595,7 @@ def get_ga():
             "count": len(gene_bank_entries),
             "max_size": gene_bank_max,
         },
+        "graveyard": graveyard,
         "config": {
             "elite_count": getattr(config, "GA_ELITE_COUNT", 1),
             "mutation_rate": getattr(config, "GA_MUTATION_RATE", 0.2),

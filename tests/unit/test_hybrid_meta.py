@@ -168,6 +168,85 @@ class TestOnlineUpdate:
         assert json.loads(raw)["subs"]["momentum"]["overall"]["n"] == 1
 
 
+def _insert_cf_decision(db_module, votes, bucket, market_up,
+                        bot_name="hybrid-v1", action="skip"):
+    """Resolved hybrid skip with meta_token for counterfactual learning."""
+    token = format_token(votes, bucket)
+    with db_module.get_conn() as conn:
+        cur = conn.execute(
+            """INSERT INTO decision_events (
+                   bot_name, strategy_type, market_id, action, side,
+                   meta_token, market_up, would_win
+               ) VALUES (?, 'hybrid', 'mkt-cf', ?, 'yes', ?, ?, ?)""",
+            (bot_name, action, token, 1 if market_up else 0,
+             1 if market_up else 0),
+        )
+        return cur.lastrowid
+
+
+class TestCounterfactualUpdate:
+    def test_skip_votes_update_multipliers(self, arena_db):
+        # market UP: momentum yes-vote correct, mean_rev no-vote wrong
+        _insert_cf_decision(
+            arena_db,
+            {"momentum": 0.5, "mean_rev": -0.4, "phantom": 0.0},
+            "trending", market_up=True,
+        )
+        learner = HybridMetaLearner(eta=0.12)
+        assert learner.update_from_decisions() == 1
+        state = learner.snapshot()
+        assert state["subs"]["momentum"]["overall"]["mult"] > 1.0
+        assert state["subs"]["mean_rev"]["overall"]["mult"] < 1.0
+        assert "phantom" not in state["subs"]  # abstained
+        assert state["cf"]["n"] == 1
+        assert state["last_decision_id"] > 0
+
+    def test_cf_eta_smaller_than_trade_eta(self, arena_db, monkeypatch):
+        import config as cfg
+        monkeypatch.setattr(cfg, "HYBRID_META_CF_ETA_SCALE", 0.25)
+        monkeypatch.setattr(cfg, "HYBRID_META_CF_ENABLED", True)
+        # One CF skip where momentum is correct
+        _insert_cf_decision(
+            arena_db, {"momentum": 0.5}, "mixed", market_up=True)
+        cf_learner = HybridMetaLearner(eta=0.12)
+        cf_learner.update_from_decisions()
+        cf_mult = cf_learner.snapshot()["subs"]["momentum"]["overall"]["mult"]
+
+        # One real trade, same vote — should move farther (full eta)
+        _insert_trade(arena_db, {"momentum": 0.5}, "mixed", "yes", "win",
+                      bot_name="hybrid-v2")
+        tr_learner = HybridMetaLearner(eta=0.12, name_prefix="hybrid-v2")
+        tr_learner.update_from_trades()
+        tr_mult = tr_learner.snapshot()["subs"]["momentum"]["overall"]["mult"]
+
+        assert tr_mult > cf_mult > 1.0
+
+    def test_buys_not_double_counted_via_decisions(self, arena_db):
+        # action=buy rows must be ignored by CF path
+        _insert_cf_decision(
+            arena_db, {"momentum": 0.5}, "mixed", market_up=True, action="buy")
+        learner = HybridMetaLearner()
+        assert learner.update_from_decisions() == 0
+
+    def test_incremental_cf_cursor(self, arena_db):
+        _insert_cf_decision(
+            arena_db, {"momentum": 0.5}, "mixed", market_up=True)
+        learner = HybridMetaLearner()
+        assert learner.update_from_decisions() == 1
+        assert learner.update_from_decisions() == 0
+
+    def test_maybe_update_runs_both_paths(self, arena_db):
+        _insert_trade(arena_db, {"momentum": 0.4}, "mixed", "yes", "win")
+        _insert_cf_decision(
+            arena_db, {"phantom": -0.5}, "ranging", market_up=False)
+        learner = HybridMetaLearner(update_ttl=0.0)
+        n = learner.maybe_update()
+        assert n >= 2
+        snap = learner.snapshot()
+        assert snap["subs"]["momentum"]["overall"]["n"] >= 1
+        assert snap["subs"]["phantom"]["overall"]["n"] >= 1
+
+
 # ---------------------------------------------------------------------------
 # Decision-time reads: shrinkage blend
 # ---------------------------------------------------------------------------
@@ -264,6 +343,30 @@ class TestHybridIntegration:
         assert bucket == "trending"
         assert any(abs(v) > 0 for v in votes.values())
         assert "[w=" in sig["reasoning"]       # effective weights visible
+        assert sig.get("meta_token") and "meta(" in sig["meta_token"]
+
+    def test_hold_with_votes_stamps_meta_for_cf(self, arena_db):
+        """Choppy single-sub lean should hold but still stamp meta_token."""
+        bot = HybridBot(name="hybrid-t")
+        # Force only momentum sub to fire (mean_rev/phantom hold)
+        hold = {"action": "hold", "side": "yes", "confidence": 0.0, "reasoning": ""}
+        buy = {"action": "buy", "side": "yes", "confidence": 0.6, "reasoning": "mom"}
+        with _neutral_perf(bot):
+            with patch.object(bot, "_cached_sub_analyze",
+                              return_value={"momentum": buy, "mean_rev": hold,
+                                            "phantom": hold}):
+                # normal/choppy regime requires ≥2-sub agreement → hold
+                sig = bot.analyze(
+                    make_market(),
+                    make_signals(btc_drift=0.2,
+                                 vol_regime={"regime": "normal",
+                                             "trend_score": 0.5},
+                                 market_regime={"regime": "normal"}),
+                )
+        assert sig["action"] == "hold"
+        assert sig.get("meta_token")
+        assert parse_token(sig["reasoning"]) is not None
+        assert abs(sig["signals"]["votes"].get("momentum", 0)) > 0
 
     def test_signals_expose_weights_online_and_bucket(self, arena_db):
         bot = HybridBot(name="hybrid-t")

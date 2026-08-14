@@ -7,13 +7,14 @@ Inspired by 0x_Punisher's sweeper V2 thesis (Polymarket):
   (rate · p · (1−p)) nearly vanishes, so thin gross edges can clear fees.
   Do NOT chase mid-book "sweeps" at 90–95¢ — fee rises and flip risk returns.
 
-BTC 5-minute adaptation (TWAP resolution, 2026-08-07+)
--------------------------------------------------------
-"Decided" is not a single settlement print — both open and close are 30s
-Chainlink TWAPs. Instant late spikes no longer flip the outcome; the
-averaging window starts ~30s before expiry. "Decided" means:
+BTC 5-minute adaptation (TWAP resolution, 2026-08-07+; 60s lookback)
+--------------------------------------------------------------------
+"Decided" is not a single settlement print — both open and close are
+Chainlink TWAPs (``TWAP_WINDOW_SEC``, 60s for 5m). Instant late spikes no
+longer flip the outcome; the averaging window starts ~60s before expiry.
+"Decided" means:
 
-  * late enough (inside entry_window_sec, preferably inside/near TWAP window)
+  * late enough (inside entry_window_sec = pre_settle + TWAP window)
   * strong signed ``btc_drift`` (TWAP moneyness) toward one side
   * optional ``twap_certainty`` floor once the settlement window is open
   * book already confirming that side at extreme prices
@@ -36,10 +37,10 @@ from bots.base_bot import BaseBot, strategy_decision
 from signals.lab import SignalView
 
 DEFAULT_PARAMS = {
-    # Final 45s only: pre_settle + settlement TWAP window (not earlier "locks").
-    # Overnight soak 2026-08-07: 75s entries at 98¢ with moderate cert blew
+    # pre_settle lead + full TWAP settlement window (config-driven; 20+60=80).
+    # Overnight soak 2026-08-07: early 98¢ entries with moderate cert blew
     # the book — require the averaging window / late certainty.
-    "entry_window_sec": 45,
+    "entry_window_sec": 80,
     # Fundamental certainty proxy (YES-frame TWAP-drift magnitude toward side).
     "min_drift": 0.65,
     # Once inside the TWAP settlement window, require this certainty (0–1).
@@ -88,7 +89,14 @@ class SweeperBot(BaseBot):
         sv = SignalView.of(signals)
 
         time_rem = market.get("time_remaining_seconds")
-        entry_window = int(p.get("entry_window_sec", 45))
+        # Floor to config horizon (pre_settle + TWAP window) so a stale
+        # evolved param cannot re-open early 98¢ entries after a window cutover.
+        try:
+            from signals.twap import settlement_entry_horizon_sec
+            horizon = int(settlement_entry_horizon_sec())
+        except Exception:
+            horizon = 80
+        entry_window = max(int(p.get("entry_window_sec", horizon) or horizon), horizon)
         if time_rem is None or float(time_rem) > entry_window:
             return strategy_decision(
                 "skip",

@@ -1,9 +1,11 @@
 """Chainlink / Polymarket TWAP helpers for BTC 5-min resolution.
 
 Effective 2026-08-07 00:00 UTC, Polymarket crypto up/down markets resolve on
-Chainlink-computed **time-weighted average prices**, not single snapshots:
+Chainlink-computed **time-weighted average prices**, not single snapshots.
 
-  * 5-minute markets  → 30-second TWAP
+Lookback windows (config-driven; override via ``TWAP_WINDOW_SEC`` env):
+
+  * 5-minute markets  → **60-second TWAP** (was 30s at initial cutover)
   * 15-minute / 4h    → 60-second TWAP
 
 Both the **opening Price to Beat** and the **final settlement price** come
@@ -11,7 +13,8 @@ from the applicable TWAP feed (PolymarketDevs clarification).
 
 This module is pure math + policy helpers:
 
-  * ``window_seconds_for_market`` — pick 30 vs 60 from market duration
+  * ``window_seconds_for_market`` — pick lookback from market duration
+  * ``rtds_topic`` — RTDS topic for the active lookback (thirty vs sixty)
   * ``compute_twap`` — local time-weighted average over a tick series
   * ``settlement_nowcast`` — partial average inside the settlement window
   * ``resolution_price`` — pick RTDS TWAP vs nowcast for drift ``btc_now``
@@ -44,8 +47,8 @@ def window_seconds_for_market(
 ) -> int:
     """TWAP lookback for a market duration (seconds).
 
-    Defaults to the arena's 5-min series (30s). Longer windows use 60s per
-    Polymarket's published table.
+    Defaults to the arena's 5-min series (``TWAP_WINDOW_SEC``, 60s). Longer
+    windows use ``TWAP_WINDOW_SEC_15M`` (also 60s per Polymarket's table).
     """
     mw = float(
         market_window_sec
@@ -53,8 +56,39 @@ def window_seconds_for_market(
         else getattr(config, "MARKET_WINDOW_SEC", 300) or 300
     )
     if mw <= 300 + 1e-6:
-        return int(getattr(config, "TWAP_WINDOW_SEC", 30) or 30)
+        return int(getattr(config, "TWAP_WINDOW_SEC", 60) or 60)
     return int(getattr(config, "TWAP_WINDOW_SEC_15M", 60) or 60)
+
+
+def rtds_topic(window_sec: Optional[int] = None) -> str:
+    """Polymarket RTDS topic for the given TWAP lookback.
+
+    60s → ``crypto_prices_twap_sixty``; 30s → ``crypto_prices_twap_thirty``.
+    """
+    w = int(
+        window_sec
+        if window_sec is not None
+        else getattr(config, "TWAP_WINDOW_SEC", 60) or 60
+    )
+    if w >= 60:
+        return str(
+            getattr(config, "TWAP_RTDS_TOPIC_60", "crypto_prices_twap_sixty")
+            or "crypto_prices_twap_sixty"
+        )
+    return str(
+        getattr(config, "TWAP_RTDS_TOPIC_30", "crypto_prices_twap_thirty")
+        or "crypto_prices_twap_thirty"
+    )
+
+
+def settlement_entry_horizon_sec() -> int:
+    """Seconds before expiry covering pre_settle lead + full TWAP window.
+
+    Used by sweeper / late-window strategies as the default entry gate.
+    """
+    w = int(getattr(config, "TWAP_WINDOW_SEC", 60) or 60)
+    lead = int(getattr(config, "TWAP_PRE_SETTLE_LEAD_SEC", 20) or 20)
+    return max(1, w + lead)
 
 
 def in_settlement_window(
@@ -68,7 +102,7 @@ def in_settlement_window(
     w = int(
         twap_window_sec
         if twap_window_sec is not None
-        else getattr(config, "TWAP_WINDOW_SEC", 30) or 30
+        else getattr(config, "TWAP_WINDOW_SEC", 60) or 60
     )
     try:
         tr = float(time_remaining_sec)
@@ -167,7 +201,7 @@ def settlement_nowcast(
     w = float(
         twap_window_sec
         if twap_window_sec is not None
-        else getattr(config, "TWAP_WINDOW_SEC", 30) or 30
+        else getattr(config, "TWAP_WINDOW_SEC", 60) or 60
     )
     window_end = float(expiry_epoch)
     window_start = window_end - w
@@ -251,7 +285,7 @@ def resolution_btc_now(
     w = int(
         twap_window_sec
         if twap_window_sec is not None
-        else getattr(config, "TWAP_WINDOW_SEC", 30) or 30
+        else getattr(config, "TWAP_WINDOW_SEC", 60) or 60
     )
 
     result = {
@@ -370,7 +404,7 @@ def market_phase(
     w = int(
         twap_window_sec
         if twap_window_sec is not None
-        else getattr(config, "TWAP_WINDOW_SEC", 30) or 30
+        else getattr(config, "TWAP_WINDOW_SEC", 60) or 60
     )
     mw = float(
         market_window_sec

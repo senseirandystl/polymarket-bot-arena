@@ -239,9 +239,12 @@ class BaseBot(ABC):
     STRATEGY_SIGNAL_PROFILE = {
         "momentum":          {"drift": 0.55, "mom": 0.30, "strat": 0.15, **_DEAD_LANES},
         "phantom":           {"drift": 0.50, "mom": 0.25, "strat": 0.25, **_DEAD_LANES},
-        "mean_reversion":    {"drift": 0.75, "mom": 0.00, "strat": 0.25, **_DEAD_LANES},
-        "mean_reversion_sl": {"drift": 0.75, "mom": 0.00, "strat": 0.25, **_DEAD_LANES},
-        "mean_reversion_tp": {"drift": 0.75, "mom": 0.00, "strat": 0.25, **_DEAD_LANES},
+        # Meanrev honesty (2026-08-11): was 0.75 drift → mom-lite clone.
+        # Lower drift, higher strat so the gated fade thesis can matter;
+        # lag-justified gate still requires market lag on the shared path.
+        "mean_reversion":    {"drift": 0.50, "mom": 0.00, "strat": 0.35, **_DEAD_LANES},
+        "mean_reversion_sl": {"drift": 0.50, "mom": 0.00, "strat": 0.35, **_DEAD_LANES},
+        "mean_reversion_tp": {"drift": 0.50, "mom": 0.00, "strat": 0.35, **_DEAD_LANES},
         "hybrid":            {"drift": 0.55, "mom": 0.20, "strat": 0.25, **_DEAD_LANES},
         "sniper":            {"drift": 0.55, "mom": 0.10, "strat": 0.10, **_DEAD_LANES},
         # Menu-only strategies (not default slate)
@@ -289,6 +292,9 @@ class BaseBot(ABC):
         "mean_reversion_tp": 0.58,
         "momentum": 0.62,
         "phantom": 0.62,
+        # Hybrid paper soak (2026-08): avg entry ~0.59 with thin +1.8¢ B/E gap —
+        # cap mid-band chase; matches momentum's priced-in floor.
+        "hybrid": 0.62,
         "lag_residual": 0.58,
         "no_lag": 0.58,
         "regime_specialist": 0.62,
@@ -530,6 +536,26 @@ class BaseBot(ABC):
         if raw_signal["action"] != "hold":
             strategy_yes = 1.0 if raw_signal["side"] == "yes" else -1.0
             strategy_signal = strategy_yes * raw_signal["confidence"]
+        else:
+            # Counterfactual strat: when analyze() held but still produced a
+            # lean (e.g. hybrid weighted_score / sub-votes that failed an
+            # internal gate), log it so core-lane tuner + decision_events
+            # learn from would-be theses — not only fills.
+            lean = 0.0
+            try:
+                sigs = raw_signal.get("signals") or {}
+                if "weighted_score" in sigs:
+                    lean = float(sigs["weighted_score"] or 0.0)
+                elif raw_signal.get("side") in ("yes", "no") and raw_signal.get(
+                        "confidence"):
+                    lean = (
+                        (1.0 if raw_signal["side"] == "yes" else -1.0)
+                        * float(raw_signal["confidence"] or 0.0)
+                    )
+            except (TypeError, ValueError):
+                lean = 0.0
+            if abs(lean) > 1e-12:
+                strategy_signal = lean
         # Strat-lane confidence cap (BUG #30): live data showed WR falls as
         # the thesis gets MORE confident (>=0.6 magnitude ran 36.1% WR/-$60,
         # 0.3-0.6 ran 55.9%) — clamp so an overconfident read still blends at
@@ -697,19 +723,41 @@ class BaseBot(ABC):
             "learn": learning_signal * 2.0 * learning_weight,
         }
         # Re-normalize profile weights when strat is zeroed by confirm/fight
-        # mode so drift/mom fill the weight budget that strat would waste.
-        # Without this, strategies like phantom (strat=0.25) lose 25% of their
-        # signal budget whenever the thesis disagrees with drift.
+        # When strat is zeroed (confirm-mode fight), park its weight as
+        # *uncertainty* that lowers trust — do NOT renorm into drift (that
+        # amplified mid-window overconfidence, 2026-08-11).
         _profile = dict(self._signal_profile())
+        _uncertainty_share = 0.0
         if abs(strategy_signal) < 1e-12 and _profile.get("strat", 0) > 0:
-            _strat_w = _profile.pop("strat", 0.0)
-            _total = sum(_profile.values())
-            if _total > 1e-9:
-                _redist = _strat_w / _total
-                for k in list(_profile):
-                    _profile[k] += _profile[k] * _redist
+            _strat_w = float(_profile.pop("strat", 0.0) or 0.0)
+            _total_before = sum(_profile.values()) + _strat_w
+            if (
+                bool(getattr(config, "STRAT_FIGHT_UNCERTAINTY", True))
+                and _total_before > 1e-9
+            ):
+                _uncertainty_share = _strat_w / _total_before
+                # Leave remaining lanes un-renormalized (sum < 1) so lean
+                # magnitude drops when the thesis fights drift.
             else:
-                _profile["strat"] = 0.0
+                # Legacy: redistrib into other live lanes
+                _total = sum(_profile.values())
+                if _total > 1e-9:
+                    _redist = _strat_w / _total
+                    for k in list(_profile):
+                        _profile[k] += _profile[k] * _redist
+                else:
+                    _profile["strat"] = 0.0
+        # Phase-aware drift trust: damp noisy open/mid √t-inflated z
+        if bool(getattr(config, "DRIFT_PHASE_TRUST_ENABLED", True)):
+            try:
+                _phase = (sv.settlement_policy or {}).get("phase") or "mid"
+                _pt = getattr(config, "DRIFT_PHASE_TRUST", None) or {}
+                _pm = float(_pt.get(_phase, 1.0) or 1.0)
+                if "drift" in lanes and _pm < 1.0 - 1e-12:
+                    lanes = dict(lanes)
+                    lanes["drift"] = float(lanes["drift"]) * _pm
+            except Exception:
+                pass
         blend = lab.blend(self.strategy_type, lanes, _profile,
                           overrides=overrides, signals=signals)
         model_prob = blend.prob
@@ -727,25 +775,48 @@ class BaseBot(ABC):
             # Always attach lane reads so decision_events can score skips
             # counterfactually (same raw cand() values as buys). Explicit
             # skip_reason beats reasoning-parse in decision_log / trader.
+            # Hybrid meta(...) tokens ride along so the meta-learner can train
+            # on would-be ensemble votes, not only filled buys.
             try:
                 from arena.decision_log import classify_skip_reason as _csr
                 bucket = skip_reason or _csr(reason)
             except Exception:
                 bucket = skip_reason
+            _meta_tok = raw_signal.get("meta_token")
+            if not _meta_tok:
+                _mm = re.search(
+                    r"meta\(mom=[+-][\d.]+ rev=[+-][\d.]+ (?:sent=[+-][\d.]+ )?"
+                    r"ph=[+-][\d.]+ \| reg=\w+\)",
+                    raw_signal.get("reasoning") or "",
+                )
+                _meta_tok = _mm.group(0) if _mm else None
+            _sig_out = {
+                "drift": drift_signal_val, "mom": momentum_signal,
+                "strat": strategy_signal, "model_prob": model_prob,
+                "fut": raw.get("fut_taker"), "tech": raw.get("tech_mtf"),
+                "xasset": raw.get("xasset"),
+                "lag": raw.get("lag"), "ms_mom": raw.get("ms_mom"),
+                "flow_decay": raw.get("flow_decay"),
+                "regime": _regime_label,
+            }
+            _rs = raw_signal.get("signals") or {}
+            if isinstance(_rs.get("votes"), dict):
+                _sig_out["votes"] = _rs["votes"]
+            if _rs.get("regime_bucket"):
+                _sig_out["regime_bucket"] = _rs["regime_bucket"]
+            if _rs.get("weighted_score") is not None:
+                _sig_out["weighted_score"] = _rs["weighted_score"]
+            reason_out = reason
+            if _meta_tok and "meta(" not in reason_out:
+                reason_out = f"{reason_out} {_meta_tok}".strip()
             return strategy_decision(
-                "skip", side, edge=edge, confidence=confidence, reasoning=reason,
-                signals={
-                    "drift": drift_signal_val, "mom": momentum_signal,
-                    "strat": strategy_signal, "model_prob": model_prob,
-                    "fut": raw.get("fut_taker"), "tech": raw.get("tech_mtf"),
-                    "xasset": raw.get("xasset"),
-                    "lag": raw.get("lag"), "ms_mom": raw.get("ms_mom"),
-                    "flow_decay": raw.get("flow_decay"),
-                    "regime": _regime_label,
-                },
+                "skip", side, edge=edge, confidence=confidence,
+                reasoning=reason_out,
+                signals=_sig_out,
                 features=features,
                 entry_price=entry_price,
                 skip_reason=bucket,
+                meta_token=_meta_tok,
             )
 
         macro = sv.macro_caution
@@ -783,6 +854,10 @@ class BaseBot(ABC):
         # untouched.
         conviction = min(1.0, abs(model_prob - 0.5) / config.MODEL_CONVICTION_SCALE)
         trust_eff = trust * conviction
+        # Strat-fight uncertainty damp (parked weight → lower model say)
+        if _uncertainty_share > 0:
+            damp = float(getattr(config, "STRAT_FIGHT_TRUST_DAMP", 0.55) or 0.0)
+            trust_eff *= max(0.15, 1.0 - damp * _uncertainty_share)
         fair_yes = self._compute_fair_yes(market_price, model_prob, trust_eff)
 
         # --- Per-side evaluation: each side scored on its OWN price + fee ---
@@ -1029,6 +1104,40 @@ class BaseBot(ABC):
                     f"(got {signed_side:+.3f}; reg={getattr(_radj, 'label', '?')})",
                     side=side, confidence=confidence, entry_price=side_mid_dz)
 
+        # --- Lag-justified edge (regime-agnostic; all directionals) ---
+        # Drift-implied fair must beat side mid + fee by LAG_JUSTIFIED_MIN_EDGE.
+        # Continuous alternative to hard mid caps: high mids still trade when
+        # |drift| is large enough that residual lag remains. Exempt structural
+        # strategies (arb/sweeper/makers) that own their own path.
+        if (
+            bool(getattr(config, "LAG_JUSTIFIED_ENABLED", True))
+            and (self.strategy_type or "").lower()
+            not in {
+                str(t).lower()
+                for t in (getattr(config, "LAG_JUSTIFIED_EXEMPT", ()) or ())
+            }
+        ):
+            signed_for_side = (
+                float(drift_signal_val) if side == "yes"
+                else -float(drift_signal_val)
+            )
+            implied_side = 0.5 + 0.5 * max(-1.0, min(1.0, signed_for_side))
+            try:
+                from polymarket_fills import taker_fee as _tfee
+                lag_fee = float(_tfee(1.0, side_mid_dz) or 0.0)
+            except Exception:
+                lag_fee = 0.0
+            lag_residual = implied_side - float(side_mid_dz) - lag_fee
+            lag_min = float(getattr(config, "LAG_JUSTIFIED_MIN_EDGE", 0.02))
+            # Hybrid / regime adapt can raise the bar when lag is thin
+            lag_min *= float(getattr(_radj, "lag_edge_mult", 1.0) or 1.0)
+            if lag_residual < lag_min:
+                return _skip(
+                    f"Lag-justified: implied={implied_side:.3f} mid={side_mid_dz:.3f} "
+                    f"fee={lag_fee:.3f} residual={lag_residual:+.3f} "
+                    f"< {lag_min:.3f} (market not lagging drift)",
+                    side=side, confidence=confidence, entry_price=side_mid_dz)
+
         # --- Extreme-drift market-lag gate ---
         # |drift| ≥ DRIFT_EXTREME is only tradable when the market still LAGS
         # (side mid ≤ DRIFT_EXTREME_MAX_SIDE_MID). Extreme drift with price
@@ -1231,8 +1340,7 @@ class BaseBot(ABC):
             pass
 
         # Late-window size: prefer TWAP settlement policy over last-tick ramp.
-        # Old ramp (90→30s) assumed a single expiry print; under TWAP the
-        # decisive interval is the final 30s with partial observation.
+        # Soft ramp targets final TWAP_WINDOW_SEC (partially observed avg).
         time_rem = market.get("time_remaining_seconds")
         late_size_boost = 1.0
         try:
@@ -1240,12 +1348,16 @@ class BaseBot(ABC):
             if _sp.get("policy_active"):
                 late_size_boost = float(_sp.get("size_mult") or 1.0)
             elif time_rem is not None and abs(drift_signal_val) >= 0.20:
-                # Pre-TWAP soft ramp into settlement (ends at rem=30, not 0)
-                late = smooth_ramp(-float(time_rem), -90.0, -30.0)
+                # Soft ramp into settlement TWAP window (ends at rem=W, not 0)
+                settle_w = float(getattr(config, "TWAP_WINDOW_SEC", 60) or 60)
+                late = smooth_ramp(
+                    -float(time_rem), -90.0 - settle_w * 0.5, -settle_w)
                 late_size_boost = 1.0 + 0.10 * late
         except Exception:
             if time_rem is not None and abs(drift_signal_val) >= 0.20:
-                late = smooth_ramp(-float(time_rem), -90.0, -30.0)
+                settle_w = float(getattr(config, "TWAP_WINDOW_SEC", 60) or 60)
+                late = smooth_ramp(
+                    -float(time_rem), -90.0 - settle_w * 0.5, -settle_w)
                 late_size_boost = 1.0 + 0.10 * late
 
         # --- Bet sizing: pure fractional Kelly, SHARES-FIRST ---
@@ -1374,13 +1486,33 @@ class BaseBot(ABC):
             ctx_vec = build_context(sv.prices, signals, datetime.now(tz=timezone.utc))
         except Exception:
             ctx_vec = None
+        _meta_tok = raw_signal.get("meta_token")
         _meta_m = re.search(
             r"meta\(mom=[+-][\d.]+ rev=[+-][\d.]+ (?:sent=[+-][\d.]+ )?"
             r"ph=[+-][\d.]+ \| reg=\w+\)",
             raw_signal.get("reasoning") or "",
         )
-        if _meta_m:
-            reasoning = f"{reasoning} {_meta_m.group(0)}"
+        if not _meta_tok and _meta_m:
+            _meta_tok = _meta_m.group(0)
+        if _meta_tok:
+            reasoning = f"{reasoning} {_meta_tok}"
+
+        _buy_sigs = {
+            "drift": drift_signal_val, "mom": momentum_signal,
+            "strat": strategy_signal, "model_prob": model_prob,
+            "trust_eff": trust_eff,
+            # Raw candidate reads (pre kill-switch) for decision_events.
+            "fut": raw.get("fut_taker"), "tech": raw.get("tech_mtf"),
+            "xasset": raw.get("xasset"),
+            "lag": raw.get("lag"), "ms_mom": raw.get("ms_mom"),
+            "flow_decay": raw.get("flow_decay"),
+            "regime": _regime_label,
+        }
+        _rs = raw_signal.get("signals") or {}
+        if isinstance(_rs.get("votes"), dict):
+            _buy_sigs["votes"] = _rs["votes"]
+        if _rs.get("regime_bucket"):
+            _buy_sigs["regime_bucket"] = _rs["regime_bucket"]
 
         return {
             "action": "buy",
@@ -1388,19 +1520,10 @@ class BaseBot(ABC):
             "edge": chosen_edge,
             "confidence": confidence,
             "reasoning": reasoning,
+            "meta_token": _meta_tok,
             # Contributing signal readings (structured contract) — the model
             # blend's own lane attribution is in lane_contributions below.
-            "signals": {
-                "drift": drift_signal_val, "mom": momentum_signal,
-                "strat": strategy_signal, "model_prob": model_prob,
-                "trust_eff": trust_eff,
-                # Raw candidate reads (pre kill-switch) for decision_events.
-                "fut": raw.get("fut_taker"), "tech": raw.get("tech_mtf"),
-                "xasset": raw.get("xasset"),
-                "lag": raw.get("lag"), "ms_mom": raw.get("ms_mom"),
-                "flow_decay": raw.get("flow_decay"),
-                "regime": _regime_label,
-            },
+            "signals": _buy_sigs,
             "suggested_amount": amount,
             "target_shares": target_shares,
             # Price the decision expects to pay. execute() turns this into a

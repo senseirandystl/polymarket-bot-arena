@@ -128,7 +128,7 @@ class SignalView(Mapping):
 
     @property
     def btc_twap(self) -> float:
-        """Official Chainlink rolling TWAP (30s for 5m markets), or 0."""
+        """Official Chainlink rolling TWAP (``TWAP_WINDOW_SEC`` lookback), or 0."""
         return float(self._d.get("btc_twap") or self._d.get("twap") or 0.0)
 
     @property

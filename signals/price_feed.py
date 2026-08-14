@@ -1,10 +1,10 @@
 """Real-time crypto price data — Chainlink spot + TWAP for BTC, Binance xasset.
 
-**BTC resolution (2026-08-07+)** uses Chainlink **TWAP** (30s for 5-min
-markets). Both Price to Beat (open) and settlement (close) come from the
-TWAP feed. Live path:
+**BTC resolution (2026-08-07+)** uses Chainlink **TWAP** (``TWAP_WINDOW_SEC``,
+60s for 5-min markets). Both Price to Beat (open) and settlement (close)
+come from the TWAP feed. Live path:
 
-  * ``crypto_prices_twap_thirty`` / ``btc/usd`` → resolution ``btc_now`` /
+  * ``crypto_prices_twap_sixty`` / ``btc/usd`` → resolution ``btc_now`` /
     strike latch (``signals/twap.py``, ``signals/strike.py``)
   * ``crypto_prices_chainlink`` / ``btc/usd`` → 1m candles, momentum,
     regime tape, settlement-nowcast tick buffer (spot path still useful)
@@ -73,12 +73,12 @@ class PriceFeed:
         self._btc_candle_open_min: Optional[int] = None  # floor(epoch/60)
         self._btc_candle_last: Optional[float] = None
 
-        # Official Chainlink TWAP (30s for 5m markets) — resolution path
+        # Official Chainlink TWAP (60s for 5m markets) — resolution path
         self._btc_twap: float = 0.0
         self._btc_twap_ts: float = 0.0          # observation epoch (sec)
         self._btc_twap_wall: float = 0.0        # local receive time
         self._btc_twap_window_s: int = int(
-            getattr(config, "TWAP_WINDOW_SEC", 30) or 30
+            getattr(config, "TWAP_WINDOW_SEC", 60) or 60
         )
         # TWAP observation ring for open latch (epoch_sec, twap_value)
         self._btc_twap_ticks: Deque[tuple[float, float]] = deque(
@@ -304,7 +304,7 @@ class PriceFeed:
             return (
                 float(self._btc_twap or 0.0),
                 float(self._btc_twap_ts or 0.0),
-                int(self._btc_twap_window_s or 30),
+                int(self._btc_twap_window_s or 60),
             )
 
     def btc_spot_ticks(self) -> list[tuple[float, float]]:
@@ -319,11 +319,11 @@ class PriceFeed:
 
     # -------------------------------------------------------------- TWAP RTDS
     def _run_chainlink_twap(self) -> None:
-        """RTDS Chainlink BTC/USD 30s TWAP (resolution path for 5m markets).
+        """RTDS Chainlink BTC/USD TWAP (resolution path for 5m markets).
 
-        Topic: ``crypto_prices_twap_thirty`` (see Polymarket chainlink-twap docs).
-        No snapshot/history/replay — reconnect + resubscribe on quiet/error.
-        Pre-launch ``topic not found`` is expected; keep retrying.
+        Topic follows ``TWAP_WINDOW_SEC`` (60 → ``crypto_prices_twap_sixty``).
+        See Polymarket chainlink-twap docs. No snapshot/history/replay —
+        reconnect + resubscribe on quiet/error.
         """
         if not bool(getattr(config, "TWAP_RESOLUTION_ENABLED", True)):
             logger.info("TWAP RTDS feed disabled (TWAP_RESOLUTION_ENABLED=False)")
@@ -331,10 +331,14 @@ class PriceFeed:
 
         import websocket
 
-        topic = str(
-            getattr(config, "TWAP_RTDS_TOPIC_30", "crypto_prices_twap_thirty")
-            or "crypto_prices_twap_thirty"
-        )
+        try:
+            from signals.twap import rtds_topic as _rtds_topic
+            topic = _rtds_topic(self._btc_twap_window_s)
+        except Exception:
+            topic = str(
+                getattr(config, "TWAP_RTDS_TOPIC_60", "crypto_prices_twap_sixty")
+                or "crypto_prices_twap_sixty"
+            )
         symbol = str(getattr(config, "TWAP_SYMBOL", "btc/usd") or "btc/usd")
         backoff = 2.0
         refresh_sec = 8.0
@@ -485,7 +489,7 @@ class PriceFeed:
                 "window_seconds"
             )
             window_s = int(win) if win else int(
-                getattr(config, "TWAP_WINDOW_SEC", 30) or 30
+                getattr(config, "TWAP_WINDOW_SEC", 60) or 60
             )
         except (TypeError, ValueError):
             return
@@ -591,7 +595,7 @@ class PriceFeed:
             twap = float(self._btc_twap or 0.0) if sym == "btc" else 0.0
             twap_ts = float(self._btc_twap_ts or 0.0) if sym == "btc" else 0.0
             twap_wall = float(self._btc_twap_wall or 0.0) if sym == "btc" else 0.0
-            twap_window = int(self._btc_twap_window_s or 30) if sym == "btc" else 0
+            twap_window = int(self._btc_twap_window_s or 60) if sym == "btc" else 0
 
         stale = (time.time() - last_up) > STALE_SEC if last_up else True
         twap_stale_sec = float(getattr(config, "TWAP_STALE_SEC", 15.0) or 15.0)

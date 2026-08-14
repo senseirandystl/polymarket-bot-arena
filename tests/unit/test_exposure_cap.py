@@ -49,6 +49,20 @@ def test_exposure_headroom_clamps_and_skips(db, monkeypatch):
     from bots.bot_momentum import MomentumBot
     from bots.base_bot import invalidate_exposure_cache
     monkeypatch.setattr(db, "get_paper_pool_gross", lambda: 100.0)
+    # Allow multi-bot for $ headroom clamp path (default max_bots=1 would
+    # zero headroom as soon as any peer is open). Stub regime adapt so it
+    # cannot tighten max_bots_side to 1 mid-test.
+    monkeypatch.setattr(config, "MARKET_SIDE_MAX_BOTS", 5, raising=False)
+    monkeypatch.setattr(config, "EXPOSURE_CORR_AWARE", False, raising=False)
+
+    class _NoAdj:
+        max_bots_side = None
+
+    monkeypatch.setattr(
+        "arena.regime_adapt.adjustments",
+        lambda *a, **k: _NoAdj(),
+        raising=False,
+    )
     bot = MomentumBot(name="momentum-test", generation=0)
     cap_usd = config.MARKET_SIDE_EXPOSURE_CAP * 100.0
     # Pool already holds cap - 2 on this side: a $5 request clamps to ~$2.
@@ -63,13 +77,14 @@ def test_exposure_headroom_clamps_and_skips(db, monkeypatch):
 
 
 def test_max_bots_per_side_blocks_new_bot(db, monkeypatch):
-    """MARKET_SIDE_MAX_BOTS: fourth distinct bot gets zero headroom."""
+    """MARKET_SIDE_MAX_BOTS: next distinct bot gets zero headroom at the cap."""
     from bots.bot_momentum import MomentumBot
+    from bots.base_bot import invalidate_exposure_cache
     monkeypatch.setattr(db, "get_paper_pool_gross", lambda: 1000.0)
-    monkeypatch.setattr(config, "MARKET_SIDE_MAX_BOTS", 3, raising=False)
+    monkeypatch.setattr(config, "MARKET_SIDE_MAX_BOTS", 1, raising=False)
     monkeypatch.setattr(config, "EXPOSURE_CORR_AWARE", False, raising=False)
-    for name in ("a", "b", "c"):
-        _open_trade(db, name, amount=1.0)
+    _open_trade(db, "a", amount=1.0)
+    invalidate_exposure_cache()
     bot = MomentumBot(name="new-bot", generation=0)
     assert bot._exposure_headroom("mkt-1", "yes", "paper") == 0.0
     # Bot that already has a position can still add

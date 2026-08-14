@@ -34,6 +34,13 @@ def test_profiles_include_strat_weight():
         assert PROF[stype]["strat"] > 0.0, stype
 
 
+def test_hybrid_max_side_price_caps_priced_in_entries():
+    """Paper soak: hybrid avg entry ~0.59 with thin BE — cap at 0.62."""
+    assert BaseBot.STRATEGY_MAX_SIDE_PRICE.get("hybrid") == 0.62
+    assert BaseBot.STRATEGY_MAX_SIDE_PRICE["hybrid"] <= \
+        BaseBot.STRATEGY_MAX_SIDE_PRICE["momentum"]
+
+
 def test_momentum_is_drift_anchored_with_mom():
     """Hold-to-resolution rebalance: drift is the validated fundamental;
     mom remains a strong co-weight, strat is secondary."""
@@ -53,10 +60,14 @@ def test_phantom_balances_thesis_with_drift():
 
 
 def test_meanrev_is_drift_plus_fade():
+    """Meanrev honesty (2026-08): lower drift, higher strat fade mass — not a
+    drift-pure clone (old 0.75/0/.25 made it a mom-lite twin)."""
     p = PROF["mean_reversion"]
-    assert p["drift"] >= 0.60
+    assert p["drift"] >= 0.45
+    assert p["drift"] <= 0.60
     assert p["mom"] == 0.0
-    assert p["strat"] > 0.0
+    assert p["strat"] >= 0.25
+    assert p["strat"] > p["mom"]
 
 
 def test_live_profiles_are_distinct():
@@ -70,15 +81,25 @@ def test_live_profiles_are_distinct():
 
 
 def test_strat_lane_uses_profile_weight(monkeypatch):
-    # Isolate from live lane_overrides so the class default is what blends.
+    # Isolate from live lane_overrides + continuous residual so the class
+    # default is exactly what blends.
     monkeypatch.setattr("bots.base_bot._lane_overrides", lambda: {})
+    monkeypatch.setattr(
+        "arena.regime_continuous.apply_residuals",
+        lambda weights, strategy_type, features=None: weights,
+        raising=False,
+    )
     bot = MeanRevBot(name="mr-test", generation=0)
     lanes = {"drift": 0.0, "mom": 0.0, "pm": 0.0, "cvd": 0.0, "obi": 0.0,
              "strat": 0.8, "learn": 0.0,
              "fut": 0.0, "tech": 0.0, "xasset": 0.0}
-    p = bot._model_prob_yes(lanes)
+    # Force blend through the lab with empty overrides (bypass residual).
+    from signals.lab import get_lab
+    r = get_lab().blend(
+        "mean_reversion", lanes, bot._signal_profile(), overrides={},
+    )
     w = PROF["mean_reversion"]["strat"]
-    assert p == pytest.approx(0.5 + 0.5 * w * 0.8, abs=1e-6)
+    assert r.prob == pytest.approx(0.5 + 0.5 * w * 0.8, abs=1e-6)
 
 
 # --- meanrev rename ---

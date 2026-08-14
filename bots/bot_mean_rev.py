@@ -28,8 +28,9 @@ DEFAULT_PARAMS = {
     # "contrarian loses in 5-min markets" death class). Gated, the identity
     # becomes "buy the dip in the WINNING direction": drift picks the side,
     # the z-score times the pullback entry.
-    # Overnight soak: meanrev YES 33% WR — require clearer PTB support.
-    "min_drift": 0.12,
+    # Raised 0.12→0.20 (2026-08-11): weak drift + high profile weight made
+    # meanrev a mom clone at 55–58¢.
+    "min_drift": 0.20,
     # PTB mean gate (P0): reversion TARGET (the z-score mean) must sit on the
     # same side of the Price-to-Beat as the bet. Fading UP → NO only when
     # mean ≤ strike (reversion still finishes ≤ PTB); fading DOWN → YES only

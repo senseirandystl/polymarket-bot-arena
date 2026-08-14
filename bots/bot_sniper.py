@@ -7,11 +7,12 @@ near-flat P&L). v3 drops zone tables entirely.
 Thesis
 ------
 BTC 5-minute markets resolve from **Chainlink TWAP** at close vs TWAP at
-open (30s lookback, 2026-08-07+). Instant spot at expiry no longer decides
-the outcome — a last-second spike is diluted across the averaging window.
-``btc_drift`` is already moneyness on the TWAP path (RTDS TWAP / settlement
-nowcast). The validated edge remains **"follow drift only when the market
-lags"** (harness + live soak). The sniper does only that:
+open (``TWAP_WINDOW_SEC`` lookback — 60s for 5m). Instant spot at expiry no
+longer decides the outcome — a last-second spike is diluted across the
+averaging window. ``btc_drift`` is already moneyness on the TWAP path
+(RTDS TWAP / settlement nowcast). The validated edge remains **"follow
+drift only when the market lags"** (harness + live soak). The sniper does
+only that:
 
 1. Read signed ``btc_drift`` (YES-frame, in [-1, 1]; TWAP-based).
 2. Convert to a drift-implied probability: ``p = 0.5 + 0.5 * signed_drift``.
@@ -23,7 +24,7 @@ lags"** (harness + live soak). The sniper does only that:
    * the chosen side's MID still **lags** (≤ max_side_mid, default 0.58),
    * model leans the same way as drift (no fade).
 
-No arbitrary cheap/strong price buckets. Inside the final 30s, TWAP
+No arbitrary cheap/strong price buckets. Inside the final TWAP window,
 certainty can slightly boost confidence (partially observed settlement).
 Sizing uses fractional Kelly on the fee-adjusted edge, same as the
 directional stack.
@@ -337,8 +338,9 @@ class SniperBot(BaseBot):
         if pol.get("policy_active"):
             late_size = float(pol.get("size_mult") or 1.0)
         elif time_rem is not None and time_rem > 0 and abs(signed) >= 0.20:
-            # Soft ramp into settlement window (rem=30), not to expiry print
-            late = smooth_ramp(-float(time_rem), -90.0, -30.0)
+            # Soft ramp into settlement TWAP window (not to expiry print)
+            settle_w = float(getattr(config, "TWAP_WINDOW_SEC", 60) or 60)
+            late = smooth_ramp(-float(time_rem), -90.0 - settle_w * 0.5, -settle_w)
             late_size = 1.0 + 0.10 * late
 
         min_conf = float(p.get("min_confidence", 0.10))

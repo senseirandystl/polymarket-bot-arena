@@ -169,118 +169,89 @@ class Trader(threading.Thread):
         import config as _cfg
         slip_cd = float(getattr(_cfg, "SLIPPAGE_RETRY_COOLDOWN_SEC", 10.0))
         slip_reasons = frozenset({"slippage_band", "slippage_exceeded"})
+        one_per_tick = bool(getattr(_cfg, "ONE_TRADE_PER_TICK", True))
+        exempt_types = {
+            str(t).lower()
+            for t in (getattr(_cfg, "ONE_TRADE_PER_TICK_EXEMPT", ()) or ())
+        }
+        try:
+            window_lock = bool(__import__("db").get_directional_window_lock())
+        except Exception:
+            window_lock = bool(getattr(_cfg, "DIRECTIONAL_WINDOW_LOCK", False))
+        lock_exempt = {
+            str(t).lower()
+            for t in (getattr(_cfg, "DIRECTIONAL_WINDOW_LOCK_EXEMPT", ()) or ())
+        }
 
-        new_trades = 0
-        for bot in bots:
-            key = (bot.name, market_id)
-            # Once a bot has an open position on this market it's done for the
-            # window; otherwise it RE-EVALUATES every tick (a skip is not sticky)
-            # so it enters the moment its edge appears mid-window.
-            if self._state.is_traded(key):
-                continue
-            # Post-slippage backoff: don't re-hammer a whipping book every 1s.
-            if self._state.is_slippage_cooling(key):
-                self._state.note_skip("slippage_cooldown")
-                continue
+        def _is_exempt(bot, exempt_set) -> bool:
+            return (getattr(bot, "strategy_type", "") or "").lower() in exempt_set
+
+        def _buy_score(signal: dict) -> float:
+            """Rank competing buys: fee-adjusted edge × conf (size-agnostic)."""
             try:
-                signal = bot.make_decision(market, combined_signals)
-                if signal.get("action") == "skip":
-                    # Do NOT mark traded — re-evaluate next tick. Skip is a
-                    # first-class outcome; tally it so runs are explainable.
-                    # Shared classifier with decision_log (explicit skip_reason
-                    # wins; otherwise parse reasoning for a specific bucket).
-                    try:
-                        from arena.decision_log import classify_skip_reason
-                        skip_bucket = classify_skip_reason(
-                            signal.get("reasoning"),
-                            explicit=signal.get("skip_reason"),
-                        ) or "skip"
-                    except Exception:
-                        skip_bucket = "skip"
-                    self._state.note_skip(skip_bucket)
-                    # Counterfactual log (throttled): skips still carry lane
-                    # reads for offline fine-tuning. Hot path = queue only.
-                    try:
-                        from arena.decision_log import enqueue as _dec_enqueue
-                        _dec_enqueue(
-                            bot_name=bot.name,
-                            strategy_type=bot.strategy_type,
-                            market_id=market_id,
-                            signal=signal,
-                        )
-                    except Exception:
-                        pass
-                    log_event(
-                        logger, logging.DEBUG,
-                        f"[{bot.name}] skip | {signal.get('reasoning', '')}",
-                        event_type="decision", outcome="skip",
-                        bot=bot.name, strategy=bot.strategy_type,
-                        market_id=market_id, side=signal.get("side"),
-                        reason=signal.get("reasoning"),
-                    )
-                    continue
+                edge = float(signal.get("edge") or 0.0)
+            except (TypeError, ValueError):
+                edge = 0.0
+            if edge != edge or edge == float("-inf"):
+                edge = 0.0
+            try:
+                conf = float(signal.get("confidence") or 0.0)
+            except (TypeError, ValueError):
+                conf = 0.0
+            # Portfolio weight as mild tie-breaker so capital goes to winners
+            try:
+                from arena.portfolio import get_weight
+                w = float(get_weight(signal.get("_bot_name") or "") or 0.0)
+            except Exception:
+                w = 0.0
+            return edge * max(0.05, conf) * (1.0 + 0.25 * w)
 
+        def _note_decision(bot, signal, *, force_buy_log=False):
+            if signal.get("action") == "skip":
+                try:
+                    from arena.decision_log import classify_skip_reason
+                    skip_bucket = classify_skip_reason(
+                        signal.get("reasoning"),
+                        explicit=signal.get("skip_reason"),
+                    ) or "skip"
+                except Exception:
+                    skip_bucket = "skip"
+                self._state.note_skip(skip_bucket)
+                try:
+                    from arena.decision_log import enqueue as _dec_enqueue
+                    _dec_enqueue(
+                        bot_name=bot.name,
+                        strategy_type=bot.strategy_type,
+                        market_id=market_id,
+                        signal=signal,
+                    )
+                except Exception:
+                    pass
+                log_event(
+                    logger, logging.DEBUG,
+                    f"[{bot.name}] skip | {signal.get('reasoning', '')}",
+                    event_type="decision", outcome="skip",
+                    bot=bot.name, strategy=bot.strategy_type,
+                    market_id=market_id, side=signal.get("side"),
+                    reason=signal.get("reasoning"),
+                )
+            elif force_buy_log:
+                try:
+                    from arena.decision_log import enqueue as _dec_enqueue
+                    _dec_enqueue(
+                        bot_name=bot.name,
+                        strategy_type=bot.strategy_type,
+                        market_id=market_id,
+                        signal=signal,
+                    )
+                except Exception:
+                    pass
+
+        def _execute_one(bot, signal) -> bool:
+            """Place one trade; return True on success."""
+            key = (bot.name, market_id)
+            try:
                 result = bot.execute(signal, market)
-                if result.get("success"):
-                    self._state.mark_traded(key)  # one position per market
-                    new_trades += 1
-                    try:
-                        from arena.decision_log import enqueue as _dec_enqueue
-                        _dec_enqueue(
-                            bot_name=bot.name,
-                            strategy_type=bot.strategy_type,
-                            market_id=market_id,
-                            signal=signal,
-                            trade_id=result.get("trade_id"),
-                            force=True,
-                        )
-                    except Exception:
-                        pass
-                    log_event(
-                        logger, logging.INFO,
-                        f"[{bot.name}] {signal['side'].upper()} "
-                        f"${signal['suggested_amount']:.2f} "
-                        f"(conf={signal['confidence']:.2f}) on "
-                        f"{market.get('question', '')[:50]}",
-                        event_type="trade", outcome="placed",
-                        bot=bot.name, strategy=bot.strategy_type,
-                        market_id=market_id, side=signal.get("side"),
-                        amount=round(float(signal.get("suggested_amount", 0.0)), 4),
-                        confidence=round(float(signal.get("confidence", 0.0)), 4),
-                        entry_price=signal.get("entry_price"),
-                        target_shares=signal.get("target_shares"),
-                        trade_id=result.get("trade_id"),
-                        fill_source=result.get("fill_source"),
-                        mode=bot.trading_mode,
-                    )
-                else:
-                    reason = result.get("reason")
-                    if reason in slip_reasons:
-                        self._state.mark_slippage_reject(key, slip_cd)
-                        self._state.note_skip("slippage")
-                    # Live-mode fill anomalies: slippage rejects, venue errors,
-                    # naked arb legs — notify operators (debounced in alerts).
-                    if (getattr(bot, "trading_mode", "paper") or "paper") == "live":
-                        try:
-                            from arena.alerts import alert_live_fill
-                            alert_live_fill(
-                                bot.name, str(reason or "not_placed"),
-                                side=str(signal.get("side") or ""),
-                                market_id=str(market_id),
-                            )
-                        except Exception:
-                            pass
-                    # Transient (no book / bankroll dry / cooldown) — don't mark
-                    # traded; retry next eligible tick.
-                    log_event(
-                        logger, logging.DEBUG,
-                        f"[{bot.name}] trade not placed on {market_id[:12]}…: "
-                        f"{reason}",
-                        event_type="trade", outcome="not_placed",
-                        bot=bot.name, strategy=bot.strategy_type,
-                        market_id=market_id, side=signal.get("side"),
-                        reason=reason,
-                    )
             except Exception as e:
                 log_event(
                     logger, logging.ERROR,
@@ -289,6 +260,128 @@ class Trader(threading.Thread):
                     event_type="error", where="trader_tick",
                     bot=bot.name, market_id=market_id,
                 )
+                return False
+            if result.get("success"):
+                self._state.mark_traded(key)
+                if not _is_exempt(bot, lock_exempt):
+                    self._state.mark_directional_lock(market_id)
+                try:
+                    from arena.decision_log import enqueue as _dec_enqueue
+                    _dec_enqueue(
+                        bot_name=bot.name,
+                        strategy_type=bot.strategy_type,
+                        market_id=market_id,
+                        signal=signal,
+                        trade_id=result.get("trade_id"),
+                        force=True,
+                    )
+                except Exception:
+                    pass
+                log_event(
+                    logger, logging.INFO,
+                    f"[{bot.name}] {signal['side'].upper()} "
+                    f"${signal.get('suggested_amount', 0):.2f} "
+                    f"(conf={float(signal.get('confidence') or 0):.2f}) on "
+                    f"{market.get('question', '')[:50]}",
+                    event_type="trade", outcome="placed",
+                    bot=bot.name, strategy=bot.strategy_type,
+                    market_id=market_id, side=signal.get("side"),
+                    amount=round(float(signal.get("suggested_amount", 0.0) or 0), 4),
+                    confidence=round(float(signal.get("confidence", 0.0) or 0), 4),
+                    entry_price=signal.get("entry_price"),
+                    target_shares=signal.get("target_shares"),
+                    trade_id=result.get("trade_id"),
+                    fill_source=result.get("fill_source"),
+                    mode=bot.trading_mode,
+                )
+                return True
+            reason = result.get("reason")
+            if reason in slip_reasons:
+                self._state.mark_slippage_reject(key, slip_cd)
+                self._state.note_skip("slippage")
+            if (getattr(bot, "trading_mode", "paper") or "paper") == "live":
+                try:
+                    from arena.alerts import alert_live_fill
+                    alert_live_fill(
+                        bot.name, str(reason or "not_placed"),
+                        side=str(signal.get("side") or ""),
+                        market_id=str(market_id),
+                    )
+                except Exception:
+                    pass
+            log_event(
+                logger, logging.DEBUG,
+                f"[{bot.name}] trade not placed on {str(market_id)[:12]}…: "
+                f"{reason}",
+                event_type="trade", outcome="not_placed",
+                bot=bot.name, strategy=bot.strategy_type,
+                market_id=market_id, side=signal.get("side"),
+                reason=reason,
+            )
+            return False
+
+        new_trades = 0
+        # Collect competing directional buys; structural bots execute immediately.
+        pending_buys: list[tuple] = []  # (score, bot, signal)
+
+        for bot in bots:
+            key = (bot.name, market_id)
+            if self._state.is_traded(key):
+                continue
+            if self._state.is_slippage_cooling(key):
+                self._state.note_skip("slippage_cooldown")
+                continue
+            # Window lock: after any directional fill, other directionals sit out
+            if (
+                window_lock
+                and self._state.is_directional_locked(market_id)
+                and not _is_exempt(bot, lock_exempt)
+            ):
+                self._state.note_skip("window_lock")
+                continue
+            try:
+                signal = bot.make_decision(market, combined_signals)
+            except Exception as e:
+                log_event(
+                    logger, logging.ERROR,
+                    f"[{bot.name}] Error on {market_id}: {e}",
+                    exc_info=True,
+                    event_type="error", where="trader_tick",
+                    bot=bot.name, market_id=market_id,
+                )
+                continue
+
+            if signal.get("action") == "skip":
+                _note_decision(bot, signal)
+                continue
+
+            # Structural / exempt bots execute immediately (arb, sweeper, …)
+            if _is_exempt(bot, exempt_types) or not one_per_tick:
+                if _execute_one(bot, signal):
+                    new_trades += 1
+                continue
+
+            # Directional buy: rank and pick one winner after the loop
+            signal = dict(signal)
+            signal["_bot_name"] = bot.name
+            pending_buys.append((_buy_score(signal), bot, signal))
+
+        if pending_buys:
+            pending_buys.sort(key=lambda t: t[0], reverse=True)
+            best_score, best_bot, best_sig = pending_buys[0]
+            if _execute_one(best_bot, best_sig):
+                new_trades += 1
+            # Superseded peers: log as skip for decision attribution
+            for score, bot, signal in pending_buys[1:]:
+                sup = dict(signal)
+                sup["action"] = "skip"
+                sup["skip_reason"] = "superseded_by_peer"
+                sup["reasoning"] = (
+                    f"Superseded by {best_bot.name} "
+                    f"(score {best_score:.4f} > {score:.4f}; one trade/tick)"
+                )
+                _note_decision(bot, sup)
+                self._state.note_skip("superseded_by_peer")
 
         if new_trades > 0:
             logger.debug(

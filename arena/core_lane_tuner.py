@@ -114,9 +114,14 @@ def _finalize_agg(agg: dict) -> dict:
         out[strat] = {}
         for lane, c in lanes.items():
             n = int(c["n"] or 0)
+            n_ev = int(c.get("n_ev") or 0)
+            sum_pnl = float(c.get("sum_pnl") or 0.0)
             out[strat][lane] = {
                 "n": n,
                 "accuracy": (c["correct"] / n) if n else None,
+                "n_ev": n_ev,
+                "sum_pnl": round(sum_pnl, 4),
+                "mean_ev": (sum_pnl / n_ev) if n_ev else None,
             }
     return out
 
@@ -171,7 +176,8 @@ def compute_core_attribution(conn, deadband: float, *,
     ) or not out:
         smap = _strategy_map(conn)
         rows = conn.execute(
-            """SELECT bot_name, side, outcome, reasoning, context, trade_features
+            """SELECT bot_name, side, outcome, pnl, reasoning, context,
+                      trade_features
                FROM trades
                WHERE outcome IN ('win', 'loss') AND reasoning LIKE 'fair=%'"""
         ).fetchall()
@@ -196,14 +202,23 @@ def compute_core_attribution(conn, deadband: float, *,
                 except (json.JSONDecodeError, TypeError, KeyError):
                     continue
             market_up = (r["side"] == "yes") == (r["outcome"] == "win")
+            side_yes = (r["side"] == "yes")
+            try:
+                trade_pnl = float(r["pnl"] or 0.0)
+            except (TypeError, ValueError):
+                trade_pnl = 0.0
             readings = _parse_readings(r["reasoning"] or "", lane_list)
             for lane, reading in readings.items():
                 if abs(reading) < deadband:
                     continue
                 cell = agg.setdefault(strat, {}).setdefault(
-                    lane, {"n": 0, "correct": 0})
+                    lane, {"n": 0, "correct": 0, "n_ev": 0, "sum_pnl": 0.0})
                 cell["n"] += 1
                 cell["correct"] += int((reading > 0) == market_up)
+                # Lane EV: P&L when the trade followed this lane's sign
+                if (reading > 0) == side_yes:
+                    cell["n_ev"] += 1
+                    cell["sum_pnl"] += trade_pnl
         trade_out = _finalize_agg(agg)
         for st, ld in trade_out.items():
             for lane, st_lane in ld.items():
@@ -281,6 +296,29 @@ def _strategy_regime_pnl(regime_id: Optional[str]) -> dict:
         from arena.regime_stats import snapshot
         by = (snapshot().get("by_strategy") or {}).get(regime_id) or {}
         return {k: dict(v) for k, v in by.items()}
+    except Exception:
+        return {}
+
+
+def _strategy_global_pnl(hours: float = 48.0) -> dict:
+    """{strategy: {n, pnl}} across all regimes for always-on P&L gate."""
+    try:
+        with db.get_conn() as conn:
+            rows = conn.execute(
+                """SELECT bc.strategy_type AS st,
+                          COUNT(*) AS n,
+                          COALESCE(SUM(t.pnl), 0) AS pnl
+                   FROM trades t
+                   JOIN bot_configs bc ON bc.bot_name = t.bot_name
+                   WHERE t.outcome IN ('win', 'loss', 'exit_tp', 'exit_sl')
+                     AND datetime(t.resolved_at) >= datetime('now', ?)
+                   GROUP BY bc.strategy_type""",
+                (f"-{float(hours)} hours",),
+            ).fetchall()
+        return {
+            r["st"]: {"n": int(r["n"] or 0), "pnl": float(r["pnl"] or 0.0)}
+            for r in rows if r["st"]
+        }
     except Exception:
         return {}
 
@@ -393,8 +431,10 @@ def tune() -> dict:
                 "using global attribution (no by_regime write)",
             )
 
-    # Live P&L per strategy in this regime — blocks UP when bleeding $.
+    # Live P&L per strategy — always-on gate (regime-local preferred, else global).
     strat_pnl = _strategy_regime_pnl(live_regime) if regime_local else {}
+    if not strat_pnl:
+        strat_pnl = _strategy_global_pnl(48.0)
     pnl_min_n = int(getattr(config, "CORE_TUNE_PNL_MIN_TRADES", 15))
     # Regime-local cells are thin (overnight: n=3–8 trades while attribution
     # n is large). Use a lower bar so red $ still blocks accuracy-driven UP.
@@ -403,6 +443,10 @@ def tune() -> dict:
             pnl_min_n,
             int(getattr(config, "CORE_TUNE_PNL_MIN_TRADES_REGIME", 5)),
         )
+    ev_primary = bool(getattr(config, "CORE_TUNE_EV_PRIMARY", True))
+    ev_min_n = int(getattr(config, "CORE_TUNE_EV_MIN_TRADES", 20))
+    ev_up_min = float(getattr(config, "CORE_TUNE_EV_UP_MIN", 0.0))
+    ev_down_max = float(getattr(config, "CORE_TUNE_EV_DOWN_MAX", -0.05))
 
     report: dict = {"applied": apply,
                     "cell_filter": list(cell_filter) if cell_filter else None,
@@ -488,12 +532,28 @@ def tune() -> dict:
             if st and st["n"] >= lane_min and st["accuracy"] is not None:
                 # Band around seed when regime-local, else class default
                 anchor = seed_w if (regime_local and is_core) else default
+                mean_ev = st.get("mean_ev")
+                n_ev = int(st.get("n_ev") or 0)
+                try:
+                    mean_ev_f = float(mean_ev) if mean_ev is not None else None
+                except (TypeError, ValueError):
+                    mean_ev_f = None
+                # Soften drift floor when EV is red (priced-in predictive)
+                red_ev = (
+                    mean_ev_f is not None
+                    and n_ev >= ev_min_n
+                    and mean_ev_f <= ev_down_max
+                )
                 if is_core:
                     lo = max(wmin, anchor - lane_band)
                     hi = min(lane_wmax, max(anchor, default) + lane_band)
-                    # drift never collapses to 0
                     if lane == "drift":
-                        lo = max(lo, 0.15)
+                        floor = float(getattr(
+                            config, "CORE_TUNE_DRIFT_FLOOR", 0.10))
+                        if red_ev or (pnl_n >= pnl_min_n and pnl_val < 0):
+                            floor = float(getattr(
+                                config, "CORE_TUNE_DRIFT_FLOOR_WHEN_RED", 0.05))
+                        lo = max(lo, floor)
                 else:
                     # Candidates may go to 0
                     lo = 0.0
@@ -502,48 +562,82 @@ def tune() -> dict:
                 revert_below = float(
                     getattr(config, "CORE_TUNE_REVERT_BELOW_ACC", high_acc)
                 )
+                # Always-on P&L gate (not only regime-local)
                 pnl_blocks_up = (
-                    regime_local
-                    and pnl_n >= pnl_min_n
+                    pnl_n >= pnl_min_n
                     and pnl_val < 0
                     and bool(getattr(config, "CORE_TUNE_PNL_GATE", True))
                 )
-                if acc >= high_acc and cur < hi and not pnl_blocks_up:
+                ev_blocks_up = (
+                    ev_primary
+                    and mean_ev_f is not None
+                    and n_ev >= ev_min_n
+                    and mean_ev_f < ev_up_min
+                )
+                ev_forces_down = (
+                    ev_primary
+                    and mean_ev_f is not None
+                    and n_ev >= ev_min_n
+                    and mean_ev_f <= ev_down_max
+                    and cur > lo
+                )
+                if ev_forces_down:
+                    new_w = round(max(lo, cur - step), 3)
+                    action = "ev_down"
+                elif (
+                    acc >= high_acc
+                    and cur < hi
+                    and not pnl_blocks_up
+                    and not ev_blocks_up
+                    and (
+                        not ev_primary
+                        or mean_ev_f is None
+                        or n_ev < ev_min_n
+                        or mean_ev_f >= ev_up_min
+                    )
+                ):
                     new_w = round(min(hi, cur + step), 3)
                     action = "up"
-                elif acc >= high_acc and pnl_blocks_up:
+                elif acc >= high_acc and (pnl_blocks_up or ev_blocks_up):
                     target = min(cur, max(lo, anchor))
                     if cur > target + 1e-9:
                         new_w = round(max(lo, cur - step), 3)
-                        action = "pnl_revert"
+                        action = "pnl_revert" if pnl_blocks_up else "ev_revert"
                     else:
-                        # Audit 2c: time-limit escape — a lane frozen at
-                        # hold_pnl_gate for > N hours gets a half-step UP
-                        # nudge to re-test the water.
+                        # Timeout UP disabled when hours <= 0 (default)
                         timeout_h = float(getattr(
-                            config, "CORE_TUNE_PNL_GATE_TIMEOUT_HOURS", 6.0))
-                        reg_meta_cell = by_regime_meta.get(
-                            live_regime, {}).get(strat, {})
-                        last_gate = reg_meta_cell.get("pnl_gate_since")
-                        try:
-                            last_gate = float(last_gate) if last_gate else None
-                        except (TypeError, ValueError):
-                            last_gate = None
-                        if last_gate is None:
-                            by_regime_meta.setdefault(
-                                live_regime, {}).setdefault(
-                                    strat, {})["pnl_gate_since"] = time.time()
+                            config, "CORE_TUNE_PNL_GATE_TIMEOUT_HOURS", 0.0))
+                        if timeout_h <= 0:
                             action = "hold_pnl_gate"
-                        elif (time.time() - last_gate) > timeout_h * 3600:
-                            new_w = round(min(hi, cur + step * 0.5), 3)
-                            action = "pnl_gate_timeout_up"
-                            # Reset the timer so the next nudge is another
-                            # timeout_h away.
-                            by_regime_meta.setdefault(
-                                live_regime, {}).setdefault(
-                                    strat, {})["pnl_gate_since"] = time.time()
                         else:
-                            action = "hold_pnl_gate"
+                            reg_meta_cell = by_regime_meta.get(
+                                live_regime or "_global", {}).get(strat, {})
+                            last_gate = reg_meta_cell.get("pnl_gate_since")
+                            try:
+                                last_gate = (
+                                    float(last_gate) if last_gate else None
+                                )
+                            except (TypeError, ValueError):
+                                last_gate = None
+                            key_reg = live_regime or "_global"
+                            if last_gate is None:
+                                by_regime_meta.setdefault(
+                                    key_reg, {}).setdefault(
+                                        strat, {})["pnl_gate_since"] = time.time()
+                                action = "hold_pnl_gate"
+                            elif (time.time() - last_gate) > timeout_h * 3600:
+                                # Only re-test if EV no longer deep red
+                                if not ev_forces_down:
+                                    new_w = round(
+                                        min(hi, cur + step * 0.5), 3)
+                                    action = "pnl_gate_timeout_up"
+                                else:
+                                    action = "hold_pnl_gate"
+                                by_regime_meta.setdefault(
+                                    key_reg, {}).setdefault(
+                                        strat, {})["pnl_gate_since"] = time.time()
+                            else:
+                                action = "hold_pnl_gate"
                 elif acc <= low_acc and cur > lo:
                     new_w = round(max(lo, cur - step), 3)
                     action = "down"
@@ -563,6 +657,9 @@ def tune() -> dict:
                     "regime": live_regime,
                     "regime_pnl": round(pnl_val, 2) if pnl_n else None,
                     "regime_pnl_n": pnl_n or None,
+                    "mean_ev": (round(mean_ev_f, 4)
+                                if mean_ev_f is not None else None),
+                    "n_ev": n_ev,
                     "kind": "core" if is_core else "candidate",
                 }
             elif st and st["n"]:
@@ -643,6 +740,41 @@ def tune() -> dict:
                         f" kind={'core' if is_core else 'cand'})"
                     )
 
+    # Renormalize core profile weights per strategy so Σw(core) ≈ 1.
+    # Only when a complete core profile exists for that strategy (all CORE_LANES
+    # present); partial writes must not scale a single lane to 1.0.
+    if (
+        apply
+        and dirty
+        and bool(getattr(config, "CORE_TUNE_NORMALIZE_PROFILE", True))
+    ):
+        core_lanes = list(CORE_LANES)
+        strats = set()
+        for lane in core_lanes:
+            prof = (new_overrides.get(lane) or {}).get("profile") or {}
+            strats.update(prof.keys())
+        for strat in strats:
+            vals = []
+            complete = True
+            for lane in core_lanes:
+                entry = new_overrides.get(lane) or {}
+                prof = entry.get("profile") or {}
+                if strat not in prof:
+                    complete = False
+                    break
+                vals.append(float(prof.get(strat) or 0.0))
+            if not complete:
+                continue
+            total = sum(vals)
+            if total <= 1e-9:
+                continue
+            scale = 1.0 / total
+            for lane, v in zip(core_lanes, vals):
+                entry = new_overrides.get(lane)
+                if not entry or "profile" not in entry:
+                    continue
+                entry["profile"][strat] = round(v * scale, 3)
+
     if apply and dirty:
         db.set_arena_state("lane_overrides", json.dumps(new_overrides))
         # Notify operators of applied weight shifts (large moves only).
@@ -650,8 +782,9 @@ def tune() -> dict:
             changes = []
             for lane, lane_report in (report.get("lanes") or {}).items():
                 for strat, r in (lane_report or {}).items():
-                    if r.get("action") in ("up", "down") and r.get(
-                            "current") != r.get("suggested"):
+                    if r.get("action") in (
+                        "up", "down", "ev_down", "pnl_revert", "ev_revert"
+                    ) and r.get("current") != r.get("suggested"):
                         changes.append({
                             "lane": lane,
                             "strategy": strat,

@@ -1418,7 +1418,7 @@ def publish_price_feed_status() -> dict[str, Any]:
                     "chainlink" if sym == "btc" else "binance"
                 ),
             }
-            # BTC TWAP resolution path (30s lookback for 5m markets).
+            # BTC TWAP resolution path (TWAP_WINDOW_SEC lookback for 5m).
             # Polymarket UI "Current Price" + Price to Beat use TWAP; spot stays
             # on ``latest`` for mom/regime forecasting only.
             if sym == "btc":

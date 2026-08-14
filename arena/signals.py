@@ -111,12 +111,12 @@ def build_combined_signals(
         logger.debug(f"drift scale update failed: {e}")
 
     # BTC drift from the window's "price to beat" (official Polymarket openPrice
-    # / TWAP at eventStartTime). Under TWAP resolution (2026-08-07+) both open
-    # and settlement are Chainlink 30s TWAP prints — so ``btc_now`` for
-    # moneyness is the official rolling TWAP (and a settlement nowcast inside
-    # the final 30s). Warm path reads the strike the warmer fetched; cold path
-    # fetches via the registry. Regime-agnostic fundamental; 0.0 until a strike
-    # is available. Vol scale is adaptive (slightly damped for TWAP smoothness).
+    # / TWAP at eventStartTime). Under TWAP resolution both open and settlement
+    # are Chainlink TWAP prints (``TWAP_WINDOW_SEC``, 60s for 5m) — so
+    # ``btc_now`` for moneyness is the official rolling TWAP (and a settlement
+    # nowcast inside the final window). Warm path reads the strike the warmer
+    # fetched; cold path fetches via the registry. Regime-agnostic fundamental;
+    # 0.0 until a strike is available.
     btc_spot = float(price_signals.get("latest", 0.0) or 0.0)
     btc_twap = float(price_signals.get("twap", 0.0) or 0.0)
     btc_latest = btc_spot  # keep candle-path "latest" = spot for mom consumers
@@ -274,6 +274,16 @@ def build_combined_signals(
     market_regime: dict = {}
     try:
         from signals.regime_detector import get_detector
+        # Recent TWAP observations for resolution-aligned regime features
+        twap_px = None
+        try:
+            if price_feed is not None and hasattr(price_feed, "btc_twap_ticks"):
+                ticks = price_feed.btc_twap_ticks() or []
+                twap_px = [float(v) for _ts, v in ticks[-40:] if v and float(v) > 0]
+                if len(twap_px) < 3:
+                    twap_px = None
+        except Exception:
+            twap_px = None
         market_regime = get_detector().update(
             btc_prices,
             cvd=cvd,
@@ -286,6 +296,7 @@ def build_combined_signals(
                 (market.get("id") or market.get("market_id"))
                 if market is not None else None
             ),
+            twap_prices=twap_px,
         )
     except Exception as e:
         logger.debug(f"regime detector update failed: {e}")

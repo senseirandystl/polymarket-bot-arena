@@ -179,6 +179,32 @@ def pairwise_correlation(
             else:
                 rho = max(-1.0, min(1.0, cov / math.sqrt(va * vb)))
             corr[a][b] = corr[b][a] = rho
+    # Strategy-family prior: tandem risk when market-overlap ρ is thin
+    prior = float(getattr(config, "PORTFOLIO_FAMILY_CORR_PRIOR", 0.75) or 0.0)
+    if prior > 0:
+        try:
+            import db as _db
+            with _db.get_conn() as conn:
+                rows = conn.execute(
+                    "SELECT bot_name, strategy_type FROM bot_configs"
+                ).fetchall()
+            type_of = {r["bot_name"]: r["strategy_type"] for r in rows}
+        except Exception:
+            type_of = {}
+        groups = getattr(config, "PORTFOLIO_FAMILY_GROUPS", ()) or ()
+        fam: dict[str, str] = {}
+        for gi, g in enumerate(groups):
+            for st in g:
+                fam[str(st)] = f"g{gi}"
+        for i, a in enumerate(names):
+            for b in names[i + 1:]:
+                fa = fam.get(type_of.get(a) or "")
+                fb = fam.get(type_of.get(b) or "")
+                if fa and fa == fb:
+                    cur = float(corr[a].get(b) or 0.0)
+                    # Never lower a measured high corr; floor at family prior
+                    rho = max(cur, prior)
+                    corr[a][b] = corr[b][a] = rho
     return corr
 
 
@@ -193,10 +219,17 @@ def _metrics_from_pnls(
         n = len(series)
         sh = sharpe_ratio(series) if n >= min_trades else 0.0
         exp = expectancy(series) if n >= min_trades else 0.0
+        # Prefer return-like variance (pnl per unit of |pnl| mass) so size
+        # does not dominate Kelly scores.
         var = 0.0
         if n >= 2:
             mean = sum(series) / n
             var = sum((p - mean) ** 2 for p in series) / (n - 1)
+            # Soft floor relative to mean absolute size
+            mean_abs = sum(abs(p) for p in series) / n
+            if mean_abs > 1e-9:
+                # Coefficient of variation style floor
+                var = max(var, (0.15 * mean_abs) ** 2)
         metrics[name] = {
             "n": n,
             "sharpe": round(sh, 4),
@@ -233,11 +266,36 @@ def compute_metrics(
         # Fast window uses a lower sample floor so it can contribute signal
         # without requiring a full long-window count in 12h.
         fast_min = max(8, min_trades // 2)
+        fast_ready_n = int(getattr(
+            config, "PORTFOLIO_FAST_READY_MIN_TRADES", 12))
+        fast_ready_on = bool(getattr(
+            config, "PORTFOLIO_FAST_READY_ENABLED", True))
         fast_m = _metrics_from_pnls(bot_names, fast_pnls, fast_min)
         for name in bot_names:
             lm = metrics[name]
             fm = fast_m.get(name) or {}
+            lm["fast_n"] = int(fm.get("n") or 0)
+            lm["fast_expectancy"] = fm.get("expectancy")
+            lm["blend_long_w"] = long_w
+            # Dual-window ready: long n≥min OR fast n with consistent sign
+            if (
+                fast_ready_on
+                and not lm.get("ready")
+                and int(fm.get("n") or 0) >= fast_ready_n
+            ):
+                f_exp = float(fm.get("expectancy") or 0.0)
+                f_pnl = float(fm.get("total_pnl") or 0.0)
+                # Ready only if short window is not a pure coin-flip red mess
+                if f_exp >= 0 or f_pnl >= 0:
+                    lm["ready"] = True
+                    lm["ready_via"] = "fast"
+                    lm["sharpe"] = float(fm.get("sharpe") or 0.0)
+                    lm["expectancy"] = f_exp
+                    lm["variance"] = float(fm.get("variance") or lm["variance"])
+                    lm["total_pnl"] = f_pnl
             if not lm.get("ready"):
+                continue
+            if lm.get("ready_via") == "fast":
                 continue
             # Blend sharpe/expectancy/variance for scoring; keep long n/ready.
             lm["sharpe"] = round(
@@ -250,9 +308,6 @@ def compute_metrics(
                 long_w * float(lm["variance"])
                 + (1.0 - long_w) * float(fm.get("variance") or lm["variance"]),
                 6)
-            lm["fast_n"] = int(fm.get("n") or 0)
-            lm["fast_expectancy"] = fm.get("expectancy")
-            lm["blend_long_w"] = long_w
     return metrics
 
 
@@ -594,6 +649,26 @@ def allocate(
         or _is_new_generation_bot(n, metrics.get(n))
     ]
     veterans = [n for n in free_names if n not in explorers]
+    # Cold start: when zero veterans, equal-split free capital (don't leave
+    # the pool dark at 0.06 explore caps only).
+    if (
+        not veterans
+        and free_names
+        and free_mass > 0
+        and bool(getattr(config, "PORTFOLIO_COLD_START_EQUAL", True))
+    ):
+        per = free_mass / len(free_names)
+        for n in free_names:
+            auto_weights[n] = per
+        weights = {**auto_weights, **locked}
+        for n in names:
+            weights.setdefault(n, 0.0)
+        # Skip normal explorer/veteran path — fall through to shared post
+        # processing via a jump: set veterans empty and explorers empty after
+        # writing equal weights.
+        explorers = []
+        veterans = []
+        free_mass = 0.0  # already allocated into auto_weights
     explore_mass = min(explore_budget, free_mass) if explorers else 0.0
     # Per-explorer equal slice, each ≤ explore_cap
     if explorers and explore_mass > 0:
@@ -998,8 +1073,9 @@ def rebalance(
             reason = "timer"
 
     method = state.get("method") or getattr(config, "PORTFOLIO_METHOD", "kelly_portfolio")
-    hours = float(state.get("window_hours") or
-                  getattr(config, "PORTFOLIO_WINDOW_HOURS", 24))
+    # Always prefer live config for window (stale 3h state broke readiness)
+    hours = float(getattr(config, "PORTFOLIO_WINDOW_HOURS", 48))
+    state["window_hours"] = hours
     overrides = state.get("manual_overrides") or {}
     prev_weights = dict(state.get("weights") or {})
 

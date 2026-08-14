@@ -230,12 +230,33 @@ body.nav-open .sidebar{transform:none}
 .ov-main-row > .card:not(.market-card){opacity:.97}
 .ov-main-row .compact-table td.quiet-zero{color:var(--dim);opacity:.75}
 
-/* Context band: Health | Signals | Allocation — secondary strip under hero */
+/* Context band: Health | Lane Health (hero width) | Allocation —
+   mirrors ov-main-row proportions so Lane Health aligns with Current Market. */
 .ov-context-row{
-  display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;margin-top:0;margin-bottom:8px;width:100%
+  display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.35fr) minmax(0,1fr);
+  gap:8px;margin-top:0;margin-bottom:8px;width:100%
 }
 @media(max-width:1000px){.ov-context-row{grid-template-columns:1fr 1fr}}
 @media(max-width:700px){.ov-context-row{grid-template-columns:1fr}}
+/* Performance card: Core vs Lock-in split cells */
+.perf-cell{display:flex;flex-direction:column;align-items:flex-end;gap:1px;line-height:1.25}
+.perf-cell .perf-pnl{font-weight:700;font-variant-numeric:tabular-nums}
+.perf-cell .perf-sub{font-size:10px;color:var(--dim);font-variant-numeric:tabular-nums}
+.perf-hint{font-size:10px;color:var(--dim);font-weight:400;text-transform:none;letter-spacing:0;margin-left:6px}
+/* Graveyard (retired bots) — reuse gene-bank grid with muted accent */
+.graveyard-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:10px}
+.graveyard-card{
+  background:var(--inset);border:1px solid var(--line);border-radius:6px;
+  padding:10px 12px;border-left:3px solid #8b949e
+}
+.graveyard-card .gb-name{font-weight:700;color:var(--muted);font-size:13px}
+.graveyard-card .gb-meta{font-size:11px;color:var(--dim);margin:2px 0 6px}
+.graveyard-card .gb-stats{
+  display:flex;flex-wrap:wrap;gap:8px 12px;font-size:11px;margin-bottom:4px
+}
+.graveyard-card .gb-stats span{white-space:nowrap}
+.graveyard-card .gb-stats .k{color:var(--dim);margin-right:3px;text-transform:uppercase;font-size:9px;letter-spacing:.06em}
+.graveyard-empty{color:var(--muted);font-size:12px;text-align:center;padding:16px 8px}
 
 /* Compact equal-allocation strip + stacked bar (segments use % width, sum to 100%) */
 .ov-alloc-equal{
@@ -745,8 +766,8 @@ tbody tr:hover{background:rgba(0,255,156,.035)}
     <div class="tab-content" id="tab-overview">
         <!-- Ops ribbon: live BTC + system KPIs -->
         <div class="ov-ribbon">
-            <div class="btc-chip" id="btc-strip" title="Chainlink BTC/USD 30s TWAP via Polymarket RTDS — same as Polymarket Current Price and Price to Beat">
-                <div class="btc-lbl">Bitcoin (TWAP)</div>
+            <div class="btc-chip" id="btc-strip" title="Chainlink BTC/USD live tick via Polymarket RTDS — spot price (not TWAP). Current Market BTC now stays TWAP for settlement parity.">
+                <div class="btc-lbl">Bitcoin (live)</div>
                 <div class="btc-px" id="btc-price-val">—</div>
                 <div class="btc-sub" id="btc-price-sub">connecting…</div>
             </div>
@@ -762,9 +783,18 @@ tbody tr:hover{background:rgba(0,255,156,.035)}
         <!-- Primary pulse: Performance | Current Market | Market Regime -->
         <div class="ov-main-row">
             <div class="card dense">
-                <h2>Performance <span style="font-weight:normal">&mdash; ET</span></h2>
+                <h2>Performance <span style="font-weight:normal">&mdash; ET</span>
+                    <span class="perf-hint" title="Core = directional bots (mom / meanrev / sniper / hybrid…). Lock-in = Sweeper + Arbitrage (near-certain / market-neutral fills).">Core vs Lock-in</span>
+                </h2>
                 <table id="stats-table" class="compact-table">
-                    <thead><tr><th>Period</th><th style="text-align:right">Trades</th><th style="text-align:right">P&amp;L</th><th style="text-align:right">WR</th></tr></thead>
+                    <thead>
+                        <tr>
+                            <th>Period</th>
+                            <th style="text-align:right" title="Directional strategies — momentum, mean-reversion, sniper, hybrid, makers">Core</th>
+                            <th style="text-align:right" title="Sweeper + Arbitrage — late-window locks and market-neutral margin">Lock-in</th>
+                            <th style="text-align:right">All</th>
+                        </tr>
+                    </thead>
                     <tbody id="stats-tbody"><tr><td colspan="4" style="color:#3f6b52">Loading&hellip;</td></tr></tbody>
                 </table>
             </div>
@@ -889,6 +919,14 @@ tbody tr:hover{background:rgba(0,255,156,.035)}
                 Shadow elites saved each GA cycle as future parents — not removed from the live roster.
             </div>
             <div id="gene-bank-grid" class="gene-bank-grid"></div>
+        </div>
+
+        <div class="section-title">Graveyard</div>
+        <div class="card" id="graveyard-card" style="margin-bottom:14px;border-left:3px solid #8b949e">
+            <div id="graveyard-summary" style="color:#5f9c78;font-size:12px;margin-bottom:10px;text-align:center">
+                Retired bots (evolved out or manually retired) with lifetime P&amp;L / WR.
+            </div>
+            <div id="graveyard-grid" class="graveyard-grid"></div>
         </div>
 
         <div class="section-title">Evolution History</div>
@@ -1104,6 +1142,27 @@ tbody tr:hover{background:rgba(0,255,156,.035)}
                 <button class="btn btn-primary" onclick="savePileinEvGate()">Save</button>
             </div>
             <div class="test-result" id="pilein-ev-result" style="margin-top:6px;font-size:11px;color:#8fd4a8"></div>
+        </div>
+
+        <div class="settings-section">
+            <h3>Directional window lock</h3>
+            <div class="settings-blurb">
+                When <b>ON</b>, after any directional bot fills on a market, no other
+                directional bot may open that same window (one thesis per market).
+                Default <b>OFF</b> — the arena still enforces <b>one trade per tick</b>
+                (best-edge wins) and max 1 bot per side. Toggle for stricter long-run
+                concentration control without a restart.
+            </div>
+            <div class="cred-row">
+                <label>Enabled<small>Current: <span id="window-lock-current">&mdash;</span></small></label>
+                <select id="window-lock-enabled" style="background:#050806;color:#bff0d2;border:1px solid #16301f;border-radius:6px;padding:8px 10px;font-family:inherit">
+                    <option value="0">Off</option>
+                    <option value="1">On</option>
+                </select>
+                <button class="btn btn-primary" onclick="saveWindowLock()">Save</button>
+            </div>
+            <div class="test-result" id="window-lock-result" style="margin-top:6px;font-size:11px;color:#8fd4a8"></div>
+            <div id="window-lock-meta" style="margin-top:6px;font-size:11px;color:#5f9c78"></div>
         </div>
 
         <div class="settings-section">
@@ -1785,6 +1844,7 @@ async function refreshSettings() {
     loadBankroll();
     loadKelly();
     loadPileinEvGate();
+    loadWindowLock();
     loadPortfolio();
     loadAlerts();
 }
@@ -1948,10 +2008,20 @@ function updateOps(ops) {
     _setOpsChip('ops-size', 'info',
         sz.paper_available != null ? ('$' + Number(sz.paper_available).toFixed(0)) : '—',
         sz.kelly_fraction != null ? ('Kelly ' + Number(sz.kelly_fraction).toFixed(2)) : '—');
-    // Arena SQLite feed: fallback when browser RTDS is down OR quiet (socket
-    // open but no ticks — RTDS often only snapshots on subscribe).
-    if (ops.prices && !_btcWsFresh()) {
-        updateBtcPrice(ops.prices.btc, ops.prices.btc_stale, 'arena');
+    // Arena SQLite feed: fallback when browser RTDS is down OR quiet.
+    // Spot → top-left chip; TWAP → Current Market (never mix the two).
+    if (ops.prices) {
+        if (!_btcWsFresh()) {
+            const spot = ops.prices.btc_spot != null ? ops.prices.btc_spot : ops.prices.btc;
+            const spotStale = ops.prices.btc_spot != null
+                ? !!ops.prices.btc_stale  // ops uses one stale flag; fine for fallback
+                : !!ops.prices.btc_stale;
+            if (spot != null) updateBtcSpot(spot, spotStale, 'arena');
+        }
+        if (!_btcTwapWsFresh()) {
+            const twap = ops.prices.btc_twap != null ? ops.prices.btc_twap : ops.prices.btc;
+            if (twap != null) updateBtcTwap(twap, !!ops.prices.btc_stale, 'arena');
+        }
     }
 
     // Lane health matrix (sign accuracy by lean side)
@@ -2510,6 +2580,43 @@ async function loadPileinEvGate() {
     } catch (e) { console.error('loadPileinEvGate error:', e); }
 }
 
+async function loadWindowLock() {
+    try {
+        const p = await fetchJSON('/api/settings/directional-window-lock');
+        const sel = document.getElementById('window-lock-enabled');
+        if (sel) sel.value = p.enabled ? '1' : '0';
+        const cur = document.getElementById('window-lock-current');
+        if (cur) cur.textContent = p.enabled ? 'On' : 'Off';
+        const meta = document.getElementById('window-lock-meta');
+        if (meta) {
+            meta.textContent =
+                `Always on: one_trade_per_tick=${p.one_trade_per_tick ? 'yes' : 'no'}, ` +
+                `max_bots_per_side=${p.market_side_max_bots}`;
+        }
+    } catch (e) { console.error('loadWindowLock error:', e); }
+}
+
+async function saveWindowLock() {
+    const sel = document.getElementById('window-lock-enabled');
+    const resultEl = document.getElementById('window-lock-result');
+    const enabled = sel && sel.value === '1';
+    try {
+        const resp = await postJSON('/api/settings/directional-window-lock', { enabled });
+        if (resultEl) {
+            resultEl.textContent = resp.enabled
+                ? 'Window lock ON — one directional fill locks the market.'
+                : 'Window lock OFF — one trade/tick still applies.';
+            resultEl.style.color = '#8fd4a8';
+        }
+        await loadWindowLock();
+    } catch (e) {
+        if (resultEl) {
+            resultEl.textContent = String(e);
+            resultEl.style.color = '#f88';
+        }
+    }
+}
+
 async function savePileinEvGate() {
     const sel = document.getElementById('pilein-ev-enabled');
     const resultEl = document.getElementById('pilein-ev-result');
@@ -2695,10 +2802,10 @@ function updateRisk(r) {
     const sum = document.getElementById('risk-summary');
     if (sum) {
         sum.innerHTML = killed
-            ? `<span style="color:#ff3b5c;font-weight:bold">KILL SWITCH ARMED</span> — ${r.kill_reason || 'halted'} <span style="color:#5f9c78">(${r.kill_source || '?'}) · file: ${r.kill_file || '—'}</span>`
+            ? `<span style="color:#ff3b5c;font-weight:bold">KILL SWITCH ARMED</span> — ${escHtml(r.kill_reason || 'halted')} <span style="color:#5f9c78">(${escHtml(r.kill_source || '?')}) · file: ${escHtml(r.kill_file || '—')}</span>`
             : `Engine <b style="color:${en ? '#35ff87' : '#5f9c78'}">${en ? 'ON' : 'OFF'}</b> · portfolio <b style="color:${_statusColor(port.status)}">${port.status || '—'}</b>`
-              + (port.reason ? ` · ${port.reason}` : '')
-              + ` · file <code style="font-size:11px">${r.kill_file || '—'}</code>`;
+              + (port.reason ? ` · ${escHtml(port.reason)}` : '')
+              + ` · file <code style="font-size:11px">${escHtml(r.kill_file || '—')}</code>`;
     }
     const killBtn = document.getElementById('risk-kill-btn');
     if (killBtn) {
@@ -2936,11 +3043,28 @@ async function riskResumeBot(name) {
 }
 
 // ---------- Overview / Bots / Trades ----------
+/** Format a Core / Lock-in / All stats cell: P&L on top, WR · n below. */
+function _perfSplitCell(pnl, wins, losses, trades, pending) {
+    const n = trades || ((wins || 0) + (losses || 0));
+    if (!n && !(pending || 0)) {
+        return `<div class="perf-cell"><span class="perf-pnl" style="color:#3f6b52">—</span></div>`;
+    }
+    const wr = (wins || losses)
+        ? winRate(wins || 0, losses || 0)
+        : '—';
+    const nLabel = n + (pending ? ` <span style="color:#ffb020">+${pending}</span>` : '');
+    return `<div class="perf-cell">
+        <span class="perf-pnl ${pnlClass(pnl || 0)}">${fmtPnl(pnl || 0)}</span>
+        <span class="perf-sub">${wr} · ${nLabel}</span>
+    </div>`;
+}
+
 function updateOverview(stats) {
     // Build the period rows, then sort ascending by (resolved) trade count so
     // the smallest count is always at the top. "Current Session" only appears
     // once the arena has recorded a session start. "Current Bots" is all-time
     // stats restricted to the live (active) roster.
+    // Columns: Core (directional) | Lock-in (sweeper+arb) | All.
     const rows = [];
     if (stats.session) rows.push(['Current Session', stats.session]);
     rows.push(['Today', stats.today]);
@@ -2971,15 +3095,20 @@ function updateOverview(stats) {
                 <td style="text-align:right;color:#3f6b52">—</td>
             </tr>`;
         }
-        // Resolved count, plus an orange "+N" for pending (matches the pending
-        // pill on the Active Bots cards).
-        const tradesCell = trades +
-            (pending ? ' <span style="color:#ffb020">+' + pending + '</span>' : '');
+        // Prefer explicit core_/lockin_ fields; fall back to directional_/structural_.
+        const corePnl = el.core_pnl != null ? el.core_pnl : el.directional_pnl;
+        const coreWins = el.core_wins != null ? el.core_wins : el.directional_wins;
+        const coreLosses = el.core_losses != null ? el.core_losses : el.directional_losses;
+        const coreTrades = el.core_trades != null ? el.core_trades : el.directional_trades;
+        const lockPnl = el.lockin_pnl != null ? el.lockin_pnl : el.structural_pnl;
+        const lockWins = el.lockin_wins != null ? el.lockin_wins : el.structural_wins;
+        const lockLosses = el.lockin_losses != null ? el.lockin_losses : el.structural_losses;
+        const lockTrades = el.lockin_trades != null ? el.lockin_trades : el.structural_trades;
         return `<tr>
             <td>${label}</td>
-            <td style="text-align:right">${tradesCell}</td>
-            <td style="text-align:right" class="${pnlClass(el.pnl)}">${fmtPnl(el.pnl || 0)}</td>
-            <td style="text-align:right">${winRate(el.wins, el.losses)}</td>
+            <td style="text-align:right">${_perfSplitCell(corePnl, coreWins, coreLosses, coreTrades, 0)}</td>
+            <td style="text-align:right">${_perfSplitCell(lockPnl, lockWins, lockLosses, lockTrades, 0)}</td>
+            <td style="text-align:right">${_perfSplitCell(el.pnl, el.wins, el.losses, trades, pending)}</td>
         </tr>`;
     }).join('');
 }
@@ -3238,10 +3367,58 @@ function updateGeneBank(ga) {
     }).join('');
 }
 
+function updateGraveyard(ga) {
+    const grid = document.getElementById('graveyard-grid');
+    const summary = document.getElementById('graveyard-summary');
+    if (!grid) return;
+    const entries = (ga && ga.graveyard) || [];
+    const n = entries.length;
+    const totalPnl = entries.reduce((s, e) => s + (Number(e.total_pnl) || 0), 0);
+    const totalTrades = entries.reduce((s, e) => s + (Number(e.total_trades) || 0), 0);
+    if (summary) {
+        summary.innerHTML = n
+            ? `<b>${n}</b> retired bot${n === 1 ? '' : 's'} · lifetime <b class="${pnlClass(totalPnl)}">${fmtPnl(totalPnl)}</b> across ${totalTrades} trades · worst first`
+            : `Empty — bots appear here when the GA replaces them or they are manually retired`;
+    }
+    if (!entries.length) {
+        grid.innerHTML = '<div class="graveyard-empty">No dead bots yet. When evolution retires a loser, its lifetime stats land here.</div>';
+        return;
+    }
+    grid.innerHTML = entries.map(e => {
+        const name = e.bot_name || '—';
+        const stype = e.strategy_type || '—';
+        const gen = e.generation != null ? e.generation : '—';
+        const pnl = e.total_pnl != null ? fmtPnl(e.total_pnl) : '—';
+        const wr = e.win_rate != null ? (Number(e.win_rate) * 100).toFixed(0) + '%' : '—';
+        const nTr = e.total_trades != null ? e.total_trades : '—';
+        const be = e.breakeven_gap != null
+            ? ((Number(e.breakeven_gap) >= 0 ? '+' : '') + (Number(e.breakeven_gap) * 100).toFixed(1) + '¢')
+            : '—';
+        const retired = e.retired_at
+            ? String(e.retired_at).replace('T', ' ').slice(0, 16)
+            : '—';
+        const lineage = e.lineage
+            ? `<div class="gb-lineage" title="${String(e.lineage).replace(/"/g, '&quot;')}">${e.lineage}</div>`
+            : '';
+        return `<div class="graveyard-card">
+            <div class="gb-name">${name}</div>
+            <div class="gb-meta">${stype} · gen ${gen} · retired ${retired}</div>
+            <div class="gb-stats">
+                <span><span class="k">P&amp;L</span><b class="${pnlClass(e.total_pnl)}">${pnl}</b></span>
+                <span><span class="k">WR</span><b>${wr}</b></span>
+                <span><span class="k">N</span><b>${nTr}</b></span>
+                <span><span class="k">B/E</span><b>${be}</b></span>
+            </div>
+            ${lineage}
+        </div>`;
+    }).join('');
+}
+
 function updateGA(ga) {
     const summary = document.getElementById('ga-status-summary');
     const fitBody = document.querySelector('#ga-fitness-table tbody');
     updateGeneBank(ga);
+    updateGraveyard(ga);
     if (!summary || !fitBody) return;
     if (!ga) {
         summary.textContent = 'No GA data';
@@ -3379,10 +3556,15 @@ let _btcWsRetry = 0;
 let _btcLastUiMs = 0;
 // RTDS often sends one snapshot on subscribe then goes quiet (no live frames).
 // Arena price_feed reconnects every ~8s for a fresh snapshot; mirror that here.
-let _btcLastTickMs = 0;           // last time a Chainlink price tick painted the UI
+// Top-left chip = Chainlink **spot tick**; Current Market BTC now = **TWAP** (60s).
+let _btcLastTickMs = 0;           // last spot tick painted on the top-left chip
+let _btcLastTwapMs = 0;           // last TWAP tick painted on Current Market
 let _btcWsQuietClose = false;     // intentional close for snapshot refresh (no backoff)
 const BTC_RTDS_REFRESH_MS = 5000; // match signals/price_feed.py refresh_sec
 const BTC_ARENA_FALLBACK_MS = 8000; // allow SQLite feed if browser WS is idle this long
+let liveBtcSpot = null;           // top-left live tick
+let liveBtcTwap = null;           // Current Market BTC now (settlement parity)
+// liveBtcPrice (above) is kept as a TWAP alias for any legacy market-card readers.
 
 function _fmtUsd(n) {
     if (n == null || !Number.isFinite(Number(n))) return '—';
@@ -3390,47 +3572,63 @@ function _fmtUsd(n) {
 }
 
 /**
- * Update live BTC display (header chip + Current Market BTC now / delta).
- * Prefer **Chainlink 30s TWAP** — same number Polymarket shows as Current Price
- * and uses for Price to Beat / settlement (not spot).
- * source: 'ws' (browser RTDS TWAP) | 'arena' (SQLite TWAP from arena) | other.
+ * Top-left Bitcoin chip — Chainlink **live spot tick** (not TWAP).
+ * source: 'ws' (browser RTDS spot) | 'arena' (SQLite latest from arena).
  */
-function updateBtcPrice(price, stale, source) {
+function updateBtcSpot(price, stale, source) {
     const strip = document.getElementById('btc-strip');
     const val = document.getElementById('btc-price-val');
     const sub = document.getElementById('btc-price-sub');
     if (!val) return;
     if (price != null && Number.isFinite(Number(price)) && Number(price) > 0) {
-        const prev = liveBtcPrice;
-        liveBtcPrice = Number(price);
-        // Throttle DOM for bursty streams; always paint first sample or ≥$0.50 move.
+        const prev = liveBtcSpot;
+        liveBtcSpot = Number(price);
         const now = Date.now();
         const first = prev == null;
-        const jump = !first && Math.abs(liveBtcPrice - prev) >= 0.5;
+        const jump = !first && Math.abs(liveBtcSpot - prev) >= 0.5;
         const throttled = source === 'ws' && !first && !jump && (now - _btcLastUiMs) < 200;
         if (!throttled) {
             _btcLastUiMs = now;
-            val.textContent = _fmtUsd(liveBtcPrice);
+            val.textContent = _fmtUsd(liveBtcSpot);
             if (strip) {
                 strip.classList.toggle('stale', !!stale);
                 strip.classList.toggle('live', (source === 'ws' || source === 'arena') && !stale);
             }
             if (sub) {
-                if (stale) sub.textContent = 'TWAP feed stale / delayed';
-                else if (source === 'ws') sub.textContent = 'TWAP 30s · RTDS';
-                else if (source === 'arena') sub.textContent = 'TWAP 30s · arena';
-                else sub.textContent = 'Chainlink TWAP 30s';
+                if (stale) sub.textContent = 'spot feed stale / delayed';
+                else if (source === 'ws') sub.textContent = 'live tick · RTDS';
+                else if (source === 'arena') sub.textContent = 'live tick · arena';
+                else sub.textContent = 'Chainlink spot';
             }
-            _patchMarketBtcDeltas();
         }
-    } else if (sub && !liveBtcPrice) {
-        sub.textContent = 'waiting for TWAP…';
+    } else if (sub && !liveBtcSpot) {
+        sub.textContent = 'waiting for spot…';
     }
+}
+
+/**
+ * Current Market "BTC now (TWAP)" + strike delta — Chainlink TWAP
+ * (``TWAP_WINDOW_SEC``, 60s for 5m). Does NOT update the top-left chip.
+ */
+function updateBtcTwap(price, stale, source) {
+    if (price == null || !Number.isFinite(Number(price)) || Number(price) <= 0) return;
+    liveBtcTwap = Number(price);
+    liveBtcPrice = liveBtcTwap;  // keep legacy alias in sync
+    _btcLastTwapMs = Date.now();
+    _patchMarketBtcDeltas();
+}
+
+/** @deprecated Use updateBtcSpot / updateBtcTwap. Kept for any stray callers. */
+function updateBtcPrice(price, stale, source) {
+    // Historical callers fed TWAP into both UI surfaces. Split: spot chip falls
+    // back only if we have no spot yet; market always takes the value as TWAP.
+    if (liveBtcSpot == null) updateBtcSpot(price, stale, source);
+    updateBtcTwap(price, stale, source);
 }
 
 /** Patch BTC now / strike delta without re-rendering the whole market card. */
 function _patchMarketBtcDeltas() {
-    const btc = liveBtcPrice;
+    const btc = liveBtcTwap != null ? liveBtcTwap : liveBtcPrice;
     const nowEl = document.getElementById('mkt-btc-now');
     if (nowEl && btc != null) nowEl.textContent = _fmtUsd(btc);
     const dEl = document.getElementById('mkt-btc-delta');
@@ -3453,12 +3651,12 @@ function _patchMarketBtcDeltas() {
 }
 
 /**
- * Browser-side Polymarket RTDS Chainlink **30s TWAP** — same oracle Polymarket
- * shows as Current Price / Price to Beat / settlement (post 2026-08-07).
- * Never Binance; never spot for this UI number (spot stays in arena for mom).
+ * Browser-side Polymarket RTDS: subscribe to **both** Chainlink spot and TWAP.
+ * - Spot → top-left Bitcoin chip
+ * - TWAP → Current Market "BTC now" (settlement / Price-to-Beat parity)
  *
- * Topic: crypto_prices_twap_thirty (filters must be compact JSON, no spaces).
- * Quiet-reconnect after BTC_RTDS_REFRESH_MS; arena SQLite TWAP is fallback.
+ * Topics: crypto_prices + crypto_prices_twap_sixty (60s lookback for 5m).
+ * Quiet-reconnect after BTC_RTDS_REFRESH_MS; arena SQLite is fallback.
  */
 function startChainlinkBtcFeed() {
     if (_btcWs) {
@@ -3480,8 +3678,8 @@ function startChainlinkBtcFeed() {
             _btcWsQuietClose = true;
             try { ws.close(); } catch (e) { /* ignore */ }
         };
-        /** Parse TWAP (or legacy spot) payload value → positive float or NaN. */
-        const _parseTwapPx = (p) => {
+        /** Parse RTDS payload value → positive float or NaN. */
+        const _parsePx = (p) => {
             if (!p || typeof p !== 'object') return NaN;
             // Prefer full_accuracy_value (E18 fixed-point string) when present.
             if (p.full_accuracy_value != null && String(p.full_accuracy_value).trim() !== '') {
@@ -3496,21 +3694,43 @@ function startChainlinkBtcFeed() {
             const px = parseFloat(p.value);
             return px;
         };
+        /** Route a parsed price to spot or TWAP based on RTDS topic. */
+        const _routePx = (msg, px) => {
+            if (!(px > 0)) return;
+            const topic = String(msg.topic || msg.channel || '').toLowerCase();
+            const isTwap = topic.includes('twap');
+            if (isTwap) {
+                _btcLastTwapMs = Date.now();
+                updateBtcTwap(px, false, 'ws');
+            } else {
+                // Default / crypto_prices → spot tick for top-left chip
+                _btcLastTickMs = Date.now();
+                updateBtcSpot(px, false, 'ws');
+            }
+        };
         ws.onopen = () => {
             _btcWsLive = true;
             _btcWsRetry = 0;
             lastMsgMs = Date.now();
             const sub = document.getElementById('btc-price-sub');
-            if (sub && !liveBtcPrice) sub.textContent = 'TWAP · connected';
-            // Official 30s TWAP for 5-min markets (Polymarket Current Price).
+            if (sub && !liveBtcSpot) sub.textContent = 'spot · connected';
+            // Dual subscribe: live tick (top chip) + 60s TWAP (Current Market).
             // filters: compact JSON, no spaces — RTDS requirement.
+            // TWAP topic must match config.TWAP_WINDOW_SEC (60 → _sixty).
             ws.send(JSON.stringify({
                 action: 'subscribe',
-                subscriptions: [{
-                    topic: 'crypto_prices_twap_thirty',
-                    type: 'update',
-                    filters: JSON.stringify({ symbol: 'btc/usd' }),
-                }],
+                subscriptions: [
+                    {
+                        topic: 'crypto_prices',
+                        type: 'update',
+                        filters: JSON.stringify({ symbol: 'btc/usd' }),
+                    },
+                    {
+                        topic: 'crypto_prices_twap_sixty',
+                        type: 'update',
+                        filters: JSON.stringify({ symbol: 'btc/usd' }),
+                    },
+                ],
             }));
             // RTDS application heartbeat + quiet-stream snapshot refresh
             clearPing();
@@ -3534,19 +3754,10 @@ function startChainlinkBtcFeed() {
                 // Snapshot-style list if ever present
                 if (Array.isArray(p.data) && p.data.length) {
                     const last = p.data[p.data.length - 1];
-                    const px = _parseTwapPx(last);
-                    if (px > 0) {
-                        _btcLastTickMs = Date.now();
-                        updateBtcPrice(px, false, 'ws');
-                    }
+                    _routePx(msg, _parsePx(last));
                     return;
                 }
-                // Live TWAP update frame
-                const px = _parseTwapPx(p);
-                if (px > 0) {
-                    _btcLastTickMs = Date.now();
-                    updateBtcPrice(px, false, 'ws');
-                }
+                _routePx(msg, _parsePx(p));
             } catch (e) { /* bad frame */ }
         };
         ws.onerror = () => { /* onclose handles retry */ };
@@ -3559,8 +3770,8 @@ function startChainlinkBtcFeed() {
             const sub = document.getElementById('btc-price-sub');
             if (sub) {
                 sub.textContent = quiet
-                    ? 'TWAP · refreshing…'
-                    : 'TWAP RTDS reconnecting…';
+                    ? 'spot · refreshing…'
+                    : 'RTDS reconnecting…';
             }
             // Quiet snapshot refresh: reconnect immediately. Real errors: backoff.
             const delay = quiet ? 300 : Math.min(30000, 1000 * Math.pow(1.6, _btcWsRetry++));
@@ -3573,10 +3784,16 @@ function startChainlinkBtcFeed() {
     }
 }
 
-/** True when browser RTDS is up AND recently delivered a price tick. */
+/** True when browser RTDS recently delivered a **spot** tick for the top chip. */
 function _btcWsFresh() {
     return _btcWsLive && _btcLastTickMs > 0
         && (Date.now() - _btcLastTickMs) < BTC_ARENA_FALLBACK_MS;
+}
+
+/** True when browser RTDS recently delivered a **TWAP** tick for Current Market. */
+function _btcTwapWsFresh() {
+    return _btcWsLive && _btcLastTwapMs > 0
+        && (Date.now() - _btcLastTwapMs) < BTC_ARENA_FALLBACK_MS;
 }
 
 /** Polish Polymarket window label → "July 30 · 8:15–8:20 AM ET". */
@@ -3776,7 +3993,8 @@ function renderMarketCard(market, bodyId, kind) {
     // --- Current market: full hierarchy (header → PTB → UP/DOWN → footer is next pill) ---
     const strike = market.strike != null ? Number(market.strike) : null;
     liveBtcStrike = (strike != null && strike > 0) ? strike : null;
-    const btc = liveBtcPrice;
+    // Current Market always uses TWAP (settlement / Price-to-Beat parity).
+    const btc = liveBtcTwap != null ? liveBtcTwap : liveBtcPrice;
     let ptbHtml;
     if (strike != null && strike > 0) {
         let deltaHtml = '';
@@ -3872,8 +4090,21 @@ async function fetchMarkets() {
     }
     if (!data || data.error) return;  // server-side error — keep last-known-good
     activeMarkets = { current: data.current, next: data.next };
-    if (data.btc_price != null && !_btcWsFresh()) {
-        updateBtcPrice(data.btc_price, data.btc_stale, 'arena');
+    // Spot → top chip; TWAP → Current Market. Prefer explicit fields when present.
+    if (!_btcWsFresh()) {
+        const spot = data.btc_spot != null ? data.btc_spot : null;
+        if (spot != null) {
+            updateBtcSpot(spot, data.btc_spot_stale != null ? data.btc_spot_stale : data.btc_stale, 'arena');
+        } else if (data.btc_price != null && data.btc_source === 'spot') {
+            updateBtcSpot(data.btc_price, data.btc_stale, 'arena');
+        }
+    }
+    if (!_btcTwapWsFresh()) {
+        const twap = data.btc_twap != null ? data.btc_twap
+            : (data.btc_price != null ? data.btc_price : null);
+        if (twap != null) {
+            updateBtcTwap(twap, data.btc_twap_stale != null ? data.btc_twap_stale : data.btc_stale, 'arena');
+        }
     }
     // Seed livePrices from the (already-fresh) market payload, and drop
     // entries for windows that are no longer current/next.

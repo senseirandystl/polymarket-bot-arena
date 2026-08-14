@@ -7,20 +7,21 @@ The hybrid's sub-strategy weights combine three layers (see bot_hybrid):
 2. **Cross-bot performance tilt** — each sub-strategy's REAL arena bot's
    recent live WR (SignalLab.perf_tilts).
 3. **THIS module** — an online multiplicative-weights (Hedge-style)
-   learner trained on the hybrid's OWN resolved trades. Every hybrid buy
-   logs its sub-votes in the trade reasoning as a parseable token::
+   learner trained on:
+     (a) the hybrid's OWN resolved **trades** (full eta), and
+     (b) resolved **decision_events** skips with a ``meta(...)`` token
+         (counterfactuals — scaled eta so one skip ≠ one fill).
 
-       meta(mom=+0.42 rev=+0.00 sent=-0.10 ph=+0.30 | reg=trending)
+   Every hybrid decision that has sub-votes logs::
+
+       meta(mom=+0.42 rev=+0.00 ph=+0.30 | reg=trending)
 
    At resolution each sub that voted (|vote| >= deadband) is scored
-   against the actual market direction (UP iff a YES trade won or a NO
-   trade lost — the same ground truth the lane monitor uses). A correct
-   vote multiplies the sub's weight by ``exp(+eta)``, a wrong one by
-   ``exp(-eta)``, clipped to [min_mult, max_mult]. Multipliers are kept
-   PER REGIME BUCKET (trending / ranging / mixed) *and* overall, blended
-   by bucket sample size at decision time — so the learner can discover
-   "phantom is right in trends but wrong in chop" instead of averaging
-   the two into nothing.
+   against the actual market direction. A correct vote multiplies the
+   sub's weight by ``exp(+eta)``, a wrong one by ``exp(-eta)``, clipped
+   to [min_mult, max_mult]. Multipliers are kept PER REGIME BUCKET
+   (trending / ranging / mixed / chop) *and* overall, blended by bucket
+   sample size at decision time.
 
 State persists in arena_state key ``hybrid_meta`` (JSON): it survives
 restarts, is SHARED by every hybrid generation (evolution mutants inherit
@@ -38,6 +39,7 @@ import threading
 import time
 from typing import Optional
 
+import config
 import db
 
 logger = logging.getLogger("bots.meta_learner")
@@ -135,8 +137,14 @@ class HybridMetaLearner:
 
     @staticmethod
     def _fresh_state() -> dict:
-        return {"last_trade_id": 0, "subs": {}, "updated_at": None,
-                "last": {}}
+        return {
+            "last_trade_id": 0,
+            "last_decision_id": 0,
+            "subs": {},
+            "cf": {"n": 0, "correct": 0},  # counterfactual counters
+            "updated_at": None,
+            "last": {},
+        }
 
     def _load(self) -> dict:
         if self._state is not None:
@@ -145,6 +153,9 @@ class HybridMetaLearner:
             raw = db.get_arena_state(STATE_KEY)
             self._key_exists = raw is not None
             self._state = json.loads(raw) if raw else self._fresh_state()
+            # Backfill keys for older arena_state rows.
+            self._state.setdefault("last_decision_id", 0)
+            self._state.setdefault("cf", {"n": 0, "correct": 0})
         except Exception:
             self._state = self._fresh_state()
         return self._state
@@ -162,8 +173,33 @@ class HybridMetaLearner:
         rec = subs.setdefault(sub, {})
         return rec.setdefault(bucket, {"mult": 1.0, "n": 0, "correct": 0})
 
+    def _apply_votes(self, votes: dict, bucket: str, market_up: bool,
+                       eta: float) -> int:
+        """Score one set of sub-votes; returns number of subs updated."""
+        if bucket not in BUCKETS:
+            bucket = "mixed"
+        n_subs = 0
+        for sub, vote in votes.items():
+            try:
+                v = float(vote)
+            except (TypeError, ValueError):
+                continue
+            if abs(v) < self.deadband:
+                continue  # this sub abstained
+            correct = (v > 0) == bool(market_up)
+            for b in (bucket, "overall"):
+                rec = self._sub_rec(sub, b)
+                step = eta if correct else -eta
+                rec["mult"] = max(self.min_mult,
+                                  min(self.max_mult,
+                                      rec["mult"] * math.exp(step)))
+                rec["n"] += 1
+                rec["correct"] += int(correct)
+            n_subs += 1
+        return n_subs
+
     # ------------------------------------------------------------------
-    # Online update (multiplicative weights on resolved trades)
+    # Online update (multiplicative weights on resolved trades + CF skips)
     # ------------------------------------------------------------------
 
     def update_from_trades(self) -> int:
@@ -209,26 +245,13 @@ class HybridMetaLearner:
                 if parsed is None:
                     continue
                 votes, bucket = parsed
-                if bucket not in BUCKETS:
-                    bucket = "mixed"
                 # Market went UP iff a YES trade won (or TP'd) or a NO trade lost.
                 side = (r["side"] or "").lower()
                 out = (r["outcome"] or "").lower()
                 won = out in ("win", "exit_tp")
                 market_up = (side == "yes") == won
-                for sub, vote in votes.items():
-                    if abs(vote) < self.deadband:
-                        continue  # this sub abstained
-                    correct = (vote > 0) == market_up
-                    for b in (bucket, "overall"):
-                        rec = self._sub_rec(sub, b)
-                        step = self.eta if correct else -self.eta
-                        rec["mult"] = max(self.min_mult,
-                                          min(self.max_mult,
-                                              rec["mult"] * math.exp(step)))
-                        rec["n"] += 1
-                        rec["correct"] += int(correct)
-                processed += 1
+                if self._apply_votes(votes, bucket, market_up, self.eta) > 0:
+                    processed += 1
             if rows:
                 # Advance past the last *processed* id that had a parseable
                 # meta token; still advance to max scanned so unparseable
@@ -240,13 +263,107 @@ class HybridMetaLearner:
                 self._persist()
         return processed
 
+    def update_from_decisions(self) -> int:
+        """Counterfactual learning from resolved hybrid *skips*.
+
+        Uses ``decision_events`` rows with a stored ``meta_token`` and known
+        ``market_up``. Buys are excluded (handled by ``update_from_trades``)
+        so a filled trade is never double-counted. CF Hedge step is
+        ``eta * HYBRID_META_CF_ETA_SCALE`` so volume of skips cannot dominate
+        real fills.
+        """
+        if not getattr(config, "HYBRID_META_CF_ENABLED", True):
+            return 0
+        if not getattr(config, "DECISION_LEARN_FROM_ALL", True):
+            return 0
+
+        state = self._load()
+        last_id = int(state.get("last_decision_id") or 0)
+        eta_scale = float(getattr(config, "HYBRID_META_CF_ETA_SCALE", 0.25))
+        eta_cf = max(1e-6, self.eta * eta_scale)
+        max_n = int(getattr(config, "HYBRID_META_CF_MAX_PER_CYCLE", 200))
+        try:
+            with db.get_conn() as conn:
+                # Prefer meta_token column; fall back to features/legacy
+                # rows that may only have the token in features JSON.
+                rows = conn.execute(
+                    """SELECT id, market_up, meta_token, features, regime, action
+                       FROM decision_events
+                       WHERE id > ?
+                         AND strategy_type = 'hybrid'
+                         AND market_up IS NOT NULL
+                         AND action = 'skip'
+                         AND (meta_token IS NOT NULL OR features LIKE '%meta(%')
+                       ORDER BY id
+                       LIMIT ?""",
+                    (last_id, max(1, max_n)),
+                ).fetchall()
+        except Exception as e:
+            # Column missing on unmigrated DB — soft no-op.
+            logger.debug(f"hybrid_meta decision scan failed: {e}")
+            return 0
+
+        processed = 0
+        cf_correct = 0
+        with self._lock:
+            max_seen = last_id
+            for r in rows:
+                max_seen = max(max_seen, int(r["id"]))
+                token = r["meta_token"]
+                if not token and r["features"]:
+                    m = re.search(r"meta\([^)]+\)", r["features"] or "")
+                    token = m.group(0) if m else None
+                if not token:
+                    continue
+                parsed = parse_token(token)
+                if parsed is None:
+                    continue
+                votes, bucket = parsed
+                # Prefer token bucket; fall back to detector regime → meta bucket
+                if bucket not in BUCKETS:
+                    try:
+                        from signals.regime_detector import meta_bucket
+                        bucket = meta_bucket(r["regime"], None) or "mixed"
+                    except Exception:
+                        bucket = "mixed"
+                market_up = bool(int(r["market_up"]))
+                n_subs = self._apply_votes(votes, bucket, market_up, eta_cf)
+                if n_subs <= 0:
+                    continue
+                processed += 1
+                # Rough CF accuracy: fraction of non-abstain subs correct
+                for sub, vote in votes.items():
+                    try:
+                        v = float(vote)
+                    except (TypeError, ValueError):
+                        continue
+                    if abs(v) < self.deadband:
+                        continue
+                    if (v > 0) == market_up:
+                        cf_correct += 1
+            if max_seen > last_id:
+                state["last_decision_id"] = max_seen
+            if processed:
+                cf = state.setdefault("cf", {"n": 0, "correct": 0})
+                cf["n"] = int(cf.get("n") or 0) + processed
+                cf["correct"] = int(cf.get("correct") or 0) + cf_correct
+                state["updated_at"] = time.strftime(
+                    "%Y-%m-%d %H:%M:%S", time.gmtime())
+                self._persist()
+        return processed
+
     def maybe_update(self) -> int:
-        """TTL-throttled update_from_trades — safe on the 1s decision path."""
+        """TTL-throttled trade + CF decision update — safe on the 1s path."""
         now = time.time()
         if (now - self._last_update_check) < self.update_ttl:
             return 0
         self._last_update_check = now
-        return self.update_from_trades()
+        n = self.update_from_trades()
+        try:
+            n += self.update_from_decisions()
+        except Exception as e:
+            logger.debug(f"hybrid_meta CF update failed: {e}")
+        return n
 
     # ------------------------------------------------------------------
     # Decision-time reads

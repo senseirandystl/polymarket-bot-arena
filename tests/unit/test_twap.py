@@ -6,18 +6,35 @@ import signals.twap as twap
 
 
 def test_window_seconds_for_5m():
-    assert twap.window_seconds_for_market(300) == 30
-    assert twap.window_seconds_for_market(None) == 30
+    # 5m markets use TWAP_WINDOW_SEC (default 60s lookback).
+    assert twap.window_seconds_for_market(300) == 60
+    assert twap.window_seconds_for_market(None) == 60
 
 
 def test_window_seconds_for_15m():
     assert twap.window_seconds_for_market(900) == 60
 
 
+def test_rtds_topic_for_window():
+    assert "sixty" in twap.rtds_topic(60)
+    assert "thirty" in twap.rtds_topic(30)
+    assert "sixty" in twap.rtds_topic(None)  # default 5m lookback
+
+
+def test_settlement_entry_horizon():
+    # pre_settle lead + full TWAP window
+    h = twap.settlement_entry_horizon_sec()
+    assert h >= 60
+    assert h == 80  # 20 lead + 60 window under defaults
+
+
 def test_in_settlement_window():
+    assert twap.in_settlement_window(60, twap_window_sec=60) is True
+    assert twap.in_settlement_window(30, twap_window_sec=60) is True
+    assert twap.in_settlement_window(0, twap_window_sec=60) is True
+    assert twap.in_settlement_window(61, twap_window_sec=60) is False
+    # Explicit 30s window still works for unit isolation
     assert twap.in_settlement_window(30, twap_window_sec=30) is True
-    assert twap.in_settlement_window(15, twap_window_sec=30) is True
-    assert twap.in_settlement_window(0, twap_window_sec=30) is True
     assert twap.in_settlement_window(31, twap_window_sec=30) is False
     assert twap.in_settlement_window(None) is False
 
@@ -143,12 +160,15 @@ def test_soft_dampen_vol_scale(monkeypatch):
     assert abs(twap.soft_dampen_vol_scale(0.0015) - 0.0015 * 0.85) < 1e-12
 
 
-def test_market_phase_labels():
+def test_market_phase_labels(monkeypatch):
+    monkeypatch.setattr("config.TWAP_WINDOW_SEC", 60)
+    monkeypatch.setattr("config.TWAP_PRE_SETTLE_LEAD_SEC", 20)
+    monkeypatch.setattr("config.MARKET_WINDOW_SEC", 300)
     assert twap.market_phase(10) == "settlement"
-    assert twap.market_phase(30) == "settlement"
-    assert twap.market_phase(40) == "pre_settle"
+    assert twap.market_phase(60) == "settlement"
+    assert twap.market_phase(70) == "pre_settle"   # 60 < rem ≤ 80
     assert twap.market_phase(150) == "mid"
-    assert twap.market_phase(290) == "open"
+    assert twap.market_phase(250) == "open"        # rem ≥ 300−60
     assert twap.market_phase(None) == "unknown"
 
 
@@ -227,8 +247,10 @@ def test_pre_settle_keeps_damps_with_zero_coverage(monkeypatch):
     """Pre-settle is before nowcast; zero coverage is expected, not an outage."""
     monkeypatch.setattr("config.TWAP_SETTLEMENT_POLICY", True)
     monkeypatch.setattr("config.TWAP_RESOLUTION_ENABLED", True)
+    monkeypatch.setattr("config.TWAP_WINDOW_SEC", 60)
+    monkeypatch.setattr("config.TWAP_PRE_SETTLE_LEAD_SEC", 20)
     adj = twap.settlement_adjustments(
-        time_remaining_sec=40.0,
+        time_remaining_sec=70.0,  # inside pre_settle (60 < rem ≤ 80)
         twap_certainty_val=0.0,
         nowcast_frac_elapsed=0.0,
         nowcast_coverage=0.0,

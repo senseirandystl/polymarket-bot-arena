@@ -109,17 +109,19 @@ def test_eth_still_accepted_in_get_signals_shape():
 
 def test_twap_tick_updates_latest_twap_and_signals():
     feed = PriceFeed()
+    # Feed defaults to config TWAP_WINDOW_SEC (60s for 5m) until first tick.
+    assert feed.latest_twap()[2] == 60
     base = 1_700_000_000
     feed._on_btc_twap_tick({
         "timestamp": base * 1000,
         "value": 65000.5,
-        "window_s": 30,
+        "window_s": 60,
         "symbol": "btc/usd",
     })
     twap, ts, win = feed.latest_twap()
     assert abs(twap - 65000.5) < 1e-6
     assert abs(ts - base) < 1e-6
-    assert win == 30
+    assert win == 60
     sig = feed.get_signals("btc")
     assert abs(sig["twap"] - 65000.5) < 1e-6
     assert sig["resolution_source"] == "rtds_twap"
@@ -133,7 +135,7 @@ def test_twap_full_accuracy_value_e18():
         "timestamp": 1_700_000_000_000,
         "full_accuracy_value": str(int(65000.5 * 1e18)),
         "value": 65000.5,
-        "window_s": 30,
+        "window_s": 60,
     })
     twap, _, _ = feed.latest_twap()
     assert abs(twap - 65000.5) < 1e-6

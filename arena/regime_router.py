@@ -52,8 +52,31 @@ def _seed_fit(strategy_type: str, regime: str) -> float:
     return 0.60
 
 
-def _bot_stats_for_strategy(strategy_type: str) -> dict[str, Any]:
-    """Aggregate risk_engine / portfolio metrics for bots of this type."""
+def _bot_stats_for_strategy(
+    strategy_type: str,
+    regime: Optional[str] = None,
+) -> dict[str, Any]:
+    """Aggregate metrics for bots of this type — prefer regime-local stats."""
+    # Prefer regime_stats.by_strategy[regime][strategy] when available
+    if regime and regime not in ("unknown",):
+        try:
+            from arena.regime_stats import snapshot
+            by = (snapshot().get("by_strategy") or {}).get(regime) or {}
+            cell = by.get(strategy_type) or {}
+            n = int(cell.get("n") or 0)
+            if n > 0:
+                wr = cell.get("wr")
+                if wr is None and cell.get("wins") is not None and n:
+                    wr = float(cell["wins"]) / n
+                return {
+                    "n": n,
+                    "wr": float(wr) if wr is not None else None,
+                    "pnl": float(cell.get("pnl") or 0.0),
+                    "source": "regime_stats",
+                }
+        except Exception:
+            pass
+
     try:
         with db.get_conn() as conn:
             rows = conn.execute(
@@ -72,16 +95,15 @@ def _bot_stats_for_strategy(strategy_type: str) -> dict[str, Any]:
         raw = db.get_arena_state("portfolio_allocation")
         data = json.loads(raw) if isinstance(raw, str) else (raw or {})
         metrics = (data or {}).get("metrics") or {}
-        n = wr_num = wr_den = 0
+        n = 0
         pnl = 0.0
         for name in names:
             m = metrics.get(name) or {}
             ni = int(m.get("n") or 0)
             n += ni
             pnl += float(m.get("total_pnl") or 0.0)
-            # approximate WR from expectancy not stored — use risk engine
         if n > 0:
-            return {"n": n, "wr": None, "pnl": pnl}
+            return {"n": n, "wr": None, "pnl": pnl, "source": "portfolio"}
     except Exception:
         pass
 
@@ -89,14 +111,14 @@ def _bot_stats_for_strategy(strategy_type: str) -> dict[str, Any]:
         raw = db.get_arena_state("risk_engine")
         data = json.loads(raw) if isinstance(raw, str) else (raw or {})
         bots = (data or {}).get("bots") or {}
-        n = wins = 0
+        n = 0
         pnl = 0.0
         for name in names:
             b = bots.get(name) or {}
             ni = int(b.get("n_window") or 0)
             n += ni
             pnl += float(b.get("window_pnl") or b.get("daily_pnl") or 0.0)
-        return {"n": n, "wr": None, "pnl": pnl}
+        return {"n": n, "wr": None, "pnl": pnl, "source": "risk"}
     except Exception:
         return {"n": 0, "wr": None, "pnl": 0.0}
 
@@ -109,13 +131,17 @@ def score(
 ) -> float:
     """Return fitness score in ~[0, 1.5] for routing (higher = prefer).
 
-    Combines seed fit with live pnl sign when sample mass is adequate.
+    Combines seed fit with **regime-local** live WR/pnl when sample mass is
+    adequate (falls back to global portfolio/risk metrics).
     """
     regime = str(regime or "unknown")
     if regime == "unknown":
         return 0.65
     seed = _seed_fit(strategy_type, regime)
-    live = live if live is not None else _bot_stats_for_strategy(strategy_type)
+    live = (
+        live if live is not None
+        else _bot_stats_for_strategy(strategy_type, regime=regime)
+    )
     n = int((live or {}).get("n") or 0)
     min_n = int(getattr(config, "REGIME_ROUTER_MIN_TRADES", 12))
     pnl = float((live or {}).get("pnl") or 0.0)

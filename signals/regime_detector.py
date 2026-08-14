@@ -576,12 +576,17 @@ class RegimeDetector:
         volumes: Optional[Sequence[float]] = None,
         volume_score: Optional[float] = None,
         market_id: Optional[str] = None,
+        twap_prices: Optional[Sequence[float]] = None,
     ) -> dict[str, Any]:
         """Ingest one market tick; return current regime snapshot.
 
         Continuous / online — safe to call every second from the warm path.
         When ``market_id`` is provided, a soft rollover note is emitted if
         the live window changed (no detector state is cleared).
+
+        ``twap_prices`` (optional): recent resolution-object TWAP series. When
+        present, trend/mom features blend spot microstructure with TWAP path
+        so "trend" is more resolution-relevant (2026-08-11).
         """
         self._ensure_loaded()
         self._live = True
@@ -593,6 +598,18 @@ class RegimeDetector:
             realized_vol=realized_vol,
             volumes=volumes, volume_score=volume_score,
         )
+        # Blend resolution-relevant TWAP trend/mom (spot still owns vol/flow)
+        if twap_prices is not None and len([p for p in twap_prices if p and p > 0]) >= 3:
+            try:
+                tw = compute_features(twap_prices, cvd=0.0, obi=0.0)
+                blend = float(getattr(config, "REGIME_TWAP_BLEND", 0.45) or 0.45)
+                blend = max(0.0, min(0.8, blend))
+                for k in ("trend", "mom"):
+                    if k in raw and k in tw:
+                        raw[k] = (1.0 - blend) * float(raw[k]) + blend * float(tw[k])
+                raw["twap_blend"] = blend
+            except Exception:
+                pass
         with self._lock:
             # EMA smooth the classifier features (+ volume for display)
             smooth_keys = FEATURE_KEYS + ("volume",)

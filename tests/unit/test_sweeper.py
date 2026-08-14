@@ -67,14 +67,15 @@ def test_skips_outside_entry_window():
     assert "waiting" in (d.get("reasoning") or "")
 
 
-def test_skips_outside_45s_window():
-    """Default entry window is last 45s (not 75s)."""
+def test_skips_outside_settlement_horizon():
+    """Default entry window = pre_settle + TWAP window (80s under 60s TWAP)."""
     bot = SweeperBot(name="sweeper-test")
-    assert DEFAULT_PARAMS["entry_window_sec"] == 45
+    assert DEFAULT_PARAMS["entry_window_sec"] == 80
     assert DEFAULT_PARAMS["min_drift"] == 0.65
     assert DEFAULT_PARAMS["min_twap_certainty"] == 0.55
+    # rem=100 is outside the 80s horizon
     d = bot.make_decision(
-        _market(time_remaining_seconds=60),
+        _market(time_remaining_seconds=100),
         _signals(drift=0.90),
     )
     assert d["action"] == "skip"

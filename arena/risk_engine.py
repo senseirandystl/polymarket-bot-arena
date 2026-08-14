@@ -657,6 +657,30 @@ def evaluate(bot_names: Optional[Sequence[str]] = None,
         # again (so Resume isn't immediately undone by the same auto-pause).
         manual_resume = bool(prev.get("manual_resume")) and not manual_pause
 
+        # Sticky taper: once reduced for DD, stay reduced until DD recovers
+        # below start * recovery_ratio (stops reduced↔active flapping).
+        if (
+            bool(getattr(config, "RISK_STICKY_TAPER", True))
+            and status == "active"
+            and (prev.get("status") == "reduced")
+            and str(prev.get("reason") or "").startswith(
+                ("drawdown_taper", "portfolio_dd_taper", "underperform")
+            )
+        ):
+            rec = float(getattr(config, "RISK_STICKY_RECOVERY_RATIO", 0.75))
+            start_dd = bot_max_dd * max(0.0, min(1.0, dd_start))
+            recover_below = start_dd * rec
+            if dd > recover_below:
+                status = "reduced"
+                size_mult = min(
+                    size_mult,
+                    max(min_mult, _dd_size_mult(dd, bot_max_dd, dd_start, min_mult)),
+                )
+                reason = (
+                    f"sticky_taper:dd={dd:.2%}>recover={recover_below:.2%} "
+                    f"(prev={prev.get('reason')})"
+                )
+
         if manual_pause:
             status = "paused"
             reason = prev.get("reason") or "manual_pause"
@@ -730,6 +754,28 @@ def evaluate(bot_names: Optional[Sequence[str]] = None,
         port_reason = f"portfolio_dd_taper:dd={port_dd:.2%}"
 
     prev_port = state.get("portfolio") or {}
+    # Sticky portfolio taper
+    if (
+        bool(getattr(config, "RISK_STICKY_TAPER", True))
+        and port_status == "active"
+        and prev_port.get("status") == "reduced"
+        and str(prev_port.get("reason") or "").startswith("portfolio_dd_taper")
+    ):
+        rec = float(getattr(config, "RISK_STICKY_RECOVERY_RATIO", 0.75))
+        start_dd = port_max_dd * max(0.0, min(1.0, dd_start))
+        recover_below = start_dd * rec
+        if port_dd > recover_below:
+            port_status = "reduced"
+            port_mult = min(
+                port_mult,
+                max(min_mult, _dd_size_mult(
+                    port_dd, port_max_dd, dd_start, min_mult)),
+            )
+            port_reason = (
+                f"sticky_portfolio_taper:dd={port_dd:.2%}"
+                f">recover={recover_below:.2%}"
+            )
+
     if prev_port.get("status") != port_status:
         log_event(
             action=f"portfolio_{port_status}",

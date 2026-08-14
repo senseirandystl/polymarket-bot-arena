@@ -13,13 +13,13 @@ evolvable base weights:
    shared DB, cached off the 1s hot path): a smooth logistic tilt around 50%
    WR, only trusted in proportion to sample size. A sub-strategy that is
    actually losing this session gets a quieter voice.
-3. **Online meta-learning** (``bots/meta_learner.py``): every hybrid buy logs
-   its sub-votes in the trade reasoning (``meta(...)`` token); at resolution
-   each vote is scored against the actual market direction and the sub's
-   multiplier updates Hedge-style (exp(±eta), clipped), kept PER REGIME
-   BUCKET with sample-size shrinkage. State persists in arena_state
-   ``hybrid_meta`` — shared across hybrid generations, visible in the
-   dashboard (/api/hybrid-meta).
+3. **Online meta-learning** (``bots/meta_learner.py``): every hybrid decision
+   with sub-votes logs a ``meta(...)`` token (buys *and* holds/skips). At
+   resolution, votes are scored against actual market direction — real
+   trades at full eta, counterfactual skips at scaled eta — Hedge-style
+   (exp(±eta), clipped), kept PER REGIME BUCKET with sample-size shrinkage.
+   State persists in arena_state ``hybrid_meta`` — shared across hybrid
+   generations, visible in the dashboard (/api/hybrid-meta).
 
 Sentiment sub-analyzer removed (2026-08 audit) — it injected kill-switched
 pm/cvd flow into the strat lane. Sub-set is momentum / mean_rev / phantom.
@@ -206,16 +206,24 @@ class HybridBot(BaseBot):
 
         The mom lane (BTC 1-candle trend) earns more say on trending tape
         and less in chop, continuously and bounded by ``signal_regime_tilt``.
-        Drift — the validated fundamental — keeps its class-default weight
-        untouched. Uses the regime stashed by analyze() (make_decision calls
-        analyze() first); no stash → class default profile.
+        In chop/range, mildly damp drift weight too so hybrid is less of a
+        pure mid-window chase (lag gate still owns hard economics).
+        Uses the regime stashed by analyze() (make_decision calls analyze()
+        first); no stash → class default profile.
         """
         prof = dict(super()._signal_profile())
         ctx = self._last_regime
         if ctx and ctx.get("known"):
             tilt = self.strategy_params.get("signal_regime_tilt", 0.4)
-            t = 2.0 * ctx["trend_score"] - 1.0
+            t = 2.0 * float(ctx.get("trend_score") or 0.5) - 1.0
             prof["mom"] = max(0.0, prof.get("mom", 0.0) * (1.0 + tilt * t))
+            # Chop/range: reduce mom further and slightly ease drift mass so
+            # mean_rev sub + strat get relatively more say in the blend.
+            label = (ctx.get("label") or "")
+            if label in ("high_vol_chop", "low_vol_range") or t < -0.25:
+                prof["mom"] = max(0.0, prof.get("mom", 0.0) * 0.65)
+                prof["drift"] = max(0.25, float(prof.get("drift", 0.55)) * 0.90)
+                prof["strat"] = float(prof.get("strat", 0.25)) * 1.15
         return prof
 
     def _cached_sub_analyze(self, market: dict, signals: dict) -> dict:
@@ -236,12 +244,33 @@ class HybridBot(BaseBot):
     # Ensemble
     # ------------------------------------------------------------------
 
+    def _stamp_meta(self, decision: dict, votes: dict, bucket: str) -> dict:
+        """Attach meta token to reasoning + top-level field for decision_log CF.
+
+        Skips and holds with sub-votes must carry the token so the meta-learner
+        can score them once the market resolves (counterfactual path).
+        """
+        if not votes:
+            return decision
+        tok = format_token(votes, bucket or "mixed")
+        decision["meta_token"] = tok
+        reason = (decision.get("reasoning") or "").strip()
+        if "meta(" not in reason:
+            decision["reasoning"] = f"{reason} {tok}".strip() if reason else tok
+        # Ensure signals carry votes/bucket for enqueue fallback formatting.
+        sigs = dict(decision.get("signals") or {})
+        sigs.setdefault("votes", votes)
+        sigs.setdefault("regime_bucket", bucket or "mixed")
+        decision["signals"] = sigs
+        return decision
+
     def analyze(self, market: dict, signals: dict) -> dict:
         """Regime-, performance- and online-weighted vote over the subs."""
         # Stash regime for _signal_profile() (called later on this tick).
         self._last_regime = self.regime_context(signals)
         weights = self._dynamic_weights(signals)
         detail = self._last_weight_detail
+        bucket = detail.get("bucket", "mixed")
 
         # Pre-gate: if drift is essentially flat and no lean, skip heavy work.
         sv = SignalView.of(signals)
@@ -266,7 +295,7 @@ class HybridBot(BaseBot):
                         "weighted_score": weighted_score,
                         "online": detail.get("online", {}),
                         "perf": detail.get("perf", {}),
-                        "regime_bucket": detail.get("bucket", "mixed"),
+                        "regime_bucket": bucket,
                         "drift": drift}
 
         # Keep the dashboard's view of the effective weights fresh
@@ -274,17 +303,41 @@ class HybridBot(BaseBot):
         try:
             self._meta.record_last(
                 weights, detail.get("online", {}),
-                self._last_regime["label"], detail.get("bucket", "mixed"))
+                self._last_regime["label"], bucket)
         except Exception as e:
             logger.debug(f"meta record_last failed: {e}")
 
         if not active:
-            return strategy_decision("hold", signals=contributing,
-                                     reasoning="All sub-strategies say hold")
+            return self._stamp_meta(
+                strategy_decision("hold", signals=contributing,
+                                  reasoning="All sub-strategies say hold"),
+                votes, bucket,
+            )
 
         yes_votes = sum(1 for _, d in active if d > 0)
         no_votes = sum(1 for _, d in active if d < 0)
         agreement = max(yes_votes, no_votes) >= 2
+        n_active = len(active)
+
+        # Regime-adaptive ensemble discipline (no hard mid caps):
+        # In chop/range, require ≥2 subs same side — single-sub leans are
+        # pure mom/phantom clones that bled mid-window 2026-08-11. In trend,
+        # a single strong sub may still fire (lag gate still applies in BaseBot).
+        rid = (self._last_regime or {}).get("label") or ""
+        choppy = rid in (
+            "high_vol_chop", "low_vol_range", "normal", "unknown", ""
+        ) or (self._last_regime or {}).get("legacy") in ("volatile", "quiet")
+        if choppy and not agreement:
+            return self._stamp_meta(
+                strategy_decision(
+                    "hold", signals=contributing,
+                    reasoning=(
+                        f"Hybrid needs ≥2-sub agreement in {rid or 'choppy'} "
+                        f"(active={n_active}, yes={yes_votes} no={no_votes})"
+                    ),
+                ),
+                votes, bucket,
+            )
 
         confidence = abs(weighted_score)
         if agreement:
@@ -298,20 +351,49 @@ class HybridBot(BaseBot):
             scale = max(0.3, 1.0 - abs(weighted_score) / max(strat_cap * 2.0, 1e-6))
             confidence = min(1.0, confidence + bonus * scale)
 
+        # Continuous lag quality: damp confidence when mid already prices drift
+        # (regime-agnostic; works at any mid, not a hard 0.58 cap).
+        side_preview = "yes" if weighted_score > 0 else "no"
+        try:
+            mid = float(
+                market.get("yes_price") if side_preview == "yes"
+                else market.get("no_price") or (1.0 - float(market.get("yes_price") or 0.5))
+            )
+            signed = float(drift) if side_preview == "yes" else -float(drift)
+            implied = 0.5 + 0.5 * max(-1.0, min(1.0, signed))
+            lag = implied - mid
+            # Thin lag → confidence cut; fat lag → mild boost (capped)
+            if lag < 0.05:
+                confidence *= max(0.25, lag / 0.05) if lag > 0 else 0.20
+            elif lag > 0.12:
+                confidence = min(1.0, confidence * 1.08)
+        except Exception:
+            pass
+
         if confidence < self.strategy_params.get("confidence_threshold", 0.15):
-            return strategy_decision(
-                "hold", signals=contributing,
-                reasoning=f"Hybrid lean too weak: conf={confidence:.3f}")
+            return self._stamp_meta(
+                strategy_decision(
+                    "hold", side=side_preview,
+                    confidence=confidence, edge=abs(weighted_score),
+                    signals=contributing,
+                    reasoning=f"Hybrid lean too weak: conf={confidence:.3f}",
+                ),
+                votes, bucket,
+            )
 
         side = "yes" if weighted_score > 0 else "no"
-        meta_tok = format_token(votes, detail.get("bucket", "mixed"))
-        return strategy_decision(
-            "buy", side,
-            confidence=confidence,
-            edge=abs(weighted_score),
-            reasoning=(
-                f"Hybrid {side} ({confidence:.2f}) {meta_tok} | "
-                + "; ".join(reasons)[:180]
+        meta_tok = format_token(votes, bucket)
+        return self._stamp_meta(
+            strategy_decision(
+                "buy", side,
+                confidence=confidence,
+                edge=abs(weighted_score),
+                reasoning=(
+                    f"Hybrid {side} ({confidence:.2f}) {meta_tok} "
+                    f"n_sub={n_active} agree={int(agreement)} | "
+                    + "; ".join(reasons)[:160]
+                ),
+                signals=contributing,
             ),
-            signals=contributing,
+            votes, bucket,
         )

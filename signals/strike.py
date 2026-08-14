@@ -3,11 +3,12 @@
 Polymarket BTC 5-min Up/Down markets resolve UP iff the Chainlink **TWAP**
 at window CLOSE is ≥ the Chainlink **TWAP** at window OPEN — the "price to
 beat" (strike). Effective 2026-08-07 00:00 UTC both open and settlement use
-the 30-second TWAP feed for 5-minute markets (60s for 15m/4h). Spec:
-https://docs.polymarket.com/market-data/chainlink-twap
+the TWAP feed (``TWAP_WINDOW_SEC`` lookback — **60s** for 5-minute markets).
+Spec: https://docs.polymarket.com/market-data/chainlink-twap
 
 The resolution source is Chainlink TWAP (relayed via Polymarket RTDS
-``crypto_prices_twap_thirty``), **not** Binance or a single spot snapshot.
+``crypto_prices_twap_sixty`` for the 60s lookback), **not** Binance or a
+single spot snapshot.
 
 **Accuracy matters (BUG #23 + 2026-07-29 fix + TWAP 2026-08).** Early code used
 a mid-window "first sighting" snapshot (inverted drift, blew the account).
@@ -18,12 +19,13 @@ against the **official** open:
        ?symbol=BTC&eventStartTime=…&variant=fiveminute&endDate=…``
   → ``{openPrice, closePrice, …}``
 
-After the 2026-08-07 TWAP cutover, the Price to Beat is the Chainlink **30s
-TWAP at window open** (same RTDS feed as live BTC). Live soak showed the
-REST ``openPrice`` field can diverge ~$2–3 from the Polymarket UI; we therefore
-prefer RTDS ``twap_at(eventStartTime)`` as sticky ``twap_open`` and use REST
-only as a fallback when the open tick was missed. Never Binance live. Offline
-harnesses may still reconstruct from Binance klines for relative ranking only.
+After the 2026-08-07 TWAP cutover, the Price to Beat is the Chainlink
+**TWAP at window open** (same RTDS feed as live BTC; 60s lookback for 5m).
+Live soak showed the REST ``openPrice`` field can diverge ~$2–3 from the
+Polymarket UI; we therefore prefer RTDS ``twap_at(eventStartTime)`` as sticky
+``twap_open`` and use REST only as a fallback when the open tick was missed.
+Never Binance live. Offline harnesses may still reconstruct from Binance
+klines for relative ranking only.
 """
 
 from __future__ import annotations
@@ -186,7 +188,7 @@ def _twap_open_from_feed(
     tol_sec: float = _LATCH_MAX_SKEW_SEC,
     allow_late: bool = True,
 ) -> Optional[float]:
-    """Chainlink RTDS 30s TWAP observation nearest to window open.
+    """Chainlink RTDS TWAP observation nearest to window open.
 
     This is the Price to Beat Polymarket shows and settles against (TWAP at
     open). ``allow_late=True`` still requires the *tick* to be within
@@ -348,7 +350,7 @@ class StrikeRegistry:
     """Per-market Price to Beat with TWAP-open priority.
 
     Production path (2026-08-07+ TWAP resolution):
-      1. **Sticky ``twap_open``** — RTDS 30s TWAP observation at
+      1. **Sticky ``twap_open``** — RTDS TWAP observation at
          ``eventStartTime``. Matches Polymarket UI PTB and settlement open.
          Persisted to arena_state so mid-window restarts keep the value.
       2. **REST ``openPrice``** — fallback only when the open tick was missed

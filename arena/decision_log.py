@@ -273,6 +273,26 @@ def enqueue(
         if m:
             regime = m.group(1)
 
+    # Hybrid meta(...) token for counterfactual sub-vote learning.
+    # Prefer structured field; fall back to parsing reasoning / signals.
+    meta_token = signal.get("meta_token")
+    if not meta_token:
+        reason = signal.get("reasoning") or ""
+        m = re.search(r"meta\([^)]+\)", reason)
+        if m:
+            meta_token = m.group(0)
+    if not meta_token and isinstance(signal.get("signals"), dict):
+        votes = signal["signals"].get("votes")
+        bucket = signal["signals"].get("regime_bucket") or "mixed"
+        if isinstance(votes, dict) and votes:
+            try:
+                from bots.meta_learner import format_token
+                meta_token = format_token(votes, str(bucket))
+            except Exception:
+                meta_token = None
+    if meta_token is not None:
+        meta_token = str(meta_token)[:200]
+
     row = {
         "bot_name": bot_name,
         "strategy_type": strategy_type,
@@ -293,6 +313,7 @@ def enqueue(
         "trust_eff": lanes["trust_eff"],
         "regime": regime if isinstance(regime, str) else None,
         "features": feats,
+        "meta_token": meta_token,
         "trade_id": int(trade_id) if trade_id not in (None, "") else None,
     }
 
@@ -322,12 +343,13 @@ def flush() -> int:
                    bot_name, strategy_type, market_id, action, side, skip_reason,
                    edge, confidence, entry_price,
                    drift, mom, strat, fut, tech, xasset,
-                   model_prob, trust_eff, regime, features, trade_id
+                   model_prob, trust_eff, regime, features, meta_token, trade_id
                ) VALUES (
                    :bot_name, :strategy_type, :market_id, :action, :side,
                    :skip_reason, :edge, :confidence, :entry_price,
                    :drift, :mom, :strat, :fut, :tech, :xasset,
-                   :model_prob, :trust_eff, :regime, :features, :trade_id
+                   :model_prob, :trust_eff, :regime, :features, :meta_token,
+                   :trade_id
                )""",
             batch,
         )
