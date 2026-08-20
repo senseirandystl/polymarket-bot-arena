@@ -99,3 +99,140 @@ def test_pnl_gate_blocks_up_with_low_regime_n(monkeypatch):
     # Accuracy would UP 0.75→0.80, but P&L gate must hold or revert
     assert mom.get("action") in ("hold_pnl_gate", "pnl_revert", "hold")
     assert mom.get("action") != "up"
+
+
+def test_scorecard_negative_net_blocks_accuracy_up(monkeypatch):
+    """Unique-market net ≤ FORCE_DOWN steps the lane down even if sign-acc is high."""
+    monkeypatch.setattr(config, "CORE_TUNE_PNL_GATE", True, raising=False)
+    monkeypatch.setattr(config, "CORE_TUNE_EV_PRIMARY", True, raising=False)
+    monkeypatch.setattr(config, "CORE_TUNE_HIGH_ACC", 0.56, raising=False)
+    monkeypatch.setattr(config, "CORE_TUNE_LOW_ACC", 0.48, raising=False)
+    monkeypatch.setattr(config, "CORE_TUNE_STEP", 0.05, raising=False)
+    monkeypatch.setattr(config, "CORE_TUNE_MIN_TRADES", 40, raising=False)
+    monkeypatch.setattr(config, "CORE_TUNE_ENABLED", True, raising=False)
+    monkeypatch.setattr(config, "CORE_TUNE_SCORECARD_MIN", 20, raising=False)
+    monkeypatch.setattr(config, "CORE_TUNE_SCORECARD_DOWN_MAX", 0.0, raising=False)
+    monkeypatch.setattr(config, "CORE_TUNE_SCORECARD_FORCE_DOWN", -0.005, raising=False)
+
+    attribution = {
+        "momentum": {
+            "drift": {"n": 59, "accuracy": 0.62, "correct": 37, "wrong": 22},
+        },
+    }
+    monkeypatch.setattr(
+        core_lane_tuner, "compute_core_attribution",
+        lambda *a, **k: attribution,
+    )
+    monkeypatch.setattr(core_lane_tuner, "_strategy_regime_pnl", lambda *a, **k: {})
+    monkeypatch.setattr(core_lane_tuner, "_strategy_global_pnl", lambda *a, **k: {})
+    monkeypatch.setattr(
+        core_lane_tuner, "_scorecard_net_by_strategy",
+        lambda hours=None: {
+            "momentum": {"drift": {"n_priced": 40, "net_edge": -0.008}},
+        },
+    )
+    monkeypatch.setattr(core_lane_tuner, "live_tune_lanes", lambda *a, **k: ["drift"])
+
+    import db
+    monkeypatch.setattr(db, "get_auto_core_tune", lambda: False)
+    monkeypatch.setattr(db, "get_lane_overrides", lambda: {
+        "drift": {
+            "enabled": True,
+            "core": True,
+            "profile": {"momentum": 0.75},
+        },
+    })
+    monkeypatch.setattr(db, "get_regime_conditioning", lambda: False)
+    monkeypatch.setattr(db, "set_arena_state", lambda *a, **k: None)
+
+    class _Det:
+        def status(self):
+            return {"current": {"regime_id": "normal"}}
+
+    monkeypatch.setattr(
+        "signals.regime_detector.get_detector", lambda: _Det(), raising=False,
+    )
+    monkeypatch.setattr(
+        "arena.regime_settings.get_bool",
+        lambda name: False,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "bots.base_bot.BaseBot.STRATEGY_SIGNAL_PROFILE",
+        {"momentum": {"drift": 0.55, "mom": 0.3, "strat": 0.15}},
+        raising=False,
+    )
+
+    class _Conn:
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            return False
+        def execute(self, *a, **k):
+            class R:
+                def fetchall(self):
+                    return []
+                def fetchone(self):
+                    return None
+            return R()
+
+    monkeypatch.setattr(db, "get_conn", lambda: _Conn())
+
+    report = core_lane_tuner.tune()
+    drift = (report.get("lanes") or {}).get("drift") or {}
+    mom = drift.get("momentum") or {}
+    assert mom.get("action") == "ev_down"
+    assert mom.get("suggested") < mom.get("current")
+
+
+def test_scorecard_unavailable_blocks_accuracy_up(monkeypatch):
+    monkeypatch.setattr(config, "CORE_TUNE_PNL_GATE", False, raising=False)
+    monkeypatch.setattr(config, "CORE_TUNE_EV_PRIMARY", True, raising=False)
+    monkeypatch.setattr(config, "CORE_TUNE_HIGH_ACC", 0.56, raising=False)
+    monkeypatch.setattr(config, "CORE_TUNE_STEP", 0.05, raising=False)
+    monkeypatch.setattr(config, "CORE_TUNE_MIN_TRADES", 40, raising=False)
+    monkeypatch.setattr(config, "CORE_TUNE_ENABLED", True, raising=False)
+
+    attribution = {
+        "momentum": {
+            "drift": {"n": 59, "accuracy": 0.62, "correct": 37, "wrong": 22},
+        },
+    }
+    monkeypatch.setattr(
+        core_lane_tuner, "compute_core_attribution",
+        lambda *a, **k: attribution,
+    )
+    monkeypatch.setattr(core_lane_tuner, "_strategy_regime_pnl", lambda *a, **k: {})
+    monkeypatch.setattr(core_lane_tuner, "_strategy_global_pnl", lambda *a, **k: {})
+    monkeypatch.setattr(core_lane_tuner, "_scorecard_net_by_strategy", lambda hours=None: None)
+    monkeypatch.setattr(core_lane_tuner, "live_tune_lanes", lambda *a, **k: ["drift"])
+
+    import db
+    monkeypatch.setattr(db, "get_auto_core_tune", lambda: False)
+    monkeypatch.setattr(db, "get_lane_overrides", lambda: {
+        "drift": {"enabled": True, "core": True, "profile": {"momentum": 0.75}},
+    })
+    monkeypatch.setattr(db, "get_regime_conditioning", lambda: False)
+    monkeypatch.setattr(db, "set_arena_state", lambda *a, **k: None)
+
+    class _Det:
+        def status(self):
+            return {"current": {"regime_id": "normal"}}
+
+    monkeypatch.setattr(
+        "signals.regime_detector.get_detector", lambda: _Det(), raising=False,
+    )
+    monkeypatch.setattr(
+        "arena.regime_settings.get_bool",
+        lambda name: False,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "bots.base_bot.BaseBot.STRATEGY_SIGNAL_PROFILE",
+        {"momentum": {"drift": 0.55, "mom": 0.3, "strat": 0.15}},
+        raising=False,
+    )
+
+    report = core_lane_tuner.tune()
+    mom = ((report.get("lanes") or {}).get("drift") or {}).get("momentum") or {}
+    assert mom.get("action") != "up"

@@ -119,12 +119,17 @@ class LiveEngine:
                           else (float(amount or 0.0) / lim))
             if shares_req < getattr(config, "POLYMARKET_MIN_SHARES", 5):
                 shares_req = float(getattr(config, "POLYMARKET_MIN_SHARES", 5))
+            limit_mode = getattr(config, "LIMIT_PRICE_MODE", "cap_ask")
+            # cap_ask / aggressive must not rest: FOK fills now or cancels.
+            # join_bid / passive_mid may rest as GTC (one per market; trader
+            # marks limit_resting as traded so we do not stack).
+            otype = "FOK" if limit_mode in ("cap_ask", "aggressive") else "GTC"
             result = polymarket_client.place_limit_order(
                 token_id=token_id,
                 side="buy",
                 size=shares_req,
                 price=float(lim),
-                order_type="GTC",
+                order_type=otype,
                 neg_risk=neg_risk,
             )
             if not result.get("success"):
@@ -143,8 +148,18 @@ class LiveEngine:
                     success=False, reason=f"limit_resting:{status or 'live'}")
             price = float(result.get("price") or lim)
             shares = float(result.get("size") or shares_req)
-            # Matched at our limit without walking asks → treat as maker.
-            is_maker = abs(price - float(lim)) <= 1e-6
+            # Crossing the ask is a taker even if the fill prints at our
+            # limit (cap_ask / aggressive). Resting below the ask is maker.
+            ask_px = None
+            try:
+                ask_px = (probe.get("asks") or [[None]])[0][0]
+            except Exception:
+                ask_px = None
+            if limit_mode in ("cap_ask", "aggressive") or ask_px is None:
+                is_maker = False
+            else:
+                crossed = float(lim) + 1e-9 >= float(ask_px)
+                is_maker = not crossed
             fee = polymarket_fills.trading_fee(shares, price, is_maker=is_maker)
             amount_out = shares * price
         else:

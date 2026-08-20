@@ -404,6 +404,8 @@ def ops_snapshot() -> dict[str, Any]:
             "id": cur.get("regime_id") or cur.get("label") or "unknown",
             "legacy": cur.get("legacy") or cur.get("regime"),
             "confidence": cur.get("confidence"),
+            "held_sec": cur.get("held_sec"),
+            "actionable": cur.get("actionable"),
             "meta_bucket": cur.get("meta_bucket"),
             "features": feats,
             "vol_abs": feats.get("vol_abs", feats.get("vol")),

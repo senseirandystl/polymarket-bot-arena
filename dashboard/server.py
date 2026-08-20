@@ -613,9 +613,19 @@ def get_skips():
     traded). Empty until the arena process has flushed at least once."""
     raw = db.get_arena_state("skip_counts")
     try:
-        return JSONResponse(json.loads(raw) if raw else {})
+        data = json.loads(raw) if raw else {}
+        if not isinstance(data, dict):
+            data = {}
     except (json.JSONDecodeError, TypeError):
-        return JSONResponse({})
+        data = {}
+    if not data:
+        try:
+            sc = json.loads(db.get_arena_state("live_scorecard") or "{}")
+            data = sc.get("raw_skips") if isinstance(sc, dict) else {}
+            data = data if isinstance(data, dict) else {}
+        except (json.JSONDecodeError, TypeError):
+            data = {}
+    return JSONResponse(data)
 
 
 @app.get("/api/settings/bankroll")
@@ -658,7 +668,7 @@ def get_pilein_ev_gate(_auth: str = Depends(verify_auth)):
         "default": bool(getattr(config, "PILEIN_EV_GATE_ENABLED", True)),
         "edge_step": float(getattr(config, "PILEIN_EV_EDGE_STEP", 0.025)),
         "min_edge": float(getattr(config, "PILEIN_EV_MIN_EDGE", 0.035)),
-        "conf_bypass": float(getattr(config, "PILEIN_EV_CONF_BYPASS", 0.85)),
+        "conf_bypass": float(getattr(config, "PILEIN_EV_CONF_BYPASS", 0.96)),
     })
 
 
@@ -904,6 +914,58 @@ def post_learned_rules_mine(_auth: str = Depends(verify_auth)):
         return JSONResponse({"success": True, **snapshot()})
     except Exception as e:
         return JSONResponse({"success": False, "error": str(e)}, status_code=500)
+
+
+@app.get("/api/live-scorecard")
+def get_live_scorecard(hours: float | None = None,
+                       refresh: int = 0,
+                       _auth: str = Depends(verify_auth)):
+    """Signal Lab: unique-market lane + gate scorecard (live TWAP-era judge)."""
+    try:
+        from arena.live_scorecard import build_live_scorecard
+        import json as _json
+        if not refresh:
+            raw = db.get_arena_state("live_scorecard")
+            if raw:
+                data = _json.loads(raw)
+                if hours is None or data.get("meta", {}).get("hours") == hours:
+                    return JSONResponse(data)
+        h = hours if hours is not None else float(
+            getattr(config, "LIVE_SCORECARD_HOURS", 72) or 72)
+        return JSONResponse(build_live_scorecard(hours=h))
+    except Exception as e:
+        return JSONResponse({"error": str(e), "lanes": {}, "gates": {}},
+                            status_code=500)
+
+
+@app.get("/api/gate-tuner")
+def get_gate_tuner(_auth: str = Depends(verify_auth)):
+    """Signal Lab: gate-tuner suggestions + applied overrides."""
+    try:
+        import json as _json
+        report = _json.loads(db.get_arena_state("gate_tuner") or "{}")
+        overrides = _json.loads(db.get_arena_state("gate_overrides") or "{}")
+        return JSONResponse({"report": report, "overrides": overrides})
+    except Exception as e:
+        return JSONResponse({"error": str(e), "report": {}, "overrides": {}})
+
+
+@app.get("/api/combo-explorer")
+def get_combo_explorer(refresh: int = 0, _auth: str = Depends(verify_auth)):
+    """Signal Lab: pairwise lane combos + foundational rules (taker-fee EV)."""
+    try:
+        import json as _json
+        if not refresh:
+            raw = db.get_arena_state("combo_explorer")
+            if raw:
+                return JSONResponse(_json.loads(raw))
+        from arena.combo_explorer import build_and_persist
+        return JSONResponse(build_and_persist())
+    except Exception as e:
+        return JSONResponse(
+            {"error": str(e), "combos": {}, "rules": {}, "earned": []},
+            status_code=500,
+        )
 
 
 @app.get("/api/lane-proposals")

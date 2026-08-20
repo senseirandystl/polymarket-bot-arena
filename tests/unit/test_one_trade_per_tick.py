@@ -7,6 +7,8 @@ from arena.state import SharedArenaState
 def test_config_one_trade_defaults():
     assert config.ONE_TRADE_PER_TICK is True
     assert config.MARKET_SIDE_MAX_BOTS == 1
+    # Structure-confidence must not skip the extra-edge bar (soak tandem leak).
+    assert config.PILEIN_EV_CONF_BYPASS >= 0.96
     assert config.DIRECTIONAL_WINDOW_LOCK is False
     assert "arbitrage" in config.ONE_TRADE_PER_TICK_EXEMPT
     assert "sweeper" in config.ONE_TRADE_PER_TICK_EXEMPT
@@ -20,6 +22,22 @@ def test_directional_window_lock_state():
     assert not st.is_directional_locked("mkt-b")
     st.reset()
     assert not st.is_directional_locked("mkt-a")
+
+
+def test_reset_rehydrates_recent_fills(tmp_path, monkeypatch):
+    """GA reset must not wipe (bot, market) keys for fills already on the book."""
+    import db as db_module
+    monkeypatch.setattr(db_module, "DB_PATH", tmp_path / "rehyd.db")
+    db_module.init_db()
+    db_module.log_trade(
+        "hybrid-v1", "mkt-live", "yes", 3.0,
+        venue="polymarket", mode="paper", fill_source="paper_sim",
+    )
+    st = SharedArenaState()
+    st.mark_traded(("other", "old"))
+    st.reset()
+    assert st.is_traded(("hybrid-v1", "mkt-live"))
+    assert not st.is_traded(("other", "old"))
 
 
 def test_window_lock_db_toggle(tmp_path, monkeypatch):

@@ -113,7 +113,7 @@ def test_pilein_ev_gate_blocks_second_bot(db, monkeypatch):
     )
     assert msg is not None
     assert "Pile-in EV gate" in msg
-    # High conf bypass
+    # High conf bypass only at the configured bar (test sets 0.85)
     assert bot._pilein_ev_block(
         "mkt-1", "yes",
         {"edge": 0.02, "confidence": 0.90},
@@ -124,6 +124,64 @@ def test_pilein_ev_gate_blocks_second_bot(db, monkeypatch):
         "mkt-1", "yes",
         {"edge": 0.05, "confidence": 0.50},
         "paper",
+    ) is None
+
+
+def test_pilein_structure_conf_does_not_bypass_production_bar(db, monkeypatch):
+    """quality_confidence routinely prints 0.82–0.91 on 55–62¢ lag trades.
+
+    That is structure, not P(win). The soak's tandem doubles (unique +$24
+    vs multi −$12) all cleared the old 0.85 bypass. Production bar sits
+    above the 0.95 cap so ordinary structure cannot skip the extra edge.
+    """
+    from bots.bot_momentum import MomentumBot
+    from bots.base_bot import invalidate_exposure_cache
+    monkeypatch.setattr(db, "get_paper_pool_gross", lambda: 1000.0)
+    monkeypatch.setattr(config, "PILEIN_EV_GATE_ENABLED", True, raising=False)
+    monkeypatch.setattr(config, "MARKET_SIDE_MAX_BOTS", 10, raising=False)
+    _open_trade(db, "peer-bot", amount=5.0)
+    invalidate_exposure_cache()
+    bot = MomentumBot(name="momentum-test", generation=0)
+    # Production bypass (≥0.96) — 0.90 structure must still need extra edge
+    assert config.PILEIN_EV_CONF_BYPASS >= 0.96
+    msg = bot._pilein_ev_block(
+        "mkt-1", "yes",
+        {"edge": 0.02, "confidence": 0.90},
+        "paper",
+    )
+    assert msg is not None
+
+
+def test_pilein_extra_peers_covers_same_tick_race(db, monkeypatch):
+    """Same-tick second bot: DB may still show n_bots=0; extra_peers=1."""
+    from bots.bot_momentum import MomentumBot
+    monkeypatch.setattr(config, "PILEIN_EV_GATE_ENABLED", True, raising=False)
+    monkeypatch.setattr(config, "PILEIN_EV_MIN_EDGE", 0.035, raising=False)
+    monkeypatch.setattr(config, "PILEIN_EV_CONF_BYPASS", 0.96, raising=False)
+    bot = MomentumBot(name="momentum-test", generation=0)
+    # No DB peers, but trader already filled one this tick
+    msg = bot._pilein_ev_block(
+        "mkt-fresh", "yes",
+        {"edge": 0.02, "confidence": 0.70},
+        "paper",
+        extra_peers=1,
+    )
+    assert msg is not None
+    # extra_peers must not double-count a peer already in DB
+    _open_trade(db, "peer-bot", market="mkt-fresh", amount=5.0)
+    msg2 = bot._pilein_ev_block(
+        "mkt-fresh", "yes",
+        {"edge": 0.02, "confidence": 0.70},
+        "paper",
+        extra_peers=1,
+    )
+    assert msg2 is not None
+    # Strong edge still clears with one in-tick peer
+    assert bot._pilein_ev_block(
+        "mkt-fresh", "yes",
+        {"edge": 0.08, "confidence": 0.70},
+        "paper",
+        extra_peers=1,
     ) is None
 
 
@@ -163,3 +221,18 @@ def test_corr_aware_weights_high_rho_peers(db, monkeypatch):
     )
     used0, _ = bot._effective_open_exposure("mkt-1", "yes", "paper")
     assert used0 == pytest.approx(5.0 * config.EXPOSURE_CORR_FLOOR)
+
+
+def test_execute_blocks_second_fill_same_market(db, monkeypatch):
+    """Evolution reset wiped is_traded; DB open row must still block."""
+    from bots.bot_momentum import MomentumBot
+    monkeypatch.setattr(db, "get_bot_mode", lambda name: "paper")
+    _open_trade(db, "momentum-test", market="mkt-1", amount=5.0)
+    bot = MomentumBot(name="momentum-test", generation=0)
+    bot.trading_mode = "paper"
+    out = bot.execute(
+        {"side": "yes", "suggested_amount": 3.0, "entry_price": 0.5},
+        {"id": "mkt-1", "condition_id": "mkt-1"},
+    )
+    assert out.get("success") is False
+    assert out.get("reason") == "already_in_market"

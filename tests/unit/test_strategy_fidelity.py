@@ -35,7 +35,6 @@ def test_profiles_include_strat_weight():
 
 
 def test_hybrid_max_side_price_caps_priced_in_entries():
-    """Paper soak: hybrid avg entry ~0.59 with thin BE — cap at 0.62."""
     assert BaseBot.STRATEGY_MAX_SIDE_PRICE.get("hybrid") == 0.62
     assert BaseBot.STRATEGY_MAX_SIDE_PRICE["hybrid"] <= \
         BaseBot.STRATEGY_MAX_SIDE_PRICE["momentum"]
@@ -46,8 +45,8 @@ def test_momentum_is_drift_anchored_with_mom():
     mom remains a strong co-weight, strat is secondary."""
     p = PROF["momentum"]
     assert p["drift"] >= p["mom"] >= p["strat"]
-    assert p["mom"] >= 0.25
-    assert p["drift"] >= 0.45
+    assert p["mom"] >= 0.15
+    assert p["drift"] >= 0.55
 
 
 def test_phantom_balances_thesis_with_drift():
@@ -63,8 +62,8 @@ def test_meanrev_is_drift_plus_fade():
     """Meanrev honesty (2026-08): lower drift, higher strat fade mass — not a
     drift-pure clone (old 0.75/0/.25 made it a mom-lite twin)."""
     p = PROF["mean_reversion"]
-    assert p["drift"] >= 0.45
-    assert p["drift"] <= 0.60
+    assert p["drift"] >= 0.55
+    assert p["drift"] <= 0.75
     assert p["mom"] == 0.0
     assert p["strat"] >= 0.25
     assert p["strat"] > p["mom"]

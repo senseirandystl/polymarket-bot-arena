@@ -114,6 +114,30 @@ def test_meanrev_fade_requires_mean_on_ptb_side():
     assert "strike=" in ok["reasoning"] and "mean=" in ok["reasoning"]
 
 
+def test_meanrev_make_decision_skips_when_analyze_holds():
+    """Identity: a held fade must not become a drift-only trend clone."""
+    bot = MeanRevBot(name="rev-clone", generation=0)
+    market = make_market()
+    market["current_price"] = 0.50
+    market["yes_price"] = 0.50
+    market["no_price"] = 0.50
+    market["yes_ask"] = 0.51
+    market["no_ask"] = 0.51
+    market["time_remaining_seconds"] = 180
+    sigs = make_signals(
+        prices=[100_000.0] * 30,
+        latest=100_000.0,
+        btc_drift=0.75,
+        btc_strike=100_000.0,
+        btc_now=100_080.0,
+        btc_implied_yes=0.62,
+    )
+    d = bot.make_decision(market, sigs)
+    assert d["action"] == "skip"
+    why = (d.get("reasoning") or "").lower()
+    assert d.get("skip_reason") == "no_thesis" or "fade thesis" in why
+
+
 def test_meanrev_window_lookback_preferred_late_window():
     """P1: late in the window, z-score uses window-local closed 1m bars."""
     from bots.bot_mean_rev import resolve_lookback

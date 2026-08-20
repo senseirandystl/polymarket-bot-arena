@@ -118,3 +118,38 @@ class TestResolverFallback:
         assert row["outcome"] == "win"
         # win: shares - amount - fee = 5 - 2 - 0 = 3
         assert abs(float(row["pnl"]) - 3.0) < 1e-9
+
+
+    def test_cycle_stamps_decision_events_without_pending_trades(
+            self, tmp_path, monkeypatch):
+        """Signal Lab must resolve skips even when no trade was placed."""
+        import db
+        from arena.resolver import TradeResolver
+
+        monkeypatch.setattr(db, "DB_PATH", tmp_path / "dec.db")
+        db.init_db()
+        with db.get_conn() as conn:
+            conn.execute(
+                """INSERT INTO decision_events
+                   (bot_name, strategy_type, market_id, action, side,
+                    skip_reason, drift, created_at)
+                   VALUES (?,?,?,?,?,?,?,datetime('now','-10 minutes'))""",
+                ("momentum-v1", "momentum", "0xdone", "skip", "yes",
+                 "weak_lean", 0.1),
+            )
+            conn.commit()
+
+        monkeypatch.setattr(pm, "recent_resolutions",
+                            lambda limit=100: {"0xdone": True})
+        monkeypatch.setattr(pm, "fetch_market_outcome", lambda mid: None)
+
+        r = TradeResolver()
+        r._do_resolution_cycle()
+
+        with db.get_conn() as conn:
+            row = conn.execute(
+                "SELECT market_up, would_win FROM decision_events "
+                "WHERE market_id='0xdone'"
+            ).fetchone()
+        assert int(row["market_up"]) == 1
+        assert int(row["would_win"]) == 1

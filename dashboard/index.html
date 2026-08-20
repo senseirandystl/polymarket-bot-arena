@@ -288,6 +288,20 @@ body.nav-open .sidebar{transform:none}
 }
 .risk-chip .k{display:block;font-size:9px;letter-spacing:.1em;text-transform:uppercase;color:var(--dim);margin-bottom:1px}
 .risk-chip .v{font-size:13px;font-weight:700;color:var(--hi);font-variant-numeric:tabular-nums}
+.why-flat-chips{display:flex;flex-wrap:wrap;gap:6px;justify-content:center}
+.why-chip{
+  background:var(--inset);border:1px solid var(--line);border-radius:4px;
+  padding:4px 9px;font-size:11px;white-space:nowrap
+}
+.why-chip .k{color:var(--muted);margin-right:6px}
+.why-chip .v{font-weight:700;font-variant-numeric:tabular-nums;color:var(--hi)}
+.lab-more{margin:8px 0 14px}
+.lab-more > summary{
+  cursor:pointer;list-style:none;margin-bottom:8px
+}
+.lab-more > summary::-webkit-details-marker{display:none}
+.lab-more > summary::before{content:'▸ ';color:var(--dim)}
+.lab-more[open] > summary::before{content:'▾ '}
 /* Shared toggle style: Recent decisions + Show bots */
 .risk-events-toggle,.risk-bots-toggle{
   background:transparent;border:none;color:var(--muted);font-family:inherit;font-size:10px;
@@ -479,9 +493,9 @@ tbody tr:hover{background:rgba(0,255,156,.035)}
 }
 .lane-health-toolbar .mode-btn.active{border-color:var(--grn-soft);color:var(--grn);background:rgba(0,255,156,.1)}
 .lane-health-table{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums}
-.lane-health-table th{color:#5f9c78;font-weight:500;text-align:right;padding:2px 4px;font-size:9px;letter-spacing:.02em}
+.lane-health-table th{color:#5f9c78;font-weight:500;text-align:center;padding:2px 4px;font-size:9px;letter-spacing:.02em}
+.lane-health-table td{padding:3px 4px;border-top:1px solid rgba(95,156,120,.15);text-align:center}
 .lane-health-table th:first-child,.lane-health-table td:first-child{text-align:left}
-.lane-health-table td{padding:3px 4px;border-top:1px solid rgba(95,156,120,.15)}
 .lane-health-table .muted{color:#5f9c78;opacity:.75}
 .lane-health-table .wr-good{color:var(--grn)}
 .lane-health-table .wr-mid{color:var(--amb)}
@@ -783,9 +797,7 @@ tbody tr:hover{background:rgba(0,255,156,.035)}
         <!-- Primary pulse: Performance | Current Market | Market Regime -->
         <div class="ov-main-row">
             <div class="card dense">
-                <h2>Performance <span style="font-weight:normal">&mdash; ET</span>
-                    <span class="perf-hint" title="Core = directional bots (mom / meanrev / sniper / hybrid…). Lock-in = Sweeper + Arbitrage (near-certain / market-neutral fills).">Core vs Lock-in</span>
-                </h2>
+                <h2>Performance</h2>
                 <table id="stats-table" class="compact-table">
                     <thead>
                         <tr>
@@ -838,6 +850,12 @@ tbody tr:hover{background:rgba(0,255,156,.035)}
                 <div id="ov-alloc-bar" class="ov-alloc-bar" style="display:none" aria-hidden="true"></div>
                 <table id="ov-alloc-table" class="compact-table center-all"><thead><tr><th>Bot</th><th>Weight</th></tr></thead><tbody></tbody></table>
             </div>
+        </div>
+
+        <div class="card dense" id="ov-why-flat-card" style="border-left:3px solid #ffb020;margin-bottom:8px">
+            <h2>Why flat</h2>
+            <div id="ov-why-flat-summary" style="color:#5f9c78;font-size:12px;margin-bottom:6px;text-align:center">—</div>
+            <div id="ov-why-flat-chips" class="why-flat-chips"></div>
         </div>
 
         <!-- Risk Engine (below Health / Signals / Allocation) -->
@@ -1044,6 +1062,17 @@ tbody tr:hover{background:rgba(0,255,156,.035)}
                 <span id="regime-conditioning-label" style="font-weight:600;color:#5f9c78">&hellip;</span>
             </label>
         </div>
+        <div class="section-title">Judge <span style="color:#5f9c78;font-size:11px;text-transform:none;letter-spacing:0;">&mdash; unique-market live scorecard (one row per strategy&times;window), last 72h. Net edge is per-share after the crypto taker fee. This is the TWAP-era judge; the harness below only nominates.</span></div>
+        <div class="card" id="live-scorecard-card">
+            <div style="color:#5f9c78">Loading&hellip;</div>
+        </div>
+        <div class="section-title">Policy <span style="color:#5f9c78;font-size:11px;text-transform:none;letter-spacing:0;">&mdash; combo explorer (cheap unique-market rules) and gate tuner (loosens a gate only when skipped markets would have been cheap and profitable). Never loosens 90¢+ favorites. Applied only when auto-approve is ON.</span></div>
+        <div class="card" id="combo-explorer-card">
+            <div style="color:#5f9c78">Loading&hellip;</div>
+        </div>
+        <div class="card" id="gate-tuner-card" style="margin-top:8px">
+            <div style="color:#5f9c78">Loading&hellip;</div>
+        </div>
         <div class="section-title">Pending Lane Proposals <span style="color:#5f9c78;font-size:11px;text-transform:none;letter-spacing:0;">&mdash; filed by the offline harness when a kill-switched signal lane clears the promotion bar (n&ge;200, follow-WR&ge;55%, net edge &ge;+0.5&cent;/share after price+fee). Live shadow accuracy (judged on real fills) is shown per proposal; approving activates the lane live within seconds.</span></div>
         <div class="card" id="lane-proposals-card">
             <div style="color:#5f9c78">Loading&hellip;</div>
@@ -1059,32 +1088,35 @@ tbody tr:hover{background:rgba(0,255,156,.035)}
             <div style="color:#5f9c78">Loading&hellip;</div>
         </div>
 
-        <div class="section-title">Hybrid Meta-Learner <span style="color:#5f9c78;font-size:11px;text-transform:none;letter-spacing:0;">&mdash; the ensemble's dynamic sub-strategy weights: base &times; regime tilt &times; live-WR tilt &times; ONLINE multiplier (Hedge-updated from the hybrid's own resolved trades, per regime bucket). Multiplier &gt;1 = that sub has been calling the market right.</span></div>
-        <div class="card" id="hybrid-meta-card">
-            <div style="color:#5f9c78">Loading&hellip;</div>
-        </div>
+        <details class="lab-more" id="lab-details">
+            <summary class="section-title">Hybrid · learned · harness</summary>
+            <div class="section-title">Hybrid Meta-Learner <span style="color:#5f9c78;font-size:11px;text-transform:none;letter-spacing:0;">&mdash; fill-only Hedge updates (skip CF off). Multiplier capped at 1.2. Multiplier &gt;1 = that sub has been calling the market right.</span></div>
+            <div class="card" id="hybrid-meta-card">
+                <div style="color:#5f9c78">Loading&hellip;</div>
+            </div>
 
-        <div class="section-title" style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px">
-            <span>Learned Trade Rules <span style="color:#5f9c78;font-size:11px;text-transform:none;letter-spacing:0;">&mdash; auto-mined from decision_events (regime &times; price &times; drift &times; side). Continuous size/edge mults from cell WR; hard skip/go only at extremes; walk-forward OOS gate; skip-reason bandit softens static guards when counterfactual says we stood down too often. Per-strategy cells auto-enable when sample mass is large enough.</span></span>
-            <button class="btn btn-primary" id="mine-learned-rules-btn" onclick="mineLearnedRules()" style="font-size:12px;padding:6px 12px">Re-mine now</button>
-        </div>
-        <div class="card" id="learned-rules-card">
-            <div style="color:#5f9c78">Loading&hellip;</div>
-        </div>
+            <div class="section-title" style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px">
+                <span>Learned Trade Rules <span style="color:#5f9c78;font-size:11px;text-transform:none;letter-spacing:0;">&mdash; auto-mined from decision_events (regime &times; price &times; drift &times; side). Continuous size/edge mults from cell WR; hard skip/go only at extremes; walk-forward OOS gate; skip-reason bandit softens static guards when counterfactual says we stood down too often.</span></span>
+                <button class="btn btn-primary" id="mine-learned-rules-btn" onclick="mineLearnedRules()" style="font-size:12px;padding:6px 12px">Re-mine now</button>
+            </div>
+            <div class="card" id="learned-rules-card">
+                <div style="color:#5f9c78">Loading&hellip;</div>
+            </div>
 
-        <div class="section-title" style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px">
-            <span>Last Validation Run</span>
-            <span style="display:flex;gap:8px;align-items:center">
-                <input type="number" id="validation-markets" min="50" max="1000" step="50" value="300"
-                       style="width:80px;background:#050806;color:#bff0d2;border:1px solid #16301f;border-radius:6px;padding:6px 8px;font-family:inherit"
-                       title="Resolved markets to sample (50-1000)">
-                <button class="btn btn-primary" id="run-validation-btn" onclick="runValidation()">Run Validation</button>
-            </span>
-        </div>
-        <div id="validation-status" style="color:#5f9c78;font-size:12px;margin:-6px 0 10px;display:none"></div>
-        <div class="card" id="lane-run-card">
-            <div style="color:#5f9c78">No validation run recorded yet &mdash; click <b>Run Validation</b> above (takes a few minutes; results and any proposals appear here when it finishes).</div>
-        </div>
+            <div class="section-title" style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px">
+                <span>Last Validation Run</span>
+                <span style="display:flex;gap:8px;align-items:center">
+                    <input type="number" id="validation-markets" min="50" max="1000" step="50" value="300"
+                           style="width:80px;background:#050806;color:#bff0d2;border:1px solid #16301f;border-radius:6px;padding:6px 8px;font-family:inherit"
+                           title="Resolved markets to sample (50-1000)">
+                    <button class="btn btn-primary" id="run-validation-btn" onclick="runValidation()">Run Validation</button>
+                </span>
+            </div>
+            <div id="validation-status" style="color:#5f9c78;font-size:12px;margin:-6px 0 10px;display:none"></div>
+            <div class="card" id="lane-run-card">
+                <div style="color:#5f9c78">No validation run recorded yet &mdash; click <b>Run Validation</b> above (takes a few minutes; results and any proposals appear here when it finishes).</div>
+            </div>
+        </details>
     </div>
 
     <!-- ===== SETTINGS TAB ===== -->
@@ -1385,6 +1417,7 @@ tbody tr:hover{background:rgba(0,255,156,.035)}
                 <label>Lookback (hours)<small>Metrics window</small></label>
                 <input type="number" id="portfolio-window" min="1" max="168" step="1" placeholder="24">
                 <button class="btn" onclick="savePortfolioWindow()">Save</button>
+                <span id="portfolio-window-hint" style="color:#5f9c78;font-size:11px">3h uses a lower N floor so weights still move; 48h is the stability default.</span>
             </div>
             <div style="margin:10px 0 6px;color:#5f9c78;font-size:12px">
                 Last rebalance: <span id="portfolio-last-rebal">&mdash;</span>
@@ -1887,9 +1920,13 @@ function updateOps(ops) {
     // overview regime card (also mirrored in topbar ticker)
     const ovs = document.getElementById('ov-regime-summary');
     if (ovs) {
+        const held = reg.held_sec != null ? Math.round(Number(reg.held_sec)) + 's' : '—';
+        const act = reg.actionable === true ? 'yes' : (reg.actionable === false ? 'no' : '—');
         ovs.innerHTML = `Now <b>${reg.id || '?'}</b>` +
             (reg.legacy ? ` <span class="neutral">(${reg.legacy})</span>` : '') +
             ` · conf <b>${conf}</b>` +
+            ` · held <b>${held}</b>` +
+            ` · act <b>${act}</b>` +
             (reg.meta_bucket ? ` · meta <b>${reg.meta_bucket}</b>` : '');
     }
     const featBody = document.querySelector('#ov-regime-features tbody');
@@ -1897,15 +1934,16 @@ function updateOps(ops) {
         const feats = reg.features || {};
         // vol = volatility (realized), volume = tape activity (separate)
         const featRows = [
-            ['vol', 'volatility'],
-            ['volume', 'volume'],
-            ['trend', 'trend'],
-            ['mom', 'momentum'],
-            ['flow', 'flow'],
+            ['vol', 'volatility', 'Relative realized vol (BTC tape)'],
+            ['direction', 'direction', 'Trend + anti-chop + multi-scale align'],
+            ['chop', 'chop', 'Path churn (high = rangebound)'],
+            ['volume', 'volume', 'Binance BTC 1m activity (not volatility)'],
+            ['mom', 'momentum', 'Short-horizon |return| intensity'],
+            ['pm_book_quality', 'PM book', 'Polymarket spread tightness + book-sum consistency'],
         ];
-        featBody.innerHTML = featRows.map(([k, label]) => {
+        featBody.innerHTML = featRows.map(([k, label, tip]) => {
             const v = feats[k];
-            return `<tr><td title="${k === 'vol' ? 'Volatility (not volume)' : ''}">${label}</td><td>${v != null ? (Number(v) * 100).toFixed(0) + '%' : '—'}</td></tr>`;
+            return `<tr><td title="${tip}">${label}</td><td>${v != null ? (Number(v) * 100).toFixed(0) + '%' : '—'}</td></tr>`;
         }).join('');
     }
 
@@ -2409,6 +2447,12 @@ async function loadPortfolio() {
         if (meth && document.activeElement !== meth) meth.value = p.method || 'kelly_portfolio';
         const win = document.getElementById('portfolio-window');
         if (win && document.activeElement !== win) win.value = Number(p.window_hours || 24);
+        const hint = document.getElementById('portfolio-window-hint');
+        if (hint) {
+            const fast = p.fast_window_hours != null ? Number(p.fast_window_hours).toFixed(1) : '—';
+            const nFloor = p.min_trades != null ? p.min_trades : '—';
+            hint.textContent = `fast = ${fast}h · N floor = ${nFloor} · 3h uses a lower N floor so weights still move; 48h is the stability default.`;
+        }
         const last = p.last_rebalance_at
             ? new Date(Number(p.last_rebalance_at) * 1000).toLocaleString()
             : 'never';
@@ -3044,10 +3088,12 @@ async function riskResumeBot(name) {
 
 // ---------- Overview / Bots / Trades ----------
 /** Format a Core / Lock-in / All stats cell: P&L on top, WR · n below. */
-function _perfSplitCell(pnl, wins, losses, trades, pending) {
+function _perfSplitCell(pnl, wins, losses, trades, pending, allowEmptyDash) {
     const n = trades || ((wins || 0) + (losses || 0));
     if (!n && !(pending || 0)) {
-        return `<div class="perf-cell"><span class="perf-pnl" style="color:#3f6b52">—</span></div>`;
+        if (allowEmptyDash !== false) {
+            return `<div class="perf-cell"><span class="perf-pnl" style="color:#3f6b52">—</span></div>`;
+        }
     }
     const wr = (wins || losses)
         ? winRate(wins || 0, losses || 0)
@@ -3067,6 +3113,7 @@ function updateOverview(stats) {
     // Columns: Core (directional) | Lock-in (sweeper+arb) | All.
     const rows = [];
     if (stats.session) rows.push(['Current Session', stats.session]);
+    if (stats.hour) rows.push(['Hour', stats.hour]);
     rows.push(['Today', stats.today]);
     rows.push(['This Week', stats.week]);
     if (stats.current_bots) rows.push(['Current Bots', stats.current_bots]);
@@ -3086,8 +3133,9 @@ function updateOverview(stats) {
     document.getElementById('stats-tbody').innerHTML = rows.map(([label, el]) => {
         const pending = el.pending || 0;
         const trades = el.trades || 0;
+        const showZeros = label === 'Hour';
         // Quiet dash for empty periods when other rows have activity
-        if (trades === 0 && pending === 0) {
+        if (trades === 0 && pending === 0 && !showZeros) {
             return `<tr class="quiet-zero">
                 <td style="color:#3f6b52">${label}</td>
                 <td style="text-align:right;color:#3f6b52">—</td>
@@ -3104,11 +3152,13 @@ function updateOverview(stats) {
         const lockWins = el.lockin_wins != null ? el.lockin_wins : el.structural_wins;
         const lockLosses = el.lockin_losses != null ? el.lockin_losses : el.structural_losses;
         const lockTrades = el.lockin_trades != null ? el.lockin_trades : el.structural_trades;
+        const corePending = el.core_pending || 0;
+        const lockPending = el.lockin_pending || 0;
         return `<tr>
             <td>${label}</td>
-            <td style="text-align:right">${_perfSplitCell(corePnl, coreWins, coreLosses, coreTrades, 0)}</td>
-            <td style="text-align:right">${_perfSplitCell(lockPnl, lockWins, lockLosses, lockTrades, 0)}</td>
-            <td style="text-align:right">${_perfSplitCell(el.pnl, el.wins, el.losses, trades, pending)}</td>
+            <td style="text-align:right">${_perfSplitCell(corePnl, coreWins, coreLosses, coreTrades, corePending, !showZeros)}</td>
+            <td style="text-align:right">${_perfSplitCell(lockPnl, lockWins, lockLosses, lockTrades, lockPending, !showZeros)}</td>
+            <td style="text-align:right">${_perfSplitCell(el.pnl, el.wins, el.losses, trades, pending, !showZeros)}</td>
         </tr>`;
     }).join('');
 }
@@ -3218,21 +3268,25 @@ function updateRegime(reg) {
     const feats = cur.features || {};
     const rid = cur.regime_id || cur.label || 'unknown';
     const legacy = cur.legacy || cur.regime || '?';
-    summary.innerHTML = `Now <b>${rid}</b> <span class="neutral">(legacy ${legacy})</span> · conf <b>${(Number(cur.confidence || 0) * 100).toFixed(0)}%</b> · meta bucket <b>${cur.meta_bucket || '?'}</b>${cur.last_change_from ? ' · last switch from ' + cur.last_change_from : ''}`;
+    const held = cur.held_sec != null ? Math.round(Number(cur.held_sec)) + 's' : '—';
+    const act = cur.actionable === true ? 'yes' : (cur.actionable === false ? 'no' : '—');
+    summary.innerHTML = `Now <b>${rid}</b> <span class="neutral">(legacy ${legacy})</span> · conf <b>${(Number(cur.confidence || 0) * 100).toFixed(0)}%</b> · held <b>${held}</b> · actionable <b>${act}</b> · meta bucket <b>${cur.meta_bucket || '?'}</b>${cur.last_change_from ? ' · last switch from ' + cur.last_change_from : ''}`;
     if (featBody) {
         // vol = volatility (realized log-return score); volume = tape activity
         const featRows = [
-            ['vol', 'volatility'],
-            ['volume', 'volume'],
-            ['trend', 'trend'],
-            ['mom', 'momentum'],
-            ['flow', 'flow'],
+            ['vol', 'volatility', 'Relative realized vol (BTC tape)'],
+            ['direction', 'direction', 'Trend + anti-chop + multi-scale align'],
+            ['chop', 'chop', 'Path churn (high = rangebound)'],
+            ['volume', 'volume', 'Binance BTC 1m activity (not volatility)'],
+            ['trend', 'trend', 'Kaufman efficiency (raw trendiness)'],
+            ['mom', 'momentum', 'Short-horizon |return| intensity'],
+            ['flow', 'flow', 'CVD/OBI intensity (context; lanes kill-switched)'],
+            ['pm_book_quality', 'PM book', 'Polymarket spread tightness + book-sum consistency'],
         ];
-        const rows = featRows.map(([k, label]) => {
+        const rows = featRows.map(([k, label, tip]) => {
             const v = feats[k] != null ? feats[k] : cur[k + '_score'];
             const pct = v != null ? (Number(v) * 100).toFixed(0) + '%' : '—';
-            const tip = k === 'vol' ? ' title="Volatility (realized), not volume"' : '';
-            return `<tr><td${tip}>${label}</td><td>${pct}</td></tr>`;
+            return `<tr><td title="${tip}">${label}</td><td>${pct}</td></tr>`;
         });
         featBody.innerHTML = rows.join('');
     }
@@ -3513,12 +3567,26 @@ function updateEntryBuckets(buckets) {
 }
 
 function updateSkips(skips) {
-    const tbody = document.querySelector('#skips-table tbody');
-    if (!tbody) return;
     const entries = Object.entries(skips || {}).sort((a, b) => b[1] - a[1]);
-    tbody.innerHTML = entries.length
-        ? entries.map(([r, c]) => `<tr><td>${r}</td><td>${c}</td></tr>`).join('')
-        : '<tr><td colspan="2" style="color:#5f9c78">No skips recorded yet</td></tr>';
+    const tbody = document.querySelector('#skips-table tbody');
+    if (tbody) {
+        tbody.innerHTML = entries.length
+            ? entries.map(([r, c]) => `<tr><td>${escHtml(r)}</td><td>${Number(c) || 0}</td></tr>`).join('')
+            : '<tr><td colspan="2" style="color:#5f9c78">No skips recorded yet</td></tr>';
+    }
+    const chips = document.getElementById('ov-why-flat-chips');
+    const sum = document.getElementById('ov-why-flat-summary');
+    if (sum) {
+        const total = entries.reduce((s, [, n]) => s + Number(n || 0), 0);
+        sum.textContent = total
+            ? `${total.toLocaleString()} skips this run · top reasons`
+            : 'No skips recorded yet';
+    }
+    if (chips) {
+        chips.innerHTML = entries.slice(0, 8).map(([r, c]) =>
+            `<span class="why-chip"><span class="k">${escHtml(r)}</span><span class="v">${Number(c) || 0}</span></span>`
+        ).join('');
+    }
 }
 
 function updateEarnings(data) {
@@ -4480,7 +4548,132 @@ async function setRegimeConditioning(enabled) {
     if (lbl) { lbl.textContent = enabled ? 'ON' : 'OFF'; lbl.style.color = enabled ? '#3fb950' : '#8b949e'; }
 }
 
+function _fmtPct(x) {
+    return x == null ? '—' : (x * 100).toFixed(1) + '%';
+}
+function _fmtC(x) {
+    return x == null ? '—' : ((x * 100).toFixed(2) + '¢');
+}
+async function loadLiveScorecard() {
+    const el = document.getElementById('live-scorecard-card');
+    if (!el) return;
+    let card;
+    try { card = await fetchJSON('/api/live-scorecard'); }
+    catch (e) {
+        el.innerHTML = '<div style="color:#ff3b5c">Failed to load live scorecard</div>';
+        return;
+    }
+    const meta = card.meta || {};
+    const lanes = card.lanes || {};
+    const gates = card.gates || {};
+    const rawSkips = card.raw_skips || {};
+    let html = `<div style="color:#5f9c78;font-size:12px;margin-bottom:10px">${meta.unique_markets || 0} unique resolved markets · ${meta.unique_rows || 0} strategy×market rows · ${meta.n_decisions || meta.resolved_ticks || 0} decisions · window ${meta.hours || '?'}h</div>`;
+    if (!meta.unique_markets && Object.keys(rawSkips).length) {
+        html += '<div style="color:#ffb020;font-size:12px;margin-bottom:8px">No resolved outcomes yet — showing live skip mix. Decisions stamp after each window closes.</div>';
+        html += '<table style="width:100%;font-size:12px;border-collapse:collapse;margin-bottom:12px"><tr style="color:#5f9c78;text-align:left"><th>skip</th><th>n</th></tr>';
+        for (const [k, n] of Object.entries(rawSkips).slice(0, 12)) {
+            html += `<tr><td>${k}</td><td>${n}</td></tr>`;
+        }
+        html += '</table>';
+    }
+    html += '<div style="font-weight:600;margin-bottom:6px">Lanes</div>';
+    html += '<table style="width:100%;font-size:12px;border-collapse:collapse"><tr style="color:#5f9c78;text-align:left"><th>lane</th><th>mkts</th><th>acc</th><th>net</th></tr>';
+    for (const [ln, s] of Object.entries(lanes)) {
+        const acc = s.accuracy, net = s.net_edge;
+        const col = acc == null ? '#5f9c78' : (acc >= 0.55 && (net || 0) > 0 ? '#35ff87' : '#ffb020');
+        html += `<tr><td>${ln}</td><td>${s.markets || 0}</td><td style="color:${col}">${_fmtPct(acc)}</td><td style="color:${col}">${_fmtC(net)}</td></tr>`;
+    }
+    html += '</table>';
+    html += '<div style="font-weight:600;margin:12px 0 6px">Gates (skips)</div>';
+    html += '<table style="width:100%;font-size:12px;border-collapse:collapse"><tr style="color:#5f9c78;text-align:left"><th>gate</th><th>mkts</th><th>WR</th><th>hyp</th><th>avg entry</th></tr>';
+    const gateKeys = Object.entries(gates).sort((a,b) => (b[1].markets||0) - (a[1].markets||0));
+    for (const [g, s] of gateKeys) {
+        if (g === 'buy') continue;
+        html += `<tr><td>${g}</td><td>${s.markets || 0}</td><td>${_fmtPct(s.wr)}</td><td>${_fmtC(s.avg_hyp_pnl)}</td><td>${s.avg_entry == null ? '—' : s.avg_entry.toFixed(2)}</td></tr>`;
+    }
+    html += '</table>';
+    el.innerHTML = html;
+}
+async function loadComboExplorer() {
+    const el = document.getElementById('combo-explorer-card');
+    if (!el) return;
+    let card;
+    try { card = await fetchJSON('/api/combo-explorer'); }
+    catch (e) {
+        el.innerHTML = '<div style="color:#ff3b5c">Failed to load combo explorer</div>';
+        return;
+    }
+    if (card.error) {
+        el.innerHTML = `<div style="color:#ff3b5c">${escHtml(card.error)}</div>`;
+        return;
+    }
+    const meta = card.meta || {};
+    const combos = card.combos || {};
+    const rules = card.rules || {};
+    const earned = card.earned || [];
+    let html = `<div style="color:#5f9c78;font-size:12px;margin-bottom:10px">${meta.rows || 0} unique rows · ${meta.n_earned || 0} earned · cheap bar ≤${meta.max_entry != null ? Number(meta.max_entry).toFixed(2) : '0.62'} · deadband ${meta.deadband != null ? Number(meta.deadband).toFixed(2) : '0.05'}</div>`;
+    if (earned.length) {
+        html += '<div style="margin-bottom:10px;font-size:12px">Live confirm: '
+            + earned.map(e => {
+                const col = e.bypass_dual_gate ? '#35ff87' : '#bff0d2';
+                return `<span style="color:${col}">${escHtml(e.name)}</span>`
+                    + ` ${_fmtPct(e.accuracy)} / ${_fmtC(e.net_edge)}`
+                    + (e.bypass_dual_gate ? ' <span style="color:#5f9c78">(may bypass dual-gate)</span>' : '');
+            }).join(' · ')
+            + '</div>';
+    } else {
+        html += '<div style="color:#5f9c78;font-size:12px;margin-bottom:10px">No combo has earned the cheap live bar yet — collecting unique-market samples. Dual-gate and lean floor stay as-is.</div>';
+    }
+    html += '<div style="font-weight:600;margin-bottom:6px">Foundational rules</div>';
+    html += '<table style="width:100%;font-size:12px;border-collapse:collapse;margin-bottom:12px"><tr style="color:#5f9c78;text-align:left"><th>rule</th><th>n</th><th>acc</th><th>cheap n</th><th>cheap acc</th><th>cheap net</th><th>verdict</th></tr>';
+    for (const [name, s] of Object.entries(rules)) {
+        const col = s.verdict === 'earned' ? '#35ff87' : '#5f9c78';
+        html += `<tr><td>${escHtml(name)}</td><td>${s.markets || 0}</td><td>${_fmtPct(s.accuracy)}</td><td>${s.cheap_markets || 0}</td><td style="color:${col}">${_fmtPct(s.cheap_accuracy)}</td><td style="color:${col}">${_fmtC(s.cheap_net_edge)}</td><td style="color:${col}">${escHtml(s.verdict || '')}</td></tr>`;
+    }
+    html += '</table>';
+    html += '<div style="font-weight:600;margin-bottom:6px">Lane combinations</div>';
+    html += '<table style="width:100%;font-size:12px;border-collapse:collapse"><tr style="color:#5f9c78;text-align:left"><th>combo</th><th>n</th><th>acc</th><th>cheap n</th><th>cheap acc</th><th>cheap net</th><th>verdict</th></tr>';
+    const comboRows = Object.entries(combos).sort((a,b) => (b[1].markets||0) - (a[1].markets||0));
+    for (const [name, s] of comboRows) {
+        const col = s.verdict === 'earned' ? '#35ff87' : '#5f9c78';
+        html += `<tr><td>${escHtml(name)}</td><td>${s.markets || 0}</td><td>${_fmtPct(s.accuracy)}</td><td>${s.cheap_markets || 0}</td><td style="color:${col}">${_fmtPct(s.cheap_accuracy)}</td><td style="color:${col}">${_fmtC(s.cheap_net_edge)}</td><td style="color:${col}">${escHtml(s.verdict || '')}</td></tr>`;
+    }
+    html += '</table>';
+    el.innerHTML = html;
+}
+async function loadGateTuner() {
+    const el = document.getElementById('gate-tuner-card');
+    if (!el) return;
+    let data;
+    try { data = await fetchJSON('/api/gate-tuner'); }
+    catch (e) {
+        el.innerHTML = '<div style="color:#ff3b5c">Failed to load gate tuner</div>';
+        return;
+    }
+    const sug = (data.report && data.report.suggestions) || {};
+    const ov = data.overrides || {};
+    if (!Object.keys(sug).length && !Object.keys(ov).length) {
+        el.innerHTML = '<div style="color:#5f9c78">No suggestions yet — needs unique-market sample (dead-zone / dual-gate / NO-side) with priced hyp P&amp;L.</div>';
+        return;
+    }
+    let html = '';
+    if (Object.keys(ov).length) {
+        html += '<div style="margin-bottom:8px;font-size:12px">Active overrides: '
+            + Object.entries(ov).map(([k,v]) => `${k}=${v}`).join(' · ')
+            + '</div>';
+    }
+    html += '<table style="width:100%;font-size:12px;border-collapse:collapse"><tr style="color:#5f9c78;text-align:left"><th>knob</th><th>action</th><th>current → suggested</th><th>why</th></tr>';
+    for (const [k, s] of Object.entries(sug)) {
+        const col = s.action === 'loosen' ? '#35ff87' : '#5f9c78';
+        html += `<tr><td>${k}</td><td style="color:${col}">${s.action}</td><td>${Number(s.current).toFixed(3)} → ${Number(s.suggested).toFixed(3)}</td><td style="color:#5f9c78">${s.why || ''}</td></tr>`;
+    }
+    html += '</table>';
+    el.innerHTML = html;
+}
 async function loadSignalLab() {
+    loadLiveScorecard().catch(() => {});
+    loadComboExplorer().catch(() => {});
+    loadGateTuner().catch(() => {});
     let data;
     try { data = await fetchJSON('/api/lane-proposals'); }
     catch (e) {

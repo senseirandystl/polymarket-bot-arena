@@ -3,6 +3,7 @@
 import random
 import copy
 import logging
+import math
 import re
 import time
 from abc import ABC, abstractmethod
@@ -53,6 +54,148 @@ def strategy_decision(action: str, side: str = "yes", *, edge: float = 0.0,
     }
     d.update(extra)
     return d
+
+
+def implied_side_prob(
+    *,
+    side: str,
+    signals: dict | None = None,
+    signed_lane: float | None = None,
+) -> float:
+    """Honest P(side wins) from Φ(z). Never ``0.5 + 0.5·tanh``.
+
+    Order: ``btc_implied_yes`` (YES-frame) → Φ(``btc_drift_z``) →
+    Φ(artanh(lane)). ``signed_lane`` is YES-frame ``btc_drift`` (tanh(z)),
+    not already flipped toward ``side``. Missing everything → 0.5.
+    """
+    sig = signals or {}
+    yes = None
+    try:
+        iy = sig.get("btc_implied_yes")
+        if iy is not None:
+            iy = float(iy)
+            if math.isfinite(iy):
+                yes = iy
+    except (TypeError, ValueError):
+        yes = None
+    if yes is None:
+        try:
+            z = sig.get("btc_drift_z")
+            if z is not None:
+                z = float(z)
+                if math.isfinite(z):
+                    yes = 0.5 * (1.0 + math.erf(z / math.sqrt(2.0)))
+        except (TypeError, ValueError):
+            yes = None
+    if yes is None and signed_lane is not None:
+        try:
+            t = float(signed_lane)
+            if math.isfinite(t):
+                t = max(-0.999999, min(0.999999, t))
+                z = math.atanh(t)
+                yes = 0.5 * (1.0 + math.erf(z / math.sqrt(2.0)))
+        except (TypeError, ValueError):
+            yes = None
+    if yes is None or not math.isfinite(yes):
+        yes = 0.5
+    yes = max(0.0, min(1.0, float(yes)))
+    if str(side).lower() == "no":
+        return 1.0 - yes
+    return yes
+
+
+def drift_z_from_signals(signals: dict | None, tanh_lane: float = 0.0) -> float:
+    """Raw z from ``btc_drift_z``, else artanh of the tanh lane. Never tanh-as-z."""
+    sig = signals or {}
+    try:
+        z = sig.get("btc_drift_z")
+        if z is not None:
+            z = float(z)
+            if math.isfinite(z):
+                return z
+    except (TypeError, ValueError):
+        pass
+    try:
+        t = float(tanh_lane)
+        if math.isfinite(t):
+            t = max(-0.999999, min(0.999999, t))
+            return math.atanh(t)
+    except (TypeError, ValueError):
+        pass
+    return 0.0
+
+
+def price_quality_ok(
+    *,
+    side_mid: float,
+    side_ask: float,
+    signed_drift: float,
+    fee: float | None = None,
+    implied_side: float | None = None,
+) -> bool:
+    """True if a directional fill is allowed at this mid/ask.
+
+    Mid-band extra residual-lag check. ``implied_side`` must be Φ(z)
+    (honest TWAP binary P), not ``0.5+0.5·tanh``.
+    """
+    try:
+        mid = float(side_mid)
+        ask = float(side_ask)
+        d = float(signed_drift)
+    except (TypeError, ValueError):
+        return False
+    lo = float(getattr(config, "PRICE_QUALITY_MID_LO", 0.50))
+    hi = float(getattr(config, "PRICE_QUALITY_MID_HI", 0.58))
+    if mid < lo or mid > hi:
+        return True
+    need_d = float(getattr(config, "PRICE_QUALITY_DRIFT_MIN", 0.15))
+    if abs(d) < need_d:
+        return False
+    if implied_side is not None:
+        try:
+            implied = float(implied_side)
+        except (TypeError, ValueError):
+            implied = implied_side_prob(side="yes", signed_lane=abs(d))
+    else:
+        implied = implied_side_prob(side="yes", signed_lane=abs(d))
+    if fee is None:
+        try:
+            fee = float(polymarket_fills.fee_per_share(ask, is_maker=False))
+        except Exception:
+            fee = 0.0
+    lag_min = float(getattr(config, "PRICE_QUALITY_LAG_MIN", 0.04))
+    return (implied - ask - float(fee)) >= lag_min
+
+
+def apply_xasset_confirm(market_lanes: dict) -> dict:
+    """Confirm-only xasset: never picks a side; only adds when it agrees.
+
+    Fighting or flat-drift reads are zeroed so ETH/SOL cannot invent a
+    direction the BTC drift lane does not already hold.
+    """
+    out = dict(market_lanes)
+    if getattr(config, "XASSET_LANE_MODE", "confirm") == "full":
+        return out
+    try:
+        xa = float(out.get("xasset") or 0.0)
+    except (TypeError, ValueError):
+        return out
+    if abs(xa) <= 1e-12:
+        return out
+    try:
+        drift = float(out.get("drift") or 0.0)
+    except (TypeError, ValueError):
+        drift = 0.0
+    need = float(getattr(config, "XASSET_DRIFT_AGREE_MIN", 0.05))
+    if abs(drift) >= need:
+        if (xa * drift) > 0:
+            xa *= float(getattr(config, "XASSET_CONFIRM_SCALE", 1.0))
+        else:
+            xa *= float(getattr(config, "XASSET_FIGHT_SCALE", 0.0))
+    else:
+        xa = 0.0
+    out["xasset"] = xa
+    return out
 
 
 # Bankroll read for Kelly sizing, cached off the 1s hot path (the pool only
@@ -237,16 +380,14 @@ class BaseBot(ABC):
     # Strat is confirmation-only (config.STRAT_LANE_MODE); mass toward drift/mom.
     # Sentiment strategy removed (2026-08 audit) — lanes stay kill-switched.
     STRATEGY_SIGNAL_PROFILE = {
-        "momentum":          {"drift": 0.55, "mom": 0.30, "strat": 0.15, **_DEAD_LANES},
-        "phantom":           {"drift": 0.50, "mom": 0.25, "strat": 0.25, **_DEAD_LANES},
-        # Meanrev honesty (2026-08-11): was 0.75 drift → mom-lite clone.
-        # Lower drift, higher strat so the gated fade thesis can matter;
-        # lag-justified gate still requires market lag on the shared path.
-        "mean_reversion":    {"drift": 0.50, "mom": 0.00, "strat": 0.35, **_DEAD_LANES},
-        "mean_reversion_sl": {"drift": 0.50, "mom": 0.00, "strat": 0.35, **_DEAD_LANES},
-        "mean_reversion_tp": {"drift": 0.50, "mom": 0.00, "strat": 0.35, **_DEAD_LANES},
-        "hybrid":            {"drift": 0.55, "mom": 0.20, "strat": 0.25, **_DEAD_LANES},
-        "sniper":            {"drift": 0.55, "mom": 0.10, "strat": 0.10, **_DEAD_LANES},
+        "momentum":          {"drift": 0.65, "mom": 0.20, "strat": 0.10, **_DEAD_LANES, "xasset": 0.10},
+        "phantom":           {"drift": 0.50, "mom": 0.25, "strat": 0.25, **_DEAD_LANES, "xasset": 0.10},
+        # Meanrev: this session's +$3.65 was 35¢ YES on |drift|=0.75.
+        "mean_reversion":    {"drift": 0.65, "mom": 0.00, "strat": 0.25, **_DEAD_LANES},
+        "mean_reversion_sl": {"drift": 0.65, "mom": 0.00, "strat": 0.25, **_DEAD_LANES},
+        "mean_reversion_tp": {"drift": 0.65, "mom": 0.00, "strat": 0.25, **_DEAD_LANES},
+        "hybrid":            {"drift": 0.60, "mom": 0.15, "strat": 0.15, **_DEAD_LANES, "xasset": 0.10},
+        "sniper":            {"drift": 0.70, "mom": 0.10, "strat": 0.05, **_DEAD_LANES, "xasset": 0.10},
         # Menu-only strategies (not default slate)
         "lag_residual":      {"drift": 0.70, "mom": 0.10, "strat": 0.20, **_DEAD_LANES},
         "regime_specialist": {"drift": 0.60, "mom": 0.25, "strat": 0.15, **_DEAD_LANES},
@@ -292,8 +433,6 @@ class BaseBot(ABC):
         "mean_reversion_tp": 0.58,
         "momentum": 0.62,
         "phantom": 0.62,
-        # Hybrid paper soak (2026-08): avg entry ~0.59 with thin +1.8¢ B/E gap —
-        # cap mid-band chase; matches momentum's priced-in floor.
         "hybrid": 0.62,
         "lag_residual": 0.58,
         "no_lag": 0.58,
@@ -477,20 +616,25 @@ class BaseBot(ABC):
         return max(float(config.MODEL_PROB_MIN), min(float(config.MODEL_PROB_MAX), fair))
 
     def _assumed_maker(self) -> bool:
-        """Whether edge math should use maker fee (0) under limit-first style."""
-        if getattr(config, "ORDER_STYLE", "limit") != "limit":
-            return False
-        mode = getattr(config, "LIMIT_PRICE_MODE", "passive_mid")
-        return mode in ("passive_mid", "join_bid")
+        """Whether edge math should use maker fee (0).
+
+        Always False for directional bots: a 5-min window that needs the
+        fill *now* will lift the ask (taker). Pricing as maker manufactured
+        a 10¢/trade phantom edge in paper. Sweeper/true-maker pass their
+        own quote and override fee locally.
+        """
+        return False
 
     def _side_net_edges(self, model_prob: float, trust_eff: float,
                         yes_price: float, no_price: float) -> tuple:
         """Cost-adjusted edge per side, each anchored on its OWN book price.
 
         edge_side = trust_eff * (P_model_side - side_price) - fee. Fee is
-        maker (0) when ORDER_STYLE=limit and LIMIT_PRICE_MODE is passive, else
-        the crypto taker fee. Per-side anchoring makes edge purely
-        model-vs-that-side's-price (BUG #27).
+        the crypto taker fee — we never assume a maker rebate in the
+        decision (BUG: paper LIMIT_PAPER_ASSUME_MAKER_FILL invented 0-fee
+        fills). A real maker fill is a positive surprise vs this bar.
+        Per-side anchoring makes edge purely model-vs-that-side's-price
+        (BUG #27).
         """
         is_maker = self._assumed_maker()
         edge_yes = (trust_eff * (model_prob - yes_price)
@@ -529,9 +673,20 @@ class BaseBot(ABC):
         price_momentum = raw["price_momentum"]
         momentum_signal = market_lanes["mom"]
         drift_signal_val = market_lanes["drift"]
+        # Xasset confirm-only: never picks a side; only adds when it
+        # agrees with non-trivial drift (same contract as strat confirm).
+        # Copy — compute_lanes returns a shared cached dict per tick.
+        market_lanes = apply_xasset_confirm(market_lanes)
 
         # --- Lane: strategy thesis from analyze() ---
         raw_signal = self._normalize_analysis(self.analyze(market, signals))
+        _fade_types = (
+            "mean_reversion", "mean_reversion_sl", "mean_reversion_tp",
+        )
+        _need_fade_thesis = (
+            (self.strategy_type or "") in _fade_types
+            and raw_signal.get("action") != "buy"
+        )
         strategy_signal = 0.0
         if raw_signal["action"] != "hold":
             strategy_yes = 1.0 if raw_signal["side"] == "yes" else -1.0
@@ -596,7 +751,7 @@ class BaseBot(ABC):
         # analysis can condition on the regime the trade was taken in.
         try:
             rctx = self.regime_context(signals)
-            if rctx.get("label") and rctx["label"] != "unknown":
+            if rctx.get("label"):
                 features = list(features) + [f"regime:{rctx['label']}"]
                 if rctx.get("legacy"):
                     features.append(f"regime_legacy:{rctx['legacy']}")
@@ -762,6 +917,34 @@ class BaseBot(ABC):
                           overrides=overrides, signals=signals)
         model_prob = blend.prob
 
+        # Earned cheap combo (Signal Lab). Measure-first: only fires when
+        # combo_explorer has live unique-market +EV after taker fee. Never
+        # used on 90¢+ favorites. Does not loosen global gates.
+        _combo = None
+        try:
+            from arena.combo_explorer import try_confirm as _try_combo
+            _yes_m = float(market_price)
+            _no_m = market.get("no_price")
+            _no_m = float(_no_m) if _no_m is not None else round(1.0 - _yes_m, 4)
+            _yes_ask = float(market.get("yes_ask") or _yes_m)
+            _no_ask = float(market.get("no_ask") or _no_m)
+            _combo = _try_combo(
+                {
+                    "drift": drift_signal_val,
+                    "mom": momentum_signal,
+                    "strat": strategy_signal,
+                    "tech": raw.get("tech_mtf"),
+                    "xasset": raw.get("xasset"),
+                },
+                yes_mid=_yes_m,
+                no_mid=_no_m,
+                yes_ask=_yes_ask,
+                no_ask=_no_ask,
+            )
+        except Exception as e:
+            logger.debug("[%s] combo confirm unavailable: %s", self.name, e)
+            _combo = None
+
         # --- Macro-release caution: stand down around high-impact prints ---
         # Non-directional context (signals/macro_calendar.py): the smooth 0..1
         # caution peaks in the minutes around 08:30/14:00 ET weekday release
@@ -819,6 +1002,12 @@ class BaseBot(ABC):
                 meta_token=_meta_tok,
             )
 
+        if _need_fade_thesis:
+            return _skip(
+                "meanrev: analyze held — no fade thesis (refuse drift-clone)",
+                skip_reason="no_thesis",
+            )
+
         macro = sv.macro_caution
         if macro >= getattr(config, "MACRO_CAUTION_SKIP", 0.75):
             return _skip(f"Macro-release caution {macro:.2f} — high-impact window")
@@ -830,6 +1019,7 @@ class BaseBot(ABC):
         # -$78.74 live; lean >= 0.10: 73% WR / +$96.12). Below the floor the
         # model has nothing tradable to say — skip outright.
         model_lean = abs(model_prob - 0.5)
+        _combo_used = False
         lean_min = float(config.MODEL_LEAN_MIN)
         try:
             from arena.learned_rules import skip_softening as _skip_soft
@@ -838,6 +1028,16 @@ class BaseBot(ABC):
                 lean_min = max(0.02, lean_min * float(_wl["factor"]))
         except Exception as e:
             logger.debug("[%s] learned-rules skip_softening lean unavailable: %s", self.name, e)
+        # Prefer an earned cheap combo when it is *more* informed than the
+        # blend (typical: drift-flat, other lanes agree). Does not lower
+        # the lean floor — it substitutes a live-validated thesis.
+        if (
+            _combo
+            and float(_combo.get("lean") or 0.0) > model_lean
+        ):
+            model_prob = float(_combo["p_model"])
+            model_lean = abs(model_prob - 0.5)
+            _combo_used = True
         if model_lean < lean_min:
             return _skip(
                 f"Model lean too weak: |{model_prob:.3f}-0.5|="
@@ -970,8 +1170,15 @@ class BaseBot(ABC):
             d_pct = float(sv.btc_drift_pct or 0.0)
         except (TypeError, ValueError):
             d_pct = 0.0
-        min_pct = float(getattr(config, "DRIFT_MIN_ABS_PCT", 0.00030) or 0.0)
-        min_z = float(getattr(config, "DRIFT_MIN_ABS_Z", 0.35) or 0.0)
+        try:
+            from arena.gate_tuner import gate_float as _gf
+        except Exception:
+            def _gf(name, default):
+                return float(default)
+        min_pct = _gf("DRIFT_MIN_ABS_PCT",
+                      getattr(config, "DRIFT_MIN_ABS_PCT", 0.00030) or 0.0)
+        min_z = _gf("DRIFT_MIN_ABS_Z",
+                    getattr(config, "DRIFT_MIN_ABS_Z", 0.35) or 0.0)
         signed_drift = (
             float(drift_signal_val) if side == "yes"
             else -float(drift_signal_val)
@@ -984,25 +1191,30 @@ class BaseBot(ABC):
             and signed_drift > 0.05
             and (min_pct > 0 or min_z > 0)
         ):
-            z_ok = abs(float(drift_signal_val)) >= min_z if min_z > 0 else True
+            # Prefer raw z (btc_drift_z). Never treat tanh(z) as z.
+            _z_read = drift_z_from_signals(signals, drift_signal_val)
+            z_ok = abs(_z_read) >= min_z if min_z > 0 else True
             pct_ok = abs(d_pct) >= min_pct if min_pct > 0 else True
             if not (z_ok and pct_ok):
-                return strategy_decision(
-                    "skip",
-                    side=side,
-                    reasoning=(
+                _combo_ok = (
+                    _combo_used
+                    and _combo
+                    and _combo.get("bypass_dual_gate")
+                    and _combo.get("side") == side
+                )
+                if not _combo_ok:
+                    _dq_entry = (
+                        yes_exec if side == "yes" else no_exec
+                    )
+                    return _skip(
                         f"Drift dual-gate: d_pct={d_pct:+.5f}"
                         f" (need |≥{min_pct:.5f}) "
-                        f"d_z={drift_signal_val:+.3f}"
-                        f" (need |≥{min_z:.2f}) side={side}"
-                    ),
-                    signals={
-                        "drift": drift_signal_val, "mom": momentum_signal,
-                        "strat": strategy_signal,
-                        "btc_drift_pct": d_pct,
-                    },
-                    features=features,
-                )
+                        f"d_z={_z_read:+.3f}"
+                        f" (need |≥{min_z:.2f}) side={side}",
+                        side=side,
+                        entry_price=_dq_entry,
+                        skip_reason="drift_dual_gate",
+                    )
 
         # --- Dead-zone gate (2026-07-21): the single biggest live leak ---
         # A flat-drift opinion against a near-coin-flip market was 59 trades,
@@ -1016,9 +1228,17 @@ class BaseBot(ABC):
         # (DEAD_ZONE_QUIET_DRIFT_MIN) — weak-to-moderate drift in the mid band
         # was the 2026-07-29 soak's largest leak under low_vol_range.
         side_mid_dz = yes_price if side == "yes" else no_price
+        try:
+            from arena.gate_tuner import gate_float as _gf_dz
+        except Exception:
+            def _gf_dz(name, default):
+                return float(default)
         dz_lo = getattr(config, "DEAD_ZONE_PRICE_LO", 0.42)
         dz_hi = getattr(config, "DEAD_ZONE_PRICE_HI", 0.58)
-        dz_drift = float(getattr(config, "DEAD_ZONE_DRIFT_MIN", 0.10))
+        dz_drift = _gf_dz(
+            "DEAD_ZONE_DRIFT_MIN",
+            getattr(config, "DEAD_ZONE_DRIFT_MIN", 0.10),
+        )
         try:
             rctx = self.regime_context(signals)
             quiet_regs = getattr(
@@ -1049,7 +1269,37 @@ class BaseBot(ABC):
                 f"Dead-zone gate: {side} mid={side_mid_dz:.2f} in "
                 f"[{dz_lo:.2f},{dz_hi:.2f}] & |drift|={abs(drift_signal_val):.3f}"
                 f"<{dz_drift:.2f} (coin-flip, no conviction)",
-                side=side, confidence=confidence, entry_price=side_mid_dz)
+                side=side, confidence=confidence, entry_price=side_mid_dz,
+                skip_reason="dead_zone")
+
+        # Mid-band price quality (2026-08-18): 50–58¢ directionals bled.
+        _pq_ask = yes_exec if side == "yes" else no_exec
+        _pq_signed = (
+            float(drift_signal_val) if side == "yes"
+            else -float(drift_signal_val)
+        )
+        _imp_yes = signals.get("btc_implied_yes")
+        _imp_side = None
+        try:
+            if _imp_yes is not None:
+                _imp_side = (
+                    float(_imp_yes) if side == "yes"
+                    else 1.0 - float(_imp_yes)
+                )
+        except (TypeError, ValueError):
+            _imp_side = None
+        if not price_quality_ok(
+            side_mid=side_mid_dz, side_ask=_pq_ask, signed_drift=_pq_signed,
+            implied_side=_imp_side,
+        ):
+            return _skip(
+                f"Price-quality: {side} mid={side_mid_dz:.2f} "
+                f"ask={float(_pq_ask):.2f} implied="
+                f"{(_imp_side if _imp_side is not None else implied_side_prob(side=side, signals=signals, signed_lane=float(drift_signal_val))):.2f} "
+                f"|d|={abs(_pq_signed):.3f}",
+                side=side, confidence=confidence, entry_price=_pq_ask,
+                skip_reason="price_quality",
+            )
 
         # --- NO-side intelligence (2026-08 soak: NO net −$15, YES +$245) ---
         # Prefer NO only as a true market-lag trade with real signed drift —
@@ -1063,8 +1313,17 @@ class BaseBot(ABC):
                 return _skip(
                     f"NO-side drift: signed_drift_for_NO={signed_for_no:+.3f} "
                     f"< {no_min_d:.2f} (need real down-conviction)",
-                    side=side, confidence=confidence, entry_price=side_mid_dz)
-            no_max_mid = float(getattr(config, "NO_SIDE_MAX_MID", 0.58))
+                    side=side, confidence=confidence, entry_price=side_mid_dz,
+                    skip_reason="no_side_gate")
+            try:
+                from arena.gate_tuner import gate_float as _gf_no
+            except Exception:
+                def _gf_no(name, default):
+                    return float(default)
+            no_max_mid = _gf_no(
+                "NO_SIDE_MAX_MID",
+                getattr(config, "NO_SIDE_MAX_MID", 0.58),
+            )
             if side_mid_dz > no_max_mid:
                 return _skip(
                     f"NO-side lag gate: mid={side_mid_dz:.2f} > {no_max_mid:.2f} "
@@ -1111,6 +1370,12 @@ class BaseBot(ABC):
         # strategies (arb/sweeper/makers) that own their own path.
         if (
             bool(getattr(config, "LAG_JUSTIFIED_ENABLED", True))
+            and not (
+                _combo_used
+                and _combo
+                and _combo.get("bypass_dual_gate")
+                and _combo.get("side") == side
+            )
             and (self.strategy_type or "").lower()
             not in {
                 str(t).lower()
@@ -1121,7 +1386,9 @@ class BaseBot(ABC):
                 float(drift_signal_val) if side == "yes"
                 else -float(drift_signal_val)
             )
-            implied_side = 0.5 + 0.5 * max(-1.0, min(1.0, signed_for_side))
+            implied_side = implied_side_prob(
+                side=side, signals=signals, signed_lane=float(drift_signal_val),
+            )
             try:
                 from polymarket_fills import taker_fee as _tfee
                 lag_fee = float(_tfee(1.0, side_mid_dz) or 0.0)
@@ -1480,6 +1747,7 @@ class BaseBot(ABC):
             f"reg={_regime_label or '?'} "
             f"{blend.log_str()}"
             f"{_twap_tag}"
+            + (f" combo({_combo['name']})" if _combo_used else "")
         )
         # Stamp context only on buys (deferred from skip path).
         try:
@@ -1508,6 +1776,8 @@ class BaseBot(ABC):
             "flow_decay": raw.get("flow_decay"),
             "regime": _regime_label,
         }
+        if _combo_used:
+            _buy_sigs["combo"] = _combo.get("name")
         _rs = raw_signal.get("signals") or {}
         if isinstance(_rs.get("votes"), dict):
             _buy_sigs["votes"] = _rs["votes"]
@@ -1600,11 +1870,51 @@ class BaseBot(ABC):
         # correlated positions the OTHER bots just opened on the same (market,
         # side) — clamp to the pool's remaining headroom, or stand down.
         # Arbitrage is exempt (overrides execute(); its legs are hedged).
-        market_id = market.get("condition_id") or market.get("id")
+        market_id = (
+            market.get("id") or market.get("market_id")
+            or market.get("condition_id")
+        )
         side = signal.get("side")
+        # One open directional position per (bot, market). In-memory
+        # is_traded is wiped by evolution reset; the DB is the source of
+        # truth (hybrid 08:33 double-fill, −$5.49 on one candle).
+        if (
+            (self.strategy_type or "").lower() != "arbitrage"
+            and market_id
+        ):
+            ids = [
+                x for x in (
+                    market.get("id"),
+                    market.get("market_id"),
+                    market.get("condition_id"),
+                ) if x
+            ] or [market_id]
+            try:
+                placeholders = ",".join("?" * len(ids))
+                with db.get_conn() as conn:
+                    row = conn.execute(
+                        f"""SELECT id FROM trades
+                            WHERE bot_name=? AND market_id IN ({placeholders})
+                              AND outcome IS NULL LIMIT 1""",
+                        (self.name, *ids),
+                    ).fetchone()
+                if row:
+                    logger.info(
+                        f"[{self.name}] already open on {str(market_id)[:12]}… "
+                        f"— skip second fill"
+                    )
+                    return {"success": False, "reason": "already_in_market"}
+            except Exception:
+                pass
         # Progressive EV pile-in gate: after peers already hold this side,
         # require a higher edge (unless confidence is very high). Toggleable.
-        pilein_block = self._pilein_ev_block(market_id, side, signal, mode)
+        try:
+            extra_peers = int(signal.get("_pilein_extra_peers") or 0)
+        except (TypeError, ValueError):
+            extra_peers = 0
+        pilein_block = self._pilein_ev_block(
+            market_id, side, signal, mode, extra_peers=extra_peers,
+        )
         if pilein_block:
             logger.info(f"[{self.name}] {pilein_block}")
             return {"success": False, "reason": "pilein_ev_gate"}
@@ -1636,14 +1946,16 @@ class BaseBot(ABC):
             return bool(getattr(config, "PILEIN_EV_GATE_ENABLED", True))
 
     def _pilein_ev_block(
-        self, market_id, side, signal: dict, mode: str
+        self, market_id, side, signal: dict, mode: str,
+        extra_peers: int = 0,
     ) -> str | None:
         """Return a human reason if progressive pile-in EV bar fails.
 
         After one or more peers already hold open exposure on (market, side),
         a *new* bot must clear a higher edge bar (cumulative EV requirement).
-        Very high confidence bypasses the extra bar. Not a hard bot-count cap
-        — MARKET_SIDE_MAX_BOTS remains the hard cluster limit.
+        Confidence bypass sits above quality_confidence's 0.95 cap so
+        ordinary structure scores cannot skip the extra edge. Not a hard
+        bot-count cap — MARKET_SIDE_MAX_BOTS remains the hard cluster limit.
         """
         if not self._pilein_ev_enabled():
             return None
@@ -1657,8 +1969,18 @@ class BaseBot(ABC):
         try:
             used, n_bots = self._effective_open_exposure(market_id, side, mode)
         except Exception:
-            return None
-        if n_bots <= 0:
+            used, n_bots = 0.0, 0
+        try:
+            extra = int(extra_peers or 0)
+        except (TypeError, ValueError):
+            extra = 0
+        if extra < 0:
+            extra = 0
+        # Same-tick race: extra_peers is "fills already placed this tick".
+        # Paper log_trade commits before execute() returns, so extra and
+        # n_bots usually describe the SAME set — take max, never sum.
+        n_peers = max(int(n_bots), extra)
+        if n_peers <= 0:
             return None
         # Already have our own open position → adding size is not a pile-in
         try:
@@ -1674,11 +1996,8 @@ class BaseBot(ABC):
             mine = 0.0
         if mine > 0:
             return None  # sizing up an existing leg is not a pile-in
-        n_peers = int(n_bots)  # all open bots are peers (we have none)
-        if n_peers <= 0:
-            return None
         conf = float(signal.get("confidence") or 0.0)
-        bypass = float(getattr(config, "PILEIN_EV_CONF_BYPASS", 0.85))
+        bypass = float(getattr(config, "PILEIN_EV_CONF_BYPASS", 0.96))
         if conf >= bypass:
             return None
         try:

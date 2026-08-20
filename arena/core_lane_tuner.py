@@ -335,6 +335,43 @@ def _seed_or_default(regime: Optional[str], strat: str, lane: str,
     return float(default)
 
 
+def _scorecard_net_by_strategy(hours: float | None = None) -> dict | None:
+    """Unique-market net edge per (strategy, lane) from the live scorecard."""
+    try:
+        from arena.live_scorecard import unique_market_rows, _lane_stats
+        h = hours if hours is not None else float(
+            getattr(config, "LIVE_SCORECARD_HOURS", 72) or 72
+        )
+        with db.get_conn() as conn:
+            rows = unique_market_rows(conn, hours=h)
+        by_st: dict[str, list] = {}
+        for r in rows:
+            st = str(r.get("strategy_type") or "")
+            if st:
+                by_st.setdefault(st, []).append(r)
+        out: dict = {}
+        lanes = CORE_LANES + ("xasset", "fut", "tech", "ms_mom")
+        cheap_max = float(getattr(config, "CORE_TUNE_SCORECARD_MAX_ENTRY", 0.62))
+        for st, grp in by_st.items():
+            cheap = []
+            for r in grp:
+                try:
+                    e = r.get("entry_price")
+                    e = float(e) if e is not None else None
+                except (TypeError, ValueError):
+                    e = None
+                if e is None or e <= cheap_max:
+                    cheap.append(r)
+            for lane in lanes:
+                stats = _lane_stats(cheap, lane, 0.05)
+                if (stats.get("n_priced") or 0) or (stats.get("markets") or 0):
+                    out.setdefault(st, {})[lane] = stats
+        return out
+    except Exception:
+        logger.exception("scorecard net overlay failed")
+        return None
+
+
 def tune() -> dict:
     """Score core lanes per strategy; nudge weights when the toggle is on.
 
@@ -378,8 +415,9 @@ def tune() -> dict:
     live_regime = None
     try:
         from signals.regime_detector import get_detector
-        live_regime = get_detector().status().get("current", {}).get("regime_id")
-        if live_regime in (None, "unknown"):
+        cur = get_detector().status().get("current") or {}
+        live_regime = cur.get("regime_id")
+        if live_regime in (None, "unknown") or not cur.get("actionable", False):
             live_regime = None
     except Exception:
         live_regime = None
@@ -447,6 +485,13 @@ def tune() -> dict:
     ev_min_n = int(getattr(config, "CORE_TUNE_EV_MIN_TRADES", 20))
     ev_up_min = float(getattr(config, "CORE_TUNE_EV_UP_MIN", 0.0))
     ev_down_max = float(getattr(config, "CORE_TUNE_EV_DOWN_MAX", -0.05))
+    scorecard_net = _scorecard_net_by_strategy()
+    scorecard_unavailable = scorecard_net is None
+    if scorecard_unavailable:
+        scorecard_net = {}
+    sc_min = int(getattr(config, "CORE_TUNE_SCORECARD_MIN", 20))
+    sc_block = float(getattr(config, "CORE_TUNE_SCORECARD_DOWN_MAX", 0.0))
+    sc_force = float(getattr(config, "CORE_TUNE_SCORECARD_FORCE_DOWN", -0.005))
 
     report: dict = {"applied": apply,
                     "cell_filter": list(cell_filter) if cell_filter else None,
@@ -581,6 +626,20 @@ def tune() -> dict:
                     and mean_ev_f <= ev_down_max
                     and cur > lo
                 )
+                sc = (scorecard_net.get(strat) or {}).get(lane) or {}
+                sc_n = int(sc.get("n_priced") or 0)
+                try:
+                    sc_net = float(sc["net_edge"]) if sc.get("net_edge") is not None else None
+                except (TypeError, ValueError, KeyError):
+                    sc_net = None
+                if scorecard_unavailable:
+                    # Missing judge must not allow accuracy-led UP.
+                    ev_blocks_up = True
+                elif sc_n >= sc_min and sc_net is not None:
+                    if sc_net <= sc_block:
+                        ev_blocks_up = True
+                    if sc_net <= sc_force and cur > lo:
+                        ev_forces_down = True
                 if ev_forces_down:
                     new_w = round(max(lo, cur - step), 3)
                     action = "ev_down"

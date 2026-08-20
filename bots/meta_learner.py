@@ -73,7 +73,11 @@ def bucket_for(trend_score: Optional[float] = None,
     """
     if regime_id:
         try:
-            from signals.regime_detector import meta_bucket
+            from signals.regime_detector import meta_bucket, get_detector
+            snap = get_detector().snapshot() or {}
+            if (snap.get("regime_id") or snap.get("label")) == regime_id:
+                if not snap.get("actionable", False):
+                    return "mixed"
             b = meta_bucket(regime_id, trend_score)
             if b in BUCKETS:
                 return b
@@ -387,7 +391,8 @@ class HybridMetaLearner:
                 if brec:
                     t = min(1.0, float(brec.get("n", 0)) / self.bucket_full_trust)
                     mult = (1.0 - t) * mult + t * float(brec.get("mult", 1.0))
-            out[sub] = mult
+            # Clamp persisted CF-era values (live state can still be 2.5).
+            out[sub] = max(self.min_mult, min(self.max_mult, mult))
         return out
 
     def record_last(self, weights: dict, online: dict, regime_label: str,

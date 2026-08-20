@@ -84,6 +84,14 @@ def seed_weight(regime: Optional[str], strategy: str, lane: str) -> Optional[flo
             return None
     if not regime or regime in ("unknown", "normal"):
         return None
+    try:
+        from signals.regime_detector import get_detector
+        snap = get_detector().snapshot() or {}
+        if (snap.get("regime_id") or snap.get("label")) == regime:
+            if not snap.get("actionable", False):
+                return None
+    except Exception:
+        pass
     block = REGIME_PROFILE_SEEDS.get(regime) or {}
     strat = block.get(strategy) or {}
     if lane not in strat:

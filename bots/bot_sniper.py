@@ -15,9 +15,10 @@ drift only when the market lags"** (harness + live soak). The sniper does
 only that:
 
 1. Read signed ``btc_drift`` (YES-frame, in [-1, 1]; TWAP-based).
-2. Convert to a drift-implied probability: ``p = 0.5 + 0.5 * signed_drift``.
-3. Score BOTH sides: ``edge = p_side - side_mid - fee`` (maker fee when
-   limit-first passive mode is on).
+2. Convert to a drift-implied probability via Φ(z) (``btc_implied_yes``).
+   Never ``0.5 + 0.5·tanh`` — that mapped 5 bp TWAP to ~78¢.
+3. Score BOTH sides on the **executable ask**:
+   ``edge = p_side - side_ask - fee`` (BUG #28: mid = info, ask = cost).
 4. Trade only when:
    * |drift| ≥ min_drift (real conviction),
    * edge ≥ min_edge,
@@ -35,7 +36,10 @@ from __future__ import annotations
 import config
 import learning
 import polymarket_fills
-from bots.base_bot import BaseBot, strategy_decision
+from bots.base_bot import (
+    BaseBot, strategy_decision, price_quality_ok, implied_side_prob,
+    drift_z_from_signals,
+)
 from signals.curves import smooth_ramp
 from signals.lab import SignalView
 
@@ -46,7 +50,7 @@ DEFAULT_PARAMS = {
     # Net edge floor after fee (probability units).
     "min_edge": 0.02,
     # Market-lag ceiling: never snipe a side already priced above this mid.
-    # Matches the harness "follow drift when side ≤ 58¢" rule.
+    # Tightened 0.58→0.50 after the 2026-08-18 mid-band bleed.
     "max_side_mid": 0.58,
     # Optional absolute floor so we don't buy deep longshots on noise.
     "min_side_mid": 0.30,
@@ -92,18 +96,31 @@ class SniperBot(BaseBot):
             d_pct = float(signals.get("btc_drift_pct") or 0.0)
         min_drift = float(p.get("min_drift", 0.15))
         # Dual gate floors (shared with BaseBot) — sniper is pure lag hunter.
-        min_pct = float(getattr(config, "DRIFT_MIN_ABS_PCT", 0.00030) or 0.0)
-        min_z = float(getattr(config, "DRIFT_MIN_ABS_Z", 0.35) or 0.0)
-        # Sniper needs stronger z than generic directional (was free at 0.15).
-        min_drift = max(min_drift, min_z, 0.40)
-        if abs(d_pct) < min_pct or abs(drift) < min_drift:
+        try:
+            from arena.gate_tuner import gate_float as _gf
+        except Exception:
+            def _gf(name, default):
+                return float(default)
+        min_pct = _gf("DRIFT_MIN_ABS_PCT",
+                      getattr(config, "DRIFT_MIN_ABS_PCT", 0.00030) or 0.0)
+        min_z = _gf("DRIFT_MIN_ABS_Z",
+                    getattr(config, "DRIFT_MIN_ABS_Z", 0.35) or 0.0)
+        raw_z = drift_z_from_signals(signals, drift)
+        # Lag hunter: require honest z / moneyness, not a 0.40 tanh floor
+        # that never clears after the TWAP σ fix.
+        if abs(d_pct) < min_pct or abs(raw_z) < min_z:
+            _side = "yes" if drift >= 0 else "no"
+            _ask = yes_ask if _side == "yes" else no_ask
             return strategy_decision(
                 "skip",
+                side=_side,
                 reasoning=(
                     f"sniper: dual-gate d_pct={d_pct:+.5f}"
-                    f" (need |≥{min_pct:.5f}) d_z={drift:+.3f}"
-                    f" (need |≥{min_drift:.2f})"
+                    f" (need |≥{min_pct:.5f}) z={raw_z:+.3f}"
+                    f" (need |≥{min_z:.2f})"
                 ),
+                entry_price=_ask,
+                skip_reason="drift_dual_gate",
             )
         regime = self.regime_context(signals)
         # Data-driven hard stand-down when live regime is toxic.
@@ -138,30 +155,58 @@ class SniperBot(BaseBot):
             or (regime.get("known") and regime.get("vol_score", 0.5) < 0.35)
         )
         if quiet:
-            min_drift += float(p.get("quiet_drift_bump", 0.05))
+            q_bump = float(p.get("quiet_drift_bump", 0.05))
+            min_drift += q_bump
+            # Dual-gate already required |z|≥min_z (~0.35). Default
+            # min_drift 0.15+0.05 is below that, so the bump was a no-op.
+            # Raise the z floor too — quiet tape needs extra moneyness.
+            if abs(raw_z) < (min_z + q_bump):
+                _side = "yes" if drift >= 0 else "no"
+                _ask = yes_ask if _side == "yes" else no_ask
+                return strategy_decision(
+                    "skip",
+                    side=_side,
+                    reasoning=(
+                        f"sniper: quiet-regime z={raw_z:+.3f} "
+                        f"< {min_z + q_bump:.2f}"
+                    ),
+                    entry_price=_ask,
+                    skip_reason="quiet_drift",
+                )
 
         min_edge = float(p.get("min_edge", 0.02)) * float(min_edge_tax or 1.0)
         max_mid = float(p.get("max_side_mid", 0.58))
+        # DB still has 0.50 from the band-aid era; lag vs Φ(z) is the cap.
+        if max_mid <= 0.51:
+            max_mid = 0.58
         min_mid = float(p.get("min_side_mid", 0.30))
         ext_abs = float(p.get("extreme_drift_abs",
                               getattr(config, "DRIFT_EXTREME_ABS", 0.50)))
 
-        is_maker = (
-            getattr(config, "ORDER_STYLE", "limit") == "limit"
-            and getattr(config, "LIMIT_PRICE_MODE", "passive_mid")
-            in ("passive_mid", "join_bid")
-        )
+        def _edge(side: str, side_ask: float) -> float:
+            # Φ(z) is YES-frame. NO implied is 1−iy. Pass YES-frame tanh.
+            implied = implied_side_prob(
+                side=side, signals=signals, signed_lane=drift,
+            )
+            fee = polymarket_fills.fee_per_share(side_ask, is_maker=False)
+            return implied - float(side_ask) - fee
 
-        def _edge(side_mid: float, signed_drift: float) -> float:
-            implied = 0.5 + 0.5 * signed_drift
-            fee = polymarket_fills.fee_per_share(side_mid, is_maker=is_maker)
-            return implied - side_mid - fee
-
-        yes_edge = _edge(yes_mid, drift)
-        no_edge = _edge(no_mid, -drift)
+        yes_edge = _edge("yes", yes_ask)
+        no_edge = _edge("no", no_ask)
 
         of_data = sv.orderflow
-        prices = sv.prices
+        prices = list(sv.prices)
+        try:
+            from signals.drift_scale import resample_tick_prices
+            ticks = signals.get("btc_twap_ticks") or []
+            if not ticks:
+                from signals.price_feed import get_price_feed
+                ticks = get_price_feed().btc_twap_ticks()
+            tw = resample_tick_prices(ticks, sample_sec=60.0) or []
+            if len(tw) >= 2:
+                prices = list(tw)
+        except Exception:
+            pass
         btc_momentum = 0.0
         if len(prices) >= 2 and prices[-1] > 0:
             btc_momentum = (prices[-1] - prices[-2]) / prices[-2]
@@ -170,6 +215,13 @@ class SniperBot(BaseBot):
             volume=of_data.get("volume_24h"),
             time_rem=market.get("time_remaining_seconds"),
         )
+        try:
+            if regime.get("label"):
+                features = list(features) + [f"regime:{regime['label']}"]
+                if regime.get("legacy"):
+                    features.append(f"regime_legacy:{regime['legacy']}")
+        except Exception:
+            pass
         contributing = {
             "drift": drift, "yes_edge": yes_edge, "no_edge": no_edge,
             "regime": regime.get("label"), "min_drift": min_drift,
@@ -204,6 +256,11 @@ class SniperBot(BaseBot):
                 return False
             if edge < min_edge:
                 return False
+            # Ask below mid is a crossed/stale book — overnight 10:02
+            # logged NO mid=0.51 ask=0.36 and the gap check (ask−mid>spread)
+            # treated the negative spread as fine.
+            if float(ask) + 1e-9 < float(mid):
+                return False
             if (float(ask) - float(mid)) > max_spread:
                 return False
             return True
@@ -236,9 +293,41 @@ class SniperBot(BaseBot):
         if yes_ok and (not no_ok or yes_edge >= no_edge):
             side, side_mid, side_ask, side_edge = "yes", yes_mid, yes_ask, yes_edge
             signed = drift
+            if not price_quality_ok(
+                side_mid=side_mid, side_ask=side_ask, signed_drift=signed,
+                implied_side=implied_side_prob(
+                    side=side, signals=signals, signed_lane=drift,
+                ),
+            ):
+                return strategy_decision(
+                    "skip", side=side,
+                    reasoning=(
+                        f"sniper: price-quality mid-band "
+                        f"mid={side_mid:.2f} ask={side_ask:.2f} "
+                        f"|d|={abs(signed):.3f}"
+                    ),
+                    signals=contributing, features=features,
+                    entry_price=side_ask, skip_reason="price_quality",
+                )
         elif no_ok:
             side, side_mid, side_ask, side_edge = "no", no_mid, no_ask, no_edge
             signed = -drift
+            if not price_quality_ok(
+                side_mid=side_mid, side_ask=side_ask, signed_drift=signed,
+                implied_side=implied_side_prob(
+                    side=side, signals=signals, signed_lane=drift,
+                ),
+            ):
+                return strategy_decision(
+                    "skip", side=side,
+                    reasoning=(
+                        f"sniper: price-quality mid-band "
+                        f"mid={side_mid:.2f} ask={side_ask:.2f} "
+                        f"|d|={abs(signed):.3f}"
+                    ),
+                    signals=contributing, features=features,
+                    entry_price=side_ask, skip_reason="price_quality",
+                )
         else:
             # Distinguish ask-quality skips for telemetry when lag edge existed
             # on mid but ask gap killed it.
@@ -263,6 +352,7 @@ class SniperBot(BaseBot):
                 "skip",
                 reasoning=why,
                 signals=contributing, features=features,
+                skip_reason="ask_quality" if ask_gap else "no_lag_edge",
             )
 
         # Data-driven side skip / continuous side edge tax
@@ -404,10 +494,13 @@ class SniperBot(BaseBot):
             amount = min(max_pos * pct, max_pos)
             target_shares = None
 
+        _imp_log = implied_side_prob(
+            side=side, signals=signals, signed_lane=drift,
+        )
         reasoning = (
             f"sniper: drift={drift:+.3f} → {side} mid={side_mid:.2f} "
             f"ask={side_ask:.2f} edge={side_edge:+.3f} "
-            f"implied={0.5 + 0.5 * signed:.2f} lag≤{max_mid:.2f} "
+            f"implied={_imp_log:.2f} lag≤{max_mid:.2f} "
             f"reg={regime.get('label', '?')} conf={confidence:.2f}"
         )
         out = strategy_decision(

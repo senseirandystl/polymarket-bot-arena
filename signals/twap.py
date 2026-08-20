@@ -179,6 +179,31 @@ def compute_twap(
     return weighted / covered, len(points), min(1.0, covered / total)
 
 
+def ensure_nowcast_ticks(
+    ticks: Sequence[Tick],
+    *,
+    now_epoch: float,
+    price: Optional[float],
+    expiry_epoch: Optional[float] = None,
+    twap_window_sec: Optional[int] = None,
+) -> list[Tick]:
+    """Append the live print only when the ring has no earlier tick.
+
+    Does **not** back-date the current price to window open (that would
+    invent a full-window TWAP and fake coverage≈1). Empty tape stays
+    empty so settlement policy treats it as an outage and ``btc_now``
+    falls back to the official rolling RTDS TWAP.
+    """
+    out = list(ticks or [])
+    if not price or price <= 0 or now_epoch is None:
+        return out
+    now = float(now_epoch)
+    if any(float(ts) < now - 1e-9 for ts, _px in out):
+        return out
+    out.append((now - 0.05, float(price)))
+    return out
+
+
 def settlement_nowcast(
     ticks: Sequence[Tick],
     *,
@@ -264,6 +289,7 @@ def resolution_btc_now(
     now_epoch: Optional[float] = None,
     expiry_epoch: Optional[float] = None,
     twap_window_sec: Optional[int] = None,
+    prefer_remaining_expiry: bool = True,
 ) -> dict:
     """Choose the BTC level used for drift moneyness under TWAP resolution.
 
@@ -309,14 +335,35 @@ def resolution_btc_now(
         return result
 
     # Settlement nowcast when we can build it.
+    # Expiry from remaining-time is the same clock the phase uses. A drifted
+    # Gamma endDate used to put [expiry−W, now] in the future → coverage=0
+    # every window even though the feed was live.
+    if (
+        prefer_remaining_expiry
+        and now_epoch is not None
+        and time_remaining_sec is not None
+    ):
+        try:
+            rem_exp = float(now_epoch) + float(time_remaining_sec)
+            if expiry_epoch is None or abs(float(expiry_epoch) - rem_exp) > 5.0:
+                expiry_epoch = rem_exp
+        except (TypeError, ValueError):
+            pass
+
     if (
         use_nowcast
         and result["in_settlement_window"]
         and now_epoch is not None
         and expiry_epoch is not None
-        and ticks
     ):
         fill = result["rtds_twap"] or result["spot"]
+        ticks = ensure_nowcast_ticks(
+            ticks,
+            now_epoch=float(now_epoch),
+            price=fill,
+            expiry_epoch=float(expiry_epoch),
+            twap_window_sec=w,
+        )
         nc = settlement_nowcast(
             ticks,
             now_epoch=float(now_epoch),

@@ -42,9 +42,9 @@ DEFAULT_PARAMS = {
     # the book — require the averaging window / late certainty.
     "entry_window_sec": 80,
     # Fundamental certainty proxy (YES-frame TWAP-drift magnitude toward side).
-    "min_drift": 0.65,
+    "min_drift": 0.32,
     # Once inside the TWAP settlement window, require this certainty (0–1).
-    "min_twap_certainty": 0.55,
+    "min_twap_certainty": 0.45,
     # Outside settlement (pre_settle only): need even stronger drift.
     "pre_settle_extra_drift": 0.10,
     # Fee-curve extreme only. Do not lower min_price toward 0.90.
@@ -116,13 +116,18 @@ class SweeperBot(BaseBot):
         no_ask = float(market.get("no_ask") or no_mid)
 
         drift = float(sv.btc_drift or 0.0)
-        min_drift = float(p.get("min_drift", 0.65))
+        min_drift = float(p.get("min_drift", 0.32))
+        # DB/evolved 0.65 was calibrated when 5 bp printed as tanh 0.75.
+        if min_drift >= 0.55:
+            min_drift = float(getattr(config, "SWEEPER_MIN_DRIFT", 0.32))
         min_price = float(p.get("min_price", 0.97))
         max_price = float(p.get("max_price", 0.999))
         min_edge = float(p.get("min_edge", 0.003))
         max_spread = float(p.get("max_ask_mid_spread", 0.015))
         mom_contra = float(p.get("mom_contradict", 0.0010))
-        min_twap_cert = float(p.get("min_twap_certainty", 0.55))
+        min_twap_cert = float(p.get("min_twap_certainty", 0.45))
+        if min_twap_cert >= 0.54:
+            min_twap_cert = float(getattr(config, "SWEEPER_MIN_TWAP_CERTAINTY", 0.45))
         pol = sv.settlement_policy or {}
         twap_cert = float(pol.get("certainty") or sv.twap_certainty or 0.0)
         in_twap_win = bool(sv.in_settlement_window)
@@ -148,8 +153,16 @@ class SweeperBot(BaseBot):
         if phase == "pre_settle":
             min_drift += float(p.get("pre_settle_extra_drift", 0.10))
         # Inside the TWAP averaging window, require partial-settlement certainty
-        # so a single tick spike can't look like a free lock.
-        if in_twap_win and twap_cert < min_twap_cert:
+        # so a single tick spike can't look like a free lock. A coverage
+        # *outage* is missing data — do not treat cert≈0 as a lock unless the
+        # book itself is already at the fee-curve extreme (≥98.5¢).
+        coverage_outage = bool(pol.get("coverage_outage"))
+        book_locked = max(yes_mid, no_mid, yes_ask, no_ask) >= 0.985
+        if (
+            in_twap_win
+            and twap_cert < min_twap_cert
+            and not (coverage_outage and book_locked)
+        ):
             return strategy_decision(
                 "skip",
                 reasoning=(
@@ -184,6 +197,20 @@ class SweeperBot(BaseBot):
 
         def _candidate(side: str, signed_d: float, mid: float, ask: float):
             if signed_d < min_drift:
+                return None
+            # 1 − ask − fee is only EV if the outcome is actually decided.
+            # tanh 0.45 @ 99¢ is Φ≈0.67 — overnight 02:34 lost $5.70.
+            from bots.base_bot import implied_side_prob as _imp
+            implied = _imp(
+                side=side, signals=signals, signed_lane=drift,
+            )
+            need_imp = float(
+                p.get(
+                    "min_implied",
+                    getattr(config, "SWEEPER_MIN_IMPLIED", 0.97),
+                )
+            )
+            if implied + 1e-12 < need_imp:
                 return None
             if not (min_price <= mid <= max_price):
                 return None

@@ -1,12 +1,28 @@
 """Unit tests for the pure signal-validation logic (no network)."""
 
 from tools.signal_validation import build_samples, predictiveness, time_buckets
+from tools.validate_signals import fetch_official_strike
 
 
 def _traj_up():
     # BTC rises steadily from a 100000 strike over 5 one-min steps.
     return [(0, 100000.0), (60, 100050.0), (120, 100100.0),
             (180, 100150.0), (240, 100200.0)]
+
+
+def test_official_strike_prefers_cached_ptb():
+    cache = {"ptb:m1": 64000.5}
+    mkt = {"id": "m1", "start": "2026-08-15T12:00:00Z"}
+    assert fetch_official_strike(mkt, cache, True) == 64000.5
+
+
+def test_official_strike_cache_miss_none_without_network(monkeypatch):
+    import signals.strike as strike
+    monkeypatch.setattr(strike, "fetch_official_open_price", lambda *_a, **_k: None)
+    mkt = {"id": "m2", "start": "2026-08-15T12:00:00Z"}
+    cache = {}
+    assert fetch_official_strike(mkt, cache, True) is None
+    assert cache.get("ptb:m2") is None or cache["ptb:m2"] is None
 
 
 def test_build_samples_skips_open_and_sets_time_remaining():

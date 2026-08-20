@@ -40,8 +40,6 @@ def _sig(prices, drift=0.0):
 # --- Sniper ---
 
 def test_sniper_buys_no_on_cheap_no_zone_with_down_momentum():
-    # yes=0.55 (coin-flip for YES) -> no=0.45 (cheap-NO zone) + BTC dropping
-    # + down-drift backing -> NO
     bot = SniperBot()
     m = _market(yes=0.55, no=0.45)
     s = _sig([100.5, 100.0], drift=-0.50)   # negative momentum + down drift

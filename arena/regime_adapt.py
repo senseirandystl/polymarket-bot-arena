@@ -72,20 +72,51 @@ class RegimeAdjust:
 
 # Strategy-aware priors (structural; live WR then modulates size/block).
 _REGIME_STRATEGY_PRIORS: dict[str, dict[str, dict[str, float]]] = {
+    # Most session fills stamped "normal" — without priors they got no mid-band tax.
+    "normal": {
+        "_default": {
+            "edge_mult": 1.15,
+            "flow_full_trust": 0.32,
+            "mom_lane_scale": 0.75,
+            "strat_lane_scale": 0.70,
+            "no_edge_mult": 1.35,
+            "extra_drift_floor": 0.06,
+            "mid_band_drift_min": 0.40,
+        },
+        "momentum": {
+            "edge_mult": 1.20,
+            "mom_lane_scale": 0.65,
+            "no_edge_mult": 1.45,
+            "extra_drift_floor": 0.08,
+            "mid_band_drift_min": 0.42,
+        },
+        "hybrid": {
+            "edge_mult": 1.20,
+            "no_edge_mult": 1.45,
+            "extra_drift_floor": 0.08,
+            "mid_band_drift_min": 0.42,
+        },
+        "sniper": {
+            "edge_mult": 1.10,
+            "no_edge_mult": 1.40,
+            "extra_drift_floor": 0.08,
+            "mid_band_drift_min": 0.40,
+        },
+    },
     "low_vol_trend": {
         "_default": {
-            "edge_mult": 1.35,
+            "edge_mult": 1.20,
             "flow_full_trust": 0.38,
-            "mom_lane_scale": 0.50,
+            "mom_lane_scale": 0.65,
             "strat_lane_scale": 0.45,
             "no_edge_mult": 1.40,
             "extra_drift_floor": 0.08,
             "mid_band_drift_min": 0.40,
         },
         "momentum": {
-            "edge_mult": 1.45,
+            "edge_mult": 1.25,
             "flow_full_trust": 0.40,
-            "mom_lane_scale": 0.40,
+            "mom_lane_scale": 0.55,
             "strat_lane_scale": 0.40,
             "no_edge_mult": 1.45,
             "extra_drift_floor": 0.10,
@@ -139,48 +170,48 @@ _REGIME_STRATEGY_PRIORS: dict[str, dict[str, dict[str, float]]] = {
     },
     "low_vol_range": {
         "_default": {
-            "edge_mult": 1.05,
-            "flow_full_trust": 0.28,
-            "mom_lane_scale": 0.70,
-            "strat_lane_scale": 0.75,
-            "no_edge_mult": 1.15,
-            "extra_drift_floor": 0.02,
-            "mid_band_drift_min": 0.28,
+            "edge_mult": 1.15,
+            "flow_full_trust": 0.32,
+            "mom_lane_scale": 0.55,
+            "strat_lane_scale": 0.60,
+            "no_edge_mult": 1.40,
+            "extra_drift_floor": 0.08,
+            "mid_band_drift_min": 0.40,
         },
         "mean_reversion": {
-            "edge_mult": 0.95,
+            "edge_mult": 1.05,
             "mom_lane_scale": 0.0,
-            "strat_lane_scale": 0.85,
-            "no_edge_mult": 1.10,
-            "mid_band_drift_min": 0.25,
+            "strat_lane_scale": 0.70,
+            "no_edge_mult": 1.25,
+            "mid_band_drift_min": 0.40,
         },
         "momentum": {
-            "edge_mult": 1.15,
-            "mom_lane_scale": 0.60,
-            "strat_lane_scale": 0.65,
-            "no_edge_mult": 1.20,
-            "mid_band_drift_min": 0.30,
+            "edge_mult": 1.20,
+            "mom_lane_scale": 0.50,
+            "strat_lane_scale": 0.55,
+            "no_edge_mult": 1.45,
+            "mid_band_drift_min": 0.42,
         },
         "phantom": {
-            "edge_mult": 1.10,
-            "mom_lane_scale": 0.55,
-            "strat_lane_scale": 0.65,
-            "no_edge_mult": 1.25,
-            "mid_band_drift_min": 0.32,
+            "edge_mult": 1.15,
+            "mom_lane_scale": 0.50,
+            "strat_lane_scale": 0.55,
+            "no_edge_mult": 1.40,
+            "mid_band_drift_min": 0.42,
         },
         "hybrid": {
-            "edge_mult": 1.05,
-            "mom_lane_scale": 0.65,
-            "strat_lane_scale": 0.75,
-            "no_edge_mult": 1.20,
-            "mid_band_drift_min": 0.28,
+            "edge_mult": 1.15,
+            "mom_lane_scale": 0.55,
+            "strat_lane_scale": 0.60,
+            "no_edge_mult": 1.40,
+            "mid_band_drift_min": 0.42,
         },
         "sniper": {
-            "edge_mult": 1.02,
-            "mom_lane_scale": 0.85,
-            "strat_lane_scale": 0.90,
-            "no_edge_mult": 1.15,
-            "mid_band_drift_min": 0.26,
+            "edge_mult": 1.10,
+            "mom_lane_scale": 0.80,
+            "strat_lane_scale": 0.85,
+            "no_edge_mult": 1.40,
+            "mid_band_drift_min": 0.40,
         },
     },
     "high_vol_chop": {
@@ -272,16 +303,6 @@ _REGIME_STRATEGY_PRIORS: dict[str, dict[str, dict[str, float]]] = {
             "mom_lane_scale": 1.05,
             "strat_lane_scale": 1.0,
             "no_edge_mult": 1.10,
-        },
-    },
-    "normal": {
-        "_default": {
-            "edge_mult": 1.0,
-            "mom_lane_scale": 1.0,
-            "strat_lane_scale": 1.0,
-            "no_edge_mult": 1.15,
-            "extra_drift_floor": 0.0,
-            "mid_band_drift_min": 0.28,
         },
     },
 }
@@ -626,6 +647,18 @@ def adjustments(
     label = str(regime_label or "unknown")
     if label in ("unknown", ""):
         return RegimeAdjust(label=label, reason="unknown_regime")
+    # If the live detector is on this same label and it is not yet
+    # actionable (thin tape / low conf / just flipped), do not apply
+    # style-skip or prior taxes. Unit tests that pass a label with no
+    # matching live snapshot still get structural priors.
+    try:
+        from signals.regime_detector import get_detector
+        live = get_detector().snapshot() or {}
+        if (live.get("regime_id") or live.get("label")) == label:
+            if not live.get("actionable", False):
+                return RegimeAdjust(label=label, reason="not_actionable")
+    except Exception:
+        pass
 
     _refresh_cache()
     size_table = _cache[1]

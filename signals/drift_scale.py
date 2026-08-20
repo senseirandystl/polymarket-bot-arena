@@ -240,7 +240,7 @@ def estimate_vol_scale_from_ticks(
     dt = float(
         sample_sec
         if sample_sec is not None
-        else getattr(config, "DRIFT_ADAPT_TWAP_SAMPLE_SEC", 5.0) or 5.0
+        else getattr(config, "DRIFT_ADAPT_TWAP_SAMPLE_SEC", 60.0) or 60.0
     )
     series = resample_tick_prices(ticks, sample_sec=dt)
     if not series or len(series) < 5:

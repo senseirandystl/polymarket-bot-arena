@@ -103,7 +103,17 @@ def weighted_trade_pnls(
         if current_regime:
             rid = _regime_from_trade(t)
             if rid and rid == current_regime:
-                w *= boost
+                apply_boost = True
+                try:
+                    from signals.regime_detector import get_detector
+                    snap = get_detector().snapshot() or {}
+                    live_rid = snap.get("regime_id") or snap.get("label")
+                    if live_rid == current_regime and not snap.get("actionable", False):
+                        apply_boost = False
+                except Exception:
+                    pass
+                if apply_boost:
+                    w *= boost
         # Floor so ancient trades still count a little
         w = max(0.15, w)
         out.append(float(t["pnl"]) * w)

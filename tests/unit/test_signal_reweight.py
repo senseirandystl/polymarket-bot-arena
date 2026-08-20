@@ -83,10 +83,12 @@ def test_priced_in_signal_earns_nothing():
 
 def test_market_lagging_model_is_the_trade():
     # Same drift, market still near 50c -> the model-vs-price gap IS the edge.
-    # Under the fidelity profiles this pure-fundamental trade belongs to the
-    # drift-anchored meanrev bot (the momentum bot needs actual momentum).
-    d = MeanRevSLBot().make_decision(_market(yes=0.52, tr=150),
-                                     _sig(btc_drift=0.5))
+    # Meanrev must not fire as a drift clone; momentum with agreeing tape does.
+    d = _bot().make_decision(
+        _market(yes=0.52, tr=150),
+        _sig(btc_drift=0.5, prices=[100.0, 100.1, 100.2, 100.3, 100.4],
+             latest=100.4),
+    )
     assert d["action"] == "buy"
     assert d["side"] == "yes"
 
@@ -115,12 +117,14 @@ def test_strategies_diverge_on_momentum_only_input(monkeypatch):
         "arena.regime_adapt.adjustments",
         lambda *a, **k: RegimeAdjust(size_mult=1.0, label="normal"),
     )
-    # mid 0.60 is outside the coin-flip band; drift high enough to clear lag gates.
-    m = _market(yes=0.60, tr=150)
-    m["yes_ask"] = 0.61
-    m["no_ask"] = 0.40
-    s = _sig(btc_drift=0.35, prices=[100.0, 100.2], latest=100.2)
-    assert _bot().make_decision(m, s)["action"] == "buy"
+    monkeypatch.setattr("bots.base_bot._lane_overrides", lambda: {})
+    # Mid-band allowed when |drift|≥0.40 and residual lag is real.
+    m = _market(yes=0.56, tr=150)
+    m["yes_ask"] = 0.56
+    m["no_ask"] = 0.45
+    s = _sig(btc_drift=0.45, prices=[100.0, 100.2], latest=100.2)
+    d_mom = _bot().make_decision(m, s)
+    assert d_mom["action"] == "buy", d_mom.get("reasoning")
     assert MeanRevSLBot().make_decision(m, s)["action"] == "skip"
 
 
@@ -192,8 +196,9 @@ def test_dead_zone_gate_blocks_flat_drift_coinflip():
 def test_dead_zone_gate_allows_high_drift_in_band():
     # |drift| >= 0.30 in the SAME price band is the profitable "market lags
     # drift" trade (+$30.10, 65.7% WR) and must pass through the gate.
-    m = _market(yes=0.50, tr=150)
-    s = _sig(btc_drift=0.35, cvd=0.5, prices=[100.0, 100.3], latest=100.3)
+    m = _market(yes=0.56, tr=150)
+    m["yes_ask"] = 0.56
+    s = _sig(btc_drift=0.50, cvd=0.5, prices=[100.0, 100.3], latest=100.3)
     assert _bot().make_decision(m, s)["action"] == "buy"
 
 

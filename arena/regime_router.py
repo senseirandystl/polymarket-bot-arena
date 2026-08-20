@@ -27,7 +27,7 @@ _SEED_FIT: dict[str, dict[str, float]] = {
         "fee_zone_maker": 0.55, "true_maker": 0.50,
     },
     "low_vol_trend": {
-        "momentum": 0.75, "phantom": 0.70, "hybrid": 0.75, "sniper": 0.80,
+        "momentum": 0.80, "phantom": 0.70, "hybrid": 0.75, "sniper": 0.80,
         "mean_reversion": 0.55, "lag_residual": 0.70, "regime_specialist": 0.70,
     },
     "high_vol_trend": {
@@ -137,6 +137,14 @@ def score(
     regime = str(regime or "unknown")
     if regime == "unknown":
         return 0.65
+    try:
+        from signals.regime_detector import get_detector
+        snap = get_detector().snapshot() or {}
+        if (snap.get("regime_id") or snap.get("label")) == regime:
+            if not snap.get("actionable", False):
+                return 0.65
+    except Exception:
+        pass
     seed = _seed_fit(strategy_type, regime)
     live = (
         live if live is not None
@@ -184,6 +192,14 @@ def boost_type_alloc_scores(
     )
     if blend <= 0 or not regime or regime == "unknown":
         return dict(base_scores)
+    try:
+        from signals.regime_detector import get_detector
+        snap = get_detector().snapshot() or {}
+        if (snap.get("regime_id") or snap.get("label")) == regime:
+            if not snap.get("actionable", False):
+                return dict(base_scores)
+    except Exception:
+        pass
     out = {}
     for st, base in base_scores.items():
         r = score(st, regime)

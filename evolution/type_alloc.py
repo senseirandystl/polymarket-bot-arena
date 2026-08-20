@@ -70,8 +70,9 @@ def _type_scores(
     # Regime-router blend
     try:
         from signals.regime_detector import get_detector
-        rid = get_detector().status().get("current", {}).get("regime_id")
-        if rid and rid != "unknown":
+        cur = get_detector().status().get("current") or {}
+        rid = cur.get("regime_id")
+        if rid and rid != "unknown" and cur.get("actionable", False):
             from arena.regime_router import boost_type_alloc_scores
             scores = boost_type_alloc_scores(scores, rid)
     except Exception:

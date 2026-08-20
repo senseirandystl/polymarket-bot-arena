@@ -114,6 +114,11 @@ EVOLUTION_WINDOW_HOURS = 72        # 24→72 (audit: 24h overfits current regime
 # noisy 30-trade dips mid-run; mutants then bled the book. Need a fuller
 # window sample before a bot is eligible for replacement.
 MIN_TRADES_FOR_JUDGMENT = 40   # Fewer resolved trades in the window = immune
+# Post-TWAP trade rate can sit at 1–13 fills / 72h. Adaptive floor lets the
+# most-active directional be judged without waiting 40 samples; never below
+# GA_MIN_TRADES_FLOOR (starved slates stay immune).
+GA_MIN_TRADES_ADAPTIVE = True
+GA_MIN_TRADES_FLOOR = 20
 # Deep-red early cull: bots with n in [GA_EARLY_CULL_MIN_TRADES, MIN_TRADES)
 # can still be replaceable when P&L and BE gap are catastrophically bad —
 # prevents "IMMUNE forever" while a bot bleeds mid-session (2026-08-11).
@@ -172,6 +177,10 @@ REGIME_EMA_ALPHA = 0.25        # feature EMA (higher = faster)
 # vol/direction bounced across normal↔low_vol_range↔low_vol_trend every few
 # minutes and portfolio rebalanced on every flip. 20 ticks ≈ 20s hold.
 REGIME_HOLD_TICKS = 20
+# Downstream (adapt / router / portfolio / hybrid / GA) only act when the
+# committed label is this confident and has been held this long.
+REGIME_ACTION_MIN_CONF = 0.50
+REGIME_ACTION_MIN_HOLD_SEC = 20.0
 REGIME_SWITCH_MARGIN = 0.12    # required confidence edge to start switch
 REGIME_USE_CENTROIDS = True    # lightweight online clustering soft vote
 MOM_CHOP_REGIME_DAMP = 0.45    # mom lane damp under high_vol_chop
@@ -181,8 +190,8 @@ STRAT_CHOP_REGIME_DAMP = 0.70  # strat lane damp under high_vol_chop
 REGIME_USE_RELATIVE = True
 REGIME_REL_RESERVOIR_MAX = 20_000
 REGIME_REL_MIN_SAMPLES = 500
-REGIME_REL_WINDOW_DAYS = 14          # documentation / slow-path; reservoir is live 1s
-REGIME_REL_WINDOW_DAYS_SLOW = 60
+REGIME_REL_WINDOW_DAYS = 14          # rolling window of unique 1m candles
+REGIME_REL_WINDOW_DAYS_SLOW = 60     # reserved; not used this pass
 REGIME_CLASSIFY_VOL_HI = 0.70        # percentile / relative score
 REGIME_CLASSIFY_VOL_LO = 0.30
 REGIME_CLASSIFY_DIR_HI = 0.55        # directionality composite
@@ -203,6 +212,11 @@ CORE_TUNE_EV_PRIMARY = True
 CORE_TUNE_EV_MIN_TRADES = 20
 CORE_TUNE_EV_UP_MIN = 0.0          # need mean attributed $ ≥ this to UP
 CORE_TUNE_EV_DOWN_MAX = -0.05      # mean attributed $ ≤ this → DOWN
+# Unique-market scorecard net ¢/share (preferred judge over sign accuracy).
+CORE_TUNE_SCORECARD_MIN = 20
+CORE_TUNE_SCORECARD_DOWN_MAX = 0.0   # net ≤ this → block UP
+CORE_TUNE_SCORECARD_FORCE_DOWN = -0.005  # net ≤ this → step DOWN
+CORE_TUNE_SCORECARD_MAX_ENTRY = 0.62  # ignore 84¢+ dual-gate rows in overlay
 # Timeout UP disabled (was re-pumping red lanes after 6h of hold_pnl_gate).
 CORE_TUNE_PNL_GATE_TIMEOUT_HOURS = 0.0  # 0 = never timeout-up
 # Soften drift floor: allow collapse toward this when EV is red (was hard 0.15).
@@ -317,14 +331,14 @@ SNIPER_MAX_ASK_MID_SPREAD = 0.08
 # --- Portfolio explore floor for new gN bots ---
 # Until a post-evolution bot has this many resolved trades, cap its capital
 # weight so cold mutants cannot eat a full Kelly slice immediately.
-PORTFOLIO_EXPLORE_MIN_TRADES = 20
+PORTFOLIO_EXPLORE_MIN_TRADES = 8
 PORTFOLIO_EXPLORE_MAX_WEIGHT = 0.06   # per cold bot
 # Total capital budget shared by ALL not-ready / cold bots (prevents 3×24%).
 PORTFOLIO_EXPLORE_TOTAL_BUDGET = 0.12
 # Proven bots (long-window exp>0 or gen0 with n≥floor) keep at least this
 # weight even if short-window expectancy dips slightly negative.
 PORTFOLIO_PROVEN_FLOOR = 0.06
-PORTFOLIO_PROVEN_MIN_TRADES = 25
+PORTFOLIO_PROVEN_MIN_TRADES = 10
 # Anti-starvation floor (audit 2b): active bots with few recent fills keep
 # at least this weight so flat-market hysteresis doesn't zero their capital.
 PORTFOLIO_ACTIVE_MIN_TRADES = 3
@@ -496,15 +510,17 @@ STRAT_LANE_CONF_CAP = 0.25
 
 # Mean-reversion identity guard (audit 1d): at |drift| >= this floor the
 # drift-heavy profile makes the bot a duplicate trend follower. Stand down.
-MEANREV_MIN_FADE_DRIFT = 0.40  # stand down earlier so meanrev ≠ pure trend chase
+# Stand down only when TWAP is actually locked (honest tanh ~0.70 ≈ Φ 0.85).
+# 0.40 was a catch-22 with dual-gate z≥0.35: meanrev never had a fade window.
+MEANREV_MIN_FADE_DRIFT = 0.70
 
 # --- NO-side intelligence (2026-08 soak: YES +$245 / NO −$15) ---
 # Not a blanket NO ban. Prefer NO only when it is a true market-lag trade
 # (cheap relative to signed drift) with real drift conviction. Strategies
 # that already print on NO (momentum/meanrev) keep milder extras.
 NO_SIDE_ENABLED = True
-NO_SIDE_MIN_SIGNED_DRIFT = 0.12     # |signed drift toward NO| floor
-NO_SIDE_MAX_MID = 0.58              # lag ceiling (same spirit as sniper)
+NO_SIDE_MIN_SIGNED_DRIFT = 0.12
+NO_SIDE_MAX_MID = 0.58
 NO_SIDE_EDGE_MULT = 1.20            # global min_edge mult on NO
 NO_SIDE_UNDERDOG_EDGE_MULT = 1.35   # extra when NO mid in cheap band
 # Per-strategy extra min_edge mult on NO (on top of global). 1.0 = no extra.
@@ -527,8 +543,14 @@ NO_SIDE_STRATEGY_EDGE_MULT = {
 # --- Cheap underdog band (0.35–0.42): mild leak at 38% WR / −$23 ---
 UNDERDOG_BAND_LO = 0.35
 UNDERDOG_BAND_HI = 0.42
-UNDERDOG_MIN_DRIFT = 0.18           # need real drift to buy deep underdogs
-UNDERDOG_EDGE_MULT = 1.40           # higher min_edge in this band
+UNDERDOG_MIN_DRIFT = 0.18
+UNDERDOG_EDGE_MULT = 1.40
+# Residual-lag check in the mid band, scored with Φ(z) not tanh.
+PRICE_QUALITY_MID_LO = 0.50
+PRICE_QUALITY_MID_HI = 0.58
+PRICE_QUALITY_DRIFT_MIN = 0.15
+PRICE_QUALITY_ASK_MAX = 0.99
+PRICE_QUALITY_LAG_MIN = 0.04
 
 # --- Maker mid/ask integrity ---
 MAKER_MAX_MID_ASK_GAP = 0.08        # |mid − ask| above this → refuse trade
@@ -546,7 +568,12 @@ CVD_VOLUME_FLOOR = 200.0
 # its lane for every strategy, same pattern as OBI/PM/CVD above.
 SIGNAL_WEIGHT_FUT = 0.0      # Binance perp funding/OI/taker delta (signals/futures_meta.py)
 SIGNAL_WEIGHT_TECH = 0.0     # MACD/Bollinger/multi-TF composite (signals/technicals.py)
-SIGNAL_WEIGHT_XASSET = 0.0   # ETH/SOL cross-asset confirmation (signals/cross_asset.py)
+SIGNAL_WEIGHT_XASSET = 1.0   # ETH/SOL confirm-only (live +0.51¢/share, 79% WR)
+# Confirm-only: xasset may not pick a side; it only adds when it agrees with drift.
+XASSET_LANE_MODE = "confirm"
+XASSET_CONFIRM_SCALE = 1.0
+XASSET_FIGHT_SCALE = 0.0
+XASSET_DRIFT_AGREE_MIN = 0.05
 # --- Expanded candidate lanes (2026-08 audit) — kill-switched until Lab ---
 # Logged in cand(...) and available via Signal Lab promote path. Same house
 # rule: no live weight without harness + live-shadow net edge.
@@ -616,6 +643,10 @@ AUTO_APPROVE_MIN_ACCURACY = 0.57  # 0.55→0.57 (audit: wider 4pp gap vs demotio
 # Require positive LIVE shadow net edge (¢/share after fee) in addition to
 # accuracy — accuracy alone promoted fut at ~55% that later scored ~38% live.
 AUTO_APPROVE_MIN_NET_EDGE = 0.005  # +0.5¢/share on shadow follow-the-sign
+# Fill-level bar: unique-market / tick shadow cannot promote alone. A lane
+# must also show positive net edge on actual resolved fills (the tech
+# 80%→−5.5¢ incident). Below this fill count the verdict stays "collecting".
+AUTO_APPROVE_MIN_FILLS = 15
 AUTO_APPROVE_MAX_ACTIVE = 3       # cap on simultaneously-enabled CANDIDATE lanes
 # Core-lane tuner apply toggle — SEPARATE from auto-approve so operators can
 # freeze promotions without freezing drift/mom/strat weight nudges (and vice
@@ -687,21 +718,32 @@ MARKET_WINDOW_SEC = 300           # 5-min window length
 # raised; adaptive σ prefers **TWAP** samples (same object as moneyness).
 DRIFT_VOL_SCALE = 0.0022          # ~0.22% of price full-window prior
 DRIFT_ADAPTIVE_SCALE = True       # False → always use DRIFT_VOL_SCALE prior
-DRIFT_VOL_SCALE_MIN = 0.0010      # quiet floor (was 0.0006 — too sensitive)
+DRIFT_VOL_SCALE_MIN = 0.0018      # 0.0010 mapped 5bp TWAP wiggles to |d|≈0.55
 DRIFT_VOL_SCALE_MAX = 0.0050      # panic ceiling
 DRIFT_ADAPT_EMA_ALPHA = 0.08      # slightly faster than 0.05 (5m product)
 DRIFT_ADAPT_MIN_SAMPLES = 20      # warm faster after restart
 # Prefer Chainlink TWAP tick series for adaptive σ (falls back to spot 1m).
 DRIFT_ADAPT_USE_TWAP = True
-DRIFT_ADAPT_TWAP_SAMPLE_SEC = 5.0  # resample TWAP ticks for log-return vol
+# Sample near the TWAP lookback so increments are not overlapping 5s
+# averages (those pin σ at the floor and invent 78¢ implied probs).
+DRIFT_ADAPT_TWAP_SAMPLE_SEC = 60.0
 # Raw moneyness floor (fraction): dual-gate with z-score so $noise ≠ "strong drift".
-# 0.00030 ≈ $20 at $65k / $30 at $100k.
-DRIFT_MIN_ABS_PCT = 0.00030
+# Overnight 2026-08-20: 5–6 bp at σ floor 0.0018 cleared |z|≥0.35 and printed
+# Φ≈0.64–0.69 on 32–38¢ underdogs (core directional 12/35 = 34% WR).
+# 8 bp ≈ $55 at $70k — still below a real 5m move; binds when z is inflated.
+DRIFT_MIN_ABS_PCT = 0.00080
 # Floor remaining-window time in σ_rem = scale·√(tr/W) so last-minute noise
 # cannot explode z. 60s ⇒ σ_rem never below scale·√(60/300).
 DRIFT_TIME_SCALE_MIN_SEC = 60.0
-# Directional bots require |btc_drift| ≥ this once moneyness clears (z-score bar).
+# Dual-gate bar on *raw* z = moneyness / σ_rem (not tanh). 0.35 ≈ 6–8 bp
+# mid-window at σ=0.22%. Pre-TWAP-recal this was compared to tanh(z).
 DRIFT_MIN_ABS_Z = 0.35
+# Sweeper lock floor on tanh(z). 0.32 is only a first filter — a 99¢ buy
+# also needs Φ(z) ≥ SWEEPER_MIN_IMPLIED (overnight tanh 0.455 @ 99¢ NO
+# lost $5.70; Φ was ~0.67, not a lock).
+SWEEPER_MIN_DRIFT = 0.32
+SWEEPER_MIN_IMPLIED = 0.97
+SWEEPER_MIN_TWAP_CERTAINTY = 0.45
 # RE-ENABLED (2026-07-16) after the #23 blow-up was traced to a MISCALCULATED
 # strike (mid-window "first sighting"), not a bad signal. Live strike is
 # Polymarket's official openPrice (same /api/crypto/crypto-price endpoint the
@@ -943,9 +985,9 @@ PORTFOLIO_METHOD = "kelly_portfolio"  # equal | sharpe | expectancy | kelly_port
 PORTFOLIO_WINDOW_HOURS = 48.0         # primary (long) lookback
 PORTFOLIO_FAST_WINDOW_HOURS = 12.0    # short window for blend
 PORTFOLIO_LONG_WEIGHT = 0.65          # blend = long*W + fast*(1-W)
-PORTFOLIO_MIN_TRADES = 20             # sample floor before a bot's score counts
+PORTFOLIO_MIN_TRADES = 6              # 5m tape: ~2–3 directional fills/hour
 # Dual-window ready: also ready if short window has enough consistent samples
-PORTFOLIO_FAST_READY_MIN_TRADES = 12
+PORTFOLIO_FAST_READY_MIN_TRADES = 4
 PORTFOLIO_FAST_READY_ENABLED = True
 # When zero veterans, equal-split free capital (don't leave pool dark)
 PORTFOLIO_COLD_START_EQUAL = True
@@ -964,7 +1006,7 @@ PORTFOLIO_UNPROVEN_MAX_WEIGHT = 0.20
 PORTFOLIO_EDGE_PROVEN_MIN_N = 20
 # After n≥NEG_EXP_MIN_N with expectancy<0: strip manual floors and zero auto
 # weight so losers cannot keep capital via override floors.
-PORTFOLIO_NEG_EXP_MIN_N = 20
+PORTFOLIO_NEG_EXP_MIN_N = 6
 PORTFOLIO_NEG_EXP_MAX_WEIGHT = 0.0
 PORTFOLIO_CORR_SHRINK = 0.65          # 0..1: how hard correlation cuts raw score
 PORTFOLIO_CORR_MIN_OVERLAP = 8        # shared markets needed to estimate ρ
@@ -1104,7 +1146,9 @@ EXPOSURE_CORR_AWARE = True
 EXPOSURE_CORR_FLOOR = 0.35
 # Hard cap on distinct bots already open on the same (market, side) before
 # another directional bot is allowed in (arb exempt). Soft "one thesis" limit.
-# 2026-08-11: default 1 — tandem mom+meanrev+hybrid was the session's $ bleed.
+# Overnight 2026-08-20: unique-market +$3.84 vs multi-bot −$36. Model
+# "edges" of 5–23¢ always cleared the 3.5¢ pile-in bar. One directional
+# thesis per (market, side).
 MARKET_SIDE_MAX_BOTS = 1
 # Tighter tandem caps when live data says the regime/strategy is toxic
 MARKET_SIDE_MAX_BOTS_BAD_REGIME = 1
@@ -1115,7 +1159,11 @@ MARKET_SIDE_MAX_BOTS_CHOP = 1
 PILEIN_EV_GATE_ENABLED = True
 PILEIN_EV_EDGE_STEP = 0.025       # extra edge required per peer bot open
 PILEIN_EV_MIN_EDGE = 0.035        # absolute min edge when ≥1 peer is open
-PILEIN_EV_CONF_BYPASS = 0.85      # very high conf skips the extra bar
+# quality_confidence is a 0–0.95 *structure* score, not P(win). Soak
+# 2026-08-19: tandem mom/hybrid/sniper routinely printed 0.82–0.91 and
+# skipped this bar — unique-market +$24 vs multi-bot −$12. Sit above the
+# 0.95 cap so ordinary structure cannot bypass the extra-edge requirement.
+PILEIN_EV_CONF_BYPASS = 0.96
 PILEIN_EV_EXEMPT_TYPES = ("arbitrage",)  # market-neutral legs
 
 # --- One directional trade per evaluation (trader tick) ---
@@ -1168,13 +1216,38 @@ RISK_STICKY_RECOVERY_RATIO = 0.75  # must recover to 75% of taper-start DD
 #   join_bid    — best_bid (true join; lowest fill rate, pure maker)
 #   aggressive  — best_ask (marketable limit; still taker fee when it crosses)
 ORDER_STYLE = "limit"
-LIMIT_PRICE_MODE = "passive_mid"
+# cap_ask: buy limit = best ask. Immediate fill, taker fee, no book-walk past
+# the displayed ask. Honest live-equivalent for 5-min directionals that need
+# the fill *now*. join_bid / passive_mid remain available for makers.
+LIMIT_PRICE_MODE = "cap_ask"
 LIMIT_TICK = 0.01
-# Paper: when a resting limit does not cross the ask, still fill at the limit
-# as maker (fee 0) so the soak can measure maker economics. Live posts a real
-# GTC and only logs a trade when the CLOB reports matched. Documented
-# optimism for paper — compare live fills before trusting paper edge fully.
-LIMIT_PAPER_ASSUME_MAKER_FILL = True
+# Paper must not invent a maker fill when the limit does not cross. Live
+# already only logs a trade when the CLOB reports matched. Sweeper / true
+# maker pass an explicit limit_price and fill when marketable.
+LIMIT_PAPER_ASSUME_MAKER_FILL = False
+# Live unique-market scorecard (Signal Lab) + gate tuner.
+LIVE_SCORECARD_HOURS = 72
+LIVE_SCORECARD_INTERVAL_SEC = 300
+GATE_TUNE_ENABLED = True
+GATE_TUNE_APPLY = False         # suggest-only until a human/toggle enables apply
+GATE_TUNE_MIN_MARKETS = 30
+GATE_TUNE_LOOSEN_WR = 0.58
+GATE_TUNE_LOOSEN_EDGE = 0.02    # +2¢/share hyp P&L after taker fee
+GATE_TUNE_APPLY_COOLDOWN_SEC = 86400  # one step per knob per day if apply is on
+# Combination / foundational-rule explorer (Signal Lab). Measures pairwise
+# lane agreement + named rules on unique-market rows after taker fee.
+# Confirm-apply uses only *earned cheap* combos — it does not loosen
+# dual-gate / lean floor / sweeper certainty globally.
+COMBO_EXPLORE_ENABLED = True
+COMBO_EXPLORE_HOURS = 72
+COMBO_EXPLORE_INTERVAL_SEC = 300
+COMBO_DEADBAND = 0.05
+COMBO_MAX_ENTRY = 0.62          # never earn/apply on sweeper-book favorites
+COMBO_MIN_MARKETS = 20
+COMBO_MIN_ACCURACY = 0.55
+COMBO_MIN_NET_EDGE = 0.0
+COMBO_CONFIRM_APPLY = False     # suggest-only until a combo earns on cheap fills
+COMBO_CONFIRM_MIN_LANES = 2
 
 # --- Regime-adaptive policy (PLAN 2026-08-05: adapt weights, not starve) ---
 # Primary response to a weak regime is reweight lanes + capital routing
@@ -1203,8 +1276,8 @@ REGIME_HARD_SKIP_REQUIRE_NEG_PNL = True
 # (2026-08: 229 trades, 50% WR, −$37; with low_vol_trend −$49).
 MID_COINFLIP_LO = 0.50
 MID_COINFLIP_HI = 0.58
-MID_COINFLIP_DRIFT_MIN = 0.28
-MID_COINFLIP_DRIFT_MIN_BAD_REGIME = 0.35  # mild; was 0.40 with deep size cuts
+MID_COINFLIP_DRIFT_MIN = 0.40
+MID_COINFLIP_DRIFT_MIN_BAD_REGIME = 0.45
 
 # --- Decision-event log (counterfactual learning) ---
 # Hot path only enqueues; a background flusher batch-inserts. Non-buy actions
@@ -1223,7 +1296,8 @@ DECISION_LEARN_MIN_RESOLVED = 30       # floor before replacing trade-only path
 # Hybrid meta-learner counterfactuals (bots/meta_learner.py): score sub-votes
 # from resolved decision_events skips (would-be trades), not only filled buys.
 # CF step is scaled by HYBRID_META_CF_ETA_SCALE so one skip ≠ one real trade.
-HYBRID_META_CF_ENABLED = True
+HYBRID_META_CF_ENABLED = False         # fills only — skip CF overfit (2.5× mom)
+HYBRID_META_MAX_MULT = 1.20            # cap online multiplier until fill n is large
 HYBRID_META_CF_ETA_SCALE = 0.25        # CF Hedge step = eta * this
 HYBRID_META_CF_MAX_PER_CYCLE = 200     # bound per maybe_update pass
 

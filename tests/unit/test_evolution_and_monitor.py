@@ -163,7 +163,7 @@ def test_negative_pnl_and_gap_is_replaced(monkeypatch):
                         "rsi_period": 14, "rsi_oversold": 40,
                         "rsi_overbought": 60, "trending_conf_damp": 0.6}),
         FakeBot("loser", "momentum",
-                {"pnl": -86.0, "wr": 0.508, "trades": 126, "gap": -0.006}),
+                {"pnl": -86.0, "wr": 0.508, "trades": 126, "gap": -0.05}),
     ]
     result, replaced = _run(bots, monkeypatch)
     assert replaced == ["loser"]

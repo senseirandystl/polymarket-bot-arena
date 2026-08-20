@@ -79,8 +79,17 @@ HISTORY_KEY = "regime_transitions"
 # ``vol`` is VOLATILITY (realized log-return stdev score), not volume.
 # ``volume`` is a separate activity feature (dashboard / context only) —
 # filled from Binance BTC 1m kline volume (price stays Chainlink). Classifier
-# rules do not use volume (see compute_features).
+# rules do not use volume as a grid axis (see compute_features).
 FEATURE_KEYS = ("vol", "trend", "mom", "flow")
+# Live-path EMA also holds the directionality composite and its inputs so
+# classify_rules sees the same axes compute_features produced (chop +
+# multi-scale align were previously dropped before scoring).
+SMOOTH_KEYS = FEATURE_KEYS + ("volume", "chop", "direction", "ms_mom_align", "vol_rel")
+PASS_KEYS = (
+    "flow_align", "realized_vol", "trend_sign", "vol_abs", "calibration",
+    "twap_blend", "sample_ok", "xasset_align",
+    "pm_spread_score", "pm_book_sum", "pm_mid", "pm_lag", "pm_book_quality",
+)
 
 # Human labels for dashboard / ops (vol ≠ volume).
 FEATURE_LABELS = {
@@ -96,6 +105,16 @@ FEATURE_LABELS = {
 
 def _clip01(x: float) -> float:
     return max(0.0, min(1.0, float(x)))
+
+
+def _feat(features: dict, key: str, default: float) -> float:
+    """Read a float feature. ``0.0`` is a valid extreme — never use ``or``."""
+    if not features or key not in features or features[key] is None:
+        return float(default)
+    try:
+        return float(features[key])
+    except (TypeError, ValueError):
+        return float(default)
 
 
 def _volume_score(volumes: Optional[Sequence[float]]) -> float:
@@ -120,6 +139,68 @@ def _volume_score(volumes: Optional[Sequence[float]]) -> float:
     return _clip01(1.0 / (1.0 + math.exp(-2.2 * (ratio - 1.0))))
 
 
+def _pm_sidecar(pm_state: Optional[dict]) -> dict[str, float]:
+    """Polymarket book-quality sidecar — never a BTC-grid axis.
+
+    Spread tightness + YES+NO book-sum consistency. Used to *damp
+    confidence* when the tradeable book is gapped/wide, not to relabel
+    the underlying BTC tape.
+    """
+    if not pm_state:
+        return {}
+    try:
+        spread_score = _clip01(float(pm_state.get("spread_score", 0.5) or 0.5))
+    except (TypeError, ValueError):
+        spread_score = 0.5
+    try:
+        yes = float(pm_state.get("yes_price") or pm_state.get("mid") or 0.0)
+    except (TypeError, ValueError):
+        yes = 0.0
+    try:
+        no = float(pm_state.get("no_price") or 0.0)
+    except (TypeError, ValueError):
+        no = 0.0
+    try:
+        book_sum = float(pm_state.get("book_sum") or 0.0)
+    except (TypeError, ValueError):
+        book_sum = 0.0
+    if book_sum <= 0 and yes > 0 and no > 0:
+        book_sum = yes + no
+    if book_sum > 0:
+        consistency = _clip01(1.0 - abs(book_sum - 1.0) / 0.08)
+    else:
+        consistency = 0.5
+    out: dict[str, float] = {
+        "pm_spread_score": spread_score,
+        "pm_book_sum": book_sum if book_sum > 0 else 0.0,
+        "pm_book_quality": _clip01(0.6 * spread_score + 0.4 * consistency),
+    }
+    if yes > 0:
+        out["pm_mid"] = yes
+    lag = pm_state.get("lag_residual")
+    if lag is not None:
+        try:
+            out["pm_lag"] = float(max(-1.0, min(1.0, float(lag))))
+        except (TypeError, ValueError):
+            pass
+    return out
+
+
+def _apply_xasset(feats: dict[str, float], xasset_score: float) -> dict[str, float]:
+    """Sidecar ETH/SOL alignment. Never writes the BTC direction axis."""
+    out = dict(feats)
+    try:
+        xa = float(xasset_score)
+    except (TypeError, ValueError):
+        return out
+    ts = _feat(out, "trend_sign", 0.0)
+    if abs(xa) > 0.2 and abs(ts) > 0.15:
+        out["xasset_align"] = 1.0 if (xa > 0) == (ts > 0) else 0.0
+    else:
+        out["xasset_align"] = 0.5
+    return out
+
+
 def compute_features(
     prices: Sequence[float],
     *,
@@ -130,6 +211,7 @@ def compute_features(
     realized_vol: Optional[float] = None,
     volumes: Optional[Sequence[float]] = None,
     volume_score: Optional[float] = None,
+    calibrate: bool = True,
 ) -> dict[str, float]:
     """Derive continuous feature vector in ~[0, 1] from market inputs.
 
@@ -194,7 +276,7 @@ def compute_features(
         from signals import regime as regime_mod
         from signals import multiscale
         reg_feats = regime_mod.compute(clean)
-        chop = float(reg_feats.get("regime_chop", 0.5) or 0.5)
+        chop = _feat(reg_feats, "regime_chop", 0.5)
         # Prefer multi-window trend mean when available
         if reg_feats.get("regime_trend") is not None:
             trend_score = float(reg_feats["regime_trend"])
@@ -228,6 +310,11 @@ def compute_features(
         "ms_mom_align": _clip01(ms_mom_align),
         # Signed YES-frame direction of the tape ∈ [-1, 1]
         "trend_sign": float(max(-1.0, min(1.0, trend_sign))),
+        # 0 → classify_rules returns unknown (cold start ≠ quiet range).
+        # Gate on series length only: the live path always passes
+        # vol_score=0.0 / trend_score=0.0 (not None) for a cold feed, which
+        # is not "enough data".
+        "sample_ok": 1.0 if len(clean) >= 5 else 0.0,
     }
     feats["direction"] = directionality(feats)
 
@@ -241,12 +328,20 @@ def compute_features(
         try:
             from signals.regime_calibration import get_calibrator
             cal = get_calibrator()
-            cal.update(
-                realized_vol=float(realized_vol),
-                trend_eff=float(trend_score),
-                chop=float(chop),
-                mom_abs=float(mom),
-            )
+            if calibrate:
+                # Fingerprint the *candle*, not the feature values — consecutive
+                # quiet minutes can share the same rounded vol/chop/mom and
+                # must still enter the reservoir.
+                cal.update_if_changed(
+                    (
+                        len(clean),
+                        round(float(clean[-1]), 2) if clean else 0.0,
+                    ),
+                    realized_vol=float(realized_vol),
+                    trend_eff=float(trend_score),
+                    chop=float(chop),
+                    mom_abs=float(mom),
+                )
             vol_rel = cal.percentile(
                 "realized_vol", float(realized_vol),
                 fallback=_clip01(vol_score),
@@ -283,9 +378,9 @@ def directionality(features: dict[str, float]) -> float:
     Used as the second axis of the regime grid (alongside vol). High =
     efficient directional tape; low = range / churn.
     """
-    t = float(features.get("trend", 0.5) or 0.5)
-    chop = float(features.get("chop", 0.5) or 0.5)
-    align = float(features.get("ms_mom_align", 0.5) or 0.5)
+    t = _feat(features, "trend", 0.5)
+    chop = _feat(features, "chop", 0.5)
+    align = _feat(features, "ms_mom_align", 0.5)
     return _clip01(0.45 * t + 0.35 * (1.0 - chop) + 0.20 * align)
 
 
@@ -303,6 +398,12 @@ def classify_rules(features: dict[str, float],
 
     Returns (regime_id, confidence in 0..1).
     """
+    try:
+        _sample_ok = float(features["sample_ok"]) if "sample_ok" in features else 1.0
+    except (TypeError, ValueError):
+        _sample_ok = 1.0
+    if _sample_ok < 0.5:
+        return "unknown", 0.0
     try:
         from arena.regime_settings import get_bool as _reg_bool
         use_rel = bool(_reg_bool("use_relative"))
@@ -358,13 +459,18 @@ def classify_rules(features: dict[str, float],
         edge = max(abs(v - 0.5), abs(t - 0.5))
         conf = 0.45 + 0.2 * (1.0 - edge)
 
-    # Mild boost when momentum/flow agree with the classification
+    # Mild boost when momentum/flow/volume agree with the classification
+    vol_act = float(features.get("volume", 0.0) or 0.0)
     if rid in ("high_vol_trend", "low_vol_trend") and m > 0.4:
         conf = min(1.0, conf + 0.05)
     if rid == "high_vol_chop" and f > 0.4 and m < 0.3:
         conf = min(1.0, conf + 0.05)
     if rid == "low_vol_range" and m < 0.25:
         conf = min(1.0, conf + 0.05)
+    if rid in ("high_vol_trend", "high_vol_chop") and vol_act > 0.6:
+        conf = min(1.0, conf + 0.04)
+    if rid == "low_vol_range" and 0.0 < vol_act < 0.35:
+        conf = min(1.0, conf + 0.04)
 
     return rid, _clip01(conf)
 
@@ -483,6 +589,24 @@ class RegimeDetector:
                 self._last_change_from = data.get(
                     "last_change_from", self._last_change_from
                 )
+                ts = data.get("last_change_ts")
+                if ts is not None:
+                    try:
+                        self._last_change_ts = float(ts)
+                    except (TypeError, ValueError):
+                        ts = None
+                # Old snapshots had no last_change_ts. A restored committed
+                # label must already count as held or every gate stays off
+                # until the next flip (which may be hours).
+                if ts is None and self._regime not in ("unknown", "", None):
+                    try:
+                        updated = float(data.get("updated_at") or 0.0)
+                    except (TypeError, ValueError):
+                        updated = 0.0
+                    hold = float(getattr(config, "REGIME_ACTION_MIN_HOLD_SEC", 20.0))
+                    self._last_change_ts = (
+                        updated if updated > 0 else time.time() - hold
+                    )
                 cents = data.get("centroids") or {}
                 for rid, c in cents.items():
                     if rid in self._centroids and isinstance(c, dict):
@@ -517,6 +641,7 @@ class RegimeDetector:
                 "ema": dict(self._ema),
                 "last_features": dict(self._last_features),
                 "last_change_from": self._last_change_from,
+                "last_change_ts": self._last_change_ts,
                 "centroids": {
                     rid: {"n": c["n"], "mean": list(c["mean"])}
                     for rid, c in self._centroids.items()
@@ -577,6 +702,8 @@ class RegimeDetector:
         volume_score: Optional[float] = None,
         market_id: Optional[str] = None,
         twap_prices: Optional[Sequence[float]] = None,
+        pm_state: Optional[dict] = None,
+        xasset_score: Optional[float] = None,
     ) -> dict[str, Any]:
         """Ingest one market tick; return current regime snapshot.
 
@@ -587,6 +714,13 @@ class RegimeDetector:
         ``twap_prices`` (optional): recent resolution-object TWAP series. When
         present, trend/mom features blend spot microstructure with TWAP path
         so "trend" is more resolution-relevant (2026-08-11).
+
+        ``pm_state`` (optional): Polymarket book sidecar (spread / YES+NO
+        sum / mid). Damps confidence on gapped books; never changes the
+        BTC vol×direction label.
+
+        ``xasset_score`` (optional): ETH/SOL confirmation in ~[-1, 1].
+        Sidecar alignment only (confidence ±0.03) — not a classification axis.
         """
         self._ensure_loaded()
         self._live = True
@@ -598,22 +732,40 @@ class RegimeDetector:
             realized_vol=realized_vol,
             volumes=volumes, volume_score=volume_score,
         )
-        # Blend resolution-relevant TWAP trend/mom (spot still owns vol/flow)
-        if twap_prices is not None and len([p for p in twap_prices if p and p > 0]) >= 3:
+        # Blend resolution-relevant TWAP trend/mom (spot still owns vol/flow).
+        # Only blend a TWAP series that itself cleared the sample floor —
+        # a 3-print cold TWAP has trend=0 and would drag spot toward range.
+        if twap_prices is not None and len([p for p in twap_prices if p and p > 0]) >= 5:
             try:
-                tw = compute_features(twap_prices, cvd=0.0, obi=0.0)
-                blend = float(getattr(config, "REGIME_TWAP_BLEND", 0.45) or 0.45)
-                blend = max(0.0, min(0.8, blend))
-                for k in ("trend", "mom"):
-                    if k in raw and k in tw:
-                        raw[k] = (1.0 - blend) * float(raw[k]) + blend * float(tw[k])
-                raw["twap_blend"] = blend
+                tw = compute_features(twap_prices, cvd=0.0, obi=0.0, calibrate=False)
+                if _feat(tw, "sample_ok", 0.0) >= 0.5:
+                    blend = float(getattr(config, "REGIME_TWAP_BLEND", 0.45) or 0.45)
+                    blend = max(0.0, min(0.8, blend))
+                    for k in ("trend", "mom"):
+                        if k in raw and k in tw:
+                            raw[k] = (1.0 - blend) * float(raw[k]) + blend * float(tw[k])
+                    raw["twap_blend"] = blend
+                    raw["direction"] = directionality(raw)
             except Exception:
                 pass
+        raw.update(_pm_sidecar(pm_state))
+        # Thin tape: do not EMA zeros over a restored state or commit
+        # low_vol_range from a 2–4 candle restart.
+        if _feat(raw, "sample_ok", 1.0) < 0.5:
+            with self._lock:
+                if self._regime == "unknown":
+                    self._last_features = dict(raw)
+                    self._confidence = 0.0
+                    return self._snapshot_unlocked()
+                # Keep the last committed regime; always stamp sample_ok=0
+                # so snapshot() does not default to 1.0 on an empty restore.
+                prev = dict(self._last_features) if self._last_features else {}
+                prev["sample_ok"] = 0.0
+                self._last_features = prev
+                return self._snapshot_unlocked()
         with self._lock:
-            # EMA smooth the classifier features (+ volume for display)
-            smooth_keys = FEATURE_KEYS + ("volume",)
-            for k in smooth_keys:
+            # EMA the classifier axes + directionality inputs
+            for k in SMOOTH_KEYS:
                 if k not in raw:
                     continue
                 prev = self._ema.get(k)
@@ -623,10 +775,16 @@ class RegimeDetector:
                 else:
                     a = self.ema_alpha
                     self._ema[k] = a * cur + (1.0 - a) * prev
-            smoothed = {k: self._ema.get(k, raw[k]) for k in FEATURE_KEYS}
-            smoothed["volume"] = self._ema.get("volume", raw.get("volume", 0.0))
-            smoothed["flow_align"] = raw.get("flow_align", 0.5)
-            smoothed["realized_vol"] = raw.get("realized_vol", 0.0)
+            smoothed = {k: self._ema.get(k, raw[k]) for k in SMOOTH_KEYS if k in raw or k in self._ema}
+            for k in PASS_KEYS:
+                if k in raw:
+                    smoothed[k] = raw[k]
+            # Recompute direction from *smoothed* chop/trend/align so the
+            # classifier sees a coherent composite, not a mix of raw+EMA.
+            if "chop" in smoothed or "ms_mom_align" in smoothed:
+                smoothed["direction"] = directionality(smoothed)
+            if xasset_score is not None:
+                smoothed = _apply_xasset(smoothed, xasset_score)
             self._last_features = dict(smoothed)
 
             rule_id, rule_conf = classify_rules(smoothed)
@@ -640,6 +798,18 @@ class RegimeDetector:
                     # Strong centroid disagreement → slight pull, keep rules primary
                     conf = _clip01(rule_conf - 0.05)
                 # else keep rule winner
+            # Book quality + xasset are SIDECARS: they scale confidence
+            # after the vote so they cannot flip the BTC vol×direction label
+            # and cannot be overwritten by the centroid mix.
+            pq = smoothed.get("pm_book_quality")
+            if pq is not None and float(pq) < 0.55:
+                conf = _clip01(conf * (0.70 + 0.30 * (float(pq) / 0.55)))
+            xa = smoothed.get("xasset_align")
+            if xa is not None:
+                if float(xa) >= 0.99:
+                    conf = _clip01(conf + 0.03)
+                elif float(xa) <= 0.01:
+                    conf = _clip01(conf - 0.03)
 
             self._ticks += 1
             changed = self._apply_hysteresis(final_id, conf)
@@ -736,11 +906,13 @@ class RegimeDetector:
             and self._candidate_ticks >= max(1, self.hold_ticks // 2)
         ):
             prev = self._regime
+            old_conf = float(self._confidence)
             self._last_change_from = prev
             self._regime = candidate
             # Blend in a fraction of the old confidence so a single fleeting
             # spike cannot fully determine the new confidence.
-            self._confidence = 0.5 * self._confidence + 0.5 * conf
+            blended = 0.5 * old_conf + 0.5 * conf
+            self._confidence = blended
             self._candidate = None
             self._candidate_ticks = 0
             self._last_change_ts = time.time()
@@ -749,8 +921,8 @@ class RegimeDetector:
                 "(absolute-confidence escape: old_conf=%.2f margin=%.2f "
                 "blended=%.2f)",
                 prev, candidate, conf,
-                self._confidence, self.switch_margin,
-                self._confidence,
+                old_conf, self.switch_margin,
+                blended,
             )
             return True
 
@@ -872,12 +1044,27 @@ class RegimeDetector:
             trend_side = "no"
         else:
             trend_side = "flat"
+        sample_ok = _feat(feats, "sample_ok", 0.0)
+        held_sec = 0.0
+        if self._last_change_ts is not None:
+            held_sec = max(0.0, time.time() - float(self._last_change_ts))
+        min_conf = float(getattr(config, "REGIME_ACTION_MIN_CONF", 0.50))
+        min_hold = float(getattr(config, "REGIME_ACTION_MIN_HOLD_SEC", 20.0))
+        actionable = (
+            rid not in ("unknown", "", None)
+            and sample_ok >= 0.5
+            and float(self._confidence) >= min_conf
+            and held_sec >= min_hold
+        )
         return {
             "regime_id": rid,
             "regime": legacy_label(rid),          # legacy quiet/normal/...
             "label": rid,                         # rich id (preferred)
             "legacy": legacy_label(rid),
             "confidence": float(self._confidence),
+            "sample_ok": sample_ok,
+            "held_sec": held_sec,
+            "actionable": bool(actionable),
             "features": feats,
             "vol_score": float(feats.get("vol", 0.0)),
             "trend_score": float(feats.get("trend", 0.0)),
@@ -923,6 +1110,23 @@ class RegimeDetector:
 # Process-wide singleton
 _detector: Optional[RegimeDetector] = None
 _detector_lock = threading.Lock()
+
+
+def is_actionable(snap: Optional[dict] = None) -> bool:
+    """True when downstream may apply regime policy (adapt / tilt / boost)."""
+    if snap is None:
+        try:
+            snap = get_detector().snapshot()
+        except Exception:
+            return False
+    if not isinstance(snap, dict):
+        return False
+    if "actionable" in snap:
+        return bool(snap["actionable"])
+    rid = snap.get("regime_id") or snap.get("label") or "unknown"
+    if rid in ("unknown", "", None):
+        return False
+    return True
 
 
 def get_detector() -> RegimeDetector:

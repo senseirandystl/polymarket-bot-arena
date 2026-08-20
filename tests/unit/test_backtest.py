@@ -157,7 +157,8 @@ def _synthetic_data(n_markets=4, yes_won=True, rising=True):
     base = 1_700_000_000
     markets, opens, closes, pm = [], [], [], {}
     px = 100000.0
-    step = 1.0005 if rising else 0.9995
+    # ~0.20%/min so |d_pct| and |z| clear the TWAP dual-gate after taker fees.
+    step = 1.0020 if rising else 0.9980
     for i in range(n_markets):
         o = base + i * 300
         markets.append(MarketRecord(

@@ -72,6 +72,11 @@ _OPENPRICE_BACKOFF_LOCK = threading.Lock()
 _OPENPRICE_VARIANT = "fiveminute"  # window-specific; other variants return sticky garbage
 
 
+def fetch_official_open_price(event_start_iso: str) -> Optional[float]:
+    """Public alias for the official PTB fetch (offline harness uses this)."""
+    return _fetch_polymarket_open_price(event_start_iso)
+
+
 def _fetch_polymarket_open_price(event_start_iso: str) -> Optional[float]:
     """Official Polymarket Price to Beat (Chainlink TWAP open at eventStartTime).
 
@@ -535,31 +540,23 @@ class StrikeRegistry:
             return rec.get("source") if rec else None
 
 
-def drift_signal(strike_price: Optional[float], btc_now: float,
-                 time_remaining: Optional[float],
-                 vol_scale: Optional[float] = None) -> float:
-    """Bounded, time-scaled BTC drift-from-strike signal in ``[-1, 1]``.
+def drift_z(strike_price: Optional[float], btc_now: float,
+            time_remaining: Optional[float],
+            vol_scale: Optional[float] = None) -> float:
+    """Time-scaled moneyness z = (TWAP−strike) / (σ_window · √frac).
 
-    ``>0`` = BTC above the strike (YES/Up favored), ``<0`` = below (NO/Down).
-    Magnitude scales with the drift as a fraction of remaining-window
-    volatility, so the same drift reads stronger as expiry nears.
-
-    Full-window vol scale (``vol_scale``) is **adaptive by default** from
-    TWAP (preferred) or spot 1m tape via ``signals.drift_scale``.
-
-    **Time-scale floor (2026-08-07):** ``σ_rem`` never uses effective remaining
-    time below ``DRIFT_TIME_SCALE_MIN_SEC`` (default 60s), so last-minute TWAP
-    noise cannot explode z into fake "strong" drift.
+    This is the binary-settlement score. ``tanh(z)`` is only a bounded
+    *lane* — edge and lag must use ``implied_up_prob`` (Φ(z)), not
+    ``0.5 + 0.5·tanh(z)`` (that maps a 5 bp TWAP wiggle to ~78¢).
     """
     if not strike_price or strike_price <= 0 or not btc_now or btc_now <= 0:
         return 0.0
-    drift_pct = (btc_now - strike_price) / strike_price
+    drift_pct = (float(btc_now) - float(strike_price)) / float(strike_price)
     if drift_pct == 0.0:
         return 0.0
     window = float(getattr(config, "MARKET_WINDOW_SEC", 300) or 300)
     tr_raw = float(time_remaining if time_remaining is not None else window)
     tr_raw = max(tr_raw, 10.0)
-    # Floor the *time factor* so late-window noise cannot dominate.
     t_floor = float(getattr(config, "DRIFT_TIME_SCALE_MIN_SEC", 60.0) or 60.0)
     t_floor = max(10.0, min(window, t_floor))
     tr_eff = max(tr_raw, t_floor)
@@ -574,8 +571,28 @@ def drift_signal(strike_price: Optional[float], btc_now: float,
     sigma_remaining = scale * math.sqrt(min(tr_eff, window) / window)
     if sigma_remaining <= 0:
         return 0.0
-    z = drift_pct / sigma_remaining
-    return math.tanh(z)
+    return drift_pct / sigma_remaining
+
+
+def implied_up_prob(strike_price: Optional[float], btc_now: float,
+                    time_remaining: Optional[float],
+                    vol_scale: Optional[float] = None) -> float:
+    """P(TWAP_close ≥ strike) ≈ Φ(z). Honest binary probability.
+
+    Do not substitute ``0.5 + 0.5·btc_drift`` — tanh saturation is not a
+    probability. A 5 bp mid-window TWAP move is ~55–65¢, not 78¢.
+    """
+    z = drift_z(strike_price, btc_now, time_remaining, vol_scale=vol_scale)
+    return 0.5 * (1.0 + math.erf(z / math.sqrt(2.0)))
+
+
+def drift_signal(strike_price: Optional[float], btc_now: float,
+                 time_remaining: Optional[float],
+                 vol_scale: Optional[float] = None) -> float:
+    """Bounded lane in ``[-1, 1]``: ``tanh(z)``. Not a probability."""
+    return math.tanh(drift_z(
+        strike_price, btc_now, time_remaining, vol_scale=vol_scale,
+    ))
 
 
 def drift_pct(strike_price: Optional[float], btc_now: float) -> float:

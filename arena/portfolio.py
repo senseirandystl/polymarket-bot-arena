@@ -52,6 +52,28 @@ METHODS = ("equal", "sharpe", "expectancy", "kelly_portfolio")
 _weight_cache: tuple = (0.0, False, {}, 0)
 
 
+def effective_windows(long_h: float | None = None) -> dict[str, float | int]:
+    """Operator lookback plus a fast window and sample floor that scale with it.
+
+    A 3h save must not keep a 12h "fast" window or a 20-trade floor that
+    starves every bot. 48h (config default) keeps the historical 12h / 20.
+    """
+    default = float(getattr(config, "PORTFOLIO_WINDOW_HOURS", 48))
+    try:
+        long = float(long_h if long_h is not None else default)
+    except (TypeError, ValueError):
+        long = default
+    if not math.isfinite(long):
+        long = default
+    long = max(1.0, min(168.0, long))
+    cfg_fast = float(getattr(config, "PORTFOLIO_FAST_WINDOW_HOURS", 12) or 12)
+    fast = min(cfg_fast, max(1.0, long * 0.25))
+    cfg_min = int(getattr(config, "PORTFOLIO_MIN_TRADES", 6))
+    floor = int(getattr(config, "PORTFOLIO_MIN_TRADES_FLOOR", 4))
+    min_trades = max(floor, int(round(cfg_min * long / 48.0)))
+    return {"long": long, "fast": fast, "min_trades": min_trades}
+
+
 # ---------------------------------------------------------------------------
 # Metrics + correlation
 # ---------------------------------------------------------------------------
@@ -250,13 +272,15 @@ def compute_metrics(
     Dual-window blend (2026-08): long lookback stabilizes weights; short
     window keeps freshness without letting a lucky 6–12h streak dominate.
     ``ready`` / ``n`` use the long window so sample floors stay honest.
+    Fast window and min_trades scale down when the operator picks a short
+    long-window (3h / 6h) so readiness is still reachable.
     """
-    long_h = float(hours if hours is not None else
-                   getattr(config, "PORTFOLIO_WINDOW_HOURS", 48))
-    fast_h = float(getattr(config, "PORTFOLIO_FAST_WINDOW_HOURS", 12))
+    wins = effective_windows(hours)
+    long_h = float(wins["long"])
+    fast_h = float(wins["fast"])
     long_w = float(getattr(config, "PORTFOLIO_LONG_WEIGHT", 0.65))
     long_w = max(0.0, min(1.0, long_w))
-    min_trades = int(getattr(config, "PORTFOLIO_MIN_TRADES", 20))
+    min_trades = int(wins["min_trades"])
 
     long_pnls = _resolved_pnls_by_bot(bot_names, long_h)
     metrics = _metrics_from_pnls(bot_names, long_pnls, min_trades)
@@ -265,7 +289,10 @@ def compute_metrics(
         fast_pnls = _resolved_pnls_by_bot(bot_names, fast_h)
         # Fast window uses a lower sample floor so it can contribute signal
         # without requiring a full long-window count in 12h.
-        fast_min = max(8, min_trades // 2)
+        fast_min = max(
+            int(getattr(config, "PORTFOLIO_MIN_TRADES_FLOOR", 4)),
+            min_trades // 2,
+        )
         fast_ready_n = int(getattr(
             config, "PORTFOLIO_FAST_READY_MIN_TRADES", 12))
         fast_ready_on = bool(getattr(
@@ -571,8 +598,7 @@ def allocate(
     """
     names = list(dict.fromkeys(bot_names))  # stable unique
     method = method if method in METHODS else "equal"
-    hours = float(hours if hours is not None else
-                  getattr(config, "PORTFOLIO_WINDOW_HOURS", 24))
+    hours = float(effective_windows(hours)["long"])
     min_w = float(getattr(config, "PORTFOLIO_MIN_WEIGHT", 0.05))
     max_w = float(getattr(config, "PORTFOLIO_MAX_WEIGHT", 0.45))
     overrides = {k: float(v) for k, v in (manual_overrides or {}).items()
@@ -968,8 +994,11 @@ def load_state() -> dict[str, Any]:
     method = base.get("method") or "kelly_portfolio"
     base["method"] = method if method in METHODS else "kelly_portfolio"
     try:
-        base["window_hours"] = float(base.get("window_hours") or
-                                     getattr(config, "PORTFOLIO_WINDOW_HOURS", 24))
+        wh = base.get("window_hours")
+        base["window_hours"] = float(
+            wh if wh is not None
+            else getattr(config, "PORTFOLIO_WINDOW_HOURS", 48)
+        )
     except (TypeError, ValueError):
         base["window_hours"] = float(getattr(config, "PORTFOLIO_WINDOW_HOURS", 24))
     for key in ("weights", "auto_weights", "manual_overrides", "metrics",
@@ -1041,6 +1070,15 @@ def rebalance(
         and regime != last_regime
         and regime not in ("unknown",)
     )
+    if regime_changed:
+        try:
+            from signals.regime_detector import get_detector
+            snap = get_detector().snapshot() or {}
+            if (snap.get("regime_id") or snap.get("label")) == regime:
+                if not snap.get("actionable", False):
+                    regime_changed = False
+        except Exception:
+            pass
     # Dwell gate: only rebalance on regime after the *new* regime has been
     # held long enough. Quiet-tape boundary chatter was flipping every few
     # minutes and thrashing weights (133 rebalances overnight).
@@ -1073,8 +1111,11 @@ def rebalance(
             reason = "timer"
 
     method = state.get("method") or getattr(config, "PORTFOLIO_METHOD", "kelly_portfolio")
-    # Always prefer live config for window (stale 3h state broke readiness)
-    hours = float(getattr(config, "PORTFOLIO_WINDOW_HOURS", 48))
+    # Operator-saved lookback is source of truth; config is the default only.
+    # (A previous override always slammed PORTFOLIO_WINDOW_HOURS=48, so
+    # dashboard 3h/6h saves appeared to fail.)
+    wins = effective_windows(state.get("window_hours"))
+    hours = float(wins["long"])
     state["window_hours"] = hours
     overrides = state.get("manual_overrides") or {}
     prev_weights = dict(state.get("weights") or {})
@@ -1139,7 +1180,9 @@ def rebalance(
         "metrics": result["metrics"],
         "correlations": result["correlations"],
         "method": result["method"],
-        "window_hours": result["window_hours"],
+        "window_hours": hours,
+        "fast_window_hours": float(wins["fast"]),
+        "min_trades": int(wins["min_trades"]),
         "last_rebalance_at": now,
         "last_regime": regime,
         "rebalance_reason": reason,
@@ -1302,4 +1345,7 @@ def dashboard_snapshot() -> dict[str, Any]:
     ):
         # Soft refresh without waiting for timer when roster changed
         state = rebalance(force=True, reason="roster_sync", bot_names=names)
+    wins = effective_windows(state.get("window_hours"))
+    state["fast_window_hours"] = float(wins["fast"])
+    state["min_trades"] = int(wins["min_trades"])
     return state

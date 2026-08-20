@@ -44,6 +44,18 @@ def trading_fee(shares: float, price: float, *, is_maker: bool) -> float:
     return taker_fee(shares, price)
 
 
+def affordable_spend(available: float, price: float, *,
+                     is_maker: bool) -> float:
+    """Max USDC spend such that cost + fee ≤ ``available``."""
+    if available <= 0 or price <= 0:
+        return 0.0
+    if is_maker:
+        return float(available)
+    rate = float(config.POLYMARKET_TAKER_FEE_RATE)
+    # spend * (1 + rate*(1-p)) = available
+    return float(available) / (1.0 + rate * (1.0 - float(price)))
+
+
 def fee_per_share(price: float, *, is_maker: bool) -> float:
     """Per-share fee used in edge math (1 share notional)."""
     return trading_fee(1.0, price, is_maker=is_maker)
@@ -81,7 +93,9 @@ def limit_buy_price(book: dict, mid: float | None = None,
         if mid is not None:
             return round(max(tick, min(mid, (ask or mid) - tick)), 4)
         return round(max(tick, (ask or 0.5) - tick), 4)
-    if mode == "aggressive":
+    if mode in ("aggressive", "cap_ask"):
+        # Immediate fill at the touch — limit-capped taker (no book walk
+        # past the displayed ask). Honest fee = taker.
         if ask is not None:
             return round(ask, 4)
         if mid is not None:

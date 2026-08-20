@@ -646,6 +646,21 @@ def _evolution_check_loop(bots, state, pos_monitor, trader, maker_bots=None):
                     flush()
                     maybe_rollup()
                     try:
+                        from arena.live_scorecard import maybe_refresh
+                        maybe_refresh()
+                    except Exception as se:
+                        logger.debug("live_scorecard: %s", se)
+                    try:
+                        from arena.gate_tuner import maybe_tune
+                        maybe_tune()
+                    except Exception as ge:
+                        logger.debug("gate_tuner: %s", ge)
+                    try:
+                        from arena.combo_explorer import maybe_refresh as combo_refresh
+                        combo_refresh()
+                    except Exception as ce:
+                        logger.debug("combo_explorer: %s", ce)
+                    try:
                         from arena.learned_rules import mine_and_update
                         mine_and_update()
                     except Exception as le:

@@ -10,7 +10,7 @@ from evolution.ga import EVOLUTION_EXEMPT_TYPES
 import polymarket_fills
 
 
-def _signals(drift=0.85, prices=None):
+def _signals(drift=0.98, prices=None):
     prices = prices or [100.0, 100.05, 100.08]
     return {
         "btc_drift": drift,
@@ -34,7 +34,7 @@ def _market(**kw):
 
 def test_buys_locked_yes_in_fee_curve_extreme():
     bot = SweeperBot(name="sweeper-test")
-    d = bot.make_decision(_market(), _signals(drift=0.85))
+    d = bot.make_decision(_market(), _signals(drift=0.98))
     assert d["action"] == "buy"
     assert d["side"] == "yes"
     assert d["edge"] > 0
@@ -52,9 +52,36 @@ def test_buys_locked_no_when_drift_negative():
         yes_ask=0.020,
         no_ask=0.988,
     )
-    d = bot.make_decision(market, _signals(drift=-0.85, prices=[100.0, 99.95, 99.90]))
+    d = bot.make_decision(market, _signals(drift=-0.98, prices=[100.0, 99.95, 99.90]))
     assert d["action"] == "buy"
     assert d["side"] == "no"
+
+
+def test_legacy_inflated_min_drift_is_clamped():
+    """DB/evolved 0.65 assumed 5 bp printed as tanh 0.75.
+
+    Clamp still applies, but tanh 0.40 is Φ≈0.66 — not a 98¢ lock
+    (overnight 02:34: tanh 0.455 @ 99¢ NO lost $5.70).
+    """
+    bot = SweeperBot(name="sweeper-legacy", params={**DEFAULT_PARAMS, "min_drift": 0.65})
+    d = bot.make_decision(_market(), _signals(drift=0.40))
+    assert d["action"] == "skip"
+
+
+def test_skips_modest_tanh_at_fee_extreme():
+    """Sweeper edge = 1−ask−fee assumes P=1. Φ must actually be a lock."""
+    bot = SweeperBot(name="sweeper-notlock")
+    market = _market(
+        current_price=0.015,
+        no_price=0.985,
+        yes_ask=0.020,
+        no_ask=0.990,
+        time_remaining_seconds=56,
+    )
+    d = bot.make_decision(
+        market, _signals(drift=-0.455, prices=[100.0, 99.95, 99.90]),
+    )
+    assert d["action"] == "skip"
 
 
 def test_skips_outside_entry_window():
@@ -71,8 +98,8 @@ def test_skips_outside_settlement_horizon():
     """Default entry window = pre_settle + TWAP window (80s under 60s TWAP)."""
     bot = SweeperBot(name="sweeper-test")
     assert DEFAULT_PARAMS["entry_window_sec"] == 80
-    assert DEFAULT_PARAMS["min_drift"] == 0.65
-    assert DEFAULT_PARAMS["min_twap_certainty"] == 0.55
+    assert DEFAULT_PARAMS["min_drift"] == 0.32
+    assert DEFAULT_PARAMS["min_twap_certainty"] == 0.45
     # rem=100 is outside the 80s horizon
     d = bot.make_decision(
         _market(time_remaining_seconds=100),
@@ -156,3 +183,36 @@ def test_settlement_edge_matches_fee_formula():
 
 def test_evolution_exempt():
     assert "sweeper" in EVOLUTION_EXEMPT_TYPES
+
+
+def test_coverage_outage_does_not_block_locked_book():
+    """Missing settlement ticks ≠ uncertain TWAP — cert floor would starve."""
+    bot = SweeperBot(name="sweeper-test")
+    sigs = _signals(drift=0.98)
+    sigs["in_settlement_window"] = True
+    sigs["market_phase"] = "settlement"
+    sigs["twap_certainty"] = 0.10
+    sigs["settlement_policy"] = {
+        "phase": "settlement",
+        "certainty": 0.10,
+        "coverage_outage": True,
+    }
+    d = bot.make_decision(_market(time_remaining_seconds=25), sigs)
+    assert d["action"] == "buy"
+    assert d["side"] == "yes"
+
+
+def test_low_cert_without_outage_still_skips():
+    bot = SweeperBot(name="sweeper-test")
+    sigs = _signals(drift=0.85)
+    sigs["in_settlement_window"] = True
+    sigs["market_phase"] = "settlement"
+    sigs["twap_certainty"] = 0.10
+    sigs["settlement_policy"] = {
+        "phase": "settlement",
+        "certainty": 0.10,
+        "coverage_outage": False,
+    }
+    d = bot.make_decision(_market(time_remaining_seconds=25), sigs)
+    assert d["action"] == "skip"
+    assert d.get("skip_reason") == "twap_certainty"

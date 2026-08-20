@@ -122,6 +122,21 @@ def test_registry_corrects_rest_when_twap_open_appears():
         assert reg.get_source("m-fix") == "twap_open"
 
 
+def test_five_bp_twap_stays_modest_under_vol_floor():
+    """σ floor 0.18% so a 5 bp mid-window move cannot print as 75¢+."""
+    import config
+    assert config.DRIFT_VOL_SCALE_MIN >= 0.0017
+    p = strike.implied_up_prob(100_000.0, 100_050.0, 180.0, vol_scale=0.0005)
+    assert 0.52 <= p <= 0.70
+
+
+def test_implied_up_prob_symmetric():
+    k, tr, scale = 100_000.0, 150.0, 0.0022
+    up = strike.implied_up_prob(k, 100_080.0, tr, vol_scale=scale)
+    dn = strike.implied_up_prob(k, 99_920.0, tr, vol_scale=scale)
+    assert abs((up + dn) - 1.0) < 1e-9
+
+
 def test_drift_positive_when_btc_above_strike():
     # Fixed vol_scale keeps tests independent of adaptive EMA state.
     assert strike.drift_signal(100000.0, 100200.0, 60, vol_scale=0.0015) > 0

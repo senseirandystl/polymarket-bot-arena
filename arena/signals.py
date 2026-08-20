@@ -123,6 +123,8 @@ def build_combined_signals(
     btc_drift = 0.0
     btc_strike = None
     btc_drift_pct = 0.0
+    btc_implied_yes = 0.5
+    btc_drift_z = 0.0
     resolution_meta: dict = {
         "btc_now": 0.0,
         "source": "none",
@@ -170,9 +172,14 @@ def build_combined_signals(
                     pass
 
             ticks = []
-            if price_feed is not None and hasattr(price_feed, "btc_spot_ticks"):
+            if price_feed is not None:
                 try:
-                    ticks = price_feed.btc_spot_ticks()
+                    # Settlement is a TWAP object — do not mix in denser spot
+                    # ticks (that averages the wrong series vs TWAP-open strike).
+                    if hasattr(price_feed, "btc_twap_ticks"):
+                        ticks = list(price_feed.btc_twap_ticks() or [])
+                    if not ticks and hasattr(price_feed, "btc_spot_ticks"):
+                        ticks = list(price_feed.btc_spot_ticks() or [])
                 except Exception:
                     ticks = []
 
@@ -212,6 +219,16 @@ def build_combined_signals(
             btc_drift_pct = _drift_pct(btc_strike, btc_now)
             btc_drift = drift_signal(
                 btc_strike, btc_now, tr, vol_scale=drift_vol_scale)
+            try:
+                from signals.strike import implied_up_prob as _imp
+                from signals.strike import drift_z as _dz
+                btc_implied_yes = float(_imp(
+                    btc_strike, btc_now, tr, vol_scale=drift_vol_scale))
+                btc_drift_z = float(_dz(
+                    btc_strike, btc_now, tr, vol_scale=drift_vol_scale))
+            except Exception:
+                btc_implied_yes = 0.5
+                btc_drift_z = 0.0
         try:
             from signals import twap as twap_mod
             if resolution_meta.get("in_settlement_window"):
@@ -284,6 +301,35 @@ def build_combined_signals(
                     twap_px = None
         except Exception:
             twap_px = None
+        pm_state = None
+        try:
+            yes_px = no_px = None
+            if market is not None:
+                yes_px = market.get("current_price") or market.get("yes_price")
+                no_px = market.get("no_price")
+            if warm is not None:
+                if warm.get("yes_price") is not None:
+                    yes_px = warm.get("yes_price")
+                if warm.get("no_price") is not None:
+                    no_px = warm.get("no_price")
+            spread_score = 0.5
+            src = warm if warm is not None else market
+            if src is not None and src.get("micro_spread_score") is not None:
+                spread_score = float(src.get("micro_spread_score") or 0.5)
+            yes_f = float(yes_px or 0.0)
+            no_f = float(no_px or 0.0)
+            # Omit sidecar until both sides exist — a 0.5 default quality
+            # would otherwise haircut confidence every tick on a cold book.
+            pm_state = (
+                {"spread_score": spread_score, "yes_price": yes_f, "no_price": no_f}
+                if yes_f > 0 and no_f > 0 else None
+            )
+        except (TypeError, ValueError):
+            pm_state = None
+        try:
+            xasset_score = float(xasset.get("xasset_score") or 0.0)
+        except (TypeError, ValueError, AttributeError):
+            xasset_score = None
         market_regime = get_detector().update(
             btc_prices,
             cvd=cvd,
@@ -297,6 +343,8 @@ def build_combined_signals(
                 if market is not None else None
             ),
             twap_prices=twap_px,
+            pm_state=pm_state,
+            xasset_score=xasset_score,
         )
     except Exception as e:
         logger.debug(f"regime detector update failed: {e}")
@@ -389,6 +437,8 @@ def build_combined_signals(
         "cvd": cvd,
         "btc_drift": btc_drift,
         "btc_drift_pct": btc_drift_pct,
+        "btc_implied_yes": btc_implied_yes,
+        "btc_drift_z": btc_drift_z,
         "btc_strike": btc_strike,
         "btc_now": float(resolution_meta.get("btc_now") or 0.0),
         "btc_spot": btc_spot,

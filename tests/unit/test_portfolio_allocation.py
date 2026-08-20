@@ -179,6 +179,63 @@ def test_neg_expectancy_strips_manual_override():
     assert "sweeper-v1" not in (result.get("manual_overrides") or {})
 
 
+def test_effective_windows_scales_short_lookback():
+    w48 = portfolio.effective_windows(48)
+    assert w48["long"] == pytest.approx(48.0)
+    assert w48["fast"] == pytest.approx(12.0)
+    assert w48["min_trades"] == 6
+    w3 = portfolio.effective_windows(3)
+    assert w3["long"] == pytest.approx(3.0)
+    assert w3["fast"] <= 12.0
+    assert w3["fast"] == pytest.approx(max(1.0, 3.0 * 0.25))
+    assert w3["min_trades"] == 4
+    w6 = portfolio.effective_windows(6)
+    assert w6["min_trades"] == 4  # floor; 6×6/48 rounds below 4
+    assert w6["fast"] == pytest.approx(1.5)
+
+
+def test_rebalance_keeps_saved_window_hours(monkeypatch):
+    """Operator 3h lookback must survive rebalance (not slam back to 48)."""
+    names = ["phantom-v1", "sniper-v1"]
+    monkeypatch.setattr(portfolio, "active_bot_names", lambda: names)
+    monkeypatch.setattr(portfolio, "_current_regime_label", lambda: "normal")
+    saved = {}
+
+    def fake_save(state):
+        saved.update(state)
+
+    monkeypatch.setattr(portfolio, "save_state", fake_save)
+    monkeypatch.setattr(portfolio, "load_state", lambda: {
+        "enabled": True,
+        "method": "equal",
+        "window_hours": 3.0,
+        "weights": {},
+        "manual_overrides": {},
+        "last_rebalance_at": 0.0,
+        "last_regime": "normal",
+    })
+    captured = {}
+
+    def fake_allocate(bot_names, method="equal", **kwargs):
+        captured["hours"] = kwargs.get("hours")
+        n = list(bot_names)
+        return {
+            "weights": {x: 1.0 / len(n) for x in n},
+            "auto_weights": {x: 1.0 / len(n) for x in n},
+            "manual_overrides": {},
+            "metrics": {},
+            "correlations": {},
+            "method": method,
+            "window_hours": kwargs.get("hours"),
+        }
+
+    monkeypatch.setattr(portfolio, "allocate", fake_allocate)
+    state = portfolio.rebalance(force=True, reason="window_change")
+    assert captured["hours"] == pytest.approx(3.0)
+    assert state["window_hours"] == pytest.approx(3.0)
+    assert saved["window_hours"] == pytest.approx(3.0)
+
+
 def test_rebalance_force_evolution_reason(monkeypatch):
     """Post-GA path uses force=True + reason=evolution on the new roster."""
     names = ["phantom-v1", "hybrid-g4-158", "sniper-g4-144"]

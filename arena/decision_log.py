@@ -104,12 +104,20 @@ def classify_skip_reason(
         return "dead_zone"
     if "extreme-drift" in why or "extreme drift" in why:
         return "extreme_drift"
+    if "price-quality" in why or "price quality" in why:
+        return "price_quality"
+    if "no fade thesis" in why or "no_thesis" in why:
+        return "no_thesis"
     if "mid-band lag" in why or "mid-band" in why:
         return "mid_band"
     if "underdog band" in why or "underdog" in why:
         return "underdog"
     if "no-side drift" in why or "no-side lag" in why:
         return "no_side_gate"
+    if "quiet-regime" in why or "quiet_drift" in why:
+        return "quiet_drift"
+    if "no lag edge" in why or "no_lag_edge" in why:
+        return "no_lag_edge"
     if "drift dual-gate" in why or "dual-gate" in why:
         return "drift_dual_gate"
     if "drift veto" in why:
@@ -367,12 +375,7 @@ def _hyp_pnl(side: str, market_up: bool, entry_price: float | None) -> float | N
     if entry_price is None:
         return None
     cost = max(0.01, min(0.99, float(entry_price)))
-    fee = polymarket_fills.fee_per_share(
-        cost,
-        is_maker=(getattr(config, "ORDER_STYLE", "limit") == "limit"
-                  and getattr(config, "LIMIT_PRICE_MODE", "passive_mid")
-                  in ("passive_mid", "join_bid")),
-    )
+    fee = polymarket_fills.fee_per_share(cost, is_maker=False)
     won = (side == "yes" and market_up) or (side == "no" and not market_up)
     return (1.0 - cost - fee) if won else (-cost - fee)
 
@@ -451,21 +454,33 @@ def resolve_from_resolution_map(resolved: dict) -> int:
 # ---------------------------------------------------------------------------
 
 def core_lane_attribution(conn, deadband: float = 0.05,
-                          *, strategy_type: str | None = None) -> dict:
+                          *, strategy_type: str | None = None,
+                          unique_market: bool = True) -> dict:
     """{strategy_type: {lane: {n, accuracy}}} from resolved decision_events.
 
-    Uses ALL sided-or-lane-bearing decisions, not just placed trades.
+    Default is one row per (strategy, market) so tick storms cannot inflate
+    accuracy. Pass unique_market=False for the raw tick series.
     """
     lanes = ("drift", "mom", "strat")
-    q = """SELECT strategy_type, market_up, drift, mom, strat
-           FROM decision_events
-           WHERE market_up IS NOT NULL
-             AND (drift IS NOT NULL OR mom IS NOT NULL OR strat IS NOT NULL)"""
-    params: list = []
-    if strategy_type:
-        q += " AND strategy_type=?"
-        params.append(strategy_type)
-    rows = conn.execute(q, params).fetchall()
+    if unique_market:
+        try:
+            from arena.live_scorecard import unique_market_rows
+            raw = unique_market_rows(conn)
+            if strategy_type:
+                raw = [r for r in raw if r.get("strategy_type") == strategy_type]
+            rows = raw
+        except Exception:
+            return {}
+    if not unique_market:
+        q = """SELECT strategy_type, market_up, drift, mom, strat
+               FROM decision_events
+               WHERE market_up IS NOT NULL
+                 AND (drift IS NOT NULL OR mom IS NOT NULL OR strat IS NOT NULL)"""
+        params: list = []
+        if strategy_type:
+            q += " AND strategy_type=?"
+            params.append(strategy_type)
+        rows = conn.execute(q, params).fetchall()
     agg: dict = {}
     for r in rows:
         st = r["strategy_type"] or "unknown"
@@ -492,21 +507,40 @@ def core_lane_attribution(conn, deadband: float = 0.05,
 
 
 def candidate_lane_attribution(conn, lane: str, deadband: float = 0.05,
-                               *, since: str | None = None) -> dict:
+                               *, since: str | None = None,
+                               unique_market: bool = True) -> dict:
     """Shadow accuracy + net edge for fut/tech/xasset from decision_events."""
     col = {"fut": "fut", "tech": "tech", "xasset": "xasset"}.get(lane)
     if not col:
         return {"n": 0, "accuracy": None, "net_edge": None}
-    q = f"""SELECT market_up, side, entry_price, {col} AS reading
-            FROM decision_events
-            WHERE market_up IS NOT NULL AND {col} IS NOT NULL"""
-    params: list = []
-    if since:
-        q += " AND created_at >= ?"
-        params.append(since)
-    rows = conn.execute(q, params).fetchall()
+    if unique_market and not since:
+        try:
+            from arena.live_scorecard import unique_market_rows
+            raw = unique_market_rows(conn)
+            rows = [
+                {"market_up": r.get("market_up"), "side": r.get("side"),
+                 "entry_price": r.get("entry_price"), "reading": r.get(col)}
+                for r in raw if r.get(col) is not None
+            ]
+            if not rows:
+                return {"n": 0, "accuracy": None, "net_edge": None}
+        except Exception:
+            return {"n": 0, "accuracy": None, "net_edge": None}
+    else:
+        unique_market = False
+        rows = []
+    if not unique_market:
+        q = f"""SELECT market_up, side, entry_price, {col} AS reading
+                FROM decision_events
+                WHERE market_up IS NOT NULL AND {col} IS NOT NULL"""
+        params: list = []
+        if since:
+            q += " AND created_at >= ?"
+            params.append(since)
+        rows = conn.execute(q, params).fetchall()
     n = correct = 0
     edge_sum = 0.0
+    n_edge = 0
     for r in rows:
         reading = float(r["reading"])
         if abs(reading) < deadband:
@@ -516,12 +550,13 @@ def candidate_lane_attribution(conn, lane: str, deadband: float = 0.05,
         ok = pred_up == market_up
         n += 1
         correct += int(ok)
-        # Hyp cost of following the lane sign
         entry = r["entry_price"]
         try:
-            entry = float(entry) if entry is not None else 0.5
+            entry = float(entry) if entry is not None else None
         except (TypeError, ValueError):
-            entry = 0.5
+            entry = None
+        if entry is None:
+            continue
         side = r["side"]
         if (pred_up and side == "yes") or ((not pred_up) and side == "no"):
             cost = entry
@@ -529,10 +564,11 @@ def candidate_lane_attribution(conn, lane: str, deadband: float = 0.05,
             cost = max(0.01, min(0.99, 1.0 - entry))
         fee = polymarket_fills.taker_fee(1.0, cost)
         edge_sum += ((1.0 - cost - fee) if ok else (-cost - fee))
+        n_edge += 1
     return {
         "n": n,
         "accuracy": (correct / n) if n else None,
-        "net_edge": (edge_sum / n) if n else None,
+        "net_edge": (edge_sum / n_edge) if n_edge else None,
     }
 
 

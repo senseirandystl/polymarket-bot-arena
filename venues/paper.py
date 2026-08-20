@@ -87,7 +87,6 @@ class PaperEngine:
                 )
                 return TradeResult(success=False, reason="insufficient_bankroll")
         elif use_limit:
-            spend = min(amount or 0.0, available)
             mid = None
             if side == "yes":
                 mid = market.get("current_price") or market.get("yes_price")
@@ -98,6 +97,12 @@ class PaperEngine:
                 lim = polymarket_fills.limit_buy_price(book, mid=mid)
             if lim is None:
                 return TradeResult(success=False, reason="no_limit_price")
+            spend = min(
+                amount or 0.0,
+                polymarket_fills.affordable_spend(
+                    available, lim, is_maker=False,
+                ),
+            )
             fill = polymarket_fills.simulate_limit_buy(book, spend, lim)
             if not fill.get("filled"):
                 return TradeResult(success=False, reason="limit_unfilled")

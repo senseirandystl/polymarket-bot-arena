@@ -92,7 +92,9 @@ def test_without_warm_book_slippage_band_still_rejects_moved_fetch(
     monkeypatch.setattr(polymarket_markets, "get_order_book", lambda token: moved)
     result = bot.execute(decision, market)
     assert not result["success"]
-    assert result.get("reason") in ("slippage_band", "slippage_exceeded")
+    assert result.get("reason") in (
+        "slippage_band", "slippage_exceeded", "limit_unfilled",
+    )
 
 
 def test_late_window_maker_entry_price_uses_ask_not_mid():

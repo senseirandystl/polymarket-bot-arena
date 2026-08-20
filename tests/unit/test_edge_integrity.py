@@ -144,11 +144,12 @@ def test_consistent_books_unaffected():
 
 def test_entry_price_uses_executable_ask():
     bot = _bot()
-    m = _market(yes=0.52, no=0.49)
-    m["yes_ask"] = 0.55
+    # Deep underdog (outside 38–50 shallow-lag sit-flat).
+    m = _market(yes=0.36, no=0.63)
+    m["yes_ask"] = 0.37
     d = bot.make_decision(m, _trending_sig(drift=0.6, up=True))
     assert d["action"] == "buy" and d["side"] == "yes"
-    assert abs(d["entry_price"] - 0.55) < 1e-9
+    assert abs(d["entry_price"] - 0.37) < 1e-9
 
 
 def test_wide_spread_kills_marginal_edge_at_decision_time():
@@ -156,8 +157,10 @@ def test_wide_spread_kills_marginal_edge_at_decision_time():
     # executable ask eats it (this used to fire, then die at the fill).
     # Marginal case: drift-pure meanrev, model ~0.62 — edge at the 0.52 mid,
     # none at a 0.60 ask.
-    bot = MeanRevBot(name="mr-test", generation=0)
-    sig = _sig(btc_drift=0.35)
+    bot = _bot()
+    # Drift high enough that taker-fee-priced edge still clears MIN_EDGE
+    # at the tight mid (0.52) — the invariant is ask-vs-mid, not a maker rebate.
+    sig = _trending_sig(drift=0.50, up=True)
     m_tight = _market(yes=0.52, no=0.48)
     d_tight = bot.make_decision(m_tight, sig)
     assert d_tight["action"] == "buy"
@@ -167,7 +170,7 @@ def test_wide_spread_kills_marginal_edge_at_decision_time():
     # the current floor — the invariant under test is that edge is priced at
     # the executable ASK (BUG #27/#28), not the mid, so a marginal edge that
     # only exists at the mid dies once the ask eats it.
-    m_wide["yes_ask"] = 0.62
+    m_wide["yes_ask"] = 0.72
     d_wide = bot.make_decision(m_wide, sig)
     assert d_wide["action"] == "skip"
 
@@ -186,7 +189,7 @@ def test_book_sum_gate_still_uses_mids():
     # Ask prices sum > 1 on any normal spread — the consistency gate must
     # keep judging the MIDS, not the asks.
     bot = _bot()
-    m = _market(yes=0.52, no=0.49)
-    m["yes_ask"], m["no_ask"] = 0.55, 0.52   # asks sum 1.07: fine
+    m = _market(yes=0.36, no=0.63)
+    m["yes_ask"], m["no_ask"] = 0.37, 0.65   # asks sum 1.02: fine
     d = bot.make_decision(m, _trending_sig(drift=0.6, up=True))
     assert d["action"] == "buy"

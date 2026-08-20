@@ -83,6 +83,7 @@ def check_proposals() -> dict:
     min_trades = getattr(config, "AUTO_APPROVE_MIN_TRADES", 60)
     min_acc = getattr(config, "AUTO_APPROVE_MIN_ACCURACY", 0.55)
     min_net = getattr(config, "AUTO_APPROVE_MIN_NET_EDGE", 0.005)
+    min_fills = int(getattr(config, "AUTO_APPROVE_MIN_FILLS", 15) or 15)
     max_active = getattr(config, "AUTO_APPROVE_MAX_ACTIVE", 3)
     deadband = getattr(config, "LANE_MONITOR_DEADBAND", 0.05)
 
@@ -104,18 +105,40 @@ def check_proposals() -> dict:
             stats = _shadow_accuracy(conn, lane, deadband)
             acc = stats["accuracy"]
             net = stats.get("net_edge")
-            clears = (
+            # Fill-level bar: harness + tick shadow cannot promote alone.
+            fill = {"n": 0, "accuracy": None, "net_edge": None}
+            try:
+                trows = conn.execute(
+                    """SELECT side, outcome, reasoning, entry_price FROM trades
+                       WHERE outcome IN ('win', 'loss') AND reasoning LIKE '%cand(%'"""
+                ).fetchall()
+                fill = _lane_accuracy(trows, lane, deadband)
+            except Exception:
+                pass
+            fill_n = int(fill.get("n") or 0)
+            fill_net = fill.get("net_edge")
+            fill_ok = (
+                fill_n >= min_fills
+                and fill_net is not None
+                and float(fill_net) >= float(min_net)
+            )
+            shadow_ok = (
                 stats["n"] >= min_trades
                 and acc is not None and acc >= min_acc
                 and net is not None and net >= min_net
             )
-            verdict = "collecting"
-            if stats["n"] >= min_trades:
+            clears = shadow_ok and fill_ok
+            if stats["n"] < min_trades or fill_n < min_fills:
+                verdict = "collecting"
+            else:
                 verdict = "clears_bar" if clears else "below_bar"
             report[lane] = {
                 **stats, "verdict": verdict, "proposal_id": p["id"],
                 "min_trades": min_trades, "min_accuracy": min_acc,
                 "min_net_edge": min_net,
+                "min_fills": min_fills,
+                "fill_n": fill_n,
+                "fill_net_edge": fill_net,
                 "auto_approve": auto_on,
             }
 

@@ -185,6 +185,11 @@ def _insert_cf_decision(db_module, votes, bucket, market_up,
 
 
 class TestCounterfactualUpdate:
+    @pytest.fixture(autouse=True)
+    def _enable_cf(self, monkeypatch):
+        import config as cfg
+        monkeypatch.setattr(cfg, "HYBRID_META_CF_ENABLED", True)
+
     def test_skip_votes_update_multipliers(self, arena_db):
         # market UP: momentum yes-vote correct, mean_rev no-vote wrong
         _insert_cf_decision(
@@ -245,6 +250,37 @@ class TestCounterfactualUpdate:
         snap = learner.snapshot()
         assert snap["subs"]["momentum"]["overall"]["n"] >= 1
         assert snap["subs"]["phantom"]["overall"]["n"] >= 1
+
+    def test_cf_disabled_skips_updates(self, arena_db, monkeypatch):
+        import config as cfg
+        monkeypatch.setattr(cfg, "HYBRID_META_CF_ENABLED", False)
+        _insert_cf_decision(
+            arena_db, {"momentum": 0.5}, "mixed", market_up=True)
+        learner = HybridMetaLearner(eta=0.12)
+        assert learner.update_from_decisions() == 0
+
+
+def test_hybrid_bot_caps_online_max_mult(monkeypatch):
+    import config as cfg
+    monkeypatch.setattr(cfg, "HYBRID_META_MAX_MULT", 1.2)
+    bot = HybridBot(name="hybrid-cap", params={"online_max_mult": 2.5})
+    assert bot._meta.max_mult == pytest.approx(1.2)
+
+
+def test_online_mults_clamps_persisted_cf_era(monkeypatch):
+    import config as cfg
+    monkeypatch.setattr(cfg, "HYBRID_META_MAX_MULT", 1.2)
+    bot = HybridBot(name="hybrid-clamp", params={"online_max_mult": 2.5})
+    bot._meta._state = {
+        "subs": {
+            "momentum": {
+                "overall": {"mult": 2.5, "n": 100},
+                "mixed": {"mult": 2.5, "n": 80},
+            }
+        }
+    }
+    mults = bot._meta.online_mults("mixed")
+    assert mults["momentum"] == pytest.approx(1.2)
 
 
 # ---------------------------------------------------------------------------

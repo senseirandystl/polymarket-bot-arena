@@ -105,10 +105,19 @@ class SharedArenaState:
             return len(self.traded)
 
     def reset(self) -> None:
-        """Clear the set.  Called by the coordinator after each evolution
-        cycle so surviving + new bots can re-evaluate the next window
-        immediately."""
+        """Clear ephemeral skip/lock state after an evolution cycle.
+
+        Rehydrate ``traded`` from recent fills. A bare clear (2026-08-20
+        08:33) let hybrid buy the same market twice 2s apart when GA ran
+        between the fills.
+        """
         with self._lock:
             self.traded.clear()
             self._slippage_until.clear()
             self._directional_locked.clear()
+        try:
+            import db
+            with db.get_conn() as conn:
+                self.load_from_db(conn)
+        except Exception:
+            pass

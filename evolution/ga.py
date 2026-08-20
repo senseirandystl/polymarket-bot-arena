@@ -151,10 +151,32 @@ def _effective_survival_pnl(ind: dict) -> float:
     return (1.0 - w) * pnl + w * recent_f
 
 
+def effective_min_trades(trade_counts: list[int] | None = None) -> int:
+    """Judgment floor scaled to the current directional trade rate.
+
+    Post-TWAP the slate may print 1–13 fills / 72h. A hard 40-trade bar then
+    makes every bot permanently IMMUNE (BUG #29 reprise). When the leader is
+    below the configured cap, require that many trades — so the leader can
+    be judged — but never drop below ``GA_MIN_TRADES_FLOOR``.
+    """
+    cap = int(config.MIN_TRADES_FOR_JUDGMENT)
+    if not getattr(config, "GA_MIN_TRADES_ADAPTIVE", True):
+        return cap
+    floor = int(getattr(config, "GA_MIN_TRADES_FLOOR", 12) or 12)
+    counts = [int(n or 0) for n in (trade_counts or [])]
+    mx = max(counts) if counts else 0
+    if mx >= cap:
+        return cap
+    if mx < floor:
+        return floor
+    return mx
+
+
 def _survives_legacy_bar(
     ind: dict,
     *,
     cycle_number: int | None = None,
+    min_n: int | None = None,
 ) -> bool:
     """Who is *eligible for replacement* (not for ranking).
 
@@ -167,7 +189,7 @@ def _survives_legacy_bar(
     recency-blended P&L, founder protect decays after N cycles.
     """
     n = int(ind.get("trades") or 0)
-    min_n = int(config.MIN_TRADES_FOR_JUDGMENT)
+    min_n = int(min_n if min_n is not None else config.MIN_TRADES_FOR_JUDGMENT)
     pnl = _effective_survival_pnl(ind)
     gap = ind.get("be_gap")
     gap_f = float(gap) if gap is not None else None
@@ -184,6 +206,22 @@ def _survives_legacy_bar(
             if pnl <= early_pnl and gap_bad:
                 return False  # replaceable despite thin n
         return True  # immune — not enough data
+
+    # Adaptive eligibility (n >= min_n) but below the configured 40-trade
+    # cap: only the catastrophic early-cull bar may replace. Stops a 20–39
+    # trade red dip from swapping in a cold mutant.
+    configured_cap = int(config.MIN_TRADES_FOR_JUDGMENT)
+    if n < configured_cap:
+        if (
+            bool(getattr(config, "GA_EARLY_CULL_ENABLED", True))
+            and n >= int(getattr(config, "GA_EARLY_CULL_MIN_TRADES", 15))
+        ):
+            early_pnl = float(getattr(config, "GA_EARLY_CULL_PNL", -15.0))
+            early_gap = float(getattr(config, "GA_EARLY_CULL_BE_GAP", -0.10))
+            gap_bad = gap_f is not None and gap_f <= early_gap
+            if pnl <= early_pnl and gap_bad:
+                return False
+        return True
 
     # Clear survival
     if pnl > 0:
@@ -311,6 +349,7 @@ def run_ga_cycle(
 
     n_elite = int(getattr(config, "GA_ELITE_COUNT", 1))
     n_elite = max(1, min(n_elite, len(individuals)))  # at least 1 elite safety net
+    min_n = effective_min_trades([int(i.get("trades") or 0) for i in individuals])
 
     # Classify: immune (too few trades), replaceable (fails survival bar), rest
     # Audit 3c: zombie check — a bot that is immune AND paused by the risk
@@ -318,9 +357,11 @@ def run_ga_cycle(
     require_surv = bool(getattr(config, "GA_ELITE_REQUIRE_SURVIVAL", True))
     zombie_replaced = []
     for ind in individuals:
-        survives = _survives_legacy_bar(ind, cycle_number=cycle_number)
+        survives = _survives_legacy_bar(
+            ind, cycle_number=cycle_number, min_n=min_n,
+        )
         n = int(ind.get("trades") or 0)
-        if n < config.MIN_TRADES_FOR_JUDGMENT and survives:
+        if n < min_n and survives:
             bot = ind.get("bot")
             if bot is not None and getattr(bot, "_paused", False):
                 ind["status"] = "replaceable"
@@ -402,6 +443,7 @@ def run_ga_cycle(
         "cycle": cycle_number,
         "skipped": False,
         "reason": None,
+        "min_trades_for_judgment": min_n,
         "individuals": [
             {
                 "name": ind["name"],

@@ -59,8 +59,6 @@ class TradeResolver(threading.Thread):
                 "SELECT id, market_id, bot_name, side, amount, shares_bought, "
                 "fee, trade_features, reasoning FROM trades WHERE outcome IS NULL"
             ).fetchall()
-        if not pending:
-            return
 
         resolved = dict(polymarket_markets.recent_resolutions() or {})
 
@@ -82,7 +80,18 @@ class TradeResolver(threading.Thread):
                 fallback_hits,
             )
 
-        if not resolved:
+        # Stamp decision_events even when no trade was placed — otherwise
+        # a wipe/restart with zero fills leaves Signal Lab empty forever.
+        try:
+            from arena.decision_log import resolve_from_resolution_map, flush
+            flush()
+            if resolved:
+                resolve_from_resolution_map(resolved)
+            self._resolve_orphan_decisions(resolved)
+        except Exception as e:
+            logger.debug("decision_events resolve failed: %s", e)
+
+        if not pending:
             return
 
         count = 0
@@ -99,14 +108,32 @@ class TradeResolver(threading.Thread):
                 f"Resolved {count} trades ({matched} pending matched "
                 f"{len(resolved)} resolved markets)"
             )
-        # Stamp decision_events (incl. skips) with the same market outcomes
-        # so offline rollups can score lanes without a placed trade.
-        try:
-            from arena.decision_log import resolve_from_resolution_map, flush
-            flush()
-            resolve_from_resolution_map(resolved)
-        except Exception as e:
-            logger.debug("decision_events resolve failed: %s", e)
+
+    def _resolve_orphan_decisions(self, resolved: dict) -> None:
+        """Look up closed markets that have skip rows but no trade."""
+        from arena.decision_log import resolve_from_resolution_map
+        with db.get_conn() as conn:
+            rows = conn.execute(
+                """SELECT DISTINCT market_id FROM decision_events
+                   WHERE market_up IS NULL AND market_id IS NOT NULL
+                     AND created_at <= datetime('now', '-6 minutes')"""
+            ).fetchall()
+        extra = {}
+        for r in rows:
+            mid = r["market_id"]
+            if not mid or mid in resolved:
+                continue
+            outcome = polymarket_markets.fetch_market_outcome(mid)
+            if outcome is not None:
+                extra[mid] = outcome
+        if extra:
+            resolved.update(extra)
+            n = resolve_from_resolution_map(extra)
+            if n:
+                logger.info(
+                    "Resolved %d orphan decision_events via Gamma (%d markets)",
+                    n, len(extra),
+                )
 
     def _settle_trade(self, trade, market_outcome: bool) -> bool:
         """Write win/loss + fee-aware P&L + learning for one resolved trade.

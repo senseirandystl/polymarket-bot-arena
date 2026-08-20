@@ -65,6 +65,7 @@ def test_tune_reports_candidate_lane(monkeypatch):
         lambda *a, **k: attr,
     )
     monkeypatch.setattr(ct.db, "set_arena_state", lambda *a, **k: None)
+    monkeypatch.setattr(ct, "_scorecard_net_by_strategy", lambda hours=None: {})
     monkeypatch.setattr(ct.config, "CORE_TUNE_MIN_TRADES", 30, raising=False)
     monkeypatch.setattr(ct.config, "CANDIDATE_TUNE_MIN_TRADES", 30, raising=False)
 

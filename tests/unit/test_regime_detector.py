@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import math
 import random
+import time
 
 import pytest
 
@@ -17,6 +19,7 @@ from signals.regime_detector import (
     classify_rules,
     compute_features,
     detect_once,
+    directionality,
     get_detector,
     legacy_label,
     meta_bucket,
@@ -106,6 +109,96 @@ def test_detect_once_on_real_series():
     assert snap["known"] is True
 
 
+def test_insufficient_prices_classify_unknown():
+    """Cold start must not look like a quiet range just because scores are 0."""
+    feats = compute_features([100_000.0, 100_001.0])
+    rid, conf = classify_rules(feats)
+    assert rid == "unknown"
+    assert conf == 0.0
+    assert feats.get("sample_ok", 1.0) < 0.5
+    snap = detect_once([])
+    assert snap["regime_id"] == "unknown"
+    assert snap["known"] is False
+
+
+def test_live_zero_scores_on_short_series_stay_unknown():
+    """arena/signals always passes vol_score=0.0 (not None) on a cold feed."""
+    feats = compute_features(
+        [100_000.0, 100_001.0], vol_score=0.0, trend_score=0.0, realized_vol=0.0,
+    )
+    assert feats.get("sample_ok", 1.0) < 0.5
+    rid, conf = classify_rules(feats)
+    assert rid == "unknown"
+    assert conf == 0.0
+
+
+def test_snapshot_actionable_requires_hold_and_conf(monkeypatch):
+    monkeypatch.setattr(config, "REGIME_HOLD_TICKS", 1, raising=False)
+    monkeypatch.setattr(config, "REGIME_EMA_ALPHA", 1.0, raising=False)
+    monkeypatch.setattr(config, "REGIME_ACTION_MIN_CONF", 0.50, raising=False)
+    monkeypatch.setattr(config, "REGIME_ACTION_MIN_HOLD_SEC", 20.0, raising=False)
+    det = reset_detector()
+    monkeypatch.setattr(det, "_persist", lambda force=False: None)
+    monkeypatch.setattr(det, "_ensure_loaded", lambda: None)
+    snap = det.update(_trending_prices(), vol_score=0.80, trend_score=0.75)
+    assert "actionable" in snap
+    assert "held_sec" in snap
+    assert snap["held_sec"] < 20.0
+    assert snap["actionable"] is False
+    det._last_change_ts = time.time() - 30.0
+    det._confidence = 0.80
+    later = det.snapshot()
+    assert later["actionable"] is True
+
+
+def test_load_missing_last_change_ts_seeds_held(monkeypatch):
+    """Old arena_state without last_change_ts must not freeze actionable off."""
+    det = reset_detector()
+    monkeypatch.setattr(det, "_persist", lambda force=False: None)
+    now = time.time()
+
+    class _DB:
+        @staticmethod
+        def get_arena_state(key, default=None):
+            if key == "regime_detector":
+                return json.dumps({
+                    "regime": "low_vol_trend",
+                    "confidence": 0.72,
+                    "ema": {},
+                    "last_features": {"sample_ok": 1.0, "vol": 0.3, "trend": 0.6},
+                    "updated_at": now - 120.0,
+                })
+            return default
+
+    monkeypatch.setattr("db.get_arena_state", _DB.get_arena_state, raising=False)
+    det._loaded = False
+    det._ensure_loaded()
+    snap = det.snapshot()
+    assert snap["regime_id"] == "low_vol_trend"
+    assert snap["held_sec"] >= 20.0
+    assert snap["actionable"] is True
+
+
+def test_directionality_preserves_zero_chop_and_align():
+    """0.0 is a real extreme (straight tape / scale disagreement), not 'missing'."""
+    strong = directionality({"trend": 0.80, "chop": 0.0, "ms_mom_align": 1.0})
+    muted = directionality({"trend": 0.80, "chop": 0.5, "ms_mom_align": 0.5})
+    disagree = directionality({"trend": 0.80, "chop": 0.0, "ms_mom_align": 0.0})
+    assert strong > muted
+    assert disagree < strong
+    # Missing keys still default to 0.5
+    assert directionality({"trend": 0.80}) == pytest.approx(muted)
+
+
+def test_directionality_uses_chop_and_align():
+    """Live classifier axis is the composite, not raw trend alone."""
+    high_dir = compute_features(_trending_prices())
+    chop_dir = compute_features(_chop_prices())
+    assert "direction" in high_dir and "chop" in high_dir
+    assert high_dir["direction"] > chop_dir["direction"]
+    assert chop_dir["chop"] > high_dir["chop"]
+
+
 # ---------------------------------------------------------------------------
 # Online detector (hysteresis, continuous update)
 # ---------------------------------------------------------------------------
@@ -180,6 +273,63 @@ def test_market_rollover_soft_note_retains_state(monkeypatch, caplog):
     caplog.clear()
     det.note_market("mkt-b")
     assert not any("ROLLOVER" in r.message for r in caplog.records)
+
+
+def test_live_snapshot_keeps_classifier_axes(monkeypatch):
+    """EMA path must retain direction/chop/trend_sign — not drop them."""
+    monkeypatch.setattr(config, "REGIME_HOLD_TICKS", 1, raising=False)
+    monkeypatch.setattr(config, "REGIME_EMA_ALPHA", 1.0, raising=False)
+    det = reset_detector()
+    monkeypatch.setattr(det, "_persist", lambda force=False: None)
+    monkeypatch.setattr(det, "_ensure_loaded", lambda: None)
+    snap = det.update(_trending_prices(), cvd=0.2, obi=0.1)
+    feats = snap["features"]
+    for key in ("direction", "chop", "trend_sign", "ms_mom_align", "vol_rel"):
+        assert key in feats, f"missing {key} on live snapshot"
+    assert snap["trend_side"] in ("yes", "no", "flat")
+    # A clear uptrend should not stamp flat just because trend_sign was dropped.
+    assert snap["trend_side"] == "yes"
+    assert 0.0 <= feats["direction"] <= 1.0
+
+
+def test_pm_state_damps_confidence_not_regime_id(monkeypatch):
+    """Polymarket book quality is sidecar context — never flips the BTC grid."""
+    monkeypatch.setattr(config, "REGIME_HOLD_TICKS", 1, raising=False)
+    monkeypatch.setattr(config, "REGIME_EMA_ALPHA", 1.0, raising=False)
+
+    def _fresh():
+        d = reset_detector()
+        monkeypatch.setattr(d, "_persist", lambda force=False: None)
+        monkeypatch.setattr(d, "_ensure_loaded", lambda: None)
+        return d
+
+    prices = _trending_prices()
+    clean = _fresh().update(
+        prices, vol_score=0.80, trend_score=0.75,
+        pm_state={"spread_score": 0.85, "yes_price": 0.52, "no_price": 0.48},
+    )
+    broken = _fresh().update(
+        prices, vol_score=0.80, trend_score=0.75,
+        pm_state={"spread_score": 0.10, "yes_price": 0.40, "no_price": 0.40},
+    )
+    assert clean["regime_id"] == broken["regime_id"]
+    assert broken["confidence"] < clean["confidence"]
+    assert "pm_book_quality" in broken["features"]
+    assert broken["features"]["pm_book_quality"] < clean["features"]["pm_book_quality"]
+
+    # Damp must still apply after centroids have warmed (production path).
+    warm = _fresh()
+    for _ in range(8):
+        warm.update(
+            prices, vol_score=0.80, trend_score=0.75,
+            pm_state={"spread_score": 0.85, "yes_price": 0.52, "no_price": 0.48},
+        )
+    warmed_clean = warm.snapshot()["confidence"]
+    warmed_broken = warm.update(
+        prices, vol_score=0.80, trend_score=0.75,
+        pm_state={"spread_score": 0.10, "yes_price": 0.40, "no_price": 0.40},
+    )["confidence"]
+    assert warmed_broken < warmed_clean
 
 
 # ---------------------------------------------------------------------------

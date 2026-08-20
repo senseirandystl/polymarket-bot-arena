@@ -222,9 +222,8 @@ class TestSniper:
             lambda *a, **k: _Flat(),
             raising=False,
         )
-        # TWAP dual-gate floors sniper at 0.40. Use drift just above the
-        # floor so the quiet bump (0.05) pushes the bar above it.
-        drift = 0.42  # clears 0.40 dual-gate; quiet bar = 0.40+0.05=0.45
+        # Dual-gate |z|≥0.35. Quiet adds quiet_drift_bump to the z floor.
+        drift = 0.37  # clears 0.35; quiet bar = 0.40 skips
         quiet = bot.make_decision(_sniper_market(), make_signals(
             btc_drift=drift, vol_regime={"regime": "quiet", "trend_score": 0.2}))
         normal = bot.make_decision(_sniper_market(), make_signals(

@@ -46,7 +46,19 @@ class MomentumBot(BaseBot):
         against the strike is noise, not a binary edge.
         """
         sv = SignalView.of(signals)
-        prices = sv.prices
+        # Prefer TWAP-sampled path (resolution object) over spot 1m candles.
+        prices = list(sv.prices)
+        try:
+            from signals.drift_scale import resample_tick_prices
+            ticks = signals.get("btc_twap_ticks") or []
+            if not ticks:
+                from signals.price_feed import get_price_feed
+                ticks = get_price_feed().btc_twap_ticks()
+            tw = resample_tick_prices(ticks, sample_sec=60.0) or []
+            if len(tw) >= self.strategy_params["lookback_candles"]:
+                prices = list(tw)
+        except Exception:
+            pass
         if len(prices) < self.strategy_params["lookback_candles"]:
             return strategy_decision("hold", reasoning="insufficient price data")
 

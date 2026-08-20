@@ -54,9 +54,10 @@ class TestSignalView:
 class TestComputeLanes:
     def test_kill_switched_lanes_zero_but_raw_preserved(self):
         lanes, raw = _lab().compute_lanes({"id": "m"}, _signals())
-        # pm/cvd/obi/fut/tech/xasset all carry 0 config weight today.
-        for lane in ("pm", "cvd", "obi", "fut", "tech", "xasset"):
+        # pm/cvd/obi/fut/tech stay kill-switched; xasset is confirm-only live.
+        for lane in ("pm", "cvd", "obi", "fut", "tech"):
             assert lanes[lane] == 0.0, lane
+        assert lanes["xasset"] == pytest.approx(0.7)
         # Raw pre-kill-switch reads survive for the validation dataset.
         assert raw["fut_taker"] == 0.5
         assert raw["tech_mtf"] == -0.6

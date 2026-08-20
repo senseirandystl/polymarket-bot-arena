@@ -918,6 +918,9 @@ def get_dashboard_stats():
         # roster — excludes retired bots still present in all-time totals.
         today_start = et_day_start_utc(0)
         week_start = et_day_start_utc(6)
+        hour_start = (datetime.now(timezone.utc) - timedelta(hours=1)).strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
         session_start = get_arena_state("session_start")
         active_names = [
             r["bot_name"] for r in conn.execute(
@@ -949,9 +952,9 @@ def get_dashboard_stats():
                 "structural_wins": 0, "structural_losses": 0,
                 # Explicit Core / Lock-in names for the Performance card.
                 "core_trades": 0, "core_pnl": 0.0,
-                "core_wins": 0, "core_losses": 0,
+                "core_wins": 0, "core_losses": 0, "core_pending": 0,
                 "lockin_trades": 0, "lockin_pnl": 0.0,
-                "lockin_wins": 0, "lockin_losses": 0,
+                "lockin_wins": 0, "lockin_losses": 0, "lockin_pending": 0,
             }
 
         def _is_lockin(bot_name: str) -> bool:
@@ -989,11 +992,15 @@ def get_dashboard_stats():
                 rows = conn.execute(q, params).fetchall()
             except Exception:
                 rows = []
-            core_trades = core_wins = core_losses = 0
-            lock_trades = lock_wins = lock_losses = 0
+            core_trades = core_wins = core_losses = core_pending = 0
+            lock_trades = lock_wins = lock_losses = lock_pending = 0
             core_pnl = lock_pnl = 0.0
             for r in rows:
                 if r["outcome"] is None:
+                    if _is_lockin(r["bot_name"]):
+                        lock_pending += 1
+                    else:
+                        core_pending += 1
                     continue
                 pnl = float(r["pnl"] or 0.0)
                 if _is_lockin(r["bot_name"]):
@@ -1015,10 +1022,12 @@ def get_dashboard_stats():
             d["core_pnl"] = core_pnl
             d["core_wins"] = core_wins
             d["core_losses"] = core_losses
+            d["core_pending"] = core_pending
             d["lockin_trades"] = lock_trades
             d["lockin_pnl"] = lock_pnl
             d["lockin_wins"] = lock_wins
             d["lockin_losses"] = lock_losses
+            d["lockin_pending"] = lock_pending
             # Backward-compatible aliases
             d["directional_trades"] = core_trades
             d["directional_pnl"] = core_pnl
@@ -1032,6 +1041,7 @@ def get_dashboard_stats():
 
         return {
             "session": _period(session_start) if session_start else None,
+            "hour": _period(hour_start),
             "today": _period(today_start),
             "week": _period(week_start),
             "current_bots": _period(bot_names=active_names),

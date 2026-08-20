@@ -296,6 +296,10 @@ class Trader(threading.Thread):
                 )
                 return True
             reason = result.get("reason")
+            # One live GTC per (bot, market). A resting limit must not be
+            # re-posted every tick or we stack orphan orders on the CLOB.
+            if isinstance(reason, str) and reason.startswith("limit_resting"):
+                self._state.mark_traded(key)
             if reason in slip_reasons:
                 self._state.mark_slippage_reject(key, slip_cd)
                 self._state.note_skip("slippage")
@@ -368,20 +372,39 @@ class Trader(threading.Thread):
 
         if pending_buys:
             pending_buys.sort(key=lambda t: t[0], reverse=True)
-            best_score, best_bot, best_sig = pending_buys[0]
-            if _execute_one(best_bot, best_sig):
-                new_trades += 1
-            # Superseded peers: log as skip for decision attribution
-            for score, bot, signal in pending_buys[1:]:
-                sup = dict(signal)
-                sup["action"] = "skip"
-                sup["skip_reason"] = "superseded_by_peer"
-                sup["reasoning"] = (
-                    f"Superseded by {best_bot.name} "
-                    f"(score {best_score:.4f} > {score:.4f}; one trade/tick)"
-                )
-                _note_decision(bot, sup)
-                self._state.note_skip("superseded_by_peer")
+            try:
+                max_dir = int(getattr(_cfg, "MARKET_SIDE_MAX_BOTS", 1) or 1)
+            except (TypeError, ValueError):
+                max_dir = 1
+            max_dir = max(1, max_dir)
+            filled_side: dict[str, int] = {}
+            winner_name = pending_buys[0][1].name
+            winner_score = pending_buys[0][0]
+            for score, bot, signal in pending_buys:
+                side = str(signal.get("side") or "")
+                n_side = int(filled_side.get(side, 0))
+                if n_side >= max_dir:
+                    sup = dict(signal)
+                    sup["action"] = "skip"
+                    sup["skip_reason"] = "superseded_by_peer"
+                    sup["reasoning"] = (
+                        f"Superseded by {winner_name} "
+                        f"(score {winner_score:.4f} > {score:.4f}; "
+                        f"max {max_dir} bot(s)/side)"
+                    )
+                    _note_decision(bot, sup)
+                    self._state.note_skip("superseded_by_peer")
+                    continue
+                signal = dict(signal)
+                # Same-tick peer count for pile-in (DB may not see the
+                # fill we just wrote this tick).
+                signal["_pilein_extra_peers"] = n_side
+                if _execute_one(bot, signal):
+                    filled_side[side] = n_side + 1
+                    new_trades += 1
+                else:
+                    # execute() refused (pile-in / exposure) — count as skip
+                    self._state.note_skip("execute_refused")
 
         if new_trades > 0:
             logger.debug(

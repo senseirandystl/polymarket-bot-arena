@@ -66,7 +66,7 @@ DEFAULT_PARAMS = {
     # resolved trades. Evolution may tune these like any numeric param.
     "online_eta": 0.12,
     "online_min_mult": 0.4,
-    "online_max_mult": 2.5,
+    "online_max_mult": 1.2,
     # How far the regime may tilt the hybrid's OWN mom-lane profile weight
     # (signal-level dynamic weighting; drift is never tilted down).
     "signal_regime_tilt": 0.4,
@@ -106,10 +106,12 @@ class HybridBot(BaseBot):
         self._perf_tilt_cache: tuple = (0.0, {})  # (ts, {sub: tilt})
         # Online meta-learner: state is shared via arena_state, so every
         # hybrid generation (and each mutant) reads/extends one record.
+        _cfg_cap = float(getattr(config, "HYBRID_META_MAX_MULT", 1.2))
+        _param_max = float(self.strategy_params.get("online_max_mult", _cfg_cap))
         self._meta = HybridMetaLearner(
             eta=self.strategy_params.get("online_eta", 0.12),
             min_mult=self.strategy_params.get("online_min_mult", 0.4),
-            max_mult=self.strategy_params.get("online_max_mult", 2.5),
+            max_mult=min(_param_max, _cfg_cap),
         )
         # Regime context stashed by analyze() for _signal_profile(), which
         # BaseBot.make_decision calls AFTER analyze() on the same tick.
@@ -355,12 +357,19 @@ class HybridBot(BaseBot):
         # (regime-agnostic; works at any mid, not a hard 0.58 cap).
         side_preview = "yes" if weighted_score > 0 else "no"
         try:
-            mid = float(
-                market.get("yes_price") if side_preview == "yes"
-                else market.get("no_price") or (1.0 - float(market.get("yes_price") or 0.5))
+            raw_yes = market.get("current_price")
+            if raw_yes is None:
+                raw_yes = market.get("yes_price")
+            if raw_yes is None:
+                raise ValueError("no mid")
+            yes_mid = float(raw_yes)
+            no_mid = market.get("no_price")
+            no_mid = float(no_mid) if no_mid is not None else round(1.0 - yes_mid, 4)
+            mid = yes_mid if side_preview == "yes" else no_mid
+            from bots.base_bot import implied_side_prob as _imp_side
+            implied = _imp_side(
+                side=side_preview, signals=signals, signed_lane=float(drift),
             )
-            signed = float(drift) if side_preview == "yes" else -float(drift)
-            implied = 0.5 + 0.5 * max(-1.0, min(1.0, signed))
             lag = implied - mid
             # Thin lag → confidence cut; fat lag → mild boost (capped)
             if lag < 0.05:

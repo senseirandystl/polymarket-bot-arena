@@ -151,7 +151,8 @@ def test_paper_rejects_fill_above_limit_price(db, monkeypatch):
     market = {"id": "sl1", "polymarket_token_id": "up", "polymarket_no_token_id": "down"}
     res = PaperEngine().place(bot_name="b", side="yes", amount=10.0,
                               market=market, mode="paper", limit_price=0.55)
-    assert not res.success and res.reason == "slippage_exceeded"
+    # Limit below the ask does not cross — no invented fill, no slippage walk.
+    assert not res.success and res.reason in ("slippage_exceeded", "limit_unfilled")
     with db.get_conn() as c:
         assert c.execute("SELECT COUNT(*) FROM trades WHERE market_id='sl1'").fetchone()[0] == 0
 
@@ -217,18 +218,28 @@ def test_live_place_missing_token_id(db):
 
 def test_live_place_records_fee(db, monkeypatch):
     from venues.live import LiveEngine
+    import polymarket_markets
     stub = types.ModuleType("polymarket_client")
     stub.place_market_order = lambda **kw: {
         "success": True, "order_id": "0xabc", "price": 0.55, "size": 3.6}
+    stub.place_limit_order = lambda **kw: {
+        "success": True, "order_id": "0xabc", "price": 0.55, "size": 3.6,
+        "status": "matched"}
     monkeypatch.setitem(sys.modules, "polymarket_client", stub)
-    market = {"id": "m6", "question": "q", "polymarket_token_id": "tok"}
+    monkeypatch.setattr(
+        polymarket_markets, "get_order_book",
+        lambda tok: {"valid": True, "asks": [(0.55, 100)], "bids": [(0.50, 100)]},
+    )
+    market = {"id": "m6", "question": "q", "polymarket_token_id": "tok",
+              "current_price": 0.52}
     res = LiveEngine().place(bot_name="b", side="yes", amount=2.0,
                              market=market, mode="live")
     assert res.success and res.fill_source == "polymarket"
     with db.get_conn() as c:
-        row = dict(c.execute("SELECT trade_id, fee, venue FROM trades "
+        row = dict(c.execute("SELECT trade_id, fee, venue, mode FROM trades "
                              "WHERE market_id='m6'").fetchone())
     assert row["trade_id"] == "0xabc" and row["venue"] == "polymarket" and row["fee"] > 0
+    assert row["mode"] == "live"
 
 
 # ---------------------------------------------------------------------------

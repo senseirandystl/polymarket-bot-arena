@@ -76,6 +76,10 @@ def _build_signals(prices: list, btc_now: float, drift: float,
         "cvd": 0.0,
         "btc_drift": drift,
         "btc_strike": strike,
+        "btc_now": btc_now,
+        "btc_drift_pct": (
+            ((btc_now - strike) / strike) if strike and btc_now else 0.0
+        ),
         "vol_regime": volatility_regime.compute(prices),
         "technicals": technicals.compute(prices),
         "xasset": 0.0,

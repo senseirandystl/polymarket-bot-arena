@@ -7,11 +7,11 @@ Uses REAL data, writes nothing to the runtime DB:
 
 Live resolution (2026-08-07+) is Chainlink **TWAP** at open vs close (60s for
 5m markets), not a
-single Binance print. This harness still reconstructs strike as the Binance open
-at ``eventStartTime`` and trajectories from 1m klines — fine for *ordering*
-signals and relative net-edge, **not** absolute live P&L. Never use mid-window
-"first sighting" as strike (BUG #23). For production moneyness see
-``signals/strike.py`` + ``signals/twap.py``.
+single Binance print. Strike prefers the official Polymarket Price to Beat
+(``signals.strike.fetch_official_open_price``) and falls back to the Binance
+1m open only when that REST call misses — fine for *ordering* signals,
+**not** absolute live P&L. Never use mid-window "first sighting" as strike
+(BUG #23). Trajectories (mom/tech/xasset) still come from Binance 1m klines.
 
 Run:
     .venv/bin/python3 tools/validate_signals.py --markets 200
@@ -117,6 +117,24 @@ def _save_cache(cache: dict) -> None:
         for k in list(cache.keys())[: len(cache) - CACHE_MAX]:
             cache.pop(k, None)
     CACHE_FILE.write_text(json.dumps(cache))
+
+
+def fetch_official_strike(mkt: dict, cache: dict, use_cache: bool):
+    """Official Polymarket PTB (TWAP-at-open). None if unpublished / error."""
+    key = f"ptb:{mkt.get('id')}"
+    if use_cache and key in cache:
+        try:
+            return float(cache[key]) if cache[key] else None
+        except (TypeError, ValueError):
+            return None
+    try:
+        from signals.strike import fetch_official_open_price
+        px = fetch_official_open_price(mkt["start"])
+    except Exception:
+        px = None
+    if use_cache and px is not None:
+        cache[key] = px
+    return px
 
 
 def fetch_trajectory(mkt: dict, cache: dict, use_cache: bool) -> list:
@@ -250,7 +268,8 @@ def main() -> int:
             continue
         if len(traj) < 3:
             continue
-        strike = traj[0][1]                         # open @ eventStartTime = true strike
+        official = fetch_official_strike(mkt, cache, use_cache)
+        strike = official if official else traj[0][1]
         up_count += 1 if mkt["yes_won"] else 0
         mkt_samples = build_samples(mkt["id"], strike, traj,
                                     mkt["yes_won"], WINDOW_SEC,

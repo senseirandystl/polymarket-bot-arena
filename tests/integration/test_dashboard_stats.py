@@ -129,6 +129,41 @@ def test_core_vs_lockin_split(db):
     assert all_time["structural_pnl"] == pytest.approx(2.4)
 
 
+def test_core_vs_lockin_pending_split(db):
+    """Pending counts are split so Core / Lock-in cells can show +N."""
+    _insert(db, "sniper-v1", None, None, "2026-07-12 10:00:00")
+    _insert(db, "hybrid-v1", None, None, "2026-07-12 10:01:00")
+    _insert(db, "sweeper-v1", None, None, "2026-07-12 10:02:00")
+    _insert(db, "sniper-v1", "win", 1.0, "2026-07-12 10:03:00", "2026-07-12 10:08:00")
+
+    all_time = db.get_dashboard_stats()["all_time"]
+    assert all_time["pending"] == 3
+    assert all_time["core_pending"] == 2
+    assert all_time["lockin_pending"] == 1
+    assert all_time["trades"] == 1
+
+
+def test_hour_is_rolling_sixty_minutes(db):
+    """Performance card includes a rolling last-hour period."""
+    from datetime import datetime, timedelta, timezone
+
+    now = datetime.now(timezone.utc)
+    inside = (now - timedelta(minutes=20)).strftime("%Y-%m-%d %H:%M:%S")
+    outside = (now - timedelta(hours=2)).strftime("%Y-%m-%d %H:%M:%S")
+    _insert(db, "sniper-v1", "win", 3.0, inside, inside)
+    _insert(db, "sweeper-v1", None, None, inside)
+    _insert(db, "sniper-v1", "win", 9.0, outside, outside)
+
+    stats = db.get_dashboard_stats()
+    hour = stats["hour"]
+    assert hour["trades"] == 1
+    assert hour["pnl"] == pytest.approx(3.0)
+    assert hour["pending"] == 1
+    assert hour["core_pending"] == 0
+    assert hour["lockin_pending"] == 1
+    assert stats["all_time"]["trades"] == 2
+
+
 def test_graveyard_stats_for_retired_bots(db):
     """Graveyard lists retired bots with lifetime P&L, worst first."""
     with db.get_conn() as conn:
