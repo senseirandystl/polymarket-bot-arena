@@ -1,7 +1,7 @@
 # Strategy design — Polymarket Bot Arena
 
 **Market:** Polymarket recurring series *BTC Up or Down 5m* (Gamma `series_id=10684`).  
-**Resolution:** window closes **Up** iff BTC ≥ the price-to-beat at window open (reconstructed from Binance 1m open at `eventStartTime`).  
+**Resolution:** window closes **Up** iff Chainlink **60s TWAP** at close ≥ TWAP at window open (Price to Beat). Live strike is sticky `twap_open`, not Binance.  
 **Goal:** positive expected value after **taker fees and slippage**, under paper-then-live discipline.
 
 This document is the strategy contract for bots, signals, evolution, and risk. Implementation detail lives in `CLAUDE.md` and `BUG_HISTORY.md`.
@@ -65,7 +65,9 @@ Per-strategy weights `w_i` come from `BaseBot.STRATEGY_SIGNAL_PROFILE`, optional
 For each side `s ∈ {YES, NO}` with executable ask `a_s`:
 
 ```
-edge_s = trust_eff · (P_s − a_s) − taker_fee(1, a_s)
+edge_s = P_s − a_s − taker_fee(1, a_s)
+# P_s = live_side_prob = empirical overlay if promoted else Φ(z)
+# tanh(z) is a lane score only — not a probability. Kelly sizes; no trust tax on edge.
 ```
 
 Buy `argmax edge_s` if that edge clears the strategy’s `MIN_EDGE` (after flow-only tax when |drift| is small). Model must **lean** toward the side (`P_model` on the correct side of 0.5).

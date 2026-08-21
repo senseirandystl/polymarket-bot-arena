@@ -24,31 +24,22 @@ def test_compute_fair_yes_clamped():
 
 
 def test_side_net_edges_complementary_is_mirror():
-    # Per-side anchoring (BUG #27): edge_side = trust_eff * (P_side - price)
-    # - fee. On complementary books the pre-fee model terms mirror exactly.
+    # Per-side anchoring (BUG #27): edge_side = P_side - price - fee.
+    # On complementary books the pre-fee model terms mirror exactly.
     bot = _bot()
-    model_prob, trust_eff = 0.62, 0.5
+    p_yes = 0.62
     yes_price, no_price = 0.55, 0.45
-    edge_yes, edge_no = bot._side_net_edges(model_prob, trust_eff,
-                                            yes_price, no_price)
+    edge_yes, edge_no = bot._side_net_edges(p_yes, yes_price, no_price)
     fee_y = polymarket_fills.taker_fee(1.0, yes_price)
     fee_n = polymarket_fills.taker_fee(1.0, no_price)
     assert abs((edge_yes + fee_y) + (edge_no + fee_n)) < 1e-9
 
 
-def test_side_net_edges_book_divergence_is_not_edge():
-    # The old cross-anchored form turned a cheap NO book (yes+no < 1) into
-    # phantom NO edge with zero model input: edge_no ~= (1 - yes_mid) -
-    # no_price, independent of trust. Per-side anchoring: the edge is ONLY
-    # the trust-scaled model-vs-own-price term, so an ignorant model
-    # (conviction-scaled trust_eff ~ 0, as make_decision passes it) sees
-    # nothing regardless of the gap.
+def test_side_net_edges_book_divergence_is_honest_p_minus_ask():
     bot = _bot()
     fee_n = polymarket_fills.taker_fee(1.0, 0.38)
-    edge_yes, edge_no = bot._side_net_edges(0.50, 0.5, 0.55, 0.38)
-    assert abs(edge_no - (0.5 * ((1 - 0.50) - 0.38) - fee_n)) < 1e-9
-    edge_yes_ign, edge_no_ign = bot._side_net_edges(0.50, 0.01, 0.55, 0.38)
-    assert edge_no_ign < 0.001 and edge_yes_ign < 0.001
+    _ey, edge_no = bot._side_net_edges(0.50, 0.55, 0.38)
+    assert abs(edge_no - ((0.50 - 0.38) - fee_n)) < 1e-9
 
 
 # --- Task 2: make_decision side selection, guards, sizing ---

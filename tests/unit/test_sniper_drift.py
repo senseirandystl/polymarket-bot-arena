@@ -11,7 +11,7 @@ from bots.bot_sniper import SniperBot
 def _signals(drift=0.50, prices=None, d_pct=None, implied_yes=None, z=None):
     prices = prices or [100.0, 100.1, 100.2]
     if d_pct is None:
-        d_pct = 0.0008 if drift >= 0 else -0.0008
+        d_pct = 0.0016 if drift >= 0 else -0.0016
     out = {
         "btc_drift": drift,
         "btc_drift_pct": d_pct,
@@ -36,9 +36,9 @@ def test_snipes_when_market_lags_drift():
         "no_price": 0.55,
         "yes_ask": 0.46,
         "no_ask": 0.56,
-        "time_remaining_seconds": 120,
+        "time_remaining_seconds": 180,
     }
-    d = bot.make_decision(market, _signals(drift=0.50, d_pct=0.0008))
+    d = bot.make_decision(market, _signals(drift=0.50, d_pct=0.0016, z=0.50))
     assert d["action"] == "buy"
     assert d["side"] == "yes"
     assert d["edge"] > 0
@@ -52,9 +52,9 @@ def test_no_lag_uses_yes_frame_implied():
         "no_price": 0.45,
         "yes_ask": 0.56,
         "no_ask": 0.45,
-        "time_remaining_seconds": 150,
+        "time_remaining_seconds": 180,
     }
-    sig = _signals(drift=-0.40, d_pct=-0.0009, prices=[100.2, 100.1, 100.0])
+    sig = _signals(drift=-0.40, d_pct=-0.0016, prices=[100.2, 100.1, 100.0], z=-0.50)
     sig["btc_implied_yes"] = 0.36
     sig["btc_drift_z"] = -0.40
     d = bot.make_decision(market, sig)
@@ -97,13 +97,17 @@ def test_skips_wide_ask_mid_spread():
         "no_price": 0.46,
         "yes_ask": 0.75,         # executable ask far above mid
         "no_ask": 0.47,
-        "time_remaining_seconds": 120,
+        "time_remaining_seconds": 180,
     }
-    d = bot.make_decision(market, _signals(drift=0.40, implied_yes=0.72))
+    d = bot.make_decision(
+        market, _signals(drift=0.40, d_pct=0.0016, implied_yes=0.72, z=0.50),
+    )
     assert d["action"] in ("skip", "hold")
     assert "ask gap" in (d.get("reasoning") or "").lower() or d["action"] != "buy"
     if d["action"] == "skip":
-        assert d.get("skip_reason") in ("ask_quality", "no_lag_edge", "price_quality")
+        assert d.get("skip_reason") in (
+            "ask_quality", "no_lag_edge", "price_quality", "sniper_conviction",
+        )
 
 
 def test_sniper_prices_edge_on_ask_not_mid():

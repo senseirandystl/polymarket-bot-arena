@@ -25,15 +25,16 @@ def _market(yes, no=None, time_rem=180):
 def _sig(prices, drift=0.0):
     d_pct = 0.0
     if drift > 0:
-        d_pct = 0.0008
+        d_pct = 0.0016
     elif drift < 0:
-        d_pct = -0.0008
+        d_pct = -0.0016
     return {
         "prices": prices, "latest": prices[-1] if prices else 0.0,
         "orderflow": {}, "btc_drift": drift,
         "btc_drift_pct": d_pct,
         "btc_strike": 100000.0,
         "btc_now": 100000.0 * (1.0 + d_pct),
+        "btc_drift_z": 0.50 if drift > 0 else (-0.50 if drift < 0 else 0.0),
     }
 
 

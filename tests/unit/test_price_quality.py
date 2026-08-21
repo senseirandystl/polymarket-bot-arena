@@ -68,11 +68,12 @@ def test_sniper_stamps_regime_feature():
         "no_price": 0.55,
         "yes_ask": 0.46,
         "no_ask": 0.56,
-        "time_remaining_seconds": 120,
+        "time_remaining_seconds": 180,
     }
     signals = {
         "btc_drift": 0.50,
-        "btc_drift_pct": 0.0008,
+        "btc_drift_pct": 0.0016,
+        "btc_drift_z": 0.50,
         "prices": [100.0, 100.1],
         "orderflow": {},
         "market_regime": {

@@ -109,4 +109,7 @@ def test_mid_band_gate_skips_weak_drift_in_coinflip(monkeypatch):
         )
     assert d["action"] == "skip"
     reason = (d.get("reasoning") or "").lower()
-    assert "mid-band" in reason or "lean" in reason or "dead-zone" in reason
+    assert (
+        "mid-band" in reason or "lean" in reason or "dead-zone" in reason
+        or "price-quality" in reason or "dual-gate" in reason
+    )

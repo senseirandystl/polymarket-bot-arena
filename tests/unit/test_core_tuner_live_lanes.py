@@ -14,7 +14,7 @@ def test_live_tune_lanes_includes_enabled_candidates():
     }
     lanes = ct.live_tune_lanes(ov)
     assert "drift" in lanes and "mom" in lanes and "strat" in lanes
-    assert "xasset" in lanes
+    assert "xasset" not in lanes
     assert "fut" not in lanes
     assert "tech" not in lanes
 
@@ -70,12 +70,5 @@ def test_tune_reports_candidate_lane(monkeypatch):
     monkeypatch.setattr(ct.config, "CANDIDATE_TUNE_MIN_TRADES", 30, raising=False)
 
     report = ct.tune()
-    assert "xasset" in report.get("tune_lanes", [])
-    assert "xasset" in report["lanes"]
-    xa = report["lanes"]["xasset"].get("momentum")
-    assert xa is not None
-    assert xa["kind"] == "candidate"
-    # accuracy 0.42 <= LOW → down from 0.15
-    assert xa["action"] in ("down", "collecting", "hold", "revert")
-    if xa["action"] == "down":
-        assert xa["suggested"] < xa["current"]
+    assert "xasset" not in report.get("tune_lanes", [])
+    assert "xasset" not in (report.get("lanes") or {})

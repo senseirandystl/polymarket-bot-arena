@@ -33,7 +33,7 @@ from __future__ import annotations
 import config
 import learning
 import polymarket_fills
-from bots.base_bot import BaseBot, strategy_decision
+from bots.base_bot import BaseBot, strategy_decision, data_quality_skip
 from signals.lab import SignalView
 
 DEFAULT_PARAMS = {
@@ -58,7 +58,7 @@ DEFAULT_PARAMS = {
     "mom_contradict": 0.0010,
     # Sizing: thin edge → modest bankroll fraction + hard USD cap.
     "position_size_pct": 0.10,
-    "max_trade_usd": 40.0,
+    "max_trade_usd": 15.0,
     "min_confidence": 0.20,
 }
 
@@ -86,6 +86,9 @@ class SweeperBot(BaseBot):
 
     def make_decision(self, market, signals):
         p = self.strategy_params
+        _dq = data_quality_skip(signals)
+        if _dq is not None:
+            return _dq
         sv = SignalView.of(signals)
 
         time_rem = market.get("time_remaining_seconds")
@@ -153,15 +156,11 @@ class SweeperBot(BaseBot):
         if phase == "pre_settle":
             min_drift += float(p.get("pre_settle_extra_drift", 0.10))
         # Inside the TWAP averaging window, require partial-settlement certainty
-        # so a single tick spike can't look like a free lock. A coverage
-        # *outage* is missing data — do not treat cert≈0 as a lock unless the
-        # book itself is already at the fee-curve extreme (≥98.5¢).
-        coverage_outage = bool(pol.get("coverage_outage"))
-        book_locked = max(yes_mid, no_mid, yes_ask, no_ask) >= 0.985
+        # so a single tick spike can't look like a free lock. Coverage outage
+        # is skipped earlier via data_quality_skip.
         if (
             in_twap_win
             and twap_cert < min_twap_cert
-            and not (coverage_outage and book_locked)
         ):
             return strategy_decision(
                 "skip",
@@ -318,8 +317,33 @@ class SweeperBot(BaseBot):
                 skip_reason="low_confidence",
             )
 
-        # Size: bankroll fraction capped by max_trade_usd. At ~99¢ most of
-        # notional is locked capital, not edge — keep per-trade USD modest.
+        from signals.prob import live_side_prob, directional_net_edge
+        p_side, _psrc = live_side_prob(
+            side=side, signals=signals, strategy_type=self.strategy_type,
+            signed_lane=drift,
+        )
+        try:
+            import db as _db
+            cutoff = _db.et_day_start_utc(0)
+            with _db.get_conn() as _conn:
+                n_loss = int((_conn.execute(
+                    """SELECT COUNT(*) FROM trades
+                       WHERE bot_name=? AND outcome='loss'
+                         AND created_at>=?""",
+                    (self.name, cutoff),
+                ).fetchone() or [0])[0] or 0)
+        except Exception:
+            n_loss = 0
+        if n_loss > 0 and p_side < 0.99:
+            return strategy_decision(
+                "skip", side,
+                reasoning=f"sweeper: post-flip p={p_side:.3f}<0.99",
+                signals=contributing,
+                features=features,
+                skip_reason="sweeper_post_flip",
+            )
+
+        # Size: Kelly on (p−ask−fee), not assume P=1. Cap USD modest.
         price = max(float(side_ask), 0.01)
         try:
             from bots.base_bot import _sizing_bankroll, _portfolio_weight, _risk_size_mult
@@ -331,9 +355,11 @@ class SweeperBot(BaseBot):
         except Exception:
             bankroll = float(getattr(config, "PAPER_BANKROLL_DEFAULT", 200.0))
 
-        pct = float(p.get("position_size_pct", 0.10))
-        max_usd = float(p.get("max_trade_usd", 40.0))
-        amount = min(bankroll * pct, max_usd)
+        size_edge = max(0.0, directional_net_edge(p_side, side_ask))
+        f_star = size_edge / max(1e-6, 1.0 - price)
+        kf = float(getattr(config, "KELLY_FRACTION", 0.25) or 0.25)
+        max_usd = float(p.get("max_trade_usd", 15.0))
+        amount = min(max_usd, kf * f_star * bankroll)
         # Venue minimum shares (slightly above floor for tick/fee rounding).
         min_cost = config.POLYMARKET_MIN_SHARES * price * 1.15
         amount = max(amount, min_cost)

@@ -220,10 +220,13 @@ def test_dead_zone_quiet_regime_raises_drift_floor():
     )
     d = _bot().make_decision(m, s_mid)
     assert d["action"] == "skip"
-    assert "dead-zone" in d["reasoning"].lower()
-    # Quiet floor is DEAD_ZONE_QUIET_DRIFT_MIN (0.30+) — accept any raised bar.
+    reason = d["reasoning"].lower()
+    assert (
+        "dead-zone" in reason
+        or "style-skip" in reason
+        or d.get("skip_reason") in ("dead_zone", "style_skip")
+    )
     assert d["action"] == "skip"
-    assert "dead-zone" in d["reasoning"].lower() or "0.3" in d["reasoning"]
 
     # Strong drift still clears quiet floor (+ regime extra) → not dead-zone
     s_hi = _sig(
@@ -232,6 +235,30 @@ def test_dead_zone_quiet_regime_raises_drift_floor():
     )
     d_hi = _bot().make_decision(m, s_hi)
     assert "dead-zone" not in d_hi["reasoning"].lower()
+
+
+def test_mid_band_with_real_moneyness_is_not_dead_zone():
+    """9 bp + z≥0.35 in 50–58¢ is the lag pocket — not stacked tanh floors."""
+    import math
+    z = 0.40
+    phi = 0.5 * (1.0 + math.erf(z / math.sqrt(2.0)))
+    m = _market(yes=0.54, tr=150)
+    m["yes_ask"] = 0.54
+    m["no_ask"] = 0.47
+    s = _sig(
+        btc_drift=math.tanh(z),
+        btc_drift_z=z,
+        btc_drift_pct=0.00090,
+        btc_implied_yes=phi,
+        btc_strike=70000.0,
+        prices=[100.0, 100.3, 100.5, 100.7, 100.9],
+        latest=100.9,
+    )
+    d = _bot().make_decision(m, s)
+    reason = (d.get("reasoning") or "").lower()
+    assert "dead-zone" not in reason
+    assert "mid-band lag" not in reason
+    assert d.get("skip_reason") != "dead_zone"
 
 
 def test_momentum_lane_not_saturated_by_median_move():

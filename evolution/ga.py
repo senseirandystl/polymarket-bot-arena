@@ -378,6 +378,15 @@ def run_ga_cycle(
         else:
             ind["status"] = "replaceable"
 
+    if getattr(config, "GA_FREEZE_DEFAULT_ROSTER", True):
+        frozen = {
+            "momentum-v1", "meanrev-v1", "sniper-v1",
+            "hybrid-v1", "arbitrage-v1", "sweeper-v1",
+        }
+        for ind in individuals:
+            if ind.get("name") in frozen and ind["status"] == "replaceable":
+                ind["status"] = "survivor"
+
     # Safety net: if EVERYONE is replaceable, promote the fittest to survivor
     if all(ind["status"] == "replaceable" for ind in individuals):
         individuals[0]["status"] = "survivor"

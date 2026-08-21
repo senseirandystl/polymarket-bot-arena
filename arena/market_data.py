@@ -296,11 +296,14 @@ class MarketDataWarmer(threading.Thread):
 
         # Parallel book GETs — critical path for decision freshness.
         yes_book, no_book = self._fetch_books_parallel(yes_tok, no_tok)
+        yes_fresh = bool(yes_book.get("valid"))
+        no_fresh = bool(no_book.get("valid"))
         # Fail soft: keep previous valid book if this fetch failed.
         if not yes_book.get("valid") and (prev.get("yes_book") or {}).get("valid"):
             yes_book = prev["yes_book"]
         if not no_book.get("valid") and (prev.get("no_book") or {}).get("valid"):
             no_book = prev["no_book"]
+        books_fresh = yes_fresh and no_fresh
 
         yes_mid = polymarket_markets.midpoint(yes_book) if yes_book.get("valid") else None
         no_mid = polymarket_markets.midpoint(no_book) if no_book.get("valid") else None
@@ -385,7 +388,8 @@ class MarketDataWarmer(threading.Thread):
             "micro_spread": micro_spread,
             "micro_spread_score": micro_spread_score,
             "strike": strike,
-            "ts": time.time(),
+            "ts": (time.time() if books_fresh
+                   else float(prev.get("ts") or time.time())),
             "warm_cycle_ms": self._last_cycle_ms,
         })
         _store.prune(keep_market_id=market_id)

@@ -46,6 +46,22 @@ from arena.market_utils import (
 logger = logging.getLogger("arena.discovery")
 
 
+def discovery_interval(tr=None, age=None) -> float:
+    """2s near rollover, otherwise DISCOVERY_INTERVAL_SEC."""
+    base = float(getattr(config, "DISCOVERY_INTERVAL_SEC", 20) or 20)
+    try:
+        if tr is not None and float(tr) < 15:
+            return 2.0
+    except (TypeError, ValueError):
+        pass
+    try:
+        if age is not None and float(age) < 15:
+            return 2.0
+    except (TypeError, ValueError):
+        pass
+    return base
+
+
 class MarketDiscovery(threading.Thread):
     """Background scanner for Polymarket BTC 5-min up/down markets."""
 
@@ -94,7 +110,10 @@ class MarketDiscovery(threading.Thread):
                         logger.error(f"on_cycle_complete hook error: {e}")
             except Exception as e:
                 logger.error(f"Discovery scan error: {e}")
-            self._stop_event.wait(config.DISCOVERY_INTERVAL_SEC)
+            snap = self.current_market_snapshot() or {}
+            tr = snap.get("time_remaining_seconds")
+            age = snap.get("window_age_seconds")
+            self._stop_event.wait(discovery_interval(tr, age))
         logger.info("Market discovery stopped")
 
     def stop(self) -> None:

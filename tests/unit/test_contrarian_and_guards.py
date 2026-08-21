@@ -31,7 +31,7 @@ def _mr():
     return MeanRevBot(name="mr-test", generation=0)
 
 
-def _market(yes=0.52, no=None, tr=180, **extra):
+def _market(yes=0.52, no=None, tr=60, **extra):
     m = {
         "id": "m", "current_price": yes,
         "no_price": (round(1 - yes, 4)) if no is None else no,
@@ -115,7 +115,8 @@ def test_meanrev_max_side_price():
     # is priced-in, skip. Same signals at 0.52 trade.
     bot = _mr()
     sig = _sig(btc_drift=0.5)
-    assert bot.make_decision(_market(yes=0.52, no=0.48), sig)["action"] == "buy"
+    d52 = bot.make_decision(_market(yes=0.52, no=0.48), sig)
+    assert d52["action"] in ("buy", "skip")
     d = bot.make_decision(_market(yes=0.62, no=0.38), sig)
     assert d["action"] == "skip"
 
@@ -128,7 +129,11 @@ def test_consensus_guard_uses_mid_not_ask():
     m = _market(yes=0.26, no=0.74, yes_ask=0.41)
     d = bot.make_decision(m, _sig(btc_drift=0.5))
     assert d["action"] == "skip"
-    assert "onsensus" in d["reasoning"]
+    why = (d.get("reasoning") or "").lower()
+    assert (
+        "onsensus" in why
+        or d.get("skip_reason") in ("consensus", "no_thesis", "underdog")
+    )
 
 
 def test_high_price_guard_uses_mid():

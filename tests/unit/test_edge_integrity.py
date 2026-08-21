@@ -19,6 +19,8 @@ Fixes under test:
      directional skip (suspect data).
 """
 
+import pytest
+
 import config
 import polymarket_fills
 from bots.bot_momentum import MomentumBot
@@ -90,24 +92,32 @@ def test_strong_lean_still_trades():
 
 def test_side_edges_anchor_on_own_price():
     bot = _bot()
-    model_prob, trust_eff = 0.62, 0.5
+    p_yes = 0.62
     yes_price, no_price = 0.55, 0.45
-    edge_yes, edge_no = bot._side_net_edges(model_prob, trust_eff,
-                                            yes_price, no_price)
+    edge_yes, edge_no = bot._side_net_edges(p_yes, yes_price, no_price)
     fee_y = polymarket_fills.taker_fee(1.0, yes_price)
     fee_n = polymarket_fills.taker_fee(1.0, no_price)
-    assert abs(edge_yes - (trust_eff * (model_prob - yes_price) - fee_y)) < 1e-9
-    assert abs(edge_no - (trust_eff * ((1 - model_prob) - no_price) - fee_n)) < 1e-9
+    assert abs(edge_yes - ((p_yes - yes_price) - fee_y)) < 1e-9
+    assert abs(edge_no - (((1 - p_yes) - no_price) - fee_n)) < 1e-9
 
 
-def test_spread_gap_is_not_directional_edge():
-    # The 19:34 disaster: yes=0.47, no=0.38 (sum 0.85), ignorant model.
-    # Old math: edge_no = (1-fair) - 0.38 ~ +0.13 -> Kelly max-sized it.
-    # New math: an ignorant model has trust_eff ~ 0 -> both edges ~ -fee.
+def test_edge_has_no_trust_tax():
+    """A 6¢ Φ-ask disagreement is not halved by trust=0.50."""
     bot = _bot()
-    edge_yes, edge_no = bot._side_net_edges(0.50, 0.01, 0.47, 0.38)
-    assert edge_no < 0.005
-    assert edge_yes < 0.005
+    ey, _en = bot._side_net_edges(0.56, 0.50, 0.50)
+    fee = polymarket_fills.taker_fee(1.0, 0.50)
+    assert ey == pytest.approx(0.56 - 0.50 - fee)
+    assert ey > 0.04  # would be ~0.0125 with a 0.5× trust tax
+
+
+def test_spread_gap_book_gate_not_edge_helper():
+    # Gapped books can still print a large helper edge at P=0.50; make_decision
+    # must skip via the book-sum gate, not a trust tax on _side_net_edges.
+    bot = _bot()
+    _ey, edge_no = bot._side_net_edges(0.50, 0.47, 0.38)
+    assert edge_no > 0.05
+    d = bot.make_decision(_market(yes=0.47, no=0.38), _sig())
+    assert d["action"] == "skip"
 
 
 # --- Fix 3: book-consistency gate ---

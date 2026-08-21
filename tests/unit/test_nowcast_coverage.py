@@ -60,3 +60,23 @@ def test_inject_does_not_backdate_or_fake_coverage():
     )
     # Must not report a full-window synthetic TWAP.
     assert nc["coverage"] < 0.10
+
+
+def test_data_quality_skip_provisional_strike():
+    from bots.base_bot import data_quality_skip
+    d = data_quality_skip({"btc_strike_source": "openPrice"})
+    assert d is not None
+    assert d["action"] == "skip"
+    assert d["skip_reason"] == "strike_unconfirmed"
+    assert data_quality_skip({"btc_strike_source": "twap_open"}) is None
+    assert data_quality_skip({}) is None
+
+
+def test_data_quality_skip_coverage_outage():
+    from bots.base_bot import data_quality_skip
+    d = data_quality_skip({"settlement_policy": {"coverage_outage": True}})
+    assert d is not None
+    assert d["skip_reason"] == "twap_coverage"
+    d2 = data_quality_skip({"twap_coverage_outage": True})
+    assert d2 is not None
+    assert d2["skip_reason"] == "twap_coverage"

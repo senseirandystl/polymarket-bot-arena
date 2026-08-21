@@ -75,7 +75,7 @@ def test_normal_regime_has_mid_band_prior(monkeypatch):
         a = adjustments("normal", "momentum")
     assert a.mid_band_drift_min is not None
     assert a.mid_band_drift_min >= 0.35
-    assert a.extra_drift_floor >= 0.05
+    assert a.extra_drift_floor == 0.0
 
 
 def test_high_vol_trend_eases_edge_relative_to_low_vol_trend():

@@ -52,7 +52,6 @@ def test_edge_math_always_subtracts_taker_fee(monkeypatch):
     monkeypatch.setattr(config, "LIMIT_PRICE_MODE", "cap_ask")
     bot = MomentumBot(name="mom-fee")
     assert bot._assumed_maker() is False
-    ey, en = bot._side_net_edges(0.60, 0.50, 0.52, 0.48)
+    ey, en = bot._side_net_edges(0.60, 0.52, 0.48)
     taker = fills.fee_per_share(0.52, is_maker=False)
-    # trust_eff * (0.60-0.52) - taker
-    assert ey == pytest.approx(0.50 * 0.08 - taker)
+    assert ey == pytest.approx(0.60 - 0.52 - taker)

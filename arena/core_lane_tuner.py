@@ -54,8 +54,9 @@ _CAND_GROUPS = {
 def live_tune_lanes(overrides: Optional[dict] = None) -> tuple[str, ...]:
     """Core lanes + enabled non-core overrides (live candidates)."""
     extra: list[str] = []
+    blocked = {"xasset", "tech", "ms_mom", "fut", "lag", "flow_decay"}
     for lane, ov in (overrides or {}).items():
-        if lane in CORE_LANES:
+        if lane in CORE_LANES or lane in blocked:
             continue
         if ov and ov.get("enabled") is True:
             extra.append(str(lane))
@@ -640,9 +641,16 @@ def tune() -> dict:
                         ev_blocks_up = True
                     if sc_net <= sc_force and cur > lo:
                         ev_forces_down = True
+                never_cut_drift = (
+                    lane == "drift"
+                    and bool(getattr(config, "CORE_TUNE_NEVER_CUT_DRIFT", True))
+                )
                 if ev_forces_down:
-                    new_w = round(max(lo, cur - step), 3)
-                    action = "ev_down"
+                    if never_cut_drift:
+                        action = "hold_pnl_gate"
+                    else:
+                        new_w = round(max(lo, cur - step), 3)
+                        action = "ev_down"
                 elif (
                     acc >= high_acc
                     and cur < hi
@@ -659,7 +667,7 @@ def tune() -> dict:
                     action = "up"
                 elif acc >= high_acc and (pnl_blocks_up or ev_blocks_up):
                     target = min(cur, max(lo, anchor))
-                    if cur > target + 1e-9:
+                    if cur > target + 1e-9 and not never_cut_drift:
                         new_w = round(max(lo, cur - step), 3)
                         action = "pnl_revert" if pnl_blocks_up else "ev_revert"
                     else:
@@ -698,8 +706,11 @@ def tune() -> dict:
                             else:
                                 action = "hold_pnl_gate"
                 elif acc <= low_acc and cur > lo:
-                    new_w = round(max(lo, cur - step), 3)
-                    action = "down"
+                    if never_cut_drift:
+                        action = "hold"
+                    else:
+                        new_w = round(max(lo, cur - step), 3)
+                        action = "down"
                 elif (acc < revert_below and cur > anchor + 1e-9
                       and cur > lo):
                     new_w = round(max(anchor, lo, cur - step), 3)

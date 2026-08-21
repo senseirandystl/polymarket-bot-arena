@@ -24,10 +24,13 @@ list copy.  Bots that appear in the list at the start of a tick remain
 in scope for the whole tick — we don't churn mid-iteration.
 """
 
+import json
 import logging
 import threading
 import time
 from datetime import datetime, timezone
+
+import db
 
 from config import TRADE_LOOP_INTERVAL_SEC
 from arena import market_data
@@ -41,6 +44,22 @@ from arena.state import SharedArenaState
 # doesn't pay for a fresh import every second.
 
 logger = logging.getLogger("arena.trader")
+
+
+def directional_buy_score(signal: dict) -> float:
+    """Rank competing buys by dollar EV: edge / (1 − ask). Ignores conf/weight."""
+    try:
+        edge = float(signal.get("edge") or 0.0)
+    except (TypeError, ValueError):
+        edge = 0.0
+    if edge != edge or edge == float("-inf"):
+        edge = 0.0
+    try:
+        ask = float(signal.get("entry_price") or 0.5)
+    except (TypeError, ValueError):
+        ask = 0.5
+    ask = min(0.99, max(0.01, ask))
+    return edge / max(1e-6, 1.0 - ask)
 
 
 class Trader(threading.Thread):
@@ -125,14 +144,9 @@ class Trader(threading.Thread):
         except Exception:
             pass
 
-        # Session-timing gate — 'build the skip, default state is flat'. Sit out
-        # high-flip session handovers (NYSE open/close) entirely, one check for
-        # all taker bots. Cheap and off the per-bot path.
-        skip_reason = session_skip(now)
-        if skip_reason is not None:
-            self._state.note_skip("session")
-            logger.debug(f"Session skip ({skip_reason}) — no taker trades this tick")
-            return
+        # Session-timing gate — NYSE open/close. Arb is market-neutral and
+        # exempt; directionals and sweeper sit flat.
+        session_reason = session_skip(now)
 
         # FRESH data every tick with ZERO network on the hot path: the
         # market-data warmer refreshes YES+NO prices, both books, OBI, CVD and
@@ -185,26 +199,6 @@ class Trader(threading.Thread):
 
         def _is_exempt(bot, exempt_set) -> bool:
             return (getattr(bot, "strategy_type", "") or "").lower() in exempt_set
-
-        def _buy_score(signal: dict) -> float:
-            """Rank competing buys: fee-adjusted edge × conf (size-agnostic)."""
-            try:
-                edge = float(signal.get("edge") or 0.0)
-            except (TypeError, ValueError):
-                edge = 0.0
-            if edge != edge or edge == float("-inf"):
-                edge = 0.0
-            try:
-                conf = float(signal.get("confidence") or 0.0)
-            except (TypeError, ValueError):
-                conf = 0.0
-            # Portfolio weight as mild tie-breaker so capital goes to winners
-            try:
-                from arena.portfolio import get_weight
-                w = float(get_weight(signal.get("_bot_name") or "") or 0.0)
-            except Exception:
-                w = 0.0
-            return edge * max(0.05, conf) * (1.0 + 0.25 * w)
 
         def _note_decision(bot, signal, *, force_buy_log=False):
             if signal.get("action") == "skip":
@@ -335,6 +329,13 @@ class Trader(threading.Thread):
             if self._state.is_slippage_cooling(key):
                 self._state.note_skip("slippage_cooldown")
                 continue
+            if (
+                session_reason is not None
+                and (getattr(bot, "strategy_type", "") or "").lower()
+                != "arbitrage"
+            ):
+                self._state.note_skip("session")
+                continue
             # Window lock: after any directional fill, other directionals sit out
             if (
                 window_lock
@@ -368,18 +369,46 @@ class Trader(threading.Thread):
             # Directional buy: rank and pick one winner after the loop
             signal = dict(signal)
             signal["_bot_name"] = bot.name
-            pending_buys.append((_buy_score(signal), bot, signal))
+            pending_buys.append((directional_buy_score(signal), bot, signal))
 
         if pending_buys:
-            pending_buys.sort(key=lambda t: t[0], reverse=True)
+            occupied = {
+                str(sig.get("side") or "")
+                for _sc, b, sig in pending_buys
+                if (getattr(b, "strategy_type", "") or "").lower() != "hybrid"
+            }
+            yielded = []
+            kept = []
+            for item in pending_buys:
+                _sc, b, sig = item
+                if (
+                    (getattr(b, "strategy_type", "") or "").lower() == "hybrid"
+                    and str(sig.get("side") or "") in occupied
+                ):
+                    yielded.append(item)
+                else:
+                    kept.append(item)
+            for _sc, bot, signal in yielded:
+                sup = dict(signal)
+                sup["action"] = "skip"
+                sup["skip_reason"] = "hybrid_yield"
+                sup["reasoning"] = (
+                    f"Hybrid yield: dedicated directional already pending "
+                    f"{signal.get('side')}"
+                )
+                _note_decision(bot, sup)
+                self._state.note_skip("hybrid_yield")
+            pending_buys = kept
+            if pending_buys:
+                pending_buys.sort(key=lambda t: t[0], reverse=True)
             try:
                 max_dir = int(getattr(_cfg, "MARKET_SIDE_MAX_BOTS", 1) or 1)
             except (TypeError, ValueError):
                 max_dir = 1
             max_dir = max(1, max_dir)
             filled_side: dict[str, int] = {}
-            winner_name = pending_buys[0][1].name
-            winner_score = pending_buys[0][0]
+            winner_name = pending_buys[0][1].name if pending_buys else ""
+            winner_score = pending_buys[0][0] if pending_buys else 0.0
             for score, bot, signal in pending_buys:
                 side = str(signal.get("side") or "")
                 n_side = int(filled_side.get(side, 0))

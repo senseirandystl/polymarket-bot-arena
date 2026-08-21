@@ -72,7 +72,8 @@ def test_complete_profile_written(tmp_db):
         BaseBot.STRATEGY_SIGNAL_PROFILE["hybrid"]["drift"])
 
 
-def test_anti_predictive_lane_nudged_down(tmp_db):
+def test_anti_predictive_lane_nudged_down(tmp_db, monkeypatch):
+    monkeypatch.setattr(config, "CORE_TUNE_NEVER_CUT_DRIFT", False, raising=False)
     db.set_auto_approve_lanes(True)
     # drift reads -0.30 on yes/win trades → contradicts UP → 0% accuracy.
     _seed("momentum", config.CORE_TUNE_MIN_TRADES, drift_reading=-0.30)

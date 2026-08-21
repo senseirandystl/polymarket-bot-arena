@@ -94,10 +94,7 @@ def resolve_lookback(
 
     if closed_in_window >= min_window and n_prices >= closed_in_window:
         return closed_in_window, "window"
-    if n_prices >= max_lookback:
-        return max_lookback, "continuous"
-    if n_prices >= min_window:
-        return n_prices, "continuous"
+    # Cross-window tape is the wrong object vs this strike — do not fade.
     return 0, "none"
 
 
@@ -113,7 +110,7 @@ class MeanRevBot(BaseBot):
 
     def _calc_rsi(self, prices, period):
         if len(prices) < period + 1:
-            return 50  # neutral
+            return None
         gains, losses = [], []
         for i in range(1, len(prices)):
             delta = prices[i] - prices[i-1]
@@ -235,7 +232,10 @@ class MeanRevBot(BaseBot):
                     reasoning=(
                         f"Fade NO mean above PTB: z={zscore:.2f}, "
                         f"mean={mean:.2f} > strike={strike_s} | {soak}"))
-            rsi_boost = max(0.0, rsi - p["rsi_overbought"]) * 0.005
+            rsi_boost = (
+                max(0.0, rsi - p["rsi_overbought"]) * 0.005
+                if rsi is not None else 0.0
+            )
             confidence = min(0.95, (0.35 + abs(zscore) * 0.15 + rsi_boost)
                              * regime_factor)
             return strategy_decision(
@@ -243,7 +243,7 @@ class MeanRevBot(BaseBot):
                 edge=min(0.10, (abs(zscore) - threshold) * 0.02 * regime_factor),
                 confidence=confidence,
                 reasoning=(
-                    f"Mean reversion SHORT: z={zscore:.2f}, RSI={rsi:.1f} "
+                    f"Mean reversion SHORT: z={zscore:.2f}, RSI={rsi if rsi is not None else 'na'} "
                     f"(fade up, regime={regime['label']}x{regime_factor:.2f}) "
                     f"| {soak}"),
                 signals=contributing,
@@ -264,7 +264,10 @@ class MeanRevBot(BaseBot):
                     reasoning=(
                         f"Fade YES mean below PTB: z={zscore:.2f}, "
                         f"mean={mean:.2f} < strike={strike_s} | {soak}"))
-            rsi_boost = max(0.0, p["rsi_oversold"] - rsi) * 0.005
+            rsi_boost = (
+                max(0.0, p["rsi_oversold"] - rsi) * 0.005
+                if rsi is not None else 0.0
+            )
             confidence = min(0.95, (0.35 + abs(zscore) * 0.15 + rsi_boost)
                              * regime_factor)
             return strategy_decision(
@@ -272,7 +275,7 @@ class MeanRevBot(BaseBot):
                 edge=min(0.10, (abs(zscore) - threshold) * 0.02 * regime_factor),
                 confidence=confidence,
                 reasoning=(
-                    f"Mean reversion LONG: z={zscore:.2f}, RSI={rsi:.1f} "
+                    f"Mean reversion LONG: z={zscore:.2f}, RSI={rsi if rsi is not None else 'na'} "
                     f"(fade down, regime={regime['label']}x{regime_factor:.2f}) "
                     f"| {soak}"),
                 signals=contributing,
@@ -281,4 +284,4 @@ class MeanRevBot(BaseBot):
 
         return strategy_decision(
             "hold", signals=contributing,
-            reasoning=f"No reversion signal: z={zscore:.2f}, RSI={rsi:.1f} | {soak}")
+            reasoning=f"No reversion signal: z={zscore:.2f}, RSI={rsi if rsi is not None else 'na'} | {soak}")

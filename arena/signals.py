@@ -440,6 +440,16 @@ def build_combined_signals(
         "btc_implied_yes": btc_implied_yes,
         "btc_drift_z": btc_drift_z,
         "btc_strike": btc_strike,
+        "btc_strike_source": (
+            get_strike_registry().get_source(
+                market.get("id") or market.get("market_id")
+            ) if market is not None else None
+        ),
+        "twap_coverage_outage": bool(
+            (resolution_meta.get("settlement_policy") or {}).get(
+                "coverage_outage"
+            )
+        ),
         "btc_now": float(resolution_meta.get("btc_now") or 0.0),
         "btc_spot": btc_spot,
         "drift_vol_scale": float(drift_vol_scale or 0.0),

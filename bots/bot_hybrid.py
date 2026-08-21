@@ -283,7 +283,17 @@ class HybridBot(BaseBot):
         reasons = []
         votes = {}
         sub_results = self._cached_sub_analyze(market, signals)
+        label = (self._last_regime or {}).get("label") or ""
+        if label in ("high_vol_trend", "low_vol_trend"):
+            allowed = {"momentum", "phantom"}
+        elif label in ("high_vol_chop", "low_vol_range"):
+            allowed = {"mean_rev"}
+        else:
+            allowed = {"momentum", "mean_rev", "phantom"}
         for sub, _param, _prefix, _sens in SUBS:
+            if sub not in allowed:
+                weights[sub] = 0.0
+                continue
             sig = sub_results.get(sub) or {"action": "hold"}
             if sig["action"] == "hold":
                 continue
@@ -298,7 +308,8 @@ class HybridBot(BaseBot):
                         "online": detail.get("online", {}),
                         "perf": detail.get("perf", {}),
                         "regime_bucket": bucket,
-                        "drift": drift}
+                        "drift": drift,
+                        "hybrid_active_subs": sorted(allowed)}
 
         # Keep the dashboard's view of the effective weights fresh
         # (arena_state 'hybrid_meta' -> /api/hybrid-meta; persist throttled).
@@ -326,10 +337,9 @@ class HybridBot(BaseBot):
         # pure mom/phantom clones that bled mid-window 2026-08-11. In trend,
         # a single strong sub may still fire (lag gate still applies in BaseBot).
         rid = (self._last_regime or {}).get("label") or ""
-        choppy = rid in (
-            "high_vol_chop", "low_vol_range", "normal", "unknown", ""
-        ) or (self._last_regime or {}).get("legacy") in ("volatile", "quiet")
-        if choppy and not agreement:
+        # Chop/range uses a single allowed sub (meanrev) — do not also
+        # demand 2-sub agreement. Mixed/normal tape still does.
+        if rid in ("normal", "unknown", "") and not agreement:
             return self._stamp_meta(
                 strategy_decision(
                     "hold", signals=contributing,

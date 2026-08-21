@@ -90,7 +90,7 @@ def test_continuous_edge_from_wr_eff(monkeypatch):
         a = adjustments("high_vol_chop", "momentum")
     assert a.edge_mult > 1.15
     assert a.wr_eff == pytest.approx(0.38)
-    assert a.extra_drift_floor > 0
+    assert a.extra_drift_floor == 0.0
     assert a.max_bots_side == 1  # soft-bad → tandem clamp
 
     with mock.patch("arena.regime_adapt._refresh_cache"), \

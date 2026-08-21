@@ -62,46 +62,39 @@ def implied_side_prob(
     signals: dict | None = None,
     signed_lane: float | None = None,
 ) -> float:
-    """Honest P(side wins) from Φ(z). Never ``0.5 + 0.5·tanh``.
+    """Honest P(side wins). Wrapper around ``signals.prob.live_side_prob``."""
+    from signals.prob import live_side_prob
+    p, _src = live_side_prob(
+        side=side, signals=signals, signed_lane=signed_lane,
+    )
+    return p
 
-    Order: ``btc_implied_yes`` (YES-frame) → Φ(``btc_drift_z``) →
-    Φ(artanh(lane)). ``signed_lane`` is YES-frame ``btc_drift`` (tanh(z)),
-    not already flipped toward ``side``. Missing everything → 0.5.
+
+_TWAP_OPEN_SOURCES = frozenset({"twap_open"})
+
+
+def data_quality_skip(signals: dict | None) -> dict | None:
+    """Skip if live strike is not TWAP-open or settlement tape is empty.
+
+    Keys absent (unit fixtures) do not skip — same pattern as the dual-gate.
     """
     sig = signals or {}
-    yes = None
-    try:
-        iy = sig.get("btc_implied_yes")
-        if iy is not None:
-            iy = float(iy)
-            if math.isfinite(iy):
-                yes = iy
-    except (TypeError, ValueError):
-        yes = None
-    if yes is None:
-        try:
-            z = sig.get("btc_drift_z")
-            if z is not None:
-                z = float(z)
-                if math.isfinite(z):
-                    yes = 0.5 * (1.0 + math.erf(z / math.sqrt(2.0)))
-        except (TypeError, ValueError):
-            yes = None
-    if yes is None and signed_lane is not None:
-        try:
-            t = float(signed_lane)
-            if math.isfinite(t):
-                t = max(-0.999999, min(0.999999, t))
-                z = math.atanh(t)
-                yes = 0.5 * (1.0 + math.erf(z / math.sqrt(2.0)))
-        except (TypeError, ValueError):
-            yes = None
-    if yes is None or not math.isfinite(yes):
-        yes = 0.5
-    yes = max(0.0, min(1.0, float(yes)))
-    if str(side).lower() == "no":
-        return 1.0 - yes
-    return yes
+    src = sig.get("btc_strike_source")
+    if src is not None and str(src) not in _TWAP_OPEN_SOURCES:
+        return strategy_decision(
+            "skip",
+            reasoning=f"Strike source {src!s} is not twap_open",
+            skip_reason="strike_unconfirmed",
+        )
+    pol = sig.get("settlement_policy") or {}
+    outage = bool(pol.get("coverage_outage") or sig.get("twap_coverage_outage"))
+    if outage:
+        return strategy_decision(
+            "skip",
+            reasoning="TWAP settlement coverage outage",
+            skip_reason="twap_coverage",
+        )
+    return None
 
 
 def drift_z_from_signals(signals: dict | None, tanh_lane: float = 0.0) -> float:
@@ -625,23 +618,19 @@ class BaseBot(ABC):
         """
         return False
 
-    def _side_net_edges(self, model_prob: float, trust_eff: float,
-                        yes_price: float, no_price: float) -> tuple:
-        """Cost-adjusted edge per side, each anchored on its OWN book price.
+    def _side_net_edges(self, p_yes: float, yes_price: float,
+                        no_price: float) -> tuple:
+        """Cost-adjusted edge per side, each anchored on its OWN ask.
 
-        edge_side = trust_eff * (P_model_side - side_price) - fee. Fee is
-        the crypto taker fee — we never assume a maker rebate in the
-        decision (BUG: paper LIMIT_PAPER_ASSUME_MAKER_FILL invented 0-fee
-        fills). A real maker fill is a positive surprise vs this bar.
-        Per-side anchoring makes edge purely model-vs-that-side's-price
-        (BUG #27).
+        ``edge = P_side − ask − taker_fee``. No trust multiplier — Kelly
+        fraction and edge cap are the conservatism. Per-side anchoring
+        (BUG #27): a cross-book gap is never directional edge.
         """
-        is_maker = self._assumed_maker()
-        edge_yes = (trust_eff * (model_prob - yes_price)
-                    - polymarket_fills.fee_per_share(yes_price, is_maker=is_maker))
-        edge_no = (trust_eff * ((1.0 - model_prob) - no_price)
-                   - polymarket_fills.fee_per_share(no_price, is_maker=is_maker))
-        return edge_yes, edge_no
+        from signals.prob import directional_net_edge
+        return (
+            directional_net_edge(p_yes, yes_price),
+            directional_net_edge(1.0 - float(p_yes), no_price),
+        )
 
     def make_decision(self, market: dict, signals: dict) -> dict:
         """Make a trading decision using market price edge + strategy + learning.
@@ -658,6 +647,9 @@ class BaseBot(ABC):
         # explicitly (key present), so a default arg wouldn't fire. A book that
         # is momentarily unavailable leaves it None — coalesce to neutral 0.5.
         market_price = market.get("current_price") or 0.5
+        _dq = data_quality_skip(signals)
+        if _dq is not None:
+            return _dq
 
         # --- Market-level lanes from the SignalLab ---
         # One cached computation per tick shared by EVERY bot: drift, mom
@@ -682,6 +674,7 @@ class BaseBot(ABC):
         raw_signal = self._normalize_analysis(self.analyze(market, signals))
         _fade_types = (
             "mean_reversion", "mean_reversion_sl", "mean_reversion_tp",
+            "hybrid",
         )
         _need_fade_thesis = (
             (self.strategy_type or "") in _fade_types
@@ -916,6 +909,13 @@ class BaseBot(ABC):
         blend = lab.blend(self.strategy_type, lanes, _profile,
                           overrides=overrides, signals=signals)
         model_prob = blend.prob
+        from signals.prob import live_side_prob
+        p_yes, p_source = live_side_prob(
+            side="yes",
+            signals=signals,
+            strategy_type=self.strategy_type,
+            signed_lane=drift_signal_val,
+        )
 
         # Earned cheap combo (Signal Lab). Measure-first: only fires when
         # combo_explorer has live unique-market +EV after taker fee. Never
@@ -976,6 +976,7 @@ class BaseBot(ABC):
             _sig_out = {
                 "drift": drift_signal_val, "mom": momentum_signal,
                 "strat": strategy_signal, "model_prob": model_prob,
+                "p_yes": p_yes, "p_source": p_source,
                 "fut": raw.get("fut_taker"), "tech": raw.get("tech_mtf"),
                 "xasset": raw.get("xasset"),
                 "lag": raw.get("lag"), "ms_mom": raw.get("ms_mom"),
@@ -1004,7 +1005,7 @@ class BaseBot(ABC):
 
         if _need_fade_thesis:
             return _skip(
-                "meanrev: analyze held — no fade thesis (refuse drift-clone)",
+                "analyze held — no thesis (refuse drift-clone)",
                 skip_reason="no_thesis",
             )
 
@@ -1013,12 +1014,8 @@ class BaseBot(ABC):
             return _skip(f"Macro-release caution {macro:.2f} — high-impact window")
 
         # --- Hard model-lean floor: no opinion, no trade (BUG #27) ---
-        # Conviction-scaled trust damps a weak model but its residual edge
-        # still scales with MARKET displacement, so near-ignorant models kept
-        # clearing MIN_EDGE against displaced prices (lean < 0.10: 28.6% WR /
-        # -$78.74 live; lean >= 0.10: 73% WR / +$96.12). Below the floor the
-        # model has nothing tradable to say — skip outright.
-        model_lean = abs(model_prob - 0.5)
+        # Lean and edge use p_yes (Φ / empirical), not the tanh blend.
+        model_lean = abs(p_yes - 0.5)
         _combo_used = False
         lean_min = float(config.MODEL_LEAN_MIN)
         try:
@@ -1028,37 +1025,28 @@ class BaseBot(ABC):
                 lean_min = max(0.02, lean_min * float(_wl["factor"]))
         except Exception as e:
             logger.debug("[%s] learned-rules skip_softening lean unavailable: %s", self.name, e)
-        # Prefer an earned cheap combo when it is *more* informed than the
-        # blend (typical: drift-flat, other lanes agree). Does not lower
-        # the lean floor — it substitutes a live-validated thesis.
         if (
             _combo
             and float(_combo.get("lean") or 0.0) > model_lean
         ):
-            model_prob = float(_combo["p_model"])
-            model_lean = abs(model_prob - 0.5)
+            p_yes = float(_combo["p_model"])
+            p_source = "combo"
+            model_lean = abs(p_yes - 0.5)
             _combo_used = True
         if model_lean < lean_min:
             return _skip(
-                f"Model lean too weak: |{model_prob:.3f}-0.5|="
+                f"Model lean too weak: |{p_yes:.3f}-0.5|="
                 f"{model_lean:.3f} < {lean_min:.2f}")
 
         trust = self.STRATEGY_MODEL_TRUST.get(self.strategy_type, 0.5)
-        # --- Conviction-scaled trust: the model's say is proportional to how
-        # much it actually knows. edge = trust*(P_model - mid) takes its
-        # magnitude from the MARKET's displacement, so a near-ignorant model
-        # (P_model ~ 0.5) could book a phantom edge on any market move away
-        # from 0.5 and systematically fade it (2026-07-17 chop run: underdog
-        # buys 38.5% WR, YES side 10% WR). A decisive model (lean >= the
-        # scale) keeps full trust — the validated market-lags-drift trade is
-        # untouched.
-        conviction = min(1.0, abs(model_prob - 0.5) / config.MODEL_CONVICTION_SCALE)
+        # Trust is logged / used for fair_yes diagnostics only. Edge is
+        # P − ask − fee with no trust tax (Kelly + edge cap size the bet).
+        conviction = min(1.0, abs(p_yes - 0.5) / config.MODEL_CONVICTION_SCALE)
         trust_eff = trust * conviction
-        # Strat-fight uncertainty damp (parked weight → lower model say)
         if _uncertainty_share > 0:
             damp = float(getattr(config, "STRAT_FIGHT_TRUST_DAMP", 0.55) or 0.0)
             trust_eff *= max(0.15, 1.0 - damp * _uncertainty_share)
-        fair_yes = self._compute_fair_yes(market_price, model_prob, trust_eff)
+        fair_yes = self._compute_fair_yes(market_price, p_yes, trust_eff)
 
         # --- Per-side evaluation: each side scored on its OWN price + fee ---
         # Binary outcomes must sum to 1, so both sides share the one fair
@@ -1096,19 +1084,12 @@ class BaseBot(ABC):
         yes_exec = market.get("yes_ask") or yes_price
         no_exec = market.get("no_ask") or no_price
 
-        edge_yes, edge_no = self._side_net_edges(model_prob, trust_eff,
-                                                 yes_exec, no_exec)
+        edge_yes, edge_no = self._side_net_edges(p_yes, yes_exec, no_exec)
 
         # --- Model-lean eligibility: never fade the market on IGNORANCE ---
-        # With no information the model sits at 0.5 and the blend would pull
-        # fair toward 0.5, making the non-favorite side look "cheap" on every
-        # market — a pure contrarian leak. A side is only tradable when the
-        # model ACTIVELY leans toward it (its lanes point that way), so the
-        # trade thesis is "market lags my information", never "market is more
-        # confident than my nothing".
-        if model_prob <= 0.5:
+        if p_yes <= 0.5:
             edge_yes = float("-inf")
-        if model_prob >= 0.5:
+        if p_yes >= 0.5:
             edge_no = float("-inf")
 
         # --- Drift veto: never trade AGAINST a non-trivial drift reading ---
@@ -1186,91 +1167,79 @@ class BaseBot(ABC):
         _live_money = (
             "btc_drift_pct" in signals or "btc_strike" in signals
         )
+        _z_read = drift_z_from_signals(signals, drift_signal_val)
+        z_ok = abs(_z_read) >= min_z if min_z > 0 else True
+        pct_ok = abs(d_pct) >= min_pct if min_pct > 0 else True
+        _dual_ok = (not _live_money) or (z_ok and pct_ok)
         if (
             _live_money
             and signed_drift > 0.05
             and (min_pct > 0 or min_z > 0)
+            and not _dual_ok
         ):
-            # Prefer raw z (btc_drift_z). Never treat tanh(z) as z.
-            _z_read = drift_z_from_signals(signals, drift_signal_val)
-            z_ok = abs(_z_read) >= min_z if min_z > 0 else True
-            pct_ok = abs(d_pct) >= min_pct if min_pct > 0 else True
-            if not (z_ok and pct_ok):
-                _combo_ok = (
-                    _combo_used
-                    and _combo
-                    and _combo.get("bypass_dual_gate")
-                    and _combo.get("side") == side
+            _combo_ok = (
+                _combo_used
+                and _combo
+                and _combo.get("bypass_dual_gate")
+                and _combo.get("side") == side
+            )
+            if not _combo_ok:
+                _dq_entry = (
+                    yes_exec if side == "yes" else no_exec
                 )
-                if not _combo_ok:
-                    _dq_entry = (
-                        yes_exec if side == "yes" else no_exec
-                    )
-                    return _skip(
-                        f"Drift dual-gate: d_pct={d_pct:+.5f}"
-                        f" (need |≥{min_pct:.5f}) "
-                        f"d_z={_z_read:+.3f}"
-                        f" (need |≥{min_z:.2f}) side={side}",
-                        side=side,
-                        entry_price=_dq_entry,
-                        skip_reason="drift_dual_gate",
-                    )
+                return _skip(
+                    f"Drift dual-gate: d_pct={d_pct:+.5f}"
+                    f" (need |≥{min_pct:.5f}) "
+                    f"d_z={_z_read:+.3f}"
+                    f" (need |≥{min_z:.2f}) side={side}",
+                    side=side,
+                    entry_price=_dq_entry,
+                    skip_reason="drift_dual_gate",
+                )
 
-        # --- Dead-zone gate (2026-07-21): the single biggest live leak ---
-        # A flat-drift opinion against a near-coin-flip market was 59 trades,
-        # 39% WR, -$77.83 over the 290-trade run — the model manufacturing an
-        # edge from noisy flow/strat lanes where the crowd is genuinely 50/50.
-        # It fires BEFORE the edge gate: the coin-flip band with no drift
-        # conviction is a "sit flat" region regardless of computed edge. The
-        # SAME price band with |drift| >= DEAD_ZONE_DRIFT_MIN is the profitable
-        # "market lags drift" trade (+$30.10, 65.7% WR) and passes through, so
-        # the gate is drift-CONDITIONAL. Quiet/range regimes raise the floor
-        # (DEAD_ZONE_QUIET_DRIFT_MIN) — weak-to-moderate drift in the mid band
-        # was the 2026-07-29 soak's largest leak under low_vol_range.
+        # Dead-zone: coin-flip mid with no real moneyness. Live path uses
+        # dual-gate failure; fixtures without moneyness keys keep a tanh floor.
         side_mid_dz = yes_price if side == "yes" else no_price
-        try:
-            from arena.gate_tuner import gate_float as _gf_dz
-        except Exception:
-            def _gf_dz(name, default):
-                return float(default)
         dz_lo = getattr(config, "DEAD_ZONE_PRICE_LO", 0.42)
         dz_hi = getattr(config, "DEAD_ZONE_PRICE_HI", 0.58)
-        dz_drift = _gf_dz(
-            "DEAD_ZONE_DRIFT_MIN",
-            getattr(config, "DEAD_ZONE_DRIFT_MIN", 0.10),
-        )
-        try:
-            rctx = self.regime_context(signals)
-            quiet_regs = getattr(
-                config, "DEAD_ZONE_QUIET_REGIMES",
-                ("low_vol_range", "low_vol_trend", "quiet"),
-            )
-            label = (rctx.get("label") or rctx.get("legacy") or "")
-            if label in quiet_regs:
-                dz_drift = max(
-                    dz_drift,
-                    float(getattr(config, "DEAD_ZONE_QUIET_DRIFT_MIN", 0.20)),
+        if dz_lo <= side_mid_dz <= dz_hi:
+            if _live_money:
+                _dz_block = not _dual_ok
+            else:
+                try:
+                    from arena.gate_tuner import gate_float as _gf_dz
+                except Exception:
+                    def _gf_dz(name, default):
+                        return float(default)
+                dz_drift = _gf_dz(
+                    "DEAD_ZONE_DRIFT_MIN",
+                    getattr(config, "DEAD_ZONE_DRIFT_MIN", 0.10),
                 )
-        except Exception:
-            pass
-        # Skip-reason bandit: if dead_zone skips often would have won, ease
-        # the drift floor (factor < 1); if they correctly avoided losses, tighten.
-        try:
-            from arena.learned_rules import skip_softening as _skip_soft
-            _dz_soft = _skip_soft("dead_zone")
-            if _dz_soft.get("soften"):
-                dz_drift = max(0.05, dz_drift * float(_dz_soft["factor"]))
-        except Exception as e:
-            logger.debug("[%s] learned-rules skip_softening dead_zone unavailable: %s", self.name, e)
-        # Regime prior can raise the dead-zone drift floor further.
-        dz_drift = max(dz_drift, dz_drift + float(getattr(_radj, "extra_drift_floor", 0.0) or 0.0))
-        if dz_lo <= side_mid_dz <= dz_hi and abs(drift_signal_val) < dz_drift:
-            return _skip(
-                f"Dead-zone gate: {side} mid={side_mid_dz:.2f} in "
-                f"[{dz_lo:.2f},{dz_hi:.2f}] & |drift|={abs(drift_signal_val):.3f}"
-                f"<{dz_drift:.2f} (coin-flip, no conviction)",
-                side=side, confidence=confidence, entry_price=side_mid_dz,
-                skip_reason="dead_zone")
+                try:
+                    rctx = self.regime_context(signals)
+                    quiet_regs = getattr(
+                        config, "DEAD_ZONE_QUIET_REGIMES",
+                        ("low_vol_range", "low_vol_trend", "quiet"),
+                    )
+                    label = (rctx.get("label") or rctx.get("legacy") or "")
+                    if label in quiet_regs:
+                        dz_drift = max(
+                            dz_drift,
+                            float(getattr(
+                                config, "DEAD_ZONE_QUIET_DRIFT_MIN", 0.20)),
+                        )
+                except Exception:
+                    pass
+                _dz_block = abs(drift_signal_val) < dz_drift
+            if _dz_block:
+                return _skip(
+                    f"Dead-zone gate: {side} mid={side_mid_dz:.2f} in "
+                    f"[{dz_lo:.2f},{dz_hi:.2f}] dual_ok={_dual_ok} "
+                    f"|drift|={abs(drift_signal_val):.3f} "
+                    f"(coin-flip, no conviction)",
+                    side=side, confidence=confidence,
+                    entry_price=side_mid_dz,
+                    skip_reason="dead_zone")
 
         # Mid-band price quality (2026-08-18): 50–58¢ directionals bled.
         _pq_ask = yes_exec if side == "yes" else no_exec
@@ -1308,7 +1277,6 @@ class BaseBot(ABC):
         if side == "no" and getattr(config, "NO_SIDE_ENABLED", True):
             signed_for_no = -float(drift_signal_val)
             no_min_d = float(getattr(config, "NO_SIDE_MIN_SIGNED_DRIFT", 0.12))
-            no_min_d += float(getattr(_radj, "extra_drift_floor", 0.0) or 0.0)
             if signed_for_no < no_min_d:
                 return _skip(
                     f"NO-side drift: signed_drift_for_NO={signed_for_no:+.3f} "
@@ -1335,7 +1303,6 @@ class BaseBot(ABC):
         ud_hi = float(getattr(config, "UNDERDOG_BAND_HI", 0.42))
         if ud_lo <= side_mid_dz < ud_hi:
             ud_drift = float(getattr(config, "UNDERDOG_MIN_DRIFT", 0.18))
-            ud_drift += float(getattr(_radj, "extra_drift_floor", 0.0) or 0.0)
             signed_side = (drift_signal_val if side == "yes"
                            else -drift_signal_val)
             if signed_side < ud_drift:
@@ -1344,66 +1311,9 @@ class BaseBot(ABC):
                     f"signed_drift≥{ud_drift:.2f} (got {signed_side:+.3f})",
                     side=side, confidence=confidence, entry_price=side_mid_dz)
 
-        # --- Coin-flip favorite band (0.50–0.58): need strong lag-worthy drift ---
-        # 2026-08 soak: 229 trades @ 50.2% WR / −$37; low_vol_trend subset −$49.
-        cf_lo = float(getattr(config, "MID_COINFLIP_LO", 0.50))
-        cf_hi = float(getattr(config, "MID_COINFLIP_HI", 0.58))
-        if cf_lo <= side_mid_dz <= cf_hi:
-            cf_drift = float(getattr(config, "MID_COINFLIP_DRIFT_MIN", 0.28))
-            # Regime prior / live depression can raise the floor further.
-            if getattr(_radj, "mid_band_drift_min", None) is not None:
-                cf_drift = max(cf_drift, float(_radj.mid_band_drift_min))
-            cf_drift += float(getattr(_radj, "extra_drift_floor", 0.0) or 0.0)
-            signed_side = (drift_signal_val if side == "yes"
-                           else -drift_signal_val)
-            if signed_side < cf_drift:
-                return _skip(
-                    f"Mid-band lag gate: {side} mid={side_mid_dz:.2f} in "
-                    f"[{cf_lo:.2f},{cf_hi:.2f}] needs signed_drift≥{cf_drift:.2f} "
-                    f"(got {signed_side:+.3f}; reg={getattr(_radj, 'label', '?')})",
-                    side=side, confidence=confidence, entry_price=side_mid_dz)
-
-        # --- Lag-justified edge (regime-agnostic; all directionals) ---
-        # Drift-implied fair must beat side mid + fee by LAG_JUSTIFIED_MIN_EDGE.
-        # Continuous alternative to hard mid caps: high mids still trade when
-        # |drift| is large enough that residual lag remains. Exempt structural
-        # strategies (arb/sweeper/makers) that own their own path.
-        if (
-            bool(getattr(config, "LAG_JUSTIFIED_ENABLED", True))
-            and not (
-                _combo_used
-                and _combo
-                and _combo.get("bypass_dual_gate")
-                and _combo.get("side") == side
-            )
-            and (self.strategy_type or "").lower()
-            not in {
-                str(t).lower()
-                for t in (getattr(config, "LAG_JUSTIFIED_EXEMPT", ()) or ())
-            }
-        ):
-            signed_for_side = (
-                float(drift_signal_val) if side == "yes"
-                else -float(drift_signal_val)
-            )
-            implied_side = implied_side_prob(
-                side=side, signals=signals, signed_lane=float(drift_signal_val),
-            )
-            try:
-                from polymarket_fills import taker_fee as _tfee
-                lag_fee = float(_tfee(1.0, side_mid_dz) or 0.0)
-            except Exception:
-                lag_fee = 0.0
-            lag_residual = implied_side - float(side_mid_dz) - lag_fee
-            lag_min = float(getattr(config, "LAG_JUSTIFIED_MIN_EDGE", 0.02))
-            # Hybrid / regime adapt can raise the bar when lag is thin
-            lag_min *= float(getattr(_radj, "lag_edge_mult", 1.0) or 1.0)
-            if lag_residual < lag_min:
-                return _skip(
-                    f"Lag-justified: implied={implied_side:.3f} mid={side_mid_dz:.3f} "
-                    f"fee={lag_fee:.3f} residual={lag_residual:+.3f} "
-                    f"< {lag_min:.3f} (market not lagging drift)",
-                    side=side, confidence=confidence, entry_price=side_mid_dz)
+        # Mid-band tanh floor (MID_COINFLIP_DRIFT_MIN) and Φ−mid lag-justified
+        # are not consulted: edge is already P−ask−fee and dual-gate is the
+        # moneyness bar. 50–58¢ with real 8 bp is the market-lags pocket.
 
         # --- Extreme-drift market-lag gate ---
         # |drift| ≥ DRIFT_EXTREME is only tradable when the market still LAGS
@@ -1726,6 +1636,7 @@ class BaseBot(ABC):
 
         reasoning = (
             f"fair={fair_yes:.2f} model={model_prob:.2f} "
+            f"p={p_yes:.2f}/{p_source} "
             f"trust={trust:.2f}x{conviction:.2f}={trust_eff:.2f} "
             f"yes={yes_price:.2f} no={no_price:.2f} "
             f"ask={yes_exec:.2f}/{no_exec:.2f} "
@@ -1768,6 +1679,7 @@ class BaseBot(ABC):
         _buy_sigs = {
             "drift": drift_signal_val, "mom": momentum_signal,
             "strat": strategy_signal, "model_prob": model_prob,
+            "p_yes": p_yes, "p_source": p_source,
             "trust_eff": trust_eff,
             # Raw candidate reads (pre kill-switch) for decision_events.
             "fut": raw.get("fut_taker"), "tech": raw.get("tech_mtf"),

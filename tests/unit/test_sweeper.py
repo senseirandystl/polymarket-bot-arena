@@ -185,8 +185,8 @@ def test_evolution_exempt():
     assert "sweeper" in EVOLUTION_EXEMPT_TYPES
 
 
-def test_coverage_outage_does_not_block_locked_book():
-    """Missing settlement ticks ≠ uncertain TWAP — cert floor would starve."""
+def test_coverage_outage_skips_even_locked_book():
+    """Empty settlement tape is not a lock — skip rather than trade spot."""
     bot = SweeperBot(name="sweeper-test")
     sigs = _signals(drift=0.98)
     sigs["in_settlement_window"] = True
@@ -198,8 +198,8 @@ def test_coverage_outage_does_not_block_locked_book():
         "coverage_outage": True,
     }
     d = bot.make_decision(_market(time_remaining_seconds=25), sigs)
-    assert d["action"] == "buy"
-    assert d["side"] == "yes"
+    assert d["action"] == "skip"
+    assert d.get("skip_reason") == "twap_coverage"
 
 
 def test_low_cert_without_outage_still_skips():

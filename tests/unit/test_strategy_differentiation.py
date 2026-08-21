@@ -18,7 +18,7 @@ RISING = [100.0 + i * 0.05 for i in range(12)]   # steady BTC uptrend
 
 
 def _mkt(**over):
-    base = {"current_price": 0.5, "no_price": 0.5, "time_remaining_seconds": 180}
+    base = {"current_price": 0.5, "no_price": 0.5, "time_remaining_seconds": 60}
     base.update(over)
     return base
 
@@ -81,7 +81,14 @@ def test_momentum_and_meanrev_take_opposite_sides():
 
 def test_hybrid_fires_when_substrategies_lean():
     # BTC trend up -> hybrid should reach a buy, not hold.
-    d = HybridBot(name="h").analyze(_mkt(), _sig(btc_drift=0.25))
+    d = HybridBot(name="h").analyze(
+        _mkt(),
+        _sig(
+            btc_drift=0.25,
+            market_regime={"label": "high_vol_trend", "known": True,
+                           "trend_score": 0.8},
+        ),
+    )
     # Hybrid's own analyze() requires ≥2-sub agreement before a BUY.
     # A single momentum lean must still show up in the ensemble vote/score.
     assert d["signals"]["votes"].get("momentum", 0) > 0

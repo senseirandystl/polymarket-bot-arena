@@ -38,7 +38,7 @@ import learning
 import polymarket_fills
 from bots.base_bot import (
     BaseBot, strategy_decision, price_quality_ok, implied_side_prob,
-    drift_z_from_signals,
+    drift_z_from_signals, data_quality_skip,
 )
 from signals.curves import smooth_ramp
 from signals.lab import SignalView
@@ -78,6 +78,9 @@ class SniperBot(BaseBot):
     def make_decision(self, market, signals):
         """Drift-implied fair vs mid/ask — snipe only when the market lags."""
         p = self.strategy_params
+        _dq = data_quality_skip(signals)
+        if _dq is not None:
+            return _dq
         sv = SignalView.of(signals)
 
         yes_mid = market.get("current_price") or 0.5
@@ -122,6 +125,40 @@ class SniperBot(BaseBot):
                 entry_price=_ask,
                 skip_reason="drift_dual_gate",
             )
+        window = float(getattr(config, "MARKET_WINDOW_SEC", 300) or 300)
+        tr = market.get("time_remaining_seconds")
+        try:
+            age = max(0.0, window - float(tr)) if tr is not None else 0.0
+        except (TypeError, ValueError):
+            age = 0.0
+        in_settle = bool(sv.in_settlement_window)
+        try:
+            cert = float(sv.twap_certainty or 0.0)
+        except (TypeError, ValueError):
+            cert = 0.0
+        if age < 60.0 and not in_settle:
+            _side = "yes" if drift >= 0 else "no"
+            _ask = yes_ask if _side == "yes" else no_ask
+            return strategy_decision(
+                "skip",
+                side=_side,
+                reasoning=f"sniper: early window age={age:.0f}s (momentum owns)",
+                entry_price=_ask,
+                skip_reason="sniper_window",
+            )
+        if abs(d_pct) < 0.0015 and not (in_settle and cert >= 0.45):
+            _side = "yes" if drift >= 0 else "no"
+            _ask = yes_ask if _side == "yes" else no_ask
+            return strategy_decision(
+                "skip",
+                side=_side,
+                reasoning=(
+                    f"sniper: need |d|≥15bp or settlement cert "
+                    f"(d_pct={d_pct:+.5f} cert={cert:.2f})"
+                ),
+                entry_price=_ask,
+                skip_reason="sniper_conviction",
+            )
         regime = self.regime_context(signals)
         # Data-driven hard stand-down when live regime is toxic.
         try:
@@ -143,7 +180,7 @@ class SniperBot(BaseBot):
                         f"({_radj.reason})"
                     ),
                 )
-            min_drift += float(getattr(_radj, "extra_drift_floor", 0.0) or 0.0)
+            pass  # extra_drift_floor is not a sniper gate (unstacked)
             # Continuous strategy×regime edge tax (data-driven).
             min_edge_tax = float(getattr(_radj, "edge_mult", 1.0) or 1.0)
         except Exception:
@@ -179,7 +216,9 @@ class SniperBot(BaseBot):
         # DB still has 0.50 from the band-aid era; lag vs Φ(z) is the cap.
         if max_mid <= 0.51:
             max_mid = 0.58
-        min_mid = float(p.get("min_side_mid", 0.30))
+        min_mid = float(p.get("min_side_mid", 0.42))
+        if min_mid < 0.42:
+            min_mid = 0.42
         ext_abs = float(p.get("extreme_drift_abs",
                               getattr(config, "DRIFT_EXTREME_ABS", 0.50)))
 
@@ -233,21 +272,12 @@ class SniperBot(BaseBot):
         # edge math can look fine on mid while fill risk/reward is trash.
         max_spread = float(p.get(
             "max_ask_mid_spread",
-            getattr(config, "SNIPER_MAX_ASK_MID_SPREAD", 0.08),
+            getattr(config, "SNIPER_MAX_ASK_MID_SPREAD", 0.03),
         ))
-
-        # Coin-flip mid band needs stronger signed drift (same spirit as base).
-        cf_lo = float(getattr(config, "MID_COINFLIP_LO", 0.50))
-        cf_hi = float(getattr(config, "MID_COINFLIP_HI", 0.58))
-        cf_drift = float(getattr(config, "MID_COINFLIP_DRIFT_MIN", 0.28))
-        if _radj is not None and getattr(_radj, "mid_band_drift_min", None):
-            cf_drift = max(cf_drift, float(_radj.mid_band_drift_min))
 
         # Eligibility per side: drift magnitude + lag + edge + not deep junk.
         def _ok(signed_d: float, mid: float, edge: float, ask: float) -> bool:
             need = min_drift
-            if cf_lo <= float(mid) <= cf_hi:
-                need = max(need, cf_drift)
             if abs(signed_d) < need:
                 return False
             if mid > max_mid or mid < min_mid:

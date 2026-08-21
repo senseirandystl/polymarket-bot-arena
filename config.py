@@ -271,7 +271,8 @@ REGIME_STATS_MAX_TRADES = 4000
 REGIME_ADAPT_CONT_MIN_N = 5
 REGIME_ADAPT_FAST_BLEND = 0.65          # weight on fast_wr when both thick
 # Performance-triggered early evolution (in addition to EVOLUTION_INTERVAL_HOURS).
-GA_PERF_TRIGGER_ENABLED = True
+GA_PERF_TRIGGER_ENABLED = False
+GA_FREEZE_DEFAULT_ROSTER = True
 GA_PERF_TRIGGER_PNL = -25.0    # fire early if pool window P&L ≤ this
 GA_PERF_TRIGGER_MIN_TRADES = 40
 GA_PERF_TRIGGER_DROP = 40.0    # optional: fire if pool P&L drops this much vs last check
@@ -326,7 +327,13 @@ GA_FROZEN_GENES = ()
 # --- Sniper ask quality ---
 # Max (ask − mid) on the chosen side; wider spreads mean the lag thesis on
 # mid is already stale at the executable price (2026-07-29 mid0.54/ask0.75).
-SNIPER_MAX_ASK_MID_SPREAD = 0.08
+SNIPER_MAX_ASK_MID_SPREAD = 0.03
+# Style-skip seeds (no wait for 12h toxic WR). Tuple (regime, strategy).
+REGIME_STYLE_SKIP_SEEDS = {
+    ("high_vol_chop", "momentum"): True,
+    ("low_vol_range", "momentum"): True,
+    ("high_vol_trend", "mean_reversion"): True,
+}
 
 # --- Portfolio explore floor for new gN bots ---
 # Until a post-evolution bot has this many resolved trades, cap its capital
@@ -1327,7 +1334,7 @@ CLEAN_TICK_STALE_SEC = 10.0  # ...unless last good is older than this (real repr
 CLEAN_TICK_DROP_FIRST = False # drop the first tick from a newly-seen token
 
 # Copy Trading Settings
-COPYTRADING_ENABLED = True
+COPYTRADING_ENABLED = False
 COPYTRADING_MAX_WALLETS_TO_TRACK = 10
 COPYTRADING_POSITION_SIZE_FRACTION = 0.5  # Copy 50% of whale's position size
 COPYTRADING_DAILY_LOSS_LIMIT = 50.0     # Max USDC in realized losses per calendar day (wins are unlimited)
@@ -1406,7 +1413,12 @@ LIVE_REQUIRE_ALERTS = True
 # historical $ leak on WR alone re-opens BUG #31.
 LEARNED_RULES_SOFTEN_REQUIRE_PNL = True
 LEARNED_RULES_SOFTEN_MIN_CF_PNL = 0.0
-LEARNED_RULES_NEVER_SOFTEN = ()     # audit: removed dead_zone — bandit may soften when skip CF WR > 0.60 + side_mid < 0.55
+LEARNED_RULES_NEVER_SOFTEN = (
+    "dead_zone", "drift_dual_gate", "price_quality",
+    "strike_unconfirmed", "twap_coverage",
+)
+CORE_TUNE_NEVER_CUT_DRIFT = True
+PORTFOLIO_EXPLORE_FLOOR = 0.05
 
 # Polymarket enforces a per-order minimum of 5 shares. Bet sizing floors the
 # spend so a trade always clears this (5 shares × price × buffer) — otherwise

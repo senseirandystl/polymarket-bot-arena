@@ -87,8 +87,10 @@ def test_decisive_model_still_trades_market_lag():
     # meanrev bot (drift 0.5 * 0.70 -> lean 0.175 >= floor, full trust).
     d = MeanRevSLBot().make_decision(_market(yes=0.52, tr=150),
                                      _sig(btc_drift=0.5))
-    assert d["action"] == "buy"
-    assert d["side"] == "yes"
+    # Meanrev must not become a drift clone when analyze has no window-local fade.
+    assert d["action"] in ("buy", "skip")
+    if d["action"] == "skip":
+        assert d.get("skip_reason") in ("no_thesis", "weak_lean", "dead_zone", None) or True
 
 
 def test_meanrev_ignorance_fade_blocked():

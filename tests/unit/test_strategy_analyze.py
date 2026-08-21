@@ -80,12 +80,13 @@ def test_meanrev_fade_requires_drift_backing():
     # A sharp up-spike at the end of a flat tape → overextended UP → fade = NO.
     prices = [100_000.0] * (lookback + 20) + [101_500.0]
     # Without a DOWN drift, the NO fade must be vetoed.
-    vetoed = bot.analyze(make_market(),
+    late = make_market(time_remaining=60)
+    vetoed = bot.analyze(late,
                          make_signals(prices=prices, latest=prices[-1], btc_drift=0.0,
                                       btc_strike=102_000.0))
     assert vetoed["action"] == "hold"
     # With a down-drift ≥ min_drift AND mean ≤ strike the same fade is allowed.
-    backed = bot.analyze(make_market(),
+    backed = bot.analyze(late,
                          make_signals(prices=prices, latest=prices[-1], btc_drift=-0.3,
                                       btc_strike=102_000.0))
     _check_contract(backed)
@@ -99,15 +100,16 @@ def test_meanrev_fade_requires_mean_on_ptb_side():
     lookback = bot.strategy_params["lookback_candles"]
     prices = [100_000.0] * (lookback + 20) + [101_500.0]
     # Drift would allow NO, but mean (~100k) is ABOVE strike → hold.
+    late = make_market(time_remaining=60)
     blocked = bot.analyze(
-        make_market(),
+        late,
         make_signals(prices=prices, latest=prices[-1], btc_drift=-0.3,
                      btc_strike=99_000.0))
     assert blocked["action"] == "hold"
     assert "PTB" in blocked["reasoning"] or "strike" in blocked["reasoning"]
     # Strike above mean → NO allowed.
     ok = bot.analyze(
-        make_market(),
+        late,
         make_signals(prices=prices, latest=prices[-1], btc_drift=-0.3,
                      btc_strike=102_000.0))
     assert ok["action"] == "buy" and ok["side"] == "no"
@@ -148,11 +150,11 @@ def test_meanrev_window_lookback_preferred_late_window():
         max_lookback=10, min_window_candles=3)
     assert src == "window" and lb == 4
 
-    # Early window (age 90s → 1 closed bar) falls back to continuous.
+    # Early window (age 90s → 1 closed bar) does not use prior windows.
     lb2, src2 = resolve_lookback(
         {"time_remaining_seconds": 210}, n_prices=20,
         max_lookback=10, min_window_candles=3)
-    assert src2 == "continuous" and lb2 == 10
+    assert src2 == "none" and lb2 == 0
 
 
 def test_regime_specialist_holds_outside_allow_list():

@@ -11,7 +11,7 @@ DEFAULT_PARAMS = {
     # >0.03%, so momentum now emits a directional lean whenever there is a real
     # trend; the strategy lane is capped at +/-0.043 of fair value, so a frequent
     # lean nudges rather than dominates.
-    "momentum_threshold": 0.0003,
+    "momentum_threshold": 0.0012,
     "position_size_pct": 0.05,    # 5% of max position
     "min_confidence": 0.55,
     "trend_strength_weight": 0.7,
@@ -141,6 +141,23 @@ class MomentumBot(BaseBot):
             "regime_factor": regime_factor,
             "market_phase": getattr(sv, "market_phase", "unknown"),
         }
+
+        window = float(getattr(config, "MARKET_WINDOW_SEC", 300) or 300)
+        tr = market.get("time_remaining_seconds")
+        try:
+            age = max(0.0, window - float(tr)) if tr is not None else float(
+                market.get("window_age_seconds") or 0.0
+            )
+        except (TypeError, ValueError):
+            age = 0.0
+        if age >= 120 and consecutive < 3:
+            return strategy_decision(
+                "hold", confidence=confidence, signals=contributing,
+                reasoning=(
+                    f"momentum late-window age={age:.0f}s without "
+                    f"{consecutive} consecutive bars"
+                ),
+            )
 
         if abs(pct_change) < threshold:
             return strategy_decision(

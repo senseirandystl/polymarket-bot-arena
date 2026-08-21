@@ -224,6 +224,7 @@ def _pnls_from_perf(perf):
 
 def _patch_ga_db(monkeypatch, bots):
     """Mock db reads/writes used by run_ga_cycle."""
+    monkeypatch.setattr(config, "GA_FREEZE_DEFAULT_ROSTER", False, raising=False)
     trade_map = {b.name: _pnls_from_perf(b._perf) for b in bots}
     retired = []
     saved = []

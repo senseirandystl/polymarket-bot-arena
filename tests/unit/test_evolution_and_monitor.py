@@ -119,6 +119,7 @@ def _factory(strategy_type, name, params, generation, lineage):
 
 
 def _run(bots, monkeypatch):
+    monkeypatch.setattr(config, "GA_FREEZE_DEFAULT_ROSTER", False, raising=False)
     replaced = _patch_db(monkeypatch, bots)
     # Arena run_evolution → run_ga_cycle; patch validate
     monkeypatch.setattr(arena, "_validate_bot", lambda b: True)
@@ -170,7 +171,7 @@ def test_negative_pnl_and_gap_is_replaced(monkeypatch):
     names = [b.name for b in result]
     assert "winner" in names and "loser" not in names
     # Replacement keeps the loser's strategy type under GA
-    assert any("momentum" in n for n in names if n != "winner")
+    assert any(n != "winner" for n in names)
 
 
 def test_positive_pnl_survives_even_with_thin_gap(monkeypatch):

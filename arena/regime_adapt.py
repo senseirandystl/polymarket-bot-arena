@@ -799,6 +799,12 @@ def adjustments(
     block_strat = False
     if strategy_type and strategy_type in _DIRECTIONAL_TYPES:
         block_strat = bool(strat_blocks.get((label, strategy_type), False))
+        seeds = getattr(config, "REGIME_STYLE_SKIP_SEEDS", None) or {}
+        if not block_strat and (
+            seeds.get((label, strategy_type))
+            or seeds.get(f"{label}|{strategy_type}")
+        ):
+            block_strat = True
     else:
         block = False
         block_strat = False
@@ -842,7 +848,7 @@ def adjustments(
         mom_lane_scale=max(0.0, min(1.5, mom_scale)),
         strat_lane_scale=max(0.0, min(1.5, strat_scale)),
         no_edge_mult=max(1.0, min(2.5, no_edge)),
-        extra_drift_floor=max(0.0, min(0.20, extra_drift)),
+        extra_drift_floor=0.0,
         block_directional=block,
         block_strategy=block_strat,
         mid_band_drift_min=mid_band,

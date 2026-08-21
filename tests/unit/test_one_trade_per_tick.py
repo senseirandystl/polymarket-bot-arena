@@ -40,6 +40,20 @@ def test_reset_rehydrates_recent_fills(tmp_path, monkeypatch):
     assert not st.is_traded(("other", "old"))
 
 
+def test_discovery_interval_near_rollover():
+    from arena.discovery import discovery_interval
+    assert discovery_interval(tr=10, age=290) == 2.0
+    assert discovery_interval(tr=200, age=5) == 2.0
+    assert discovery_interval(tr=120, age=180) >= 15
+
+
+def test_buy_score_is_dollar_ev_not_confidence():
+    from arena.trader import directional_buy_score
+    fat_conf = {"edge": 0.03, "confidence": 0.95, "entry_price": 0.50}
+    thin_conf = {"edge": 0.08, "confidence": 0.10, "entry_price": 0.50}
+    assert directional_buy_score(thin_conf) > directional_buy_score(fat_conf)
+
+
 def test_window_lock_db_toggle(tmp_path, monkeypatch):
     import db as db_module
     monkeypatch.setattr(db_module, "DB_PATH", tmp_path / "wl.db")

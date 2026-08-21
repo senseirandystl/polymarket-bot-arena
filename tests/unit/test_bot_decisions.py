@@ -138,7 +138,7 @@ def _meanrev_sig(vol_regime):
     # Sharp up-spike on flat tape → overextended UP → fade NO, backed by a
     # DOWN drift (BUG #28) and strike above the reversion mean (P0 PTB gate).
     prices = [100_000.0] * (lookback + 20) + [101_500.0]
-    return bot.analyze(make_market(), make_signals(
+    return bot.analyze(make_market(time_remaining=60), make_signals(
         prices=prices, latest=prices[-1], btc_drift=-0.30,
         btc_strike=102_000.0,
         vol_regime=vol_regime))
@@ -192,15 +192,18 @@ class TestPhantomRegime:
 # ---------------------------------------------------------------------------
 
 def _sniper_market():
-    # YES 0.44 sits in the cheap zone [0.40, 0.48).
-    return make_market(yes_price=0.44)
+    # YES 0.45 is above the 42¢ underdog floor, still lagging.
+    return make_market(yes_price=0.45, time_remaining=180)
 
 
 class TestSniper:
     def test_buys_cheap_zone_with_drift_backing(self, arena_db):
         bot = SniperBot(name="sniper-t", generation=0)
         # TWAP dual-gate floors sniper at min_drift = max(0.15, 0.35, 0.40) = 0.40.
-        sig = bot.make_decision(_sniper_market(), make_signals(btc_drift=0.45))
+        sig = bot.make_decision(
+            _sniper_market(),
+            make_signals(btc_drift=0.45, btc_drift_pct=0.0016, btc_drift_z=0.50),
+        )
         _check_contract(sig)
         assert sig["action"] == "buy" and sig["side"] == "yes"
         assert sig["edge"] > 0
@@ -224,10 +227,13 @@ class TestSniper:
         )
         # Dual-gate |z|≥0.35. Quiet adds quiet_drift_bump to the z floor.
         drift = 0.37  # clears 0.35; quiet bar = 0.40 skips
+        extra = dict(btc_drift_pct=0.0016, btc_drift_z=0.36)
         quiet = bot.make_decision(_sniper_market(), make_signals(
-            btc_drift=drift, vol_regime={"regime": "quiet", "trend_score": 0.2}))
+            btc_drift=drift, vol_regime={"regime": "quiet", "trend_score": 0.2},
+            **extra))
         normal = bot.make_decision(_sniper_market(), make_signals(
-            btc_drift=drift, vol_regime={"regime": "normal", "trend_score": 0.5}))
+            btc_drift=drift, vol_regime={"regime": "normal", "trend_score": 0.5},
+            **extra))
         assert normal["action"] == "buy"
         assert quiet["action"] == "skip"
 
