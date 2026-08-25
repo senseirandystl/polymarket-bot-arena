@@ -89,13 +89,20 @@ def process_pending_deploys(
         if st not in catalog:
             skipped.append({"strategy_type": st, "reason": "unknown_strategy"})
             continue
-        if st in active_types:
+        source = "" if isinstance(item, str) else str((item or {}).get("source") or "")
+        # Desk factory may run two momentums with different genes. Only
+        # collapse duplicates when the operator clicked the catalog deploy.
+        if st in active_types and source != "desk":
             skipped.append({"strategy_type": st, "reason": "already_active"})
             continue
         try:
             preferred = catalog[st]["default_name"]
+            if isinstance(item, dict) and item.get("name"):
+                preferred = str(item["name"])
             bot_name = unique_bot_name(preferred, taken_names)
             bot = instantiate_strategy(st, name=bot_name)
+            if isinstance(item, dict) and item.get("spec_id"):
+                bot.lineage = f"desk:{item['spec_id']}"
             db.save_bot_config(
                 bot.name, bot.strategy_type, bot.generation,
                 bot.strategy_params, lineage=getattr(bot, "lineage", None),
