@@ -5,6 +5,7 @@ import db
 import polymarket_fills
 from arena import combo_explorer as ce
 from arena.live_scorecard import unique_market_rows
+from bots.base_bot import BaseBot
 
 
 def _insert(conn, **kw):
@@ -216,6 +217,8 @@ def test_combo_confirm_can_buy_cheap_when_drift_flat(monkeypatch):
     monkeypatch.setattr(config, "COMBO_CONFIRM_APPLY", True)
     monkeypatch.setattr(db, "get_paper_available", lambda: 200.0)
     monkeypatch.setattr(db, "get_kelly_fraction", lambda: 0.25)
+    # Combo confirm is independent of the soak 0.58 momentum cap.
+    monkeypatch.setitem(BaseBot.STRATEGY_MAX_SIDE_PRICE, "momentum", 0.62)
     bot = MomentumBot(name="mom-combo")
     bot._perf_cache = (9e12, 0)
     market = {

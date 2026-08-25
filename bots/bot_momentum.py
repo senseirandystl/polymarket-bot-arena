@@ -46,19 +46,12 @@ class MomentumBot(BaseBot):
         against the strike is noise, not a binary edge.
         """
         sv = SignalView.of(signals)
-        # Prefer TWAP-sampled path (resolution object) over spot 1m candles.
-        prices = list(sv.prices)
-        try:
-            from signals.drift_scale import resample_tick_prices
-            ticks = signals.get("btc_twap_ticks") or []
-            if not ticks:
-                from signals.price_feed import get_price_feed
-                ticks = get_price_feed().btc_twap_ticks()
-            tw = resample_tick_prices(ticks, sample_sec=60.0) or []
-            if len(tw) >= self.strategy_params["lookback_candles"]:
-                prices = list(tw)
-        except Exception:
-            pass
+        # Settlement-object candles: TWAP on Polymarket, BRTI on Kalshi.
+        from signals.tape import candle_prices
+        prices = candle_prices(market, signals if isinstance(signals, dict) else {},
+                               sample_sec=60.0)
+        if len(prices) < self.strategy_params["lookback_candles"]:
+            prices = list(sv.prices)
         if len(prices) < self.strategy_params["lookback_candles"]:
             return strategy_decision("hold", reasoning="insufficient price data")
 
@@ -142,20 +135,37 @@ class MomentumBot(BaseBot):
             "market_phase": getattr(sv, "market_phase", "unknown"),
         }
 
-        window = float(getattr(config, "MARKET_WINDOW_SEC", 300) or 300)
+        window = float(market.get("window_sec") or getattr(config, "MARKET_WINDOW_SEC", 300) or 300)
+        try:
+            late_sec = float(getattr(config, "MOMENTUM_LATE_SKIP_SEC", 80))
+        except (TypeError, ValueError):
+            late_sec = 80.0
+        if late_sec < 0:
+            late_sec = 80.0
+        try:
+            from exchanges import KALSHI, exchange_of as _ex_of
+            if _ex_of(market) == KALSHI:
+                late_sec = float(getattr(config, "KALSHI_MOMENTUM_LATE_SKIP_SEC", 120) or 120)
+                window = float(market.get("window_sec") or getattr(config, "KALSHI_WINDOW_SEC", 900) or 900)
+        except Exception:
+            pass
         tr = market.get("time_remaining_seconds")
         try:
-            age = max(0.0, window - float(tr)) if tr is not None else float(
+            remaining = float(tr) if tr is not None else None
+            age = max(0.0, window - remaining) if remaining is not None else float(
                 market.get("window_age_seconds") or 0.0
             )
         except (TypeError, ValueError):
+            remaining = None
             age = 0.0
-        if age >= 120 and consecutive < 3:
+        if remaining is None and age > 0:
+            remaining = max(0.0, window - age)
+        if late_sec > 0 and remaining is not None and remaining <= late_sec:
             return strategy_decision(
                 "hold", confidence=confidence, signals=contributing,
                 reasoning=(
-                    f"momentum late-window age={age:.0f}s without "
-                    f"{consecutive} consecutive bars"
+                    f"momentum late-window remaining={remaining:.0f}s "
+                    f"(sit out last {late_sec:.0f}s)"
                 ),
             )
 

@@ -94,6 +94,71 @@ def test_arbitrage_pinned_to_equal_share():
     assert result2["weights"]["arbitrage-v1"] == pytest.approx(0.10, abs=0.01)
 
 
+def test_lockin_arb_and_sweeper_pinned_even_at_cold_start():
+    """Default 6-bot slate: lock-in (arb+sweeper) and core all start at 1/6."""
+    names = [
+        "momentum-v1", "meanrev-v1", "sniper-v1", "hybrid-v1",
+        "arbitrage-v1", "sweeper-v1",
+    ]
+    metrics = {
+        n: {"n": 0, "sharpe": 0.0, "expectancy": 0.0,
+            "total_pnl": 0.0, "variance": 1.0, "ready": False}
+        for n in names
+    }
+    with mock.patch.object(portfolio, "compute_metrics", return_value=metrics), \
+         mock.patch.object(portfolio, "_market_returns_by_bot",
+                           return_value={n: {} for n in names}):
+        result = portfolio.allocate(names, method="kelly_portfolio")
+    w = result["weights"]
+    assert abs(sum(w.values()) - 1.0) < 1e-5
+    for n in names:
+        assert w[n] == pytest.approx(1.0 / 6.0, abs=0.01)
+
+
+def test_lockin_stays_pinned_when_core_kelly_moves():
+    names = [
+        "momentum-v1", "meanrev-v1", "sniper-v1", "hybrid-v1",
+        "arbitrage-v1", "sweeper-v1",
+    ]
+    metrics = {
+        "momentum-v1": {
+            "n": 40, "sharpe": 1.2, "expectancy": 0.8,
+            "total_pnl": 20.0, "variance": 1.0, "ready": True,
+        },
+        "meanrev-v1": {
+            "n": 40, "sharpe": 0.1, "expectancy": 0.05,
+            "total_pnl": 2.0, "variance": 4.0, "ready": True,
+        },
+        "sniper-v1": {
+            "n": 40, "sharpe": 0.2, "expectancy": 0.1,
+            "total_pnl": 4.0, "variance": 3.0, "ready": True,
+        },
+        "hybrid-v1": {
+            "n": 40, "sharpe": 0.4, "expectancy": 0.2,
+            "total_pnl": 8.0, "variance": 2.0, "ready": True,
+        },
+        "arbitrage-v1": {
+            "n": 0, "sharpe": 0.0, "expectancy": 0.0,
+            "total_pnl": 0.0, "variance": 1.0, "ready": False,
+        },
+        "sweeper-v1": {
+            "n": 8, "sharpe": 0.01, "expectancy": 0.01,
+            "total_pnl": 0.1, "variance": 0.5, "ready": True,
+        },
+    }
+    with mock.patch.object(portfolio, "compute_metrics", return_value=metrics), \
+         mock.patch.object(portfolio, "_market_returns_by_bot",
+                           return_value={n: {} for n in names}):
+        result = portfolio.allocate(names, method="kelly_portfolio")
+    w = result["weights"]
+    assert abs(sum(w.values()) - 1.0) < 1e-6
+    assert w["arbitrage-v1"] == pytest.approx(1.0 / 6.0, abs=0.01)
+    assert w["sweeper-v1"] == pytest.approx(1.0 / 6.0, abs=0.01)
+    core = ["momentum-v1", "meanrev-v1", "sniper-v1", "hybrid-v1"]
+    assert abs(sum(w[n] for n in core) - 4.0 / 6.0) < 0.02
+    assert w["momentum-v1"] > w["meanrev-v1"]
+
+
 def test_losers_starved_not_floored():
     """Ready bots with negative expectancy get a tiny score, not cold-start floor."""
     # Need ≥3 bots so the simplex min/max box can actually starve a loser
@@ -156,14 +221,14 @@ def test_unproven_bots_capped_at_20pct():
 
 
 def test_neg_expectancy_strips_manual_override():
-    """Manual floor on a proven loser is removed so capital can leave."""
-    names = ["winner-v1", "sweeper-v1"]
+    """Manual floor on a proven *core* loser is removed so capital can leave."""
+    names = ["winner-v1", "momentum-v1"]
     metrics = {
         "winner-v1": {
             "n": 40, "sharpe": 0.5, "expectancy": 0.4,
             "total_pnl": 16.0, "variance": 2.0, "ready": True,
         },
-        "sweeper-v1": {
+        "momentum-v1": {
             "n": 40, "sharpe": -0.2, "expectancy": -0.5,
             "total_pnl": -20.0, "variance": 9.0, "ready": True,
         },
@@ -173,10 +238,17 @@ def test_neg_expectancy_strips_manual_override():
                            return_value={n: {} for n in names}):
         result = portfolio.allocate(
             names, method="kelly_portfolio",
-            manual_overrides={"sweeper-v1": 0.30},
+            manual_overrides={"momentum-v1": 0.30},
         )
-    assert result["weights"]["sweeper-v1"] <= 0.01
-    assert "sweeper-v1" not in (result.get("manual_overrides") or {})
+    # Paper-eval: losers keep a small floor so they still fill (not 0%).
+    cap = float(getattr(config, "PORTFOLIO_NEG_EXP_MAX_WEIGHT", 0.10))
+    assert result["weights"]["momentum-v1"] <= cap + 1e-9
+    if cap <= 1e-12:
+        assert result["weights"]["momentum-v1"] <= 0.01
+    else:
+        assert result["weights"]["momentum-v1"] > 0.0
+        assert result["weights"]["momentum-v1"] <= cap + 1e-9
+    assert "momentum-v1" not in (result.get("manual_overrides") or {})
 
 
 def test_effective_windows_scales_short_lookback():
@@ -326,8 +398,10 @@ def test_allocate_sharpe_favors_winners():
     w = result["weights"]
     assert abs(sum(w.values()) - 1.0) < 1e-6
     assert w["winner"] > w["mid"]
-    # n≥20 + neg expectancy → hard demote (no min-weight floor for losers)
-    assert w["loser"] <= 0.01
+    # n≥20 + neg expectancy → cap at PORTFOLIO_NEG_EXP_MAX_WEIGHT (paper-eval floor)
+    cap = float(getattr(config, "PORTFOLIO_NEG_EXP_MAX_WEIGHT", 0.10))
+    assert w["loser"] <= max(cap, 0.01) + 1e-9
+    assert w["loser"] < w["winner"]
 
 
 def test_allocate_kelly_portfolio_correlation_shrink():
@@ -414,6 +488,23 @@ def test_weights_respect_min_max_bounds():
 # ---------------------------------------------------------------------------
 # State / rebalance / hot-path weight
 # ---------------------------------------------------------------------------
+
+def test_load_state_honors_config_until_dashboard_toggle(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "PORTFOLIO_ALLOCATION_ENABLED", True)
+    import db as db_mod
+    monkeypatch.setattr(db_mod, "DB_PATH", tmp_path / "pf.db")
+    db_mod.init_db()
+    db_mod.set_arena_state(
+        portfolio.STATE_KEY,
+        '{"enabled": false, "weights": {}, "n_active": 0}',
+    )
+    st = portfolio.load_state()
+    assert st["enabled"] is True
+    portfolio.set_enabled(False)
+    st2 = portfolio.load_state()
+    assert st2["enabled"] is False
+    assert st2["enabled_source"] == "dashboard"
+
 
 def test_get_weight_disabled_returns_one(tmp_path, monkeypatch):
     # Isolate arena_state via mocked load_state

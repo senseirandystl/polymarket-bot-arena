@@ -120,7 +120,42 @@ class Trader(threading.Thread):
 
     def _tick(self) -> None:
         now = datetime.now(timezone.utc)
-        market = self._discovery.current_market_snapshot()
+        try:
+            from arena.risk_engine import is_killed
+            if is_killed():
+                self._state.note_skip("kill_switch")
+                return
+        except Exception:
+            pass
+        markets = {}
+        if hasattr(self._discovery, "current_markets_snapshot"):
+            try:
+                markets = self._discovery.current_markets_snapshot() or {}
+            except Exception:
+                markets = {}
+        if not markets:
+            market = self._discovery.current_market_snapshot()
+            if market:
+                markets = {"polymarket": market}
+        with self._bots_lock:
+            bots = list(self._bots)
+        for market in markets.values():
+            try:
+                self._tick_one_market(market, bots, now)
+            except Exception as e:
+                log_event(
+                    logger, logging.ERROR, f"Trader market tick error: {e}",
+                    exc_info=True, event_type="error", where="trader_run",
+                )
+        now_ts = time.time()
+        if now_ts - self._last_skip_flush >= 30:
+            self._last_skip_flush = now_ts
+            try:
+                db.set_arena_state("skip_counts", json.dumps(self._state.skip_snapshot()))
+            except Exception as e:
+                logger.debug(f"skip_counts flush failed: {e}")
+
+    def _tick_one_market(self, market: dict, bots: list, now) -> None:
         if market is not None:
             market["time_remaining_seconds"] = compute_time_remaining_seconds(
                 market, now
@@ -132,17 +167,6 @@ class Trader(threading.Thread):
         market_id = market.get("id") or market.get("market_id")
         if not market_id:
             return
-
-        # Global kill switch — cheapest possible gate (cached ~2s). When armed
-        # (dashboard / API / logs/KILL_SWITCH file) the whole taker loop sits
-        # flat; risk_engine logs the arming event separately.
-        try:
-            from arena.risk_engine import is_killed
-            if is_killed():
-                self._state.note_skip("kill_switch")
-                return
-        except Exception:
-            pass
 
         # Session-timing gate — NYSE open/close. Arb is market-neutral and
         # exempt; directionals and sweeper sit flat.
@@ -167,9 +191,6 @@ class Trader(threading.Thread):
             return
         market_data.lay_warm_onto_market(market, warm)
 
-        with self._bots_lock:
-            bots = list(self._bots)
-
         combined_signals = build_combined_signals(
             self._price_feed,
             self._sentiment_feed,
@@ -183,7 +204,22 @@ class Trader(threading.Thread):
         import config as _cfg
         slip_cd = float(getattr(_cfg, "SLIPPAGE_RETRY_COOLDOWN_SEC", 10.0))
         slip_reasons = frozenset({"slippage_band", "slippage_exceeded"})
-        one_per_tick = bool(getattr(_cfg, "ONE_TRADE_PER_TICK", True))
+        try:
+            one_per_tick = bool(__import__("db").get_one_trade_per_tick())
+        except Exception:
+            one_per_tick = bool(getattr(_cfg, "ONE_TRADE_PER_TICK", False))
+        try:
+            hybrid_yield_on = bool(__import__("db").get_hybrid_yield())
+        except Exception:
+            hybrid_yield_on = bool(getattr(_cfg, "HYBRID_YIELD_ENABLED", False))
+        # Live fuse: paper-eval open cluster must not follow a bot onto CLOB.
+        any_live = any(
+            (getattr(b, "trading_mode", "paper") or "paper") == "live"
+            for b in bots
+        )
+        if any_live:
+            one_per_tick = True
+            hybrid_yield_on = True
         exempt_types = {
             str(t).lower()
             for t in (getattr(_cfg, "ONE_TRADE_PER_TICK_EXEMPT", ()) or ())
@@ -372,47 +408,52 @@ class Trader(threading.Thread):
             pending_buys.append((directional_buy_score(signal), bot, signal))
 
         if pending_buys:
-            occupied = {
-                str(sig.get("side") or "")
-                for _sc, b, sig in pending_buys
-                if (getattr(b, "strategy_type", "") or "").lower() != "hybrid"
-            }
-            yielded = []
-            kept = []
-            for item in pending_buys:
-                _sc, b, sig = item
-                if (
-                    (getattr(b, "strategy_type", "") or "").lower() == "hybrid"
-                    and str(sig.get("side") or "") in occupied
-                ):
-                    yielded.append(item)
-                else:
-                    kept.append(item)
-            for _sc, bot, signal in yielded:
-                sup = dict(signal)
-                sup["action"] = "skip"
-                sup["skip_reason"] = "hybrid_yield"
-                sup["reasoning"] = (
-                    f"Hybrid yield: dedicated directional already pending "
-                    f"{signal.get('side')}"
-                )
-                _note_decision(bot, sup)
-                self._state.note_skip("hybrid_yield")
-            pending_buys = kept
+            if hybrid_yield_on:
+                occupied = {
+                    str(sig.get("side") or "")
+                    for _sc, b, sig in pending_buys
+                    if (getattr(b, "strategy_type", "") or "").lower() != "hybrid"
+                }
+                yielded = []
+                kept = []
+                for item in pending_buys:
+                    _sc, b, sig = item
+                    if (
+                        (getattr(b, "strategy_type", "") or "").lower() == "hybrid"
+                        and str(sig.get("side") or "") in occupied
+                    ):
+                        yielded.append(item)
+                    else:
+                        kept.append(item)
+                for _sc, bot, signal in yielded:
+                    sup = dict(signal)
+                    sup["action"] = "skip"
+                    sup["skip_reason"] = "hybrid_yield"
+                    sup["reasoning"] = (
+                        f"Hybrid yield: dedicated directional already pending "
+                        f"{signal.get('side')}"
+                    )
+                    _note_decision(bot, sup)
+                    self._state.note_skip("hybrid_yield")
+                pending_buys = kept
             if pending_buys:
                 pending_buys.sort(key=lambda t: t[0], reverse=True)
             try:
-                max_dir = int(getattr(_cfg, "MARKET_SIDE_MAX_BOTS", 1) or 1)
-            except (TypeError, ValueError):
+                max_dir = int(__import__("db").get_market_side_max_bots())
+            except Exception:
+                try:
+                    max_dir = int(getattr(_cfg, "MARKET_SIDE_MAX_BOTS", 0) or 0)
+                except (TypeError, ValueError):
+                    max_dir = 0
+            if any_live and max_dir <= 0:
                 max_dir = 1
-            max_dir = max(1, max_dir)
             filled_side: dict[str, int] = {}
             winner_name = pending_buys[0][1].name if pending_buys else ""
             winner_score = pending_buys[0][0] if pending_buys else 0.0
             for score, bot, signal in pending_buys:
                 side = str(signal.get("side") or "")
                 n_side = int(filled_side.get(side, 0))
-                if n_side >= max_dir:
+                if max_dir > 0 and n_side >= max_dir:
                     sup = dict(signal)
                     sup["action"] = "skip"
                     sup["skip_reason"] = "superseded_by_peer"
@@ -437,14 +478,5 @@ class Trader(threading.Thread):
 
         if new_trades > 0:
             logger.debug(
-                f"Trader tick: {new_trades} new trades on {market_id[:12]}..."
+                f"Trader tick: {new_trades} new trades on {str(market_id)[:12]}..."
             )
-
-        # Periodically persist the skip tally (cross-process observability).
-        now_ts = time.time()
-        if now_ts - self._last_skip_flush >= 30:
-            self._last_skip_flush = now_ts
-            try:
-                db.set_arena_state("skip_counts", json.dumps(self._state.skip_snapshot()))
-            except Exception as e:
-                logger.debug(f"skip_counts flush failed: {e}")

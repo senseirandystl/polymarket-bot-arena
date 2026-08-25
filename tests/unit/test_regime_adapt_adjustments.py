@@ -51,8 +51,20 @@ def test_not_actionable_live_match_is_neutral(monkeypatch):
     assert a.reason == "not_actionable"
 
 
-def test_low_vol_trend_style_mode_mild():
+def test_low_vol_trend_style_mode_mild(monkeypatch):
     """Style mode: mild edge nudge; partial structural lane blend."""
+    class _Det:
+        def snapshot(self):
+            return {
+                "regime_id": "low_vol_trend",
+                "label": "low_vol_trend",
+                "actionable": True,
+                "confidence": 0.8,
+                "held_sec": 60.0,
+            }
+    monkeypatch.setattr(
+        "signals.regime_detector.get_detector", lambda: _Det(), raising=False,
+    )
     with _no_live_stats():
         a = adjustments("low_vol_trend", "momentum")
     # Flattened edge mult still slightly elevated vs 1.0 for this prior
@@ -78,12 +90,14 @@ def test_normal_regime_has_mid_band_prior(monkeypatch):
     assert a.extra_drift_floor == 0.0
 
 
-def test_high_vol_trend_eases_edge_relative_to_low_vol_trend():
-    """Without live samples, structural prior for HVT eases vs LVT."""
+def test_high_vol_trend_taxes_edge_relative_to_low_vol_trend():
+    """Soak 2026-08-24: HVT continuation bled; prior must raise min_edge, not ease."""
     with _no_live_stats():
         lo = adjustments("low_vol_trend", "momentum")
         hi = adjustments("high_vol_trend", "momentum")
-    assert hi.edge_mult <= lo.edge_mult + 1e-9
+    assert hi.edge_mult >= lo.edge_mult - 1e-9
+    assert hi.edge_mult > 1.0
+    assert hi.mom_lane_scale < 1.0
 
 
 def test_regime_adjust_to_dict():

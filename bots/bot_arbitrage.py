@@ -80,9 +80,11 @@ class ArbitrageBot(BaseBot):
                                  signals=signals or {})
 
     def make_decision(self, market: dict, signals: dict) -> dict:
+        from exchanges import KALSHI, exchange_of
+        is_kalshi = exchange_of(market) == KALSHI
         yes_tok = market.get("polymarket_token_id")
         no_tok = market.get("polymarket_no_token_id")
-        if not yes_tok or not no_tok:
+        if not is_kalshi and (not yes_tok or not no_tok):
             return self._skip("arb: missing token ids")
 
         # Prefer the shared warm cache (refreshed <=1s by the market-data
@@ -97,8 +99,21 @@ class ArbitrageBot(BaseBot):
             yes_book, no_book = warm.get("yes_book"), warm.get("no_book")
         if not (yes_book and yes_book.get("valid")
                 and no_book and no_book.get("valid")):
-            yes_book = self._book(yes_tok)
-            no_book = self._book(no_tok)
+            if is_kalshi:
+                try:
+                    import kalshi_markets
+                    both = kalshi_markets.get_order_book(
+                        market.get("ticker") or market_id
+                    )
+                    yes_book = (both or {}).get("yes")
+                    no_book = (both or {}).get("no")
+                except Exception:
+                    yes_book = no_book = None
+            else:
+                yes_book = self._book(yes_tok)
+                no_book = self._book(no_tok)
+        if not yes_book or not no_book:
+            return self._skip("arb: no book on one side")
         if not yes_book.get("valid") or not no_book.get("valid"):
             return self._skip("arb: no book on one side")
 
@@ -220,14 +235,40 @@ class ArbitrageBot(BaseBot):
         except Exception as e:
             logger.warning(f"[{self.name}] ARB risk check failed (continuing): {e}")
 
+        from exchanges import KALSHI, exchange_of
+        is_kalshi = exchange_of(market) == KALSHI
         yes_tok = market.get("polymarket_token_id")
         no_tok = market.get("polymarket_no_token_id")
-        if not yes_tok or not no_tok:
+        if not is_kalshi and (not yes_tok or not no_tok):
             return {"success": False, "reason": "missing_token_ids"}
 
         # --- Atomic re-validation on a fresh snapshot ----------------------
-        yes_book = self._book(yes_tok)
-        no_book = self._book(no_tok)
+        yes_book = no_book = None
+        if is_kalshi:
+            market_id = market.get("id") or market.get("market_id")
+            try:
+                from arena.market_data import store
+                warm = store().get(market_id)
+                if warm is not None:
+                    yes_book, no_book = warm.get("yes_book"), warm.get("no_book")
+            except Exception:
+                yes_book = no_book = None
+            if not (yes_book and yes_book.get("valid")
+                    and no_book and no_book.get("valid")):
+                try:
+                    import kalshi_markets
+                    both = kalshi_markets.get_order_book(
+                        market.get("ticker") or market_id
+                    )
+                    yes_book = (both or {}).get("yes")
+                    no_book = (both or {}).get("no")
+                except Exception:
+                    yes_book = no_book = None
+        else:
+            yes_book = self._book(yes_tok)
+            no_book = self._book(no_tok)
+        if not yes_book or not no_book:
+            return {"success": False, "reason": "arb_book_gone"}
         if not yes_book.get("valid") or not no_book.get("valid"):
             return {"success": False, "reason": "arb_book_gone"}
 
@@ -235,7 +276,8 @@ class ArbitrageBot(BaseBot):
         fy = simulate_fill_shares(yes_book, target)
         fn = simulate_fill_shares(no_book, target)
         shares = min(fy["shares"], fn["shares"])
-        if shares < config.POLYMARKET_MIN_SHARES:
+        min_sh = 1 if is_kalshi else config.POLYMARKET_MIN_SHARES
+        if shares < min_sh:
             return {"success": False, "reason": "arb_depth_gone"}
         # Re-match at the achievable share count on both legs.
         fy = simulate_fill_shares(yes_book, shares)
@@ -257,7 +299,8 @@ class ArbitrageBot(BaseBot):
 
         self.trading_mode = db.get_bot_mode(self.name)
         mode = self.trading_mode
-        engine = get_engine(mode)
+        from exchanges import exchange_of
+        engine = get_engine(mode, exchange=exchange_of(market))
 
         # --- BOTH legs must be affordable BEFORE leg 1 is placed ------------
         # The pool is shared with the directional bots; if it can cover leg 1

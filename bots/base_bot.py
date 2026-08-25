@@ -71,16 +71,39 @@ def implied_side_prob(
 
 
 _TWAP_OPEN_SOURCES = frozenset({"twap_open"})
+_KALSHI_STRIKE_SOURCES = frozenset({"kalshi_floor", "brti_open"})
 
 
 def data_quality_skip(signals: dict | None) -> dict | None:
-    """Skip if live strike is not TWAP-open or settlement tape is empty.
+    """Skip if live strike is unconfirmed or settlement tape is empty.
 
     Keys absent (unit fixtures) do not skip — same pattern as the dual-gate.
+    Kalshi never uses Chainlink TWAP-open; empty BRTI is a hard skip
+    (no Binance/Chainlink substitute — BUG #23 analog).
     """
     sig = signals or {}
+    exch = str(sig.get("exchange") or "").lower()
     src = sig.get("btc_strike_source")
-    if src is not None and str(src) not in _TWAP_OPEN_SOURCES:
+    if exch == "kalshi":
+        if src is not None and str(src) not in _KALSHI_STRIKE_SOURCES:
+            return strategy_decision(
+                "skip",
+                reasoning=f"Kalshi strike source {src!s} is not floor/BRTI-open",
+                skip_reason="strike_unconfirmed",
+            )
+        res_src = sig.get("resolution_source")
+        if res_src is not None:
+            try:
+                now_px = float(sig.get("btc_now") or 0.0)
+            except (TypeError, ValueError):
+                now_px = 0.0
+            if now_px <= 0.0 or str(res_src) in ("none", ""):
+                return strategy_decision(
+                    "skip",
+                    reasoning="Kalshi BRTI tape empty — no Chainlink substitute",
+                    skip_reason="brti_empty",
+                )
+    elif src is not None and str(src) not in _TWAP_OPEN_SOURCES:
         return strategy_decision(
             "skip",
             reasoning=f"Strike source {src!s} is not twap_open",
@@ -424,9 +447,9 @@ class BaseBot(ABC):
         "mean_reversion": 0.58,
         "mean_reversion_sl": 0.58,
         "mean_reversion_tp": 0.58,
-        "momentum": 0.62,
+        "momentum": 0.58,
         "phantom": 0.62,
-        "hybrid": 0.62,
+        "hybrid": 0.58,
         "lag_residual": 0.58,
         "no_lag": 0.58,
         "regime_specialist": 0.62,
@@ -619,7 +642,7 @@ class BaseBot(ABC):
         return False
 
     def _side_net_edges(self, p_yes: float, yes_price: float,
-                        no_price: float) -> tuple:
+                        no_price: float, *, exchange: str | None = None) -> tuple:
         """Cost-adjusted edge per side, each anchored on its OWN ask.
 
         ``edge = P_side − ask − taker_fee``. No trust multiplier — Kelly
@@ -628,8 +651,12 @@ class BaseBot(ABC):
         """
         from signals.prob import directional_net_edge
         return (
-            directional_net_edge(p_yes, yes_price),
-            directional_net_edge(1.0 - float(p_yes), no_price),
+            directional_net_edge(
+                p_yes, yes_price, exchange=exchange,
+            ),
+            directional_net_edge(
+                1.0 - float(p_yes), no_price, exchange=exchange,
+            ),
         )
 
     def make_decision(self, market: dict, signals: dict) -> dict:
@@ -1084,7 +1111,9 @@ class BaseBot(ABC):
         yes_exec = market.get("yes_ask") or yes_price
         no_exec = market.get("no_ask") or no_price
 
-        edge_yes, edge_no = self._side_net_edges(p_yes, yes_exec, no_exec)
+        edge_yes, edge_no = self._side_net_edges(
+            p_yes, yes_exec, no_exec, exchange=market.get("exchange"),
+        )
 
         # --- Model-lean eligibility: never fade the market on IGNORANCE ---
         if p_yes <= 0.5:
@@ -1160,6 +1189,15 @@ class BaseBot(ABC):
                       getattr(config, "DRIFT_MIN_ABS_PCT", 0.00030) or 0.0)
         min_z = _gf("DRIFT_MIN_ABS_Z",
                     getattr(config, "DRIFT_MIN_ABS_Z", 0.35) or 0.0)
+        try:
+            from exchanges import KALSHI, exchange_of as _ex_of
+            if _ex_of(market) == KALSHI:
+                min_pct = float(getattr(
+                    config, "KALSHI_DRIFT_MIN_ABS_PCT", min_pct) or min_pct)
+                min_z = float(getattr(
+                    config, "KALSHI_DRIFT_MIN_ABS_Z", min_z) or min_z)
+        except Exception:
+            pass
         signed_drift = (
             float(drift_signal_val) if side == "yes"
             else -float(drift_signal_val)
@@ -1406,6 +1444,27 @@ class BaseBot(ABC):
         min_edge *= float(_learned.get("edge_mult") or 1.0)
         # Regime prior edge mult (structural + live WR continuous tax).
         min_edge *= float(getattr(_radj, "edge_mult", 1.0) or 1.0)
+        _fav_size = 1.0
+        _fight_mult = 1.0
+        try:
+            from arena.eval_taxes import (
+                high_vol_favorite_mult, mom_drift_fight_mult,
+            )
+            _hv_e, _fav_size = high_vol_favorite_mult(
+                strategy_type=self.strategy_type,
+                regime=getattr(_radj, "label", None),
+                side_mid=side_mid_dz,
+            )
+            min_edge *= float(_hv_e or 1.0)
+            _fight_mult = mom_drift_fight_mult(
+                mom=momentum_signal,
+                drift=drift_signal_val,
+                regime=getattr(_radj, "label", None),
+            )
+            min_edge *= float(_fight_mult or 1.0)
+        except Exception:
+            _fav_size = 1.0
+            _fight_mult = 1.0
         # Strategy×regime×side continuous tax (YES bleed ≠ NO).
         try:
             if hasattr(_radj, "side_edge_for"):
@@ -1427,6 +1486,13 @@ class BaseBot(ABC):
             min_edge *= float(getattr(_radj, "no_edge_mult", 1.0) or 1.0)
             _st_mult = getattr(config, "NO_SIDE_STRATEGY_EDGE_MULT", {}) or {}
             min_edge *= float(_st_mult.get(self.strategy_type, 1.0))
+            try:
+                from exchanges import KALSHI, exchange_of as _ex_of
+                if _ex_of(market) == KALSHI:
+                    min_edge *= float(getattr(
+                        config, "KALSHI_NO_EDGE_MULT", 1.0) or 1.0)
+            except Exception:
+                pass
             if ud_lo <= side_mid_dz < ud_hi:
                 min_edge *= float(
                     getattr(config, "NO_SIDE_UNDERDOG_EDGE_MULT", 1.35))
@@ -1558,6 +1624,7 @@ class BaseBot(ABC):
                     * _portfolio_weight(self.name)
                     * _risk_size_mult(self.name)
                     * _reg_mult
+                    * float(_fav_size or 1.0)
                     * _learn_size
                     * late_size_boost)
         # Concave edge calibration: modest edges get full credit; outsized
@@ -1643,6 +1710,7 @@ class BaseBot(ABC):
             f"=> {side} edge={chosen_edge:+.3f} (eY={edge_yes:+.3f} eN={edge_no:+.3f}) "
             f"drift={drift_signal_val:+.3f} mom={momentum_signal:+.3f} "
             f"{_meta_d} "
+            f"hv_fav={_fav_size:.2f} mom_drift_fight={_fight_mult:.2f} "
             f"pm={lanes['pm']:+.3f} "
             f"of(obi={lanes['obi']:+.3f} cvd={lanes['cvd']:+.3f}) "
             # Raw candidate-lane reads (pre-kill-switch) — logged for the
@@ -2021,19 +2089,25 @@ class BaseBot(ABC):
         except Exception:
             used = float(db.get_open_exposure(market_id, side, mode) or 0.0)
             n_bots = 0
-        max_bots = int(getattr(config, "MARKET_SIDE_MAX_BOTS", 3) or 0)
-        # Data-driven tandem tighten: toxic / chop regimes reduce cluster size
         try:
-            from arena.regime_adapt import adjustments as _radj_fn
-            from signals.regime_detector import get_detector
-            _rid = (get_detector().status().get("current") or {}).get(
-                "regime_id"
-            )
-            _radj_exp = _radj_fn(_rid, strategy_type=self.strategy_type)
-            if getattr(_radj_exp, "max_bots_side", None) is not None:
-                max_bots = min(max_bots, int(_radj_exp.max_bots_side))
+            max_bots = int(db.get_market_side_max_bots())
         except Exception:
-            pass
+            max_bots = int(getattr(config, "MARKET_SIDE_MAX_BOTS", 0) or 0)
+        # Data-driven tandem tighten only when a positive cluster cap is live.
+        # Paper-eval MAX_BOTS=0 (unlimited) must not be min()'d with a 1-bot inject.
+        if max_bots > 0:
+            try:
+                from arena.regime_adapt import adjustments as _radj_fn
+                from signals.regime_detector import get_detector
+                _rid = (get_detector().status().get("current") or {}).get(
+                    "regime_id"
+                )
+                _radj_exp = _radj_fn(_rid, strategy_type=self.strategy_type)
+                inj = getattr(_radj_exp, "max_bots_side", None)
+                if inj is not None and int(inj) > 0:
+                    max_bots = min(max_bots, int(inj))
+            except Exception:
+                pass
         headroom = cap_usd - used
         if max_bots > 0 and n_bots >= max_bots:
             # Already at thesis-cluster limit — no headroom for another bot
@@ -2096,7 +2170,8 @@ class BaseBot(ABC):
         # Note: do NOT pass Kelly ``target_shares`` here — that flag means
         # share-matched arb legs in the venue engines. Directional bots size
         # via USD amount (derived shares-first above) and use the limit path.
-        res = get_engine(mode).place(
+        from exchanges import exchange_of as _ex_of
+        res = get_engine(mode, exchange=_ex_of(market)).place(
             bot_name=self.name,
             side=signal["side"],
             amount=amount,

@@ -136,82 +136,131 @@ def build_combined_signals(
         "nowcast_frac_elapsed": 0.0,
         "twap_certainty": 0.0,
     }
+    btc_strike_source = None
     if market is not None:
         mkt_id = market.get("id") or market.get("market_id")
         tr = market.get("time_remaining_seconds")
-        if warm is not None and warm.get("strike"):
-            btc_strike = warm.get("strike")
-        else:
-            btc_strike = get_strike_registry().get_strike(
-                mkt_id, market.get("event_start_time"))
-
-        # Build resolution btc_now (TWAP / nowcast / spot fallback).
-        try:
-            from signals import twap as twap_mod
-            now_epoch = time.time()
-            expiry_epoch = None
-            if tr is not None:
-                try:
-                    expiry_epoch = now_epoch + float(tr)
-                except (TypeError, ValueError):
-                    expiry_epoch = None
-            # Prefer resolves_at when present (more accurate than rem clock).
-            ra = market.get("resolves_at") or market.get("end_time")
-            if ra is not None:
-                try:
-                    if isinstance(ra, (int, float)):
-                        expiry_epoch = float(ra)
-                        if expiry_epoch > 1e12:
-                            expiry_epoch /= 1000.0
-                    else:
+        from exchanges import KALSHI, exchange_of as _ex_of
+        if _ex_of(market) == KALSHI:
+            # Never consult the Polymarket TWAP strike registry (BUG #23 analog).
+            from signals.brti import latch_strike
+            floor = market.get("floor_strike") or market.get("btc_strike")
+            if floor is None and warm is not None:
+                floor = warm.get("strike")
+            btc_strike, btc_strike_source = latch_strike(floor)
+            try:
+                from signals import brti as brti_mod
+                now_epoch = time.time()
+                expiry_epoch = None
+                ra = market.get("resolves_at")
+                if ra is not None:
+                    try:
                         from datetime import datetime, timezone
                         expiry_epoch = datetime.fromisoformat(
                             str(ra).replace("Z", "+00:00")
                         ).timestamp()
-                except Exception:
-                    pass
+                    except Exception:
+                        expiry_epoch = None
+                if expiry_epoch is None and tr is not None:
+                    expiry_epoch = now_epoch + float(tr)
+                avg = brti_mod.last60_average(
+                    brti_mod.stored_ticks(),
+                    now=now_epoch,
+                    expiry=float(expiry_epoch or now_epoch),
+                )
+                btc_now_k = avg.get("brti_now") or brti_mod.last_price()
+                src = "brti_last60" if avg.get("brti_now") else (
+                    "brti_last" if btc_now_k else "none"
+                )
+                resolution_meta = {
+                    "btc_now": float(btc_now_k or 0.0),
+                    "source": src,
+                    "rtds_twap": None,
+                    "spot": None,
+                    "nowcast": avg.get("brti_now"),
+                    "in_settlement_window": bool(avg.get("in_settlement")),
+                    "nowcast_coverage": float(avg.get("coverage") or 0.0),
+                    "nowcast_frac_elapsed": (
+                        min(1.0, max(0.0, 1.0 - float(tr or 0) / 60.0))
+                        if avg.get("in_settlement") else 0.0
+                    ),
+                    "twap_certainty": float(avg.get("coverage") or 0.0),
+                    "brti_certainty": float(avg.get("coverage") or 0.0),
+                }
+                drift_vol_scale = float(
+                    getattr(config, "KALSHI_DRIFT_VOL_SCALE", 0.0038) or 0.0038
+                )
+                drift_scale_source = "kalshi_prior"
+            except Exception as e:
+                logger.debug("Kalshi BRTI nowcast failed: %s", e)
+            # Skip Polymarket TWAP path for Kalshi windows.
+        else:
+            if warm is not None and warm.get("strike"):
+                btc_strike = warm.get("strike")
+            else:
+                btc_strike = get_strike_registry().get_strike(
+                    mkt_id, market.get("event_start_time"))
+            # Build resolution btc_now (TWAP / nowcast / spot fallback).
+            try:
+                from signals import twap as twap_mod
+                now_epoch = time.time()
+                expiry_epoch = None
+                if tr is not None:
+                    try:
+                        expiry_epoch = now_epoch + float(tr)
+                    except (TypeError, ValueError):
+                        expiry_epoch = None
+                ra = market.get("resolves_at") or market.get("end_time")
+                if ra is not None:
+                    try:
+                        if isinstance(ra, (int, float)):
+                            expiry_epoch = float(ra)
+                            if expiry_epoch > 1e12:
+                                expiry_epoch /= 1000.0
+                        else:
+                            from datetime import datetime, timezone
+                            expiry_epoch = datetime.fromisoformat(
+                                str(ra).replace("Z", "+00:00")
+                            ).timestamp()
+                    except Exception:
+                        pass
 
-            ticks = []
-            if price_feed is not None:
-                try:
-                    # Settlement is a TWAP object — do not mix in denser spot
-                    # ticks (that averages the wrong series vs TWAP-open strike).
-                    if hasattr(price_feed, "btc_twap_ticks"):
-                        ticks = list(price_feed.btc_twap_ticks() or [])
-                    if not ticks and hasattr(price_feed, "btc_spot_ticks"):
-                        ticks = list(price_feed.btc_spot_ticks() or [])
-                except Exception:
-                    ticks = []
+                ticks = []
+                if price_feed is not None:
+                    try:
+                        if hasattr(price_feed, "btc_twap_ticks"):
+                            ticks = list(price_feed.btc_twap_ticks() or [])
+                        if not ticks and hasattr(price_feed, "btc_spot_ticks"):
+                            ticks = list(price_feed.btc_spot_ticks() or [])
+                    except Exception:
+                        ticks = []
 
-            resolution_meta = twap_mod.resolution_btc_now(
-                rtds_twap=btc_twap if btc_twap > 0 else None,
-                spot=btc_spot if btc_spot > 0 else None,
-                time_remaining_sec=tr,
-                ticks=ticks,
-                now_epoch=now_epoch,
-                expiry_epoch=expiry_epoch,
-            )
-            # Only damp σ when adaptive scale came from *spot* (TWAP σ already
-            # matches the resolution object). Mult default is 1.0 for TWAP σ.
-            if resolution_meta.get("source") in (
-                "rtds_twap", "settlement_nowcast"
-            ):
-                if drift_scale_source == "spot":
-                    mult = float(getattr(
-                        config, "TWAP_DRIFT_VOL_MULT_SPOT_FALLBACK", 0.92) or 0.92)
-                    drift_vol_scale = float(drift_vol_scale) * mult
-                else:
-                    drift_vol_scale = twap_mod.soft_dampen_vol_scale(
-                        drift_vol_scale)
-        except Exception as e:
-            logger.debug(f"TWAP resolution_btc_now failed: {e}")
-            # Fallback: prefer twap then spot
-            if btc_twap > 0:
-                resolution_meta["btc_now"] = btc_twap
-                resolution_meta["source"] = "rtds_twap"
-            elif btc_spot > 0:
-                resolution_meta["btc_now"] = btc_spot
-                resolution_meta["source"] = "spot_fallback"
+                resolution_meta = twap_mod.resolution_btc_now(
+                    rtds_twap=btc_twap if btc_twap > 0 else None,
+                    spot=btc_spot if btc_spot > 0 else None,
+                    time_remaining_sec=tr,
+                    ticks=ticks,
+                    now_epoch=now_epoch,
+                    expiry_epoch=expiry_epoch,
+                )
+                if resolution_meta.get("source") in (
+                    "rtds_twap", "settlement_nowcast"
+                ):
+                    if drift_scale_source == "spot":
+                        mult = float(getattr(
+                            config, "TWAP_DRIFT_VOL_MULT_SPOT_FALLBACK", 0.92) or 0.92)
+                        drift_vol_scale = float(drift_vol_scale) * mult
+                    else:
+                        drift_vol_scale = twap_mod.soft_dampen_vol_scale(
+                            drift_vol_scale)
+            except Exception as e:
+                logger.debug(f"TWAP resolution_btc_now failed: {e}")
+                if btc_twap > 0:
+                    resolution_meta["btc_now"] = btc_twap
+                    resolution_meta["source"] = "rtds_twap"
+                elif btc_spot > 0:
+                    resolution_meta["btc_now"] = btc_spot
+                    resolution_meta["source"] = "spot_fallback"
 
         btc_now = float(resolution_meta.get("btc_now") or 0.0)
         if btc_now > 0 and btc_strike:
@@ -240,7 +289,9 @@ def build_combined_signals(
             _pol = twap_mod.settlement_adjustments(
                 time_remaining_sec=tr,
                 twap_certainty_val=float(
-                    resolution_meta.get("twap_certainty") or 0.0
+                    resolution_meta.get("twap_certainty")
+                    or resolution_meta.get("brti_certainty")
+                    or 0.0
                 ),
                 nowcast_frac_elapsed=float(
                     resolution_meta.get("nowcast_frac_elapsed") or 0.0
@@ -252,16 +303,55 @@ def build_combined_signals(
                 in_settlement=bool(
                     resolution_meta.get("in_settlement_window")
                 ),
+                market_window_sec=(
+                    float(market.get("window_sec"))
+                    if market.get("window_sec") else None
+                ),
             )
             resolution_meta["settlement_policy"] = _pol
             resolution_meta["market_phase"] = _pol.get("phase") or "unknown"
         except Exception:
             pass
 
+    # Per-market settlement tape (Kalshi = BRTI, Polymarket = TWAP/spot).
+    # Stateful regime detector stays on Chainlink so dual-exchange ticks
+    # cannot mix two indexes into one hysteresis cell (BUG #23 analog).
+    from signals.tape import candle_prices as _tape_prices, is_kalshi_market
+    _kalshi = is_kalshi_market(market)
+    brti_ticks: list = []
+    twap_ticks_out: list = []
+    if _kalshi:
+        try:
+            from signals import brti as _brti_mod
+            brti_ticks = list(_brti_mod.stored_ticks() or [])
+        except Exception:
+            brti_ticks = []
+    elif price_feed is not None:
+        try:
+            if hasattr(price_feed, "btc_twap_ticks"):
+                twap_ticks_out = list(price_feed.btc_twap_ticks() or [])
+        except Exception:
+            twap_ticks_out = []
+    local_prices = _tape_prices(
+        market,
+        {
+            "prices": ([] if _kalshi else btc_prices),
+            "btc_brti_ticks": brti_ticks,
+            "btc_twap_ticks": twap_ticks_out,
+        },
+        sample_sec=60.0,
+    )
+    if not local_prices:
+        local_prices = [] if _kalshi else list(btc_prices or [])
+    local_latest = float(local_prices[-1]) if local_prices else 0.0
+    if _kalshi and float(resolution_meta.get("btc_now") or 0.0) > 0:
+        local_latest = float(resolution_meta["btc_now"])
+
     # Base vol/trend scores (pure, local) — still the continuous inputs
     # HybridBot and others read for tilt; the regime detector builds on them.
-    vol_base = volatility_regime.compute(btc_prices)
-    tech = technicals.compute(btc_prices)
+    _tape_for_local = local_prices or ([] if _kalshi else btc_prices)
+    vol_base = volatility_regime.compute(_tape_for_local)
+    tech = technicals.compute(_tape_for_local)
     xasset = cross_asset.compute(price_feed)
     try:
         fut_feed = get_futures_feed()
@@ -432,6 +522,17 @@ def build_combined_signals(
     return {
         **price_signals,
         **sent_signals,
+        "prices": local_prices if local_prices else (
+            [] if _kalshi else (price_signals.get("prices") or [])
+        ),
+        "latest": local_latest if local_latest > 0 else (
+            0.0 if _kalshi else float(price_signals.get("latest") or 0.0)
+        ),
+        "tape_source": "brti" if _kalshi else (
+            "twap" if twap_ticks_out else "spot"
+        ),
+        "btc_brti_ticks": brti_ticks if _kalshi else [],
+        "btc_twap_ticks": [] if _kalshi else twap_ticks_out,
         "orderflow": orderflow,
         "obi": obi,
         "cvd": cvd,
@@ -441,9 +542,11 @@ def build_combined_signals(
         "btc_drift_z": btc_drift_z,
         "btc_strike": btc_strike,
         "btc_strike_source": (
-            get_strike_registry().get_source(
-                market.get("id") or market.get("market_id")
-            ) if market is not None else None
+            btc_strike_source if btc_strike_source is not None else (
+                get_strike_registry().get_source(
+                    market.get("id") or market.get("market_id")
+                ) if market is not None else None
+            )
         ),
         "twap_coverage_outage": bool(
             (resolution_meta.get("settlement_policy") or {}).get(
@@ -455,6 +558,9 @@ def build_combined_signals(
         "drift_vol_scale": float(drift_vol_scale or 0.0),
         "drift_scale_source": drift_scale_source,
         "btc_twap": btc_twap,
+        "exchange": "polymarket" if market is None else (
+            market.get("exchange") or "polymarket"
+        ),
         "resolution_source": resolution_meta.get("source") or "none",
         "resolution_nowcast": resolution_meta.get("nowcast"),
         "in_settlement_window": bool(

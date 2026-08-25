@@ -170,7 +170,10 @@ def build_combo_report(rows: list[dict]) -> dict:
             "verdict": verdict,
             "bypass_dual_gate": bypass,
         }
-        apply_ok = bypass or name in ("drift_flat_confirm", "agree2_cheap")
+        apply_ok = (
+            name != "mom_tech_midband"
+            and (bypass or name in ("drift_flat_confirm", "agree2_cheap"))
+        )
         if verdict == "earned" and apply_ok:
             earned.append({
                 "name": name,
@@ -217,6 +220,18 @@ def build_combo_report(rows: list[dict]) -> dict:
             return None
         return s > 0
 
+    def _mom_tech_midband(row):
+        """Shadow-only: mom+tech agreement on unique 50–58¢ fills."""
+        entry = _f(row.get("entry_price"))
+        lo = float(getattr(config, "COMBO_MIDBAND_LO", 0.50))
+        hi = float(getattr(config, "COMBO_MIDBAND_HI", 0.58))
+        if entry is None or entry < lo or entry > hi:
+            return None
+        s = _agree(_readings(row), ("mom", "tech"), dbn)
+        if s is None:
+            return None
+        return s > 0
+
     def _agree2(row):
         rds = _readings(row)
         signed = []
@@ -239,6 +254,7 @@ def build_combo_report(rows: list[dict]) -> dict:
         ("drift_lag", ("drift",), _drift_lag),
         ("drift_flat_confirm", ("mom", "tech", "xasset"), _drift_flat),
         ("agree2_cheap", ("drift", "mom", "tech", "xasset"), _agree2),
+        ("mom_tech_midband", ("mom", "tech"), _mom_tech_midband),
     ):
         rules[name] = _pack(
             name, lanes,
@@ -363,10 +379,10 @@ def try_confirm(
     """Return an earned combo thesis, or None.
 
     Never fires on expensive mids (``COMBO_MAX_ENTRY``). Apply is gated by
-    ``COMBO_CONFIRM_APPLY`` (default on) *and* an earned cheap sample.
+    ``COMBO_CONFIRM_APPLY`` (default off) *and* an earned cheap sample.
     """
     if apply is None:
-        apply = bool(getattr(config, "COMBO_CONFIRM_APPLY", True))
+        apply = bool(getattr(config, "COMBO_CONFIRM_APPLY", False))
     if not apply:
         return None
     report = load_report()

@@ -72,6 +72,47 @@ def test_data_quality_skip_provisional_strike():
     assert data_quality_skip({}) is None
 
 
+def test_data_quality_skip_kalshi_floor_ok_when_brti_present():
+    from bots.base_bot import data_quality_skip
+    assert data_quality_skip({
+        "exchange": "kalshi",
+        "btc_strike_source": "kalshi_floor",
+        "btc_now": 77000.0,
+        "resolution_source": "brti_last60",
+    }) is None
+    assert data_quality_skip({
+        "exchange": "kalshi",
+        "btc_strike_source": "brti_open",
+        "btc_now": 77000.0,
+        "resolution_source": "brti_last",
+    }) is None
+
+
+def test_data_quality_skip_kalshi_empty_brti():
+    from bots.base_bot import data_quality_skip
+    d = data_quality_skip({
+        "exchange": "kalshi",
+        "btc_strike_source": "kalshi_floor",
+        "btc_now": 0.0,
+        "resolution_source": "none",
+    })
+    assert d is not None
+    assert d["action"] == "skip"
+    assert d["skip_reason"] == "brti_empty"
+
+
+def test_data_quality_skip_kalshi_rejects_twap_open_source():
+    from bots.base_bot import data_quality_skip
+    d = data_quality_skip({
+        "exchange": "kalshi",
+        "btc_strike_source": "twap_open",
+        "btc_now": 77000.0,
+        "resolution_source": "brti_last",
+    })
+    assert d is not None
+    assert d["skip_reason"] == "strike_unconfirmed"
+
+
 def test_data_quality_skip_coverage_outage():
     from bots.base_bot import data_quality_skip
     d = data_quality_skip({"settlement_policy": {"coverage_outage": True}})

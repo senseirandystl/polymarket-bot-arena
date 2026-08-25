@@ -76,44 +76,42 @@ def test_momentum_holds_below_threshold():
 def test_meanrev_fade_requires_drift_backing():
     """BUG #28: the fade only fires toward the side signed drift favors."""
     bot = MeanRevBot(name="rev-t", generation=0)
-    lookback = bot.strategy_params["lookback_candles"]
-    # A sharp up-spike at the end of a flat tape → overextended UP → fade = NO.
-    prices = [100_000.0] * (lookback + 20) + [101_500.0]
-    # Without a DOWN drift, the NO fade must be vetoed.
+    # Bounce toward strike while still below it (NO-winning pullback).
+    prices = [99_400.0, 99_400.0, 99_400.0, 99_400.0, 99_850.0]
     late = make_market(time_remaining=60)
     vetoed = bot.analyze(late,
-                         make_signals(prices=prices, latest=prices[-1], btc_drift=0.0,
-                                      btc_strike=102_000.0))
+                         make_signals(prices=prices, latest=prices[-1],
+                                      btc_now=99_850.0, btc_drift=0.0,
+                                      btc_strike=100_000.0))
     assert vetoed["action"] == "hold"
-    # With a down-drift ≥ min_drift AND mean ≤ strike the same fade is allowed.
     backed = bot.analyze(late,
-                         make_signals(prices=prices, latest=prices[-1], btc_drift=-0.3,
-                                      btc_strike=102_000.0))
+                         make_signals(prices=prices, latest=prices[-1],
+                                      btc_now=99_850.0, btc_drift=-0.3,
+                                      btc_strike=100_000.0))
     _check_contract(backed)
     if backed["action"] == "buy":
         assert backed["side"] == "no"
 
 
-def test_meanrev_fade_requires_mean_on_ptb_side():
-    """P0: fade NO only when reversion mean ≤ Price-to-Beat."""
+def test_meanrev_fade_requires_twap_on_ptb_side():
+    """P0: fade NO only when current TWAP is still below Price-to-Beat."""
     bot = MeanRevBot(name="rev-t", generation=0)
-    lookback = bot.strategy_params["lookback_candles"]
-    prices = [100_000.0] * (lookback + 20) + [101_500.0]
-    # Drift would allow NO, but mean (~100k) is ABOVE strike → hold.
+    prices = [100_000.0, 100_000.0, 100_000.0, 101_500.0]
     late = make_market(time_remaining=60)
     blocked = bot.analyze(
         late,
-        make_signals(prices=prices, latest=prices[-1], btc_drift=-0.3,
+        make_signals(prices=prices, latest=prices[-1],
+                     btc_now=101_500.0, btc_drift=-0.3,
                      btc_strike=99_000.0))
     assert blocked["action"] == "hold"
-    assert "PTB" in blocked["reasoning"] or "strike" in blocked["reasoning"]
-    # Strike above mean → NO allowed.
+    assert "strike" in blocked["reasoning"] or "drift" in blocked["reasoning"]
     ok = bot.analyze(
         late,
-        make_signals(prices=prices, latest=prices[-1], btc_drift=-0.3,
+        make_signals(prices=prices, latest=prices[-1],
+                     btc_now=101_500.0, btc_drift=-0.3,
                      btc_strike=102_000.0))
     assert ok["action"] == "buy" and ok["side"] == "no"
-    assert "strike=" in ok["reasoning"] and "mean=" in ok["reasoning"]
+    assert "strike=" in ok["reasoning"] and "pullback=" in ok["reasoning"]
 
 
 def test_meanrev_make_decision_skips_when_analyze_holds():

@@ -268,17 +268,17 @@ _REGIME_STRATEGY_PRIORS: dict[str, dict[str, dict[str, float]]] = {
     },
     "high_vol_trend": {
         "_default": {
-            "edge_mult": 0.95,
+            "edge_mult": 1.15,
             "flow_full_trust": 0.22,
-            "mom_lane_scale": 1.10,
+            "mom_lane_scale": 0.85,
             "strat_lane_scale": 0.90,
             "no_edge_mult": 1.10,
             "extra_drift_floor": 0.0,
-            "mid_band_drift_min": 0.25,
+            "mid_band_drift_min": 0.30,
         },
         "momentum": {
-            "edge_mult": 0.90,
-            "mom_lane_scale": 1.15,
+            "edge_mult": 1.25,
+            "mom_lane_scale": 0.70,
             "strat_lane_scale": 0.95,
         },
         "mean_reversion": {
@@ -289,20 +289,21 @@ _REGIME_STRATEGY_PRIORS: dict[str, dict[str, dict[str, float]]] = {
             "mid_band_drift_min": 0.30,
         },
         "phantom": {
-            "edge_mult": 0.92,
-            "mom_lane_scale": 1.10,
+            "edge_mult": 1.10,
+            "mom_lane_scale": 0.85,
             "strat_lane_scale": 0.95,
         },
         "hybrid": {
-            "edge_mult": 0.95,
-            "mom_lane_scale": 1.05,
+            "edge_mult": 1.15,
+            "mom_lane_scale": 0.80,
             "strat_lane_scale": 0.90,
         },
         "sniper": {
-            "edge_mult": 0.95,
-            "mom_lane_scale": 1.05,
+            "edge_mult": 1.20,
+            "mom_lane_scale": 0.85,
             "strat_lane_scale": 1.0,
             "no_edge_mult": 1.10,
+            "mid_band_drift_min": 0.35,
         },
     },
 }
@@ -815,12 +816,14 @@ def adjustments(
         side_m = {"yes": 1.0, "no": 1.0}
 
     # Tandem: data-driven heat (WR), not regime-name bandaid alone.
+    # 0 = unlimited (paper-eval); do not inject a 1-bot clamp over config 0.
     max_bots = None
     if reg_toxic or block_strat or strat_soft_bad:
-        max_bots = int(getattr(config, "MARKET_SIDE_MAX_BOTS_BAD_REGIME", 1))
+        mb = int(getattr(config, "MARKET_SIDE_MAX_BOTS_BAD_REGIME", 0) or 0)
+        max_bots = mb if mb > 0 else None
     elif label == "high_vol_chop":
-        # Mild default in chop only when live data has not spoken yet
-        max_bots = int(getattr(config, "MARKET_SIDE_MAX_BOTS_CHOP", 2))
+        mb = int(getattr(config, "MARKET_SIDE_MAX_BOTS_CHOP", 0) or 0)
+        max_bots = mb if mb > 0 else None
 
     reason_parts = [
         f"size={size_m:.2f}",

@@ -579,6 +579,14 @@ def _is_arbitrage_bot(name: str) -> bool:
     return n.startswith("arbitrage") or n.startswith("arb-")
 
 
+def _is_lockin_bot(name: str) -> bool:
+    """Lock-in book (arb + sweeper): pinned 1/N; core auto-adjusts the rest."""
+    n = (name or "").lower()
+    if _is_arbitrage_bot(n):
+        return True
+    return n.startswith("sweeper")
+
+
 def allocate(
     bot_names: Sequence[str],
     method: str = "kelly_portfolio",
@@ -592,9 +600,9 @@ def allocate(
     Returns dict with keys: weights, auto_weights, metrics, correlations,
     method, window_hours.
 
-    Arbitrage bots (when present) are pinned to a fixed ``1/N`` share so
-    Kelly never starves the low-risk market-neutral staple. Manual overrides
-    still win if the operator pins arb explicitly.
+    Lock-in bots (arbitrage + sweeper) are pinned to a fixed ``1/N`` share.
+    Core directionals auto-adjust on the remaining mass. Manual overrides
+    still win if the operator pins a lock-in bot explicitly.
     """
     names = list(dict.fromkeys(bot_names))  # stable unique
     method = method if method in METHODS else "equal"
@@ -620,34 +628,20 @@ def allocate(
             bool(m.get("ready"))
             and int(m.get("n") or 0) >= neg_n
             and float(m.get("expectancy") or 0.0) < 0
-            and not _is_arbitrage_bot(n)
+            and not _is_lockin_bot(n)
         ):
             overrides.pop(n, None)
 
-    # Pin arb at 1/N unless the operator already set a manual override.
-    # Audit 2a: when arb is idle (0 trades in ARB_DYNAMIC_IDLE_HOURS), reduce
-    # its fixed pin and reallocate freed capital to directional bots.
+    # Pin lock-in (arb + sweeper) at 1/N so cold-start is even across the
+    # slate and Kelly only moves Core capital. Do not shrink idle arb to
+    # ~5% — that left lock-in under-funded at startup.
     n_roster = max(len(names), 1)
     equal_share = 1.0 / n_roster
+    pin_lockin = bool(getattr(config, "PORTFOLIO_LOCKIN_FIXED_EQUAL",
+                              getattr(config, "PORTFOLIO_ARB_FIXED_EQUAL", True)))
     for n in names:
-        if _is_arbitrage_bot(n) and n not in overrides:
-            if bool(getattr(config, "PORTFOLIO_ARB_FIXED_EQUAL", True)):
-                if getattr(config, "PORTFOLIO_ARB_DYNAMIC_ENABLED", True):
-                    arb_m = metrics.get(n) or {}
-                    arb_n = int(arb_m.get("n") or 0)
-                    idle_h = float(getattr(
-                        config, "PORTFOLIO_ARB_DYNAMIC_IDLE_HOURS", 6.0))
-                    arb_min = float(getattr(
-                        config, "PORTFOLIO_ARB_DYNAMIC_MIN_WEIGHT", 0.04))
-                    # If arb has 0 fills in the lookback, scale toward min.
-                    if arb_n == 0 and hours >= idle_h:
-                        overrides[n] = max(arb_min, equal_share * 0.30)
-                    elif arb_n > 0:
-                        overrides[n] = max(arb_min, equal_share)
-                    else:
-                        overrides[n] = equal_share
-                else:
-                    overrides[n] = equal_share
+        if _is_lockin_bot(n) and n not in overrides and pin_lockin:
+            overrides[n] = equal_share
 
     # Split locked (manual + arb staple) vs free bots
     locked = {k: overrides[k] for k in overrides}
@@ -827,7 +821,7 @@ def allocate(
             bool(m.get("ready"))
             and int(m.get("n") or 0) >= neg_n
             and float(m.get("expectancy") or 0.0) < 0
-            and not _is_arbitrage_bot(n)
+            and not _is_lockin_bot(n)
         ):
             cap = min(cap, neg_max)
         if n in explore_set:
@@ -989,8 +983,12 @@ def load_state() -> dict[str, Any]:
     if not isinstance(data, dict):
         return base
     base.update(data)
-    # Coerce types
-    base["enabled"] = bool(base.get("enabled"))
+    # Coerce types. Honor config until the operator toggles via dashboard
+    # (soak persisted enabled=false from an older default).
+    if "enabled_source" not in data:
+        base["enabled"] = bool(getattr(config, "PORTFOLIO_ALLOCATION_ENABLED", False))
+    else:
+        base["enabled"] = bool(base.get("enabled"))
     method = base.get("method") or "kelly_portfolio"
     base["method"] = method if method in METHODS else "kelly_portfolio"
     try:
@@ -1295,6 +1293,7 @@ def size_multiplier(bot_name: str) -> float:
 def set_enabled(enabled: bool) -> dict[str, Any]:
     state = load_state()
     state["enabled"] = bool(enabled)
+    state["enabled_source"] = "dashboard"
     save_state(state)
     if enabled and not state.get("weights"):
         return rebalance(force=True, reason="enable")

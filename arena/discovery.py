@@ -78,6 +78,7 @@ class MarketDiscovery(threading.Thread):
         # the lock further.
         self._lock = threading.Lock()
         self._current_market: Optional[dict] = None
+        self._current_by_exchange: Dict[str, dict] = {}
         self._maker_fallback_market: Optional[dict] = None
         # NOTE: we deliberately do NOT pre-publish `next_market`.  Per the
         # user's "swap only on actual rollover" policy, the Trader loop
@@ -131,6 +132,15 @@ class MarketDiscovery(threading.Thread):
                 if self._current_market else None
             )
 
+    def current_markets_snapshot(self) -> Dict[str, dict]:
+        """Live window per enabled exchange (deep copies)."""
+        with self._lock:
+            return {
+                k: copy.deepcopy(v)
+                for k, v in (self._current_by_exchange or {}).items()
+                if v
+            }
+
     def next_market_snapshot(self) -> Optional[dict]:
         """Returns ``None`` -- Kept for back-compat. The Trader honours the
         user's "swap only on actual rollover" policy and only reads
@@ -182,9 +192,10 @@ class MarketDiscovery(threading.Thread):
     # ----------------------------------------------------------------------
 
     def _do_scan(self) -> None:
-        markets = polymarket_markets.discover_markets()
-        if not markets:
-            return
+        from exchanges import POLYMARKET, exchange_enabled as _ex_on
+        markets = []
+        if _ex_on(POLYMARKET):
+            markets = polymarket_markets.discover_markets() or []
 
         now_utc = datetime.now(timezone.utc)
         # Decorate every market with time-remaining / window-age so
@@ -245,10 +256,43 @@ class MarketDiscovery(threading.Thread):
         if maker_fallback is not None and maker_fallback is not current:
             self._refresh_market_data(maker_fallback)
 
+        try:
+            from exchanges.polymarket import stamp as _pm_stamp
+            if current is not None:
+                current = _pm_stamp(current)
+            if maker_fallback is not None:
+                maker_fallback = _pm_stamp(maker_fallback)
+            non_expired = [_pm_stamp(m) for m in non_expired]
+        except Exception:
+            pass
+
+        by_ex: Dict[str, dict] = {}
+        try:
+            from exchanges import POLYMARKET, KALSHI, exchange_enabled
+            if current is not None and exchange_enabled(POLYMARKET):
+                by_ex[POLYMARKET] = current
+            if exchange_enabled(KALSHI):
+                import kalshi_markets
+                km = kalshi_markets.discover_live()
+                for m in km:
+                    tr = compute_time_remaining_seconds(m, now_utc)
+                    m["time_remaining_seconds"] = tr
+                    w = float(m.get("window_sec") or 900)
+                    m["window_age_seconds"] = max(0.0, w - float(tr or 0))
+                kcur = kalshi_markets.select_current(km)
+                if kcur is not None:
+                    by_ex[KALSHI] = kcur
+        except Exception as e:
+            logger.debug("Kalshi discovery skipped: %s", e)
+
         prev_id = (self._current_market or {}).get("id")
         with self._lock:
             self._markets_cache = non_expired
-            self._current_market = current
+            self._current_by_exchange = by_ex
+            self._current_market = (
+                by_ex.get("polymarket")
+                or next(iter(by_ex.values()), None)
+            )
             self._maker_fallback_market = maker_fallback
             self._last_scan_ts = time.time()
 

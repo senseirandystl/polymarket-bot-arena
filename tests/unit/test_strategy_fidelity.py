@@ -35,7 +35,8 @@ def test_profiles_include_strat_weight():
 
 
 def test_hybrid_max_side_price_caps_priced_in_entries():
-    assert BaseBot.STRATEGY_MAX_SIDE_PRICE.get("hybrid") == 0.62
+    assert BaseBot.STRATEGY_MAX_SIDE_PRICE.get("hybrid") == 0.58
+    assert BaseBot.STRATEGY_MAX_SIDE_PRICE["momentum"] == 0.58
     assert BaseBot.STRATEGY_MAX_SIDE_PRICE["hybrid"] <= \
         BaseBot.STRATEGY_MAX_SIDE_PRICE["momentum"]
 

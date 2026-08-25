@@ -91,7 +91,7 @@ def test_continuous_edge_from_wr_eff(monkeypatch):
     assert a.edge_mult > 1.15
     assert a.wr_eff == pytest.approx(0.38)
     assert a.extra_drift_floor == 0.0
-    assert a.max_bots_side == 1  # soft-bad → tandem clamp
+    assert a.max_bots_side is None  # paper-eval: BAD_REGIME=0 → no bot-count inject
 
     with mock.patch("arena.regime_adapt._refresh_cache"), \
          mock.patch("arena.regime_adapt._cache", (

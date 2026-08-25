@@ -478,6 +478,7 @@ def settlement_adjustments(
     nowcast_coverage: float = 0.0,
     abs_drift: float = 0.0,
     in_settlement: Optional[bool] = None,
+    market_window_sec: Optional[float] = None,
 ) -> dict:
     """Trading policy mults for TWAP settlement / pre-settlement phases.
 
@@ -485,7 +486,9 @@ def settlement_adjustments(
     late-window strategies. Neutral (all 1.0 / 0 boost) when policy is off
     or phase is mid-window.
     """
-    phase = market_phase(time_remaining_sec)
+    phase = market_phase(
+        time_remaining_sec, market_window_sec=market_window_sec,
+    )
     if in_settlement is None:
         in_settlement = phase == "settlement"
 

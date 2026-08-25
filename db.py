@@ -298,6 +298,9 @@ def init_db():
             "ALTER TABLE trades ADD COLUMN context TEXT",
             # Hybrid sub-vote token for counterfactual meta-learning on skips.
             "ALTER TABLE decision_events ADD COLUMN meta_token TEXT",
+            "ALTER TABLE decision_events ADD COLUMN venue TEXT",
+            "ALTER TABLE trades ADD COLUMN window_sec REAL",
+            "ALTER TABLE trades ADD COLUMN settlement TEXT",
         ]:
             try:
                 conn.execute(migration)
@@ -1332,6 +1335,45 @@ def get_pilein_ev_gate() -> bool:
 def set_pilein_ev_gate(enabled: bool):
     """Flip the pile-in EV gate toggle (dashboard Settings)."""
     set_arena_state("pilein_ev_gate", "1" if enabled else "0")
+
+
+def get_one_trade_per_tick() -> bool:
+    raw = get_arena_state("one_trade_per_tick")
+    if raw is None:
+        return bool(getattr(config, "ONE_TRADE_PER_TICK", False))
+    return str(raw) in ("1", "true", "True", "yes", "on")
+
+
+def set_one_trade_per_tick(enabled: bool):
+    set_arena_state("one_trade_per_tick", "1" if enabled else "0")
+
+
+def get_hybrid_yield() -> bool:
+    raw = get_arena_state("hybrid_yield")
+    if raw is None:
+        return bool(getattr(config, "HYBRID_YIELD_ENABLED", False))
+    return str(raw) in ("1", "true", "True", "yes", "on")
+
+
+def set_hybrid_yield(enabled: bool):
+    set_arena_state("hybrid_yield", "1" if enabled else "0")
+
+
+def get_market_side_max_bots() -> int:
+    raw = get_arena_state("market_side_max_bots")
+    if raw is None:
+        try:
+            return int(getattr(config, "MARKET_SIDE_MAX_BOTS", 0) or 0)
+        except (TypeError, ValueError):
+            return 0
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return 0
+
+
+def set_market_side_max_bots(n: int):
+    set_arena_state("market_side_max_bots", str(int(n)))
 
 
 def get_directional_window_lock() -> bool:

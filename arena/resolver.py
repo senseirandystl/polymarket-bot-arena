@@ -61,6 +61,11 @@ class TradeResolver(threading.Thread):
             ).fetchall()
 
         resolved = dict(polymarket_markets.recent_resolutions() or {})
+        try:
+            import kalshi_markets
+            resolved.update(kalshi_markets.recent_resolutions() or {})
+        except Exception as e:
+            logger.debug("Kalshi resolutions skipped: %s", e)
 
         # Direct lookup for any pending market missing from the closed map.
         missing = {
@@ -69,7 +74,15 @@ class TradeResolver(threading.Thread):
         }
         fallback_hits = 0
         for mid in missing:
-            outcome = polymarket_markets.fetch_market_outcome(mid)
+            outcome = None
+            if str(mid).startswith("kalshi:"):
+                try:
+                    import kalshi_markets
+                    outcome = kalshi_markets.fetch_market_outcome(mid)
+                except Exception:
+                    outcome = None
+            else:
+                outcome = polymarket_markets.fetch_market_outcome(mid)
             if outcome is not None:
                 resolved[mid] = outcome
                 fallback_hits += 1
@@ -123,7 +136,14 @@ class TradeResolver(threading.Thread):
             mid = r["market_id"]
             if not mid or mid in resolved:
                 continue
-            outcome = polymarket_markets.fetch_market_outcome(mid)
+            if str(mid).startswith("kalshi:"):
+                try:
+                    import kalshi_markets
+                    outcome = kalshi_markets.fetch_market_outcome(mid)
+                except Exception:
+                    outcome = None
+            else:
+                outcome = polymarket_markets.fetch_market_outcome(mid)
             if outcome is not None:
                 extra[mid] = outcome
         if extra:

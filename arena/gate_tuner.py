@@ -113,11 +113,20 @@ def suggest(*, apply: bool = False, hours: float | None = None) -> dict:
         default = float(getattr(config, key))
         lo, hi = _band(default, spec)
         cur = float(current.get(key, default))
-        n = int(g.get("markets") or 0)
-        n_hyp = int(g.get("n_hyp") or 0)
-        wr = g.get("wr")
-        hyp = g.get("avg_hyp_pnl")
-        entry = g.get("avg_entry")
+        # Dual-gate: judge the 50–58¢ band, not the 90¢ lock blend.
+        src = g
+        band_tag = ""
+        if reason == "drift_dual_gate":
+            bands = g.get("by_band") or {}
+            mid = bands.get("mid_50_58") or {}
+            if int(mid.get("n_hyp") or 0) >= min_m:
+                src = mid
+                band_tag = "mid_50_58 "
+        n = int(src.get("markets") or g.get("markets") or 0)
+        n_hyp = int(src.get("n_hyp") or 0)
+        wr = src.get("wr")
+        hyp = src.get("avg_hyp_pnl")
+        entry = src.get("avg_entry")
         action = "hold"
         suggested = cur
         why = "collecting" if n_hyp < min_m else "no_edge_evidence"
@@ -134,7 +143,7 @@ def suggest(*, apply: bool = False, hours: float | None = None) -> dict:
             if abs(suggested - cur) > 1e-12:
                 action = "loosen"
                 why = (
-                    f"n={n} wr={wr:.2f} hyp={float(hyp):+.3f} "
+                    f"{band_tag}n={n} wr={wr:.2f} hyp={float(hyp):+.3f} "
                     f"entry={float(entry):.2f}"
                 )
         elif n_hyp >= min_m and not cheap and wr_ok:
@@ -153,17 +162,23 @@ def suggest(*, apply: bool = False, hours: float | None = None) -> dict:
             "avg_entry": entry,
         }
         if apply and action == "loosen":
-            cooldown = float(getattr(config, "GATE_TUNE_APPLY_COOLDOWN_SEC", 86400) or 0)
-            last_ts = float((current.get("_applied") or {}).get(key) or 0)
-            import time as _t
-            if cooldown > 0 and (_t.time() - last_ts) < cooldown:
-                suggestions[key]["action"] = "hold"
-                suggestions[key]["why"] = "cooldown"
+            # Mid-band hyp must not write a global Z floor (sniper 15bp
+            # underdogs share DRIFT_MIN_ABS_Z). Suggest-only for band evidence.
+            if band_tag:
+                suggestions[key]["why"] = (suggestions[key]["why"]
+                                           + " (suggest-only: midband, not global)")
             else:
-                new_ov[key] = round(suggested, 4)
-                applied_at = dict(new_ov.get("_applied") or {})
-                applied_at[key] = _t.time()
-                new_ov["_applied"] = applied_at
+                cooldown = float(getattr(config, "GATE_TUNE_APPLY_COOLDOWN_SEC", 86400) or 0)
+                last_ts = float((current.get("_applied") or {}).get(key) or 0)
+                import time as _t
+                if cooldown > 0 and (_t.time() - last_ts) < cooldown:
+                    suggestions[key]["action"] = "hold"
+                    suggestions[key]["why"] = "cooldown"
+                else:
+                    new_ov[key] = round(suggested, 4)
+                    applied_at = dict(new_ov.get("_applied") or {})
+                    applied_at[key] = _t.time()
+                    new_ov["_applied"] = applied_at
 
     applied = False
     if apply and {k: v for k, v in new_ov.items() if k != "_applied"} != {

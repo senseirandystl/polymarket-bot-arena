@@ -382,7 +382,7 @@ class TestHybridIntegration:
         assert sig.get("meta_token") and "meta(" in sig["meta_token"]
 
     def test_hold_with_votes_stamps_meta_for_cf(self, arena_db):
-        """Choppy single-sub lean should hold but still stamp meta_token."""
+        """Unknown-regime single-sub lean should hold but still stamp meta_token."""
         bot = HybridBot(name="hybrid-t")
         # Force only momentum sub to fire (mean_rev/phantom hold)
         hold = {"action": "hold", "side": "yes", "confidence": 0.0, "reasoning": ""}
@@ -391,13 +391,12 @@ class TestHybridIntegration:
             with patch.object(bot, "_cached_sub_analyze",
                               return_value={"momentum": buy, "mean_rev": hold,
                                             "phantom": hold}):
-                # normal/choppy regime requires ≥2-sub agreement → hold
+                # unknown tape still requires ≥2-sub agreement → hold
                 sig = bot.analyze(
                     make_market(),
                     make_signals(btc_drift=0.2,
-                                 vol_regime={"regime": "normal",
-                                             "trend_score": 0.5},
-                                 market_regime={"regime": "normal"}),
+                                 vol_regime={},
+                                 market_regime={}),
                 )
         assert sig["action"] == "hold"
         assert sig.get("meta_token")

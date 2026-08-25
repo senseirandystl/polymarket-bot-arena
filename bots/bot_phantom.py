@@ -63,7 +63,9 @@ class PhantomBot(BaseBot):
 
     def analyze(self, market: dict, signals: dict) -> dict:
         sv = SignalView.of(signals)
-        prices = sv.prices
+        from signals.tape import candle_prices
+        prices = candle_prices(market, signals if isinstance(signals, dict) else {},
+                               sample_sec=60.0) or list(sv.prices)
         p = self.strategy_params
 
         need = int(p["ema_slow"]) + int(p["breakout_lookback"])

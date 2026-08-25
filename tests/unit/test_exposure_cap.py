@@ -76,6 +76,29 @@ def test_exposure_headroom_clamps_and_skips(db, monkeypatch):
     assert bot._exposure_headroom("mkt-1", "yes", "paper") <= 0.0
 
 
+def test_max_bots_zero_does_not_block_peer(db, monkeypatch):
+    """Paper-eval: MARKET_SIDE_MAX_BOTS=0 is unlimited (dollar cap still binds)."""
+    from bots.bot_momentum import MomentumBot
+    from bots.base_bot import invalidate_exposure_cache
+    monkeypatch.setattr(db, "get_paper_pool_gross", lambda: 1000.0)
+    monkeypatch.setattr(config, "MARKET_SIDE_MAX_BOTS", 0, raising=False)
+    monkeypatch.setattr(config, "MARKET_SIDE_EXPOSURE_CAP", 0.30, raising=False)
+    monkeypatch.setattr(config, "EXPOSURE_CORR_AWARE", False, raising=False)
+
+    class _NoAdj:
+        max_bots_side = 1  # must not re-impose a 1-bot clamp over config 0
+
+    monkeypatch.setattr(
+        "arena.regime_adapt.adjustments",
+        lambda *a, **k: _NoAdj(),
+        raising=False,
+    )
+    _open_trade(db, "a", amount=1.0)
+    invalidate_exposure_cache()
+    bot = MomentumBot(name="new-bot", generation=0)
+    assert bot._exposure_headroom("mkt-1", "yes", "paper") > 0
+
+
 def test_max_bots_per_side_blocks_new_bot(db, monkeypatch):
     """MARKET_SIDE_MAX_BOTS: next distinct bot gets zero headroom at the cap."""
     from bots.bot_momentum import MomentumBot

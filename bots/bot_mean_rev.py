@@ -19,15 +19,15 @@ DEFAULT_PARAMS = {
     "rsi_period": 14,
     "rsi_oversold": 40,
     "rsi_overbought": 60,
-    # Slightly higher bar: weak z-fades were knife-catches even when drift-aligned.
-    "reversion_threshold": 0.5, # z-score threshold to fade
+    # Retrace of TWAP toward this window's strike (not a 4-bar z-score).
+    "pullback_min": 0.20,
     # Drift-agreement gate (BUG #28): the fade may only fire toward the side
     # a signed btc_drift of at least this magnitude already favors. Ungated,
     # the z-fade was a pure contrarian knife-catcher — 10 of 11 live trades
     # fired with drift 0.00-0.08 and ALL lost (-$55.30; the documented
     # "contrarian loses in 5-min markets" death class). Gated, the identity
     # becomes "buy the dip in the WINNING direction": drift picks the side,
-    # the z-score times the pullback entry.
+    # TWAP-vs-strike pullback times the entry.
     # Raised 0.12→0.20 (2026-08-11): weak drift + high profile weight made
     # meanrev a mom clone at 55–58¢.
     "min_drift": 0.20,
@@ -98,6 +98,44 @@ def resolve_lookback(
     return 0, "none"
 
 
+def strike_pullback(
+    btc_now: float,
+    strike: float,
+    window_prices: Sequence[float],
+) -> tuple[float, int, float]:
+    """Retrace of current TWAP toward this window's strike.
+
+    Returns ``(pullback_frac, side_sign, extreme)``:
+    * side_sign +1 if ``btc_now`` is above strike (YES winning), −1 below
+    * pullback_frac 0 = sitting on the window extreme, 1 = back at strike
+    * extreme is the window high (YES) or low (NO)
+    """
+    if strike is None or strike <= 0 or btc_now is None or btc_now <= 0:
+        return 0.0, 0, 0.0
+    path = [float(p) for p in (window_prices or []) if p and float(p) > 0]
+    if not path:
+        return 0.0, 0, 0.0
+    now = float(btc_now)
+    k = float(strike)
+    if now >= k:
+        extreme = max(path)
+        if extreme <= k:
+            return 0.0, 1, extreme
+        width = extreme - k
+        if width <= 0:
+            return 0.0, 1, extreme
+        frac = max(0.0, min(1.0, (extreme - now) / width))
+        return frac, 1, extreme
+    extreme = min(path)
+    if extreme >= k:
+        return 0.0, -1, extreme
+    width = k - extreme
+    if width <= 0:
+        return 0.0, -1, extreme
+    frac = max(0.0, min(1.0, (now - extreme) / width))
+    return frac, -1, extreme
+
+
 class MeanRevBot(BaseBot):
     def __init__(self, name="meanrev-v1", params=None, generation=0, lineage=None):
         super().__init__(
@@ -140,13 +178,45 @@ class MeanRevBot(BaseBot):
         z = (window[-1] - mean) / std if std > 0 else 0.0
         return z, mean
 
+    def _twap_path(self, signals: dict, min_n: int, market: dict | None = None) -> list[float]:
+        """60s settlement candles — TWAP on Polymarket, BRTI on Kalshi."""
+        from signals.tape import candle_prices, is_kalshi_market
+        raw = signals if isinstance(signals, dict) else {}
+        if not is_kalshi_market(market) and not raw.get("btc_twap_ticks"):
+            # No TWAP series → fixture/spot path (mix guard can fire).
+            return []
+        tw = candle_prices(market, raw, sample_sec=60.0)
+        if len(tw) < min_n:
+            return []
+        return [float(x) for x in tw if x and float(x) > 0]
+
     def analyze(self, market: dict, signals: dict) -> dict:
-        """Bet against overextended moves, gated by PTB (strike) + drift."""
+        """Buy the TWAP dip toward this window's strike, gated by drift."""
         sv = SignalView.of(signals)
-        prices = sv.prices
         p = self.strategy_params
         max_lb = int(p.get("lookback_candles", 10))
         min_win = int(p.get("min_window_candles", 3))
+        sig_dict = signals if isinstance(signals, dict) else {}
+
+        tw_prices = self._twap_path(sig_dict, min_win, market)
+        if tw_prices:
+            prices = tw_prices
+            from signals.tape import is_kalshi_market
+            path_kind = "brti" if is_kalshi_market(market) else "twap"
+        else:
+            prices = list(sv.prices)
+            path_kind = "fixture"
+            last = float(prices[-1]) if prices else 0.0
+            now_hint = float(sv.btc_now or 0.0)
+            # Live TWAP now vs spot candles is BUG #23-class mix — sit out.
+            if now_hint > 0 and last > 0 and abs(now_hint - last) / now_hint > 0.0005:
+                return strategy_decision(
+                    "hold",
+                    reasoning=(
+                        "meanrev: TWAP now vs spot path mix "
+                        f"(now={now_hint:.2f} last={last:.2f})"
+                    ),
+                )
 
         lookback, lb_source = resolve_lookback(
             market, len(prices),
@@ -156,32 +226,33 @@ class MeanRevBot(BaseBot):
         if lookback <= 0:
             return strategy_decision("hold", reasoning="insufficient data")
 
+        window = list(prices[-lookback:])
         zscore, mean = self._calc_zscore_and_mean(prices, lookback)
         rsi = self._calc_rsi(prices, p["rsi_period"])
-        threshold = p["reversion_threshold"]
         amount = config.get_max_position() * p["position_size_pct"]
+        pb_min = float(p.get(
+            "pullback_min",
+            getattr(config, "MEANREV_PULLBACK_MIN", 0.20),
+        ))
 
         strike = sv.btc_strike
-        # Resolution-path BTC (TWAP / nowcast), not spot — matches PTB frame.
-        btc_now = float(sv.btc_now or 0.0) or float(sv.latest or 0.0) or (
-            float(prices[-1]) if prices else 0.0
+        # Stay on the resolution object: TWAP now, else last of the chosen path.
+        btc_now = float(sv.btc_now or 0.0) or (
+            float(window[-1]) if window else 0.0
         )
+        if strike is None or btc_now <= 0:
+            return strategy_decision("hold", reasoning="insufficient strike/TWAP")
 
-        # Drift-agreement gate: fade side must match where BTC sits vs PTB.
         drift = sv.btc_drift
         min_drift = p.get("min_drift", 0.10)
         fade_no_ok = drift <= -min_drift
         fade_yes_ok = drift >= min_drift
 
-        # Audit 1d: MIN_FADE_DRIFT guard — in strong trends the drift-heavy
-        # profile pushes P_model toward the trend side, making the bot a
-        # duplicate trend follower instead of a mean-reversion fade. At
-        # |drift| ≥ this floor it's not fading — it's chasing. Stand down.
         _min_fade_floor = float(getattr(config, "MEANREV_MIN_FADE_DRIFT", 0.40))
         if abs(drift) >= _min_fade_floor:
             return strategy_decision(
                 "hold",
-                signals={"drift": drift, "zscore": zscore, "mean": mean},
+                signals={"drift": drift, "btc_now": btc_now, "strike": strike},
                 reasoning=(
                     f"Meanrev identity guard: |drift|={abs(drift):.3f}"
                     f">={_min_fade_floor:.2f} — strong trend, not fading;"
@@ -189,9 +260,7 @@ class MeanRevBot(BaseBot):
                 ),
             )
 
-        # TWAP settlement: do not fade against a high-certainty TWAP side.
-        mean_no_ok = strike is not None and mean <= strike
-        mean_yes_ok = strike is not None and mean >= strike
+        pb, side_sign, extreme = strike_pullback(btc_now, strike, window)
 
         regime = self.regime_context(signals)
         damp = p.get("trending_conf_damp", 0.60)
@@ -202,14 +271,16 @@ class MeanRevBot(BaseBot):
 
         strike_s = f"{strike:.2f}" if strike is not None else "na"
         soak = (
-            f"strike={strike_s} mean={mean:.2f} btc_now={btc_now:.2f} "
-            f"lb={lookback}/{lb_source}"
+            f"strike={strike_s} btc_now={btc_now:.2f} extreme={extreme:.2f} "
+            f"pb={pb:.2f} lb={lookback}/{lb_source}/{path_kind}"
         )
         contributing = {
             "zscore": zscore,
             "rsi": rsi,
             "drift": drift,
             "mean": mean,
+            "pullback": pb,
+            "extreme": extreme,
             "strike": strike,
             "btc_now": btc_now,
             "lookback": lookback,
@@ -218,70 +289,64 @@ class MeanRevBot(BaseBot):
             "regime_factor": regime_factor,
         }
 
-        # Overextended UP → fade → NO (expect reversion down).
-        if zscore > threshold:
+        if pb < pb_min or side_sign == 0:
+            return strategy_decision(
+                "hold", signals=contributing,
+                reasoning=(
+                    f"No TWAP pullback vs strike: pb={pb:.2f}<{pb_min:.2f} "
+                    f"| {soak}"))
+
+        if side_sign < 0:
+            # Still below strike: bounce toward PTB in a DOWN window → NO.
             if not fade_no_ok:
                 return strategy_decision(
                     "hold", signals=contributing,
                     reasoning=(
-                        f"Fade NO not drift-backed: z={zscore:.2f}, "
+                        f"Fade NO not drift-backed: pb={pb:.2f}, "
                         f"drift={drift:+.3f} | {soak}"))
-            if not mean_no_ok:
-                return strategy_decision(
-                    "hold", signals=contributing,
-                    reasoning=(
-                        f"Fade NO mean above PTB: z={zscore:.2f}, "
-                        f"mean={mean:.2f} > strike={strike_s} | {soak}"))
             rsi_boost = (
                 max(0.0, rsi - p["rsi_overbought"]) * 0.005
                 if rsi is not None else 0.0
             )
-            confidence = min(0.95, (0.35 + abs(zscore) * 0.15 + rsi_boost)
+            confidence = min(0.95, (0.35 + pb * 0.40 + rsi_boost)
                              * regime_factor)
             return strategy_decision(
                 "buy", "no",
-                edge=min(0.10, (abs(zscore) - threshold) * 0.02 * regime_factor),
+                edge=min(0.10, pb * 0.08 * regime_factor),
                 confidence=confidence,
                 reasoning=(
-                    f"Mean reversion SHORT: z={zscore:.2f}, RSI={rsi if rsi is not None else 'na'} "
-                    f"(fade up, regime={regime['label']}x{regime_factor:.2f}) "
+                    f"Mean reversion SHORT: pullback={pb:.2f} vs strike, "
+                    f"RSI={rsi if rsi is not None else 'na'} "
+                    f"(bounce in DOWN window, "
+                    f"regime={regime['label']}x{regime_factor:.2f}) "
                     f"| {soak}"),
                 signals=contributing,
                 suggested_amount=amount,
             )
 
-        # Overextended DOWN → fade → YES (expect reversion up).
-        if zscore < -threshold:
-            if not fade_yes_ok:
-                return strategy_decision(
-                    "hold", signals=contributing,
-                    reasoning=(
-                        f"Fade YES not drift-backed: z={zscore:.2f}, "
-                        f"drift={drift:+.3f} | {soak}"))
-            if not mean_yes_ok:
-                return strategy_decision(
-                    "hold", signals=contributing,
-                    reasoning=(
-                        f"Fade YES mean below PTB: z={zscore:.2f}, "
-                        f"mean={mean:.2f} < strike={strike_s} | {soak}"))
-            rsi_boost = (
-                max(0.0, p["rsi_oversold"] - rsi) * 0.005
-                if rsi is not None else 0.0
-            )
-            confidence = min(0.95, (0.35 + abs(zscore) * 0.15 + rsi_boost)
-                             * regime_factor)
+        # Still above strike: dip toward PTB in an UP window → YES.
+        if not fade_yes_ok:
             return strategy_decision(
-                "buy", "yes",
-                edge=min(0.10, (abs(zscore) - threshold) * 0.02 * regime_factor),
-                confidence=confidence,
+                "hold", signals=contributing,
                 reasoning=(
-                    f"Mean reversion LONG: z={zscore:.2f}, RSI={rsi if rsi is not None else 'na'} "
-                    f"(fade down, regime={regime['label']}x{regime_factor:.2f}) "
-                    f"| {soak}"),
-                signals=contributing,
-                suggested_amount=amount,
-            )
-
+                    f"Fade YES not drift-backed: pb={pb:.2f}, "
+                    f"drift={drift:+.3f} | {soak}"))
+        rsi_boost = (
+            max(0.0, p["rsi_oversold"] - rsi) * 0.005
+            if rsi is not None else 0.0
+        )
+        confidence = min(0.95, (0.35 + pb * 0.40 + rsi_boost)
+                         * regime_factor)
         return strategy_decision(
-            "hold", signals=contributing,
-            reasoning=f"No reversion signal: z={zscore:.2f}, RSI={rsi if rsi is not None else 'na'} | {soak}")
+            "buy", "yes",
+            edge=min(0.10, pb * 0.08 * regime_factor),
+            confidence=confidence,
+            reasoning=(
+                f"Mean reversion LONG: pullback={pb:.2f} vs strike, "
+                f"RSI={rsi if rsi is not None else 'na'} "
+                f"(dip in UP window, "
+                f"regime={regime['label']}x{regime_factor:.2f}) "
+                f"| {soak}"),
+            signals=contributing,
+            suggested_amount=amount,
+        )

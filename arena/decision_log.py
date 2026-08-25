@@ -323,6 +323,9 @@ def enqueue(
         "features": feats,
         "meta_token": meta_token,
         "trade_id": int(trade_id) if trade_id not in (None, "") else None,
+        "venue": (
+            "kalshi" if str(market_id).startswith("kalshi:") else "polymarket"
+        ),
     }
 
     qmax = int(getattr(config, "DECISION_LOG_QUEUE_MAX", 8000))
@@ -351,13 +354,14 @@ def flush() -> int:
                    bot_name, strategy_type, market_id, action, side, skip_reason,
                    edge, confidence, entry_price,
                    drift, mom, strat, fut, tech, xasset,
-                   model_prob, trust_eff, regime, features, meta_token, trade_id
+                   model_prob, trust_eff, regime, features, meta_token, trade_id,
+                   venue
                ) VALUES (
                    :bot_name, :strategy_type, :market_id, :action, :side,
                    :skip_reason, :edge, :confidence, :entry_price,
                    :drift, :mom, :strat, :fut, :tech, :xasset,
                    :model_prob, :trust_eff, :regime, :features, :meta_token,
-                   :trade_id
+                   :trade_id, :venue
                )""",
             batch,
         )
@@ -492,16 +496,41 @@ def core_lane_attribution(conn, deadband: float = 0.05,
             reading = float(reading)
             if abs(reading) < deadband:
                 continue
-            cell = agg.setdefault(st, {}).setdefault(lane, {"n": 0, "correct": 0})
+            cell = agg.setdefault(st, {}).setdefault(
+                lane, {"n": 0, "correct": 0, "n_ev": 0, "sum_pnl": 0.0})
             cell["n"] += 1
             cell["correct"] += int((reading > 0) == market_up)
+            # Lane EV from hyp_pnl when the (buy) decision followed this lane.
+            # Prefer trade P&L in compute_core_attribution; this is fallback.
+            def _rg(row, key, default=None):
+                if isinstance(row, dict):
+                    return row.get(key, default)
+                try:
+                    return row[key]
+                except (KeyError, IndexError, TypeError):
+                    return default
+            side = str(_rg(r, "side") or "").lower()
+            followed = ((reading > 0) and side == "yes") or (
+                (reading <= 0) and side == "no")
+            action = str(_rg(r, "action") or "").lower()
+            hyp = _rg(r, "hyp_pnl")
+            if followed and action == "buy" and hyp is not None:
+                try:
+                    cell["n_ev"] += 1
+                    cell["sum_pnl"] += float(hyp)
+                except (TypeError, ValueError):
+                    pass
     out: dict = {}
     for st, ld in agg.items():
         out[st] = {}
         for lane, c in ld.items():
+            n_ev = int(c.get("n_ev") or 0)
             out[st][lane] = {
                 "n": c["n"],
                 "accuracy": (c["correct"] / c["n"]) if c["n"] else None,
+                "n_ev": n_ev,
+                "sum_pnl": round(float(c.get("sum_pnl") or 0.0), 4),
+                "mean_ev": ((c["sum_pnl"] / n_ev) if n_ev else None),
             }
     return out
 

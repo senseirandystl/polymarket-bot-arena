@@ -916,6 +916,12 @@ def main_loop(bots):
     # network on their 1s tick.
     warmer = MarketDataWarmer(discovery, get_cvd_feed(), pm_price_feed)
     warmer.start()
+    try:
+        from signals.brti import start_brti_feed
+        start_brti_feed()
+        logger.info("BRTI feed started (Kalshi settlement index)")
+    except Exception:
+        logger.warning("BRTI feed failed to start", exc_info=True)
 
     resolver = TradeResolver()
     resolver.start()
@@ -962,6 +968,11 @@ def main_loop(bots):
     db.set_arena_state(
         "session_start", datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     )
+    try:
+        from arena import portfolio as _port
+        _port.rebalance(force=True, reason="startup")
+    except Exception as e:
+        logger.debug("startup portfolio rebalance skipped: %s", e)
 
     logger.info(
         f"Arena started with {len(trader_bots)} trader + {len(maker_bots)} maker "

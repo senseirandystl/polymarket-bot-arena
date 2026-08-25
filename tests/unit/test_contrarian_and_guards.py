@@ -87,7 +87,7 @@ def test_fade_with_drift_fires():
                btc_strike=99.5)
     out = bot.analyze(_market(), sig)
     assert out["action"] == "buy" and out["side"] == "yes"
-    assert "strike=" in out["reasoning"] and "mean=" in out["reasoning"]
+    assert "strike=" in out["reasoning"] and "pullback=" in out["reasoning"]
 
 
 def test_fade_with_drift_fires_symmetric_no():
@@ -106,7 +106,6 @@ def test_fade_mean_above_ptb_blocks_no():
                btc_strike=99.0)
     out = bot.analyze(_market(), sig)
     assert out["action"] == "hold"
-    assert "PTB" in out["reasoning"]
 
 
 def test_meanrev_max_side_price():

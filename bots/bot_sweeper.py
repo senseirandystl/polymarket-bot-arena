@@ -355,7 +355,9 @@ class SweeperBot(BaseBot):
         except Exception:
             bankroll = float(getattr(config, "PAPER_BANKROLL_DEFAULT", 200.0))
 
-        size_edge = max(0.0, directional_net_edge(p_side, side_ask))
+        size_edge = max(0.0, directional_net_edge(
+            p_side, side_ask, exchange=market.get("exchange"),
+        ))
         f_star = size_edge / max(1e-6, 1.0 - price)
         kf = float(getattr(config, "KELLY_FRACTION", 0.25) or 0.25)
         max_usd = float(p.get("max_trade_usd", 15.0))

@@ -333,18 +333,32 @@ class HybridBot(BaseBot):
         n_active = len(active)
 
         # Regime-adaptive ensemble discipline (no hard mid caps):
-        # In chop/range, require ≥2 subs same side — single-sub leans are
-        # pure mom/phantom clones that bled mid-window 2026-08-11. In trend,
-        # a single strong sub may still fire (lag gate still applies in BaseBot).
+        # In chop/range a single allowed sub (meanrev) may fire. In trend,
+        # a single strong sub may fire (lag gate still applies in BaseBot).
+        # In normal, a *momentum* single-sub may fire (soak: mom is the +EV
+        # book; trader still yields hybrid when dedicated mom is pending).
+        # unknown/empty still needs ≥2-sub agreement.
         rid = (self._last_regime or {}).get("label") or ""
-        # Chop/range uses a single allowed sub (meanrev) — do not also
-        # demand 2-sub agreement. Mixed/normal tape still does.
-        if rid in ("normal", "unknown", "") and not agreement:
+        only_mom = (
+            n_active == 1 and active[0][0] == "momentum"
+        )
+        if rid in ("unknown", "") and not agreement:
             return self._stamp_meta(
                 strategy_decision(
                     "hold", signals=contributing,
                     reasoning=(
-                        f"Hybrid needs ≥2-sub agreement in {rid or 'choppy'} "
+                        f"Hybrid needs ≥2-sub agreement in {rid or 'unknown'} "
+                        f"(active={n_active}, yes={yes_votes} no={no_votes})"
+                    ),
+                ),
+                votes, bucket,
+            )
+        if rid == "normal" and not agreement and not only_mom:
+            return self._stamp_meta(
+                strategy_decision(
+                    "hold", signals=contributing,
+                    reasoning=(
+                        f"Hybrid needs momentum or ≥2-sub agreement in normal "
                         f"(active={n_active}, yes={yes_votes} no={no_votes})"
                     ),
                 ),

@@ -55,6 +55,25 @@ POLYMARKET_BTC_5M_SERIES_ID = "10684"
 # both paper (simulated) and live use it. See polymarket_fills.taker_fee().
 POLYMARKET_TAKER_FEE_RATE = 0.07
 
+# --- Dual exchange (Polymarket 5m + Kalshi 15m) ---
+# Settings toggles persist in arena_state `exchange_toggles`; these are defaults
+# when the operator has never saved. Off ⇒ no discovery/eval/fills for that
+# exchange (paper included).
+EXCHANGE_POLYMARKET_ENABLED = True
+EXCHANGE_KALSHI_ENABLED = True
+KALSHI_API_BASE = "https://external-api.kalshi.com/trade-api/v2"
+KALSHI_WS_BASE = "wss://external-api-ws.kalshi.com/trade-api/ws/v2"
+KALSHI_SERIES_TICKER = "KXBTC15M"
+KALSHI_WINDOW_SEC = 900
+KALSHI_SETTLEMENT_AVG_SEC = 60
+KALSHI_TAKER_FEE_RATE = 0.07
+# 15m σ seed (~√3 vs 5m prior if the process is similar). Soak-tune later.
+KALSHI_DRIFT_VOL_SCALE = 0.0038
+KALSHI_DRIFT_MIN_ABS_PCT = 0.00080
+KALSHI_DRIFT_MIN_ABS_Z = 0.35
+KALSHI_MOMENTUM_LATE_SKIP_SEC = 120
+KALSHI_SNIPER_MIN_AGE_SEC = 90
+
 # Paper mode is a full simulation against real Polymarket order books (no order
 # is submitted). All paper bots share ONE virtual USDC bankroll, set by the user
 # in the dashboard Settings tab (arena_state key 'paper_bankroll'); this default
@@ -206,12 +225,15 @@ CORE_TUNE_MIN_TRADES_REGIME = 40
 CORE_TUNE_PNL_GATE = True
 CORE_TUNE_PNL_MIN_TRADES = 15
 CORE_TUNE_PNL_MIN_TRADES_REGIME = 5
-# Primary objective: lane net EV (signed-agreement $), not sign accuracy alone.
-# Accuracy remains a filter (must clear HIGH_ACC); EV drives UP/DOWN.
+# Primary objective: lane net EV (signed-agreement $), not sign accuracy.
+# Accuracy is a one-way UP veto (must clear UP_ACC_FLOOR). Missing EV → HOLD,
+# never an accuracy-led UP (soak 2026-08-24: mom 0.20→0.40 on 56.9% WR, −1.45¢).
 CORE_TUNE_EV_PRIMARY = True
 CORE_TUNE_EV_MIN_TRADES = 20
 CORE_TUNE_EV_UP_MIN = 0.0          # need mean attributed $ ≥ this to UP
 CORE_TUNE_EV_DOWN_MAX = -0.05      # mean attributed $ ≤ this → DOWN
+CORE_TUNE_UP_ACC_FLOOR = 0.50      # never UP a lane that is coin-flip or worse
+CORE_TUNE_RESET_SEED_ON_RED = True # snap elevated weight to seed when EV red/missing
 # Unique-market scorecard net ¢/share (preferred judge over sign accuracy).
 CORE_TUNE_SCORECARD_MIN = 20
 CORE_TUNE_SCORECARD_DOWN_MAX = 0.0   # net ≤ this → block UP
@@ -677,8 +699,8 @@ AUTO_CORE_TUNE_ENABLED = True
 CORE_TUNE_ENABLED = True
 CORE_TUNE_INTERVAL_SEC = 300   # evolution-loop host cadence (was piggybacked on 30m lane monitor)
 CORE_TUNE_MIN_TRADES = 40      # per-(strategy,lane) resolved readings before tuning
-CORE_TUNE_HIGH_ACC = 0.56      # lane sign-accuracy above this => nudge weight UP
-CORE_TUNE_LOW_ACC = 0.48       # below this => nudge weight DOWN (toward the band floor)
+CORE_TUNE_HIGH_ACC = 0.56      # legacy; UP trigger is EV. Kept as a log/compat alias.
+CORE_TUNE_LOW_ACC = 0.48       # legacy; accuracy must not DOWN a lane by itself.
 # Live candidate overrides (enabled non-core lanes) share the tuner loop
 CANDIDATE_TUNE_WEIGHT_MAX = 0.35
 CANDIDATE_TUNE_MIN_TRADES = 30
@@ -739,6 +761,15 @@ DRIFT_ADAPT_TWAP_SAMPLE_SEC = 60.0
 # Φ≈0.64–0.69 on 32–38¢ underdogs (core directional 12/35 = 34% WR).
 # 8 bp ≈ $55 at $70k — still below a real 5m move; binds when z is inflated.
 DRIFT_MIN_ABS_PCT = 0.00080
+# Sniper: 8bp dual-gate is enough inside the 50–58¢ lag pocket (soak +EV);
+# outside that band keep the 15bp conviction floor (cheap underdogs).
+SNIPER_MIDBAND_LO = 0.50
+SNIPER_MIDBAND_HI = 0.58
+SNIPER_OUTSIDE_MIN_PCT = 0.0015
+# Momentum sits out the last ~80s (soak: late≤80s −$13 even with consecutive bars).
+MOMENTUM_LATE_SKIP_SEC = 80
+# Meanrev: retrace of TWAP toward this window's strike, not a 4-bar z-score.
+MEANREV_PULLBACK_MIN = 0.20
 # Floor remaining-window time in σ_rem = scale·√(tr/W) so last-minute noise
 # cannot explode z. 60s ⇒ σ_rem never below scale·√(60/300).
 DRIFT_TIME_SCALE_MIN_SEC = 60.0
@@ -1014,17 +1045,18 @@ PORTFOLIO_EDGE_PROVEN_MIN_N = 20
 # After n≥NEG_EXP_MIN_N with expectancy<0: strip manual floors and zero auto
 # weight so losers cannot keep capital via override floors.
 PORTFOLIO_NEG_EXP_MIN_N = 6
-PORTFOLIO_NEG_EXP_MAX_WEIGHT = 0.0
+PORTFOLIO_NEG_EXP_MAX_WEIGHT = 0.10   # paper-eval floor; 0.0 starves losers to silence
 PORTFOLIO_CORR_SHRINK = 0.65          # 0..1: how hard correlation cuts raw score
 PORTFOLIO_CORR_MIN_OVERLAP = 8        # shared markets needed to estimate ρ
 PORTFOLIO_COLD_START_SCORE = 0.05     # tiny score for bots under sample floor
 PORTFOLIO_LOSER_SCORE = 0.0           # ready bots with neg expectancy → zero weight
 PORTFOLIO_ARB_FIXED_EQUAL = True      # pin arbitrage at 1/N (market-neutral staple)
-# Dynamic arb: when arb averages 0 trades/hour for ARB_DYNAMIC_IDLE_HOURS,
-# reduce its fixed equal pin and reallocate to directional bots (audit 2a).
-PORTFOLIO_ARB_DYNAMIC_ENABLED = True
+# Lock-in (arb + sweeper) stay at 1/N; Core (mom/meanrev/sniper/hybrid) auto-adjusts.
+PORTFOLIO_LOCKIN_FIXED_EQUAL = True
+# Idle-arb shrink disabled: it pinned arb ~5% at startup. Lock-in stays even.
+PORTFOLIO_ARB_DYNAMIC_ENABLED = False
 PORTFOLIO_ARB_DYNAMIC_IDLE_HOURS = 6.0
-PORTFOLIO_ARB_DYNAMIC_MIN_WEIGHT = 0.04   # floor even when idle
+PORTFOLIO_ARB_DYNAMIC_MIN_WEIGHT = 0.04   # unused while DYNAMIC_ENABLED is False
 PORTFOLIO_REBALANCE_INTERVAL_SEC = 30 * 60  # 30 min periodic rebalance
 PORTFOLIO_REBALANCE_ON_REGIME = True  # also rebalance on regime_detector flip
 # Only rebalance on regime *after* the new regime has been held this long
@@ -1143,7 +1175,7 @@ CONSENSUS_GUARD = 0.35
 # ~4x leverage on single BTC candles. Later bots clamp to the remaining
 # headroom or skip. Arbitrage (hedged, own execute()) is exempt. In live
 # mode the cap base is LIVE_MAX_POSITION * 2 per market-side.
-MARKET_SIDE_EXPOSURE_CAP = 0.10
+MARKET_SIDE_EXPOSURE_CAP = 0.30
 # Correlation-aware concentration (long-term pile-in control): when counting
 # open exposure toward MARKET_SIDE_EXPOSURE_CAP, weight each peer bot's open
 # cost by max(corr(self, peer), EXPOSURE_CORR_FLOOR). ρ≈1 bots (momentum/
@@ -1156,14 +1188,15 @@ EXPOSURE_CORR_FLOOR = 0.35
 # Overnight 2026-08-20: unique-market +$3.84 vs multi-bot −$36. Model
 # "edges" of 5–23¢ always cleared the 3.5¢ pile-in bar. One directional
 # thesis per (market, side).
-MARKET_SIDE_MAX_BOTS = 1
-# Tighter tandem caps when live data says the regime/strategy is toxic
-MARKET_SIDE_MAX_BOTS_BAD_REGIME = 1
-MARKET_SIDE_MAX_BOTS_CHOP = 1
+MARKET_SIDE_MAX_BOTS = 0              # 0 = unlimited (paper-eval sample size)
+# Tighter tandem caps when live data says the regime/strategy is toxic.
+# 0 = do not re-impose a bot-count cap (paper-eval). Restore 1 before live.
+MARKET_SIDE_MAX_BOTS_BAD_REGIME = 0
+MARKET_SIDE_MAX_BOTS_CHOP = 0
 # Progressive EV pile-in gate (togglable): after peers already hold (market,
 # side), a new bot must clear a higher edge bar — unless confidence is very
 # high. Not a hard bot-count ban; complementary to MARKET_SIDE_MAX_BOTS.
-PILEIN_EV_GATE_ENABLED = True
+PILEIN_EV_GATE_ENABLED = False
 PILEIN_EV_EDGE_STEP = 0.025       # extra edge required per peer bot open
 PILEIN_EV_MIN_EDGE = 0.035        # absolute min edge when ≥1 peer is open
 # quality_confidence is a 0–0.95 *structure* score, not P(win). Soak
@@ -1176,7 +1209,10 @@ PILEIN_EV_EXEMPT_TYPES = ("arbitrage",)  # market-neutral legs
 # --- One directional trade per evaluation (trader tick) ---
 # Phase-1: all bots make_decision; phase-2: only the best-edge directional
 # buy executes. Structural strategies (arb, sweeper, makers) stay exempt.
-ONE_TRADE_PER_TICK = True
+ONE_TRADE_PER_TICK = False
+# When the one-per-tick ranker is on, hybrid yields if a dedicated directional
+# is already pending the same side. Paper-eval default OFF so hybrid still fills.
+HYBRID_YIELD_ENABLED = False
 ONE_TRADE_PER_TICK_EXEMPT = (
     "arbitrage", "sweeper", "late_window_maker", "fee_zone_maker",
     "btc_maker", "true_maker", "copy_trade",
@@ -1191,6 +1227,24 @@ DIRECTIONAL_WINDOW_LOCK_EXEMPT = ONE_TRADE_PER_TICK_EXEMPT
 # buying. Continuous alternative to hard mid caps: high mids still trade when
 # |drift| is large enough that lag remains. Sniper/makers already enforce this
 # more strictly; this is the shared BaseBot floor.
+# --- High-vol favorite tax (soak 2026-08-24: 50–58¢ × high_vol_trend −$15) ---
+# Chosen-side MID ≥ 0.52 in high_vol_trend: raise min_edge and cut size.
+# Cheap lag (42–50¢) and cheap NO are untouched.
+HIGH_VOL_FAVORITE_ENABLED = True
+HIGH_VOL_FAVORITE_REGIMES = ("high_vol_trend",)
+HIGH_VOL_FAVORITE_MID = 0.52
+HIGH_VOL_FAVORITE_STRATEGIES = ("momentum", "sniper", "hybrid")
+HIGH_VOL_FAVORITE_EDGE_MULT = 1.50
+# Kalshi NO paper tax stub — 1.0 = off (do not tighten dual-gate). Next soak
+# can raise this without a rewrite if Kalshi NO stays ~35% WR.
+KALSHI_NO_EDGE_MULT = 1.0
+HIGH_VOL_FAVORITE_SIZE_MULT = 0.60
+# Mom sign fights drift: raise min_edge so Φ-YES at 58¢ with mom=−0.83 dies.
+MOM_DRIFT_FIGHT_ENABLED = True
+MOM_DRIFT_FIGHT_MOM_ABS = 0.50
+MOM_DRIFT_FIGHT_EDGE_MULT = 1.35
+MOM_DRIFT_FIGHT_HIGH_VOL_EDGE_MULT = 1.75
+
 LAG_JUSTIFIED_ENABLED = True
 LAG_JUSTIFIED_MIN_EDGE = 0.02      # implied − mid − fee must clear this
 LAG_JUSTIFIED_EXEMPT = (
@@ -1241,6 +1295,10 @@ GATE_TUNE_MIN_MARKETS = 30
 GATE_TUNE_LOOSEN_WR = 0.58
 GATE_TUNE_LOOSEN_EDGE = 0.02    # +2¢/share hyp P&L after taker fee
 GATE_TUNE_APPLY_COOLDOWN_SEC = 86400  # one step per knob per day if apply is on
+# Dual-gate hyp is scored on the 50–58¢ band separately from 90¢ locks.
+GATE_TUNE_MIDBAND_LO = 0.50
+GATE_TUNE_MIDBAND_HI = 0.58
+GATE_TUNE_CHEAP_MAX = 0.62
 # Combination / foundational-rule explorer (Signal Lab). Measures pairwise
 # lane agreement + named rules on unique-market rows after taker fee.
 # Confirm-apply uses only *earned cheap* combos — it does not loosen
@@ -1255,6 +1313,8 @@ COMBO_MIN_ACCURACY = 0.55
 COMBO_MIN_NET_EDGE = 0.0
 COMBO_CONFIRM_APPLY = False     # suggest-only until a combo earns on cheap fills
 COMBO_CONFIRM_MIN_LANES = 2
+COMBO_MIDBAND_LO = 0.50
+COMBO_MIDBAND_HI = 0.58
 
 # --- Regime-adaptive policy (PLAN 2026-08-05: adapt weights, not starve) ---
 # Primary response to a weak regime is reweight lanes + capital routing

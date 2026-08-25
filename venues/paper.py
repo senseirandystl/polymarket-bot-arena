@@ -35,11 +35,13 @@ class PaperEngine:
               target_shares=None, limit_price=None, expected_price=None,
               book=None, context=None) -> TradeResult:
         market_id = market.get("id") or market.get("market_id")
+        from exchanges import exchange_of, KALSHI
+        exchange = exchange_of(market)
         token = (
             market.get("polymarket_token_id") if side == "yes"
             else market.get("polymarket_no_token_id")
         )
-        if not token:
+        if exchange != KALSHI and not token:
             return TradeResult(success=False, reason="missing_token_id")
 
         # Order book for THIS side's token. Normally a fresh read (never a cached
@@ -47,7 +49,25 @@ class PaperEngine:
         # validated (the arbitrage bot's two legs) pass ``book`` so decision and
         # fill can't drift apart. See config.MAX_FILL_SLIPPAGE / BUG_HISTORY.
         if book is None:
-            book = polymarket_markets.get_order_book(token)
+            if exchange == KALSHI:
+                side_key = "yes_book" if side == "yes" else "no_book"
+                book = market.get(side_key)
+                if not (book and book.get("valid")):
+                    try:
+                        import kalshi_markets
+                        both = kalshi_markets.get_order_book(
+                            market.get("ticker") or market_id
+                        )
+                        book = (both or {}).get("yes" if side == "yes" else "no")
+                    except Exception:
+                        book = None
+                if not book:
+                    book = {"valid": False}
+                else:
+                    book = dict(book)
+                    book["exchange"] = KALSHI
+            else:
+                book = polymarket_markets.get_order_book(token)
         if not book.get("valid"):
             logger.debug(f"[{bot_name}] No order book for {str(market_id)[:12]}… — skip")
             return TradeResult(success=False, reason="no_book")
@@ -151,7 +171,7 @@ class PaperEngine:
             market_question=market.get("question"),
             side=side,
             amount=fill["cost"],          # USDC actually spent on shares
-            venue="polymarket",
+            venue=market.get("exchange") or market.get("venue") or "polymarket",
             mode=mode,
             confidence=confidence,
             reasoning=reasoning,

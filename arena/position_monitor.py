@@ -74,7 +74,18 @@ class PositionMonitorThread(threading.Thread):
         prices = {}
         for r in rows:
             mid = r["market_id"]
-            p = polymarket_markets.current_up_price(mid)
+            p = None
+            if str(mid).startswith("kalshi:"):
+                try:
+                    import kalshi_markets
+                    from exchanges import native_market_id
+                    p = kalshi_markets.current_up_price(
+                        native_market_id(str(mid)) or str(mid)
+                    )
+                except Exception:
+                    p = None
+            else:
+                p = polymarket_markets.current_up_price(mid)
             if p is not None:
                 prices[mid] = p
         self._price_cache = prices

@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import config
 import polymarket_fills
-from bots.base_bot import BaseBot, strategy_decision
+from bots.base_bot import BaseBot, data_quality_skip, strategy_decision
 from bots.edge_calibration import quality_confidence
 from signals.lab import SignalView
 
@@ -42,6 +42,9 @@ class NoLagBot(BaseBot):
         return strategy_decision("hold", reasoning="no_lag: pure make_decision path")
 
     def make_decision(self, market, signals):
+        _dq = data_quality_skip(signals)
+        if _dq is not None:
+            return _dq
         p = self.strategy_params
         sv = SignalView.of(signals)
 

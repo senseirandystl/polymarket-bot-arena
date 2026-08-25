@@ -5,9 +5,12 @@ from arena.state import SharedArenaState
 
 
 def test_config_one_trade_defaults():
-    assert config.ONE_TRADE_PER_TICK is True
-    assert config.MARKET_SIDE_MAX_BOTS == 1
-    # Structure-confidence must not skip the extra-edge bar (soak tandem leak).
+    # Paper-eval tandem pack: cluster open so every bot can fill.
+    assert config.ONE_TRADE_PER_TICK is False
+    assert config.MARKET_SIDE_MAX_BOTS == 0
+    assert config.PILEIN_EV_GATE_ENABLED is False
+    assert config.HYBRID_YIELD_ENABLED is False
+    # Structure-confidence must not skip the extra-edge bar if pile-in is restored.
     assert config.PILEIN_EV_CONF_BYPASS >= 0.96
     assert config.DIRECTIONAL_WINDOW_LOCK is False
     assert "arbitrage" in config.ONE_TRADE_PER_TICK_EXEMPT

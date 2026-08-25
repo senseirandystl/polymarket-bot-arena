@@ -109,7 +109,8 @@ def live_side_prob(
     return yes, source
 
 
-def directional_net_edge(p_side: float, ask: float) -> float:
+def directional_net_edge(p_side: float, ask: float,
+                         exchange: str | None = None) -> float:
     """``p_side − ask − taker fee/share``. No trust multiplier."""
     try:
         p = float(p_side)
@@ -118,5 +119,7 @@ def directional_net_edge(p_side: float, ask: float) -> float:
         return 0.0
     if not math.isfinite(p) or not math.isfinite(a):
         return 0.0
-    fee = polymarket_fills.fee_per_share(a, is_maker=False)
+    fee = polymarket_fills.fee_per_share(
+        a, is_maker=False, exchange=exchange,
+    )
     return p - a - float(fee)

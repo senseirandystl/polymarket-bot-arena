@@ -451,9 +451,75 @@ def get_markets():
         pass
 
     cur_s = _shape(current, with_strike=True)
+    if cur_s:
+        cur_s["exchange"] = "polymarket"
+        cur_s["exchange_label"] = "Polymarket · 5m TWAP"
     upcoming_s = [_shape(m) for m in upcoming]
+    kalshi_s = None
+    kalshi_next_s = None
+    try:
+        from exchanges import KALSHI, exchange_enabled
+        if exchange_enabled(KALSHI):
+            import kalshi_markets
+            km = kalshi_markets.discover_live(limit=12)
+            from datetime import datetime, timezone as _tz
+            _now = datetime.now(_tz.utc)
+            from arena.market_utils import compute_time_remaining_seconds as _tr
+            for m in km:
+                m["time_remaining_seconds"] = _tr(m, _now)
+            kcur = kalshi_markets.select_current(km)
+            if kcur:
+                kalshi_s = _shape(kcur, with_strike=False)
+                if kalshi_s:
+                    kalshi_s["exchange"] = "kalshi"
+                    kalshi_s["exchange_label"] = "Kalshi · 15m BRTI"
+                    kalshi_s["strike"] = kcur.get("floor_strike") or kcur.get("btc_strike")
+                    kalshi_s["strike_source"] = "kalshi_floor"
+                    kalshi_s["is_current_window"] = True
+                    kalshi_s["btc_now_label"] = "BRTI now"
+                    try:
+                        books = kalshi_markets.get_order_book(kcur.get("ticker"))
+                        kalshi_markets.apply_book_to_market(kcur, books)
+                        kalshi_s["current_price"] = kcur.get("current_price")
+                        kalshi_s["no_price"] = kcur.get("no_price")
+                    except Exception:
+                        pass
+                    try:
+                        from signals.brti import load_published
+                        pub = load_published()
+                        now_px = pub.get("avg60") or pub.get("btc_now") or pub.get("last")
+                        if now_px is not None and float(now_px) > 0:
+                            kalshi_s["btc_now"] = float(now_px)
+                            kalshi_s["btc_now_source"] = pub.get("source")
+                            if pub.get("avg60") or pub.get("settle60"):
+                                kalshi_s["btc_now_label"] = "BRTI 60s avg"
+                    except Exception:
+                        kalshi_s["btc_now"] = None
+            knext = kalshi_markets.select_next(km, kcur)
+            if knext:
+                kalshi_next_s = _shape(knext, with_strike=False)
+                if kalshi_next_s:
+                    kalshi_next_s["exchange"] = "kalshi"
+                    kalshi_next_s["exchange_label"] = "Kalshi · 15m BRTI"
+                    kalshi_next_s["window_sec"] = knext.get("window_sec") or 900
+    except Exception:
+        kalshi_s = None
+        kalshi_next_s = None
+    btc_brti = None
+    try:
+        from signals.brti import load_published
+        pub = load_published()
+        btc_brti = pub.get("avg60") or pub.get("btc_now") or pub.get("last")
+        if btc_brti is not None:
+            btc_brti = float(btc_brti)
+        if not btc_brti:
+            btc_brti = (kalshi_s or {}).get("btc_now")
+    except Exception:
+        btc_brti = (kalshi_s or {}).get("btc_now") if kalshi_s else None
     return JSONResponse({
         "current": cur_s,
+        "kalshi": kalshi_s,
+        "kalshi_next": kalshi_next_s,
         "next": upcoming_s[0] if upcoming_s else None,
         "upcoming_count": len(upcoming_s),
         "upcoming": upcoming_s,
@@ -463,13 +529,28 @@ def get_markets():
         "btc_spot_stale": btc_spot_stale,
         "btc_twap": btc_twap,             # explicit TWAP for Current Market
         "btc_twap_stale": btc_twap_stale,
+        "btc_brti": btc_brti,             # Kalshi BTC now — never Chainlink TWAP
         "btc_source": btc_source,         # "twap" | "spot"
     })
 
 
-@app.get("/api/price/{condition_id}")
+@app.get("/api/price/{condition_id:path}")
 def get_price(condition_id: str):
     """Fresh UP/DOWN prices for one market (fast poll for the market cards)."""
+    cid = condition_id or ""
+    if cid.startswith("kalshi:"):
+        import kalshi_markets
+        from exchanges import native_market_id
+        prices = kalshi_markets.current_prices(native_market_id(cid) or cid)
+        if not prices:
+            return JSONResponse({"yes": None, "no": None})
+        yes = prices.get("yes")
+        no = prices.get("no")
+        if yes is not None and no is None:
+            no = round(1.0 - yes, 4)
+        if no is not None and yes is None:
+            yes = round(1.0 - no, 4)
+        return JSONResponse({"yes": yes, "no": no})
     import polymarket_markets
     prices = polymarket_markets.current_prices(condition_id)
     if not prices:
@@ -628,6 +709,42 @@ def get_skips():
     return JSONResponse(data)
 
 
+@app.get("/api/settings/exchanges")
+def get_exchanges(_auth: str = Depends(verify_auth)):
+    from exchanges import load_toggles
+    t = load_toggles()
+    return JSONResponse({
+        "polymarket": bool(t.get("polymarket", True)),
+        "kalshi": bool(t.get("kalshi", True)),
+        "labels": {
+            "polymarket": "Polymarket BTC Up/Down 5m (Chainlink 60s TWAP)",
+            "kalshi": "Kalshi BTC Up/Down 15m (CF BRTI last-60s avg)",
+        },
+    })
+
+
+@app.post("/api/settings/exchanges")
+async def set_exchanges(request: Request, _auth: str = Depends(verify_auth)):
+    from exchanges import save_toggles, load_toggles
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    updates = {}
+    if "polymarket" in (body or {}):
+        updates["polymarket"] = bool(body["polymarket"])
+    if "kalshi" in (body or {}):
+        updates["kalshi"] = bool(body["kalshi"])
+    if updates:
+        save_toggles(updates)
+    t = load_toggles()
+    return JSONResponse({
+        "success": True,
+        "polymarket": bool(t.get("polymarket", True)),
+        "kalshi": bool(t.get("kalshi", True)),
+    })
+
+
 @app.get("/api/settings/bankroll")
 def get_bankroll(_auth: str = Depends(verify_auth)):
     return JSONResponse({
@@ -689,8 +806,9 @@ def get_directional_window_lock(_auth: str = Depends(verify_auth)):
     return JSONResponse({
         "enabled": db.get_directional_window_lock(),
         "default": bool(getattr(config, "DIRECTIONAL_WINDOW_LOCK", False)),
-        "one_trade_per_tick": bool(getattr(config, "ONE_TRADE_PER_TICK", True)),
-        "market_side_max_bots": int(getattr(config, "MARKET_SIDE_MAX_BOTS", 1)),
+        "one_trade_per_tick": db.get_one_trade_per_tick(),
+        "market_side_max_bots": db.get_market_side_max_bots(),
+        "hybrid_yield": db.get_hybrid_yield(),
     })
 
 
@@ -705,6 +823,47 @@ async def set_directional_window_lock(request: Request, _auth: str = Depends(ver
     return JSONResponse({
         "success": True,
         "enabled": db.get_directional_window_lock(),
+    })
+
+
+@app.get("/api/settings/tandem")
+def get_tandem_settings(_auth: str = Depends(verify_auth)):
+    """Paper-eval cluster controls (max bots / one-per-tick / hybrid yield)."""
+    return JSONResponse({
+        "one_trade_per_tick": db.get_one_trade_per_tick(),
+        "hybrid_yield": db.get_hybrid_yield(),
+        "market_side_max_bots": db.get_market_side_max_bots(),
+        "pilein_ev_gate": db.get_pilein_ev_gate(),
+        "exposure_cap": float(getattr(config, "MARKET_SIDE_EXPOSURE_CAP", 0.30)),
+        "warning": (
+            "Paper eval: cluster open. Restore MAX_BOTS=1 / one-per-tick "
+            "before live."
+        ),
+    })
+
+
+@app.post("/api/settings/tandem")
+async def set_tandem_settings(request: Request, _auth: str = Depends(verify_auth)):
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    body = body or {}
+    if "one_trade_per_tick" in body:
+        db.set_one_trade_per_tick(bool(body.get("one_trade_per_tick")))
+    if "hybrid_yield" in body:
+        db.set_hybrid_yield(bool(body.get("hybrid_yield")))
+    if "market_side_max_bots" in body:
+        try:
+            n = int(body.get("market_side_max_bots"))
+        except (TypeError, ValueError):
+            n = 0
+        db.set_market_side_max_bots(max(0, n))
+    return JSONResponse({
+        "success": True,
+        "one_trade_per_tick": db.get_one_trade_per_tick(),
+        "hybrid_yield": db.get_hybrid_yield(),
+        "market_side_max_bots": db.get_market_side_max_bots(),
     })
 
 
@@ -1905,6 +2064,28 @@ async def credentials_test(request: Request):
                     }
             except Exception as e:
                 results["polymarket"] = {"ok": False, "error": str(e)}
+
+    if which in ("kalshi", "all"):
+        try:
+            import kalshi_client
+            import kalshi_markets
+            payload = kalshi_client.get_json(
+                "/markets",
+                params={"series_ticker": kalshi_markets.SERIES, "limit": 1,
+                        "status": "open"},
+                timeout=12,
+            )
+            n = 0
+            if isinstance(payload, dict):
+                n = len(payload.get("markets") or [])
+            results["kalshi"] = {
+                "ok": n > 0,
+                "markets": n,
+                "auth": kalshi_client.has_auth(),
+                **({} if n > 0 else {"error": "no open KXBTC15M markets (or auth failed)"}),
+            }
+        except Exception as e:
+            results["kalshi"] = {"ok": False, "error": str(e)}
 
     return JSONResponse(results)
 

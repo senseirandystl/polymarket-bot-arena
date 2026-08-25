@@ -1,7 +1,13 @@
 # Strategy design — Polymarket Bot Arena
 
-**Market:** Polymarket recurring series *BTC Up or Down 5m* (Gamma `series_id=10684`).  
-**Resolution:** window closes **Up** iff Chainlink **60s TWAP** at close ≥ TWAP at window open (Price to Beat). Live strike is sticky `twap_open`, not Binance.  
+**Markets (dual-exchange):**
+- **Polymarket** BTC Up/Down **5m** (Gamma `series_id=10684`). Resolves Up iff Chainlink **60s TWAP** at close ≥ TWAP at open (`twap_open`).
+- **Kalshi** BTC Up/Down **15m** (`KXBTC15M`). Resolves Up iff the **last-60s simple average of CF Benchmarks BRTI** ≥ the event Price to Beat (floor strike). Not Chainlink, not a rolling full-window TWAP.
+
+Settings toggles enable each exchange independently (both **on** by default). Same six bots evaluate both live windows. **Paper-eval tandem** (2026-08-24 soak): `MARKET_SIDE_MAX_BOTS=0` (unlimited), `ONE_TRADE_PER_TICK=False`, pile-in / hybrid-yield **off**, so every directional can fill the same (market, side) and grow n. Dollar `MARKET_SIDE_EXPOSURE_CAP` (0.30 paper) remains the fuse. Restore max-bots=1 / one-per-tick / pile-in **before live**. Paper walks the real book on each venue (Kalshi fees ceil to the next cent).
+
+**Core-lane tuner** nudges drift/mom/strat on **EV / net-edge**, not sign-accuracy. Accuracy is a one-way UP veto (≥50%). Missing EV → HOLD (never accuracy-led UP). `high_vol_trend` × chosen-side mid ≥ 0.52 raises min_edge and cuts size for momentum/sniper/hybrid (the 50–58¢ continuation leak). Mom-sign fighting drift also raises min_edge. Kalshi dual-gate is **not** tightened; Kalshi NO is shadowed on the scorecard (`KALSHI_NO_EDGE_MULT=1.0` stub).
+
 **Goal:** positive expected value after **taker fees and slippage**, under paper-then-live discipline.
 
 This document is the strategy contract for bots, signals, evolution, and risk. Implementation detail lives in `CLAUDE.md` and `BUG_HISTORY.md`.
@@ -201,19 +207,19 @@ Unacceptable: reimplementing edge math only in the backtester; training on futur
 ## 10. Strategy-specific notes
 
 ### Momentum
-Rides short BTC impulse + mom lane. Vulnerable in chop → regime damp. Needs drift agreement on strong moves.
+Rides short BTC impulse + mom lane. Sits out the last ~80s (soak: late-window −EV). Max side mid 0.58. Vulnerable in chop → regime damp. Needs drift agreement on strong moves.
 
 ### Phantom
 EMA 9/26 + breakout (warmup ~36 candles). Thesis-heavy; strat cap limits overconfident analyze().
 
 ### Mean reversion
-**Not** classic fade-the-move against drift. Drift picks the side; z-score times pullbacks **with** drift (`min_drift`). Max side mid ~0.58 (“market lags” harness rule). Ungated meanrev historically 0/11.
+**Not** classic fade-the-move against drift. Drift picks the side; entry is a TWAP retrace toward **this window's strike** (not a 4-bar z-score). Max side mid ~0.58 (“market lags” harness rule). Ungated meanrev historically 0/11.
 
 ### Hybrid
-Ensemble of sub-analyzers with regime tilt × live WR tilt × online meta weights. Best as a **portfolio diversifier**, not a free lunch.
+Regime-switching specialist: trend → mom/phantom, chop/range → meanrev, `normal` → a single momentum sub may fire (trader still yields to dedicated momentum). Ensemble weights: regime tilt × live WR tilt × online meta.
 
 ### Sniper
-Price zones only with **min_drift** confirmation. Early-window size boosts removed (BUG #24).
+Lag hunter. Inside 50–58¢ uses the 8bp dual-gate; outside that pocket needs 15bp. Early-window size boosts removed (BUG #24).
 
 ### Makers
 Quote bands + drift; currently execute as **taker** fills (limit posting not yet first-class). Evolution-exempt; judged on their own P&L, not GA.

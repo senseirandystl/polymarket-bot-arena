@@ -555,12 +555,16 @@ hard-skips / deep size cuts when a regime prints weak WR.
 - Per-regime × strategy **seeds** apply until `by_regime` is *earned* on
   regime-local samples (`by_regime_meta`); unearned clones of global weights
   no longer shadow seeds (soak 2026-08-06 fix).
-- Core tuner: regime-local attribution only writes `by_regime`; **P&L gate**
+- Core tuner: **EV / net-edge** is the only UP/DOWN trigger; accuracy is an
+  UP veto (≥50%). Missing EV → HOLD (never accuracy-led UP). P&L gate still
   blocks UP when strategy×regime $ is red (`CORE_TUNE_PNL_GATE`).
 - **Strategy×regime style-skip** (`REGIME_STYLE_SKIP_*`, Settings `style_skip`):
   toxic strategy stands down in that regime only (hysteresis); others keep trading.
 - Live NO-side tax + mid-band floors when side/regime stats are toxic.
-- Tandem: `MARKET_SIDE_MAX_BOTS_BAD_REGIME=1` / `_CHOP=2` when data says so.
+  `high_vol_trend` × mid ≥ 0.52 extra min_edge/size tax for mom/sniper/hybrid.
+- Tandem **paper-eval**: `MARKET_SIDE_MAX_BOTS=0` (unlimited), one-per-tick
+  off, pile-in off. Restore 1-bot / one-per-tick **before live**. Dollar
+  `MARKET_SIDE_EXPOSURE_CAP` is the remaining fuse.
 - Portfolio / GA blend strategy-fit scores (`arena/regime_router.py`).
 - Optional continuous residual `w0 + B·F` (`REGIME_CONTINUOUS_BLEND`, default off).
 - Lab quiet/chop **mom** damps (`REGIME_LANE_DAMP`) + partial style-mode prior

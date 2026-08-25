@@ -76,12 +76,14 @@ class MarketDataStore:
             snap = self._snap.get(market_id)
             return dict(snap) if snap is not None else None
 
-    def prune(self, keep_market_id: Optional[str]) -> None:
-        """Drop every snapshot except the live market (keeps the map tiny)."""
+    def prune(self, keep_market_id: Optional[str] = None,
+              keep_ids: Optional[set] = None) -> None:
+        """Drop snapshots not in the live window set."""
+        keep = set(keep_ids or ())
+        if keep_market_id:
+            keep.add(keep_market_id)
         with self._lock:
-            self._snap = {
-                k: v for k, v in self._snap.items() if k == keep_market_id
-            }
+            self._snap = {k: v for k, v in self._snap.items() if k in keep}
 
 
 _store = MarketDataStore()
@@ -283,14 +285,90 @@ class MarketDataWarmer(threading.Thread):
         return yes_book, no_book
 
     def _warm_once(self) -> None:
-        market = self._discovery.current_market_snapshot()
-        if not market:
+        markets = {}
+        if hasattr(self._discovery, "current_markets_snapshot"):
+            try:
+                markets = self._discovery.current_markets_snapshot() or {}
+            except Exception:
+                markets = {}
+        if not markets:
+            market = self._discovery.current_market_snapshot()
+            if market:
+                from exchanges import exchange_of
+                markets = {exchange_of(market): market}
+        if not markets:
             return
+        keep_ids: set[str] = set()
+        for _ex, market in markets.items():
+            mid = self._warm_one_market(market)
+            if mid:
+                keep_ids.add(mid)
+        if keep_ids:
+            _store.prune(keep_ids=keep_ids)
+
+    def _warm_kalshi(self, market: dict) -> Optional[str]:
+        market_id = market.get("id") or market.get("ticker")
+        if not market_id:
+            return None
+        prev = _store.get(market_id) or {}
+        ticker = market.get("ticker") or market.get("native_id") or market_id
+        try:
+            import kalshi_markets
+            books = kalshi_markets.get_order_book(ticker)
+        except Exception as e:
+            logger.debug("Kalshi warm book failed: %s", e)
+            books = {"valid": False}
+        yes_book = (books or {}).get("yes") or {"valid": False}
+        no_book = (books or {}).get("no") or {"valid": False}
+        if not yes_book.get("valid") and (prev.get("yes_book") or {}).get("valid"):
+            yes_book = prev["yes_book"]
+        if not no_book.get("valid") and (prev.get("no_book") or {}).get("valid"):
+            no_book = prev["no_book"]
+        books_fresh = bool(yes_book.get("valid") and no_book.get("valid"))
+        yes_price = yes_book.get("best_bid")
+        ya = yes_book.get("best_ask")
+        if yes_price is not None and ya is not None:
+            yes_price = round((yes_price + ya) / 2.0, 4)
+        elif ya is not None:
+            yes_price = ya
+        no_price = no_book.get("best_bid")
+        na = no_book.get("best_ask")
+        if no_price is not None and na is not None:
+            no_price = round((no_price + na) / 2.0, 4)
+        elif na is not None:
+            no_price = na
+        if yes_price is None:
+            yes_price = prev.get("yes_price")
+        if no_price is None:
+            no_price = prev.get("no_price")
+        strike = market.get("floor_strike") or market.get("btc_strike") or prev.get("strike")
+        _store.put(market_id, {
+            "market_id": market_id,
+            "exchange": "kalshi",
+            "yes_price": yes_price,
+            "no_price": no_price,
+            "yes_book": yes_book,
+            "no_book": no_book,
+            "obi": 0.0,
+            "cvd": 0.0,
+            "pm_momentum": 0.0,
+            "pm_prices": [],
+            "strike": strike,
+            "ts": (time.time() if books_fresh
+                   else float(prev.get("ts") or time.time())),
+            "warm_cycle_ms": self._last_cycle_ms,
+        })
+        return market_id
+
+    def _warm_one_market(self, market: dict) -> Optional[str]:
+        from exchanges import exchange_of, KALSHI
+        if exchange_of(market) == KALSHI:
+            return self._warm_kalshi(market)
         market_id = market.get("id") or market.get("market_id")
         yes_tok = market.get("polymarket_token_id")
         no_tok = market.get("polymarket_no_token_id")
         if not market_id or not yes_tok or not no_tok:
-            return
+            return None
 
         prev = _store.get(market_id) or {}
 
@@ -375,6 +453,7 @@ class MarketDataWarmer(threading.Thread):
 
         _store.put(market_id, {
             "market_id": market_id,
+            "exchange": "polymarket",
             "yes_price": yes_price,
             "no_price": no_price,
             "yes_book": yes_book,
@@ -392,4 +471,4 @@ class MarketDataWarmer(threading.Thread):
                    else float(prev.get("ts") or time.time())),
             "warm_cycle_ms": self._last_cycle_ms,
         })
-        _store.prune(keep_market_id=market_id)
+        return market_id

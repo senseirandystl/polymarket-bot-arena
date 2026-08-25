@@ -15,8 +15,8 @@ import config
 
 
 def taker_fee(shares: float, price: float,
-              rate: float | None = None) -> float:
-    """Polymarket taker fee in USDC (makers are never charged).
+              rate: float | None = None, *, exchange: str | None = None) -> float:
+    """Taker fee in USDC (makers are never charged on PM; Kalshi ceils cents).
 
     Documented formula, symmetric around 50c so a 30c and 70c trade cost the
     same dollar fee::
@@ -25,7 +25,11 @@ def taker_fee(shares: float, price: float,
 
     ``rate`` defaults to ``config.POLYMARKET_TAKER_FEE_RATE`` (crypto tier).
     Isolated here so the exact coefficient can be tuned in one place.
+    Kalshi uses the same quadratic then **ceils to the next cent per order**.
     """
+    if (exchange or "").lower() == "kalshi":
+        from kalshi_markets import kalshi_taker_fee
+        return kalshi_taker_fee(shares, price, rate=rate)
     if rate is None:
         rate = config.POLYMARKET_TAKER_FEE_RATE
     price = max(0.0, min(1.0, price))
@@ -56,8 +60,11 @@ def affordable_spend(available: float, price: float, *,
     return float(available) / (1.0 + rate * (1.0 - float(price)))
 
 
-def fee_per_share(price: float, *, is_maker: bool) -> float:
+def fee_per_share(price: float, *, is_maker: bool,
+                  exchange: str | None = None) -> float:
     """Per-share fee used in edge math (1 share notional)."""
+    if (exchange or "").lower() == "kalshi":
+        return taker_fee(1.0, price, exchange="kalshi") if not is_maker else 0.0
     return trading_fee(1.0, price, is_maker=is_maker)
 
 
@@ -170,7 +177,7 @@ def simulate_fill(book: dict, amount_usdc: float) -> dict:
         "shares": shares,
         "cost": cost,
         "avg_price": avg_price,
-        "fee": taker_fee(shares, avg_price),
+        "fee": taker_fee(shares, avg_price, exchange=book.get("exchange")),
         "is_maker": False,
     }
 
@@ -224,7 +231,7 @@ def simulate_fill_shares(book: dict, target_shares: float) -> dict:
         "shares": shares,
         "cost": cost,
         "avg_price": avg_price,
-        "fee": taker_fee(shares, avg_price),
+        "fee": taker_fee(shares, avg_price, exchange=book.get("exchange")),
         "is_maker": False,
     }
 
@@ -271,7 +278,7 @@ def simulate_limit_buy(book: dict, amount_usdc: float,
                 "shares": shares,
                 "cost": cost,
                 "avg_price": avg,
-                "fee": taker_fee(shares, avg),
+                "fee": taker_fee(shares, avg, exchange=book.get("exchange")),
                 "is_maker": False,
             }
         # USD budget marketable walk, capped at limit
@@ -301,7 +308,7 @@ def simulate_limit_buy(book: dict, amount_usdc: float,
             "shares": shares,
             "cost": cost,
             "avg_price": avg,
-            "fee": taker_fee(shares, avg),
+            "fee": taker_fee(shares, avg, exchange=book.get("exchange")),
             "is_maker": False,
         }
 

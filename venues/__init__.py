@@ -33,9 +33,12 @@ class TradeResult:
     entry_price: float = 0.0
 
 
-def get_engine(mode: str):
-    """Return the execution engine singleton for ``mode`` ('paper' | 'live')."""
+def get_engine(mode: str, exchange: str | None = None):
+    """Return the execution engine for ``mode`` and optional ``exchange``."""
     if mode == "live":
+        if (exchange or "").lower() == "kalshi":
+            from venues.kalshi_live import KalshiLiveEngine
+            return KalshiLiveEngine.instance()
         from venues.live import LiveEngine
         return LiveEngine.instance()
     from venues.paper import PaperEngine

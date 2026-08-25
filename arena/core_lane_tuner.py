@@ -225,7 +225,19 @@ def compute_core_attribution(conn, deadband: float, *,
             for lane, st_lane in ld.items():
                 prev = out.setdefault(st, {}).get(lane)
                 if prev is None or (prev.get("n") or 0) < (st_lane.get("n") or 0):
-                    out.setdefault(st, {})[lane] = st_lane
+                    merged = dict(st_lane)
+                    # Keep trade EV if the larger-n (decision_events) row lacks it.
+                    if prev and not merged.get("n_ev") and prev.get("n_ev"):
+                        merged["n_ev"] = prev.get("n_ev")
+                        merged["mean_ev"] = prev.get("mean_ev")
+                        merged["sum_pnl"] = prev.get("sum_pnl")
+                    out.setdefault(st, {})[lane] = merged
+                elif prev is not None and not prev.get("n_ev") and st_lane.get("n_ev"):
+                    prev = dict(prev)
+                    prev["n_ev"] = st_lane.get("n_ev")
+                    prev["mean_ev"] = st_lane.get("mean_ev")
+                    prev["sum_pnl"] = st_lane.get("sum_pnl")
+                    out.setdefault(st, {})[lane] = prev
 
     # Merge decision_events core on top when trade path was primary
     if core_need and not regime_id:
@@ -239,7 +251,18 @@ def compute_core_attribution(conn, deadband: float, *,
                             continue
                         prev = out.setdefault(st, {}).get(lane)
                         if prev is None or (prev.get("n") or 0) < (st_lane.get("n") or 0):
-                            out.setdefault(st, {})[lane] = st_lane
+                            merged = dict(st_lane)
+                            if prev and not merged.get("n_ev") and prev.get("n_ev"):
+                                merged["n_ev"] = prev.get("n_ev")
+                                merged["mean_ev"] = prev.get("mean_ev")
+                                merged["sum_pnl"] = prev.get("sum_pnl")
+                            out.setdefault(st, {})[lane] = merged
+                        elif prev is not None and not prev.get("n_ev") and st_lane.get("n_ev"):
+                            prev = dict(prev)
+                            prev["n_ev"] = st_lane.get("n_ev")
+                            prev["mean_ev"] = st_lane.get("mean_ev")
+                            prev["sum_pnl"] = st_lane.get("sum_pnl")
+                            out.setdefault(st, {})[lane] = prev
         except Exception:
             pass
     return out
@@ -605,27 +628,19 @@ def tune() -> dict:
                     lo = 0.0
                     hi = min(lane_wmax, max(anchor, 0.05) + lane_band)
                 acc = float(st["accuracy"])
-                revert_below = float(
-                    getattr(config, "CORE_TUNE_REVERT_BELOW_ACC", high_acc)
-                )
+                acc_floor = float(getattr(
+                    config, "CORE_TUNE_UP_ACC_FLOOR", 0.50))
+                reset_seed = bool(getattr(
+                    config, "CORE_TUNE_RESET_SEED_ON_RED", True))
                 # Always-on P&L gate (not only regime-local)
                 pnl_blocks_up = (
                     pnl_n >= pnl_min_n
                     and pnl_val < 0
                     and bool(getattr(config, "CORE_TUNE_PNL_GATE", True))
                 )
-                ev_blocks_up = (
-                    ev_primary
-                    and mean_ev_f is not None
+                has_ev = (
+                    mean_ev_f is not None
                     and n_ev >= ev_min_n
-                    and mean_ev_f < ev_up_min
-                )
-                ev_forces_down = (
-                    ev_primary
-                    and mean_ev_f is not None
-                    and n_ev >= ev_min_n
-                    and mean_ev_f <= ev_down_max
-                    and cur > lo
                 )
                 sc = (scorecard_net.get(strat) or {}).get(lane) or {}
                 sc_n = int(sc.get("n_priced") or 0)
@@ -633,88 +648,68 @@ def tune() -> dict:
                     sc_net = float(sc["net_edge"]) if sc.get("net_edge") is not None else None
                 except (TypeError, ValueError, KeyError):
                     sc_net = None
+                has_sc = sc_n >= sc_min and sc_net is not None
+                # Missing EV must not allow accuracy-led UP (soak mom 0.20→0.40).
+                ev_blocks_up = (not has_ev) or (
+                    has_ev and mean_ev_f < ev_up_min
+                ) or pnl_blocks_up
                 if scorecard_unavailable:
-                    # Missing judge must not allow accuracy-led UP.
                     ev_blocks_up = True
-                elif sc_n >= sc_min and sc_net is not None:
-                    if sc_net <= sc_block:
-                        ev_blocks_up = True
-                    if sc_net <= sc_force and cur > lo:
-                        ev_forces_down = True
+                elif has_sc and sc_net <= sc_block:
+                    ev_blocks_up = True
+                if acc < acc_floor:
+                    ev_blocks_up = True
+                ev_forces_down = (
+                    has_ev
+                    and mean_ev_f <= ev_down_max
+                    and cur > lo
+                )
+                if has_sc and sc_net <= sc_force and cur > lo:
+                    ev_forces_down = True
                 never_cut_drift = (
                     lane == "drift"
                     and bool(getattr(config, "CORE_TUNE_NEVER_CUT_DRIFT", True))
                 )
-                if ev_forces_down:
+                seed_target = max(lo, anchor)
+                needs_reset = (
+                    reset_seed
+                    and cur > seed_target + 1e-9
+                    and (not has_ev or ev_forces_down)
+                )
+                if ev_forces_down or (needs_reset and not has_ev):
                     if never_cut_drift:
                         action = "hold_pnl_gate"
+                    elif needs_reset:
+                        new_w = round(seed_target, 3)
+                        action = "reset_seed"
                     else:
                         new_w = round(max(lo, cur - step), 3)
                         action = "ev_down"
                 elif (
-                    acc >= high_acc
+                    has_ev
+                    and mean_ev_f >= ev_up_min
                     and cur < hi
-                    and not pnl_blocks_up
                     and not ev_blocks_up
-                    and (
-                        not ev_primary
-                        or mean_ev_f is None
-                        or n_ev < ev_min_n
-                        or mean_ev_f >= ev_up_min
-                    )
+                    and acc >= acc_floor
                 ):
                     new_w = round(min(hi, cur + step), 3)
                     action = "up"
-                elif acc >= high_acc and (pnl_blocks_up or ev_blocks_up):
-                    target = min(cur, max(lo, anchor))
-                    if cur > target + 1e-9 and not never_cut_drift:
+                elif (
+                    ev_blocks_up
+                    and cur > seed_target + 1e-9
+                    and not never_cut_drift
+                    and not scorecard_unavailable
+                    and (pnl_blocks_up or (has_ev and mean_ev_f < ev_up_min)
+                         or (has_sc and sc_net is not None and sc_net <= sc_block))
+                ):
+                    if needs_reset and not has_ev:
+                        new_w = round(seed_target, 3)
+                        action = "reset_seed"
+                    else:
                         new_w = round(max(lo, cur - step), 3)
                         action = "pnl_revert" if pnl_blocks_up else "ev_revert"
-                    else:
-                        # Timeout UP disabled when hours <= 0 (default)
-                        timeout_h = float(getattr(
-                            config, "CORE_TUNE_PNL_GATE_TIMEOUT_HOURS", 0.0))
-                        if timeout_h <= 0:
-                            action = "hold_pnl_gate"
-                        else:
-                            reg_meta_cell = by_regime_meta.get(
-                                live_regime or "_global", {}).get(strat, {})
-                            last_gate = reg_meta_cell.get("pnl_gate_since")
-                            try:
-                                last_gate = (
-                                    float(last_gate) if last_gate else None
-                                )
-                            except (TypeError, ValueError):
-                                last_gate = None
-                            key_reg = live_regime or "_global"
-                            if last_gate is None:
-                                by_regime_meta.setdefault(
-                                    key_reg, {}).setdefault(
-                                        strat, {})["pnl_gate_since"] = time.time()
-                                action = "hold_pnl_gate"
-                            elif (time.time() - last_gate) > timeout_h * 3600:
-                                # Only re-test if EV no longer deep red
-                                if not ev_forces_down:
-                                    new_w = round(
-                                        min(hi, cur + step * 0.5), 3)
-                                    action = "pnl_gate_timeout_up"
-                                else:
-                                    action = "hold_pnl_gate"
-                                by_regime_meta.setdefault(
-                                    key_reg, {}).setdefault(
-                                        strat, {})["pnl_gate_since"] = time.time()
-                            else:
-                                action = "hold_pnl_gate"
-                elif acc <= low_acc and cur > lo:
-                    if never_cut_drift:
-                        action = "hold"
-                    else:
-                        new_w = round(max(lo, cur - step), 3)
-                        action = "down"
-                elif (acc < revert_below and cur > anchor + 1e-9
-                      and cur > lo):
-                    new_w = round(max(anchor, lo, cur - step), 3)
-                    action = "revert"
+                elif ev_blocks_up:
+                    action = "hold_pnl_gate" if (pnl_blocks_up or not has_ev) else "hold"
                 if new_w != cur:
                     changed = True
                     if live_regime and profile_adapt and regime_local:
@@ -730,6 +725,8 @@ def tune() -> dict:
                     "mean_ev": (round(mean_ev_f, 4)
                                 if mean_ev_f is not None else None),
                     "n_ev": n_ev,
+                    "sc_net": (round(sc_net, 4) if sc_net is not None else None),
+                    "sc_n": sc_n,
                     "kind": "core" if is_core else "candidate",
                 }
             elif st and st["n"]:

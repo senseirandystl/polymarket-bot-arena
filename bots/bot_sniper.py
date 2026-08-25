@@ -108,6 +108,15 @@ class SniperBot(BaseBot):
                       getattr(config, "DRIFT_MIN_ABS_PCT", 0.00030) or 0.0)
         min_z = _gf("DRIFT_MIN_ABS_Z",
                     getattr(config, "DRIFT_MIN_ABS_Z", 0.35) or 0.0)
+        try:
+            from exchanges import KALSHI, exchange_of as _ex_of
+            if _ex_of(market) == KALSHI:
+                min_pct = float(getattr(
+                    config, "KALSHI_DRIFT_MIN_ABS_PCT", min_pct) or min_pct)
+                min_z = float(getattr(
+                    config, "KALSHI_DRIFT_MIN_ABS_Z", min_z) or min_z)
+        except Exception:
+            pass
         raw_z = drift_z_from_signals(signals, drift)
         # Lag hunter: require honest z / moneyness, not a 0.40 tanh floor
         # that never clears after the TWAP σ fix.
@@ -125,7 +134,7 @@ class SniperBot(BaseBot):
                 entry_price=_ask,
                 skip_reason="drift_dual_gate",
             )
-        window = float(getattr(config, "MARKET_WINDOW_SEC", 300) or 300)
+        window = float(market.get("window_sec") or getattr(config, "MARKET_WINDOW_SEC", 300) or 300)
         tr = market.get("time_remaining_seconds")
         try:
             age = max(0.0, window - float(tr)) if tr is not None else 0.0
@@ -136,7 +145,16 @@ class SniperBot(BaseBot):
             cert = float(sv.twap_certainty or 0.0)
         except (TypeError, ValueError):
             cert = 0.0
-        if age < 60.0 and not in_settle:
+        min_age = 60.0
+        try:
+            from exchanges import KALSHI, exchange_of as _ex_of
+            if _ex_of(market) == KALSHI:
+                min_age = float(getattr(config, "KALSHI_SNIPER_MIN_AGE_SEC", 90) or 90)
+                min_pct = float(getattr(config, "KALSHI_DRIFT_MIN_ABS_PCT", min_pct) or min_pct)
+                min_z = float(getattr(config, "KALSHI_DRIFT_MIN_ABS_Z", min_z) or min_z)
+        except Exception:
+            pass
+        if age < min_age and not in_settle:
             _side = "yes" if drift >= 0 else "no"
             _ask = yes_ask if _side == "yes" else no_ask
             return strategy_decision(
@@ -146,15 +164,25 @@ class SniperBot(BaseBot):
                 entry_price=_ask,
                 skip_reason="sniper_window",
             )
-        if abs(d_pct) < 0.0015 and not (in_settle and cert >= 0.45):
+        # 50–58¢ lag pocket: 8bp dual-gate is enough (soak +EV). Cheap
+        # underdogs (<50¢) still need 15bp so we don't snipe 34% WR noise.
+        favored_mid = float(yes_mid if drift >= 0 else no_mid)
+        pocket_lo = float(getattr(config, "SNIPER_MIDBAND_LO", 0.50))
+        pocket_hi = float(getattr(config, "SNIPER_MIDBAND_HI", 0.58))
+        in_pocket = pocket_lo <= favored_mid <= pocket_hi
+        need_pct = float(min_pct if in_pocket else getattr(
+            config, "SNIPER_OUTSIDE_MIN_PCT", 0.0015))
+        if abs(d_pct) < need_pct and not (in_settle and cert >= 0.45):
             _side = "yes" if drift >= 0 else "no"
             _ask = yes_ask if _side == "yes" else no_ask
             return strategy_decision(
                 "skip",
                 side=_side,
                 reasoning=(
-                    f"sniper: need |d|≥15bp or settlement cert "
-                    f"(d_pct={d_pct:+.5f} cert={cert:.2f})"
+                    f"sniper: need |d|≥{need_pct:.5f}"
+                    f"{' (15bp outside 50-58)' if not in_pocket else ' (8bp pocket)'}"
+                    f" or settlement cert "
+                    f"(d_pct={d_pct:+.5f} cert={cert:.2f} mid={favored_mid:.2f})"
                 ),
                 entry_price=_ask,
                 skip_reason="sniper_conviction",
@@ -234,18 +262,11 @@ class SniperBot(BaseBot):
         no_edge = _edge("no", no_ask)
 
         of_data = sv.orderflow
-        prices = list(sv.prices)
-        try:
-            from signals.drift_scale import resample_tick_prices
-            ticks = signals.get("btc_twap_ticks") or []
-            if not ticks:
-                from signals.price_feed import get_price_feed
-                ticks = get_price_feed().btc_twap_ticks()
-            tw = resample_tick_prices(ticks, sample_sec=60.0) or []
-            if len(tw) >= 2:
-                prices = list(tw)
-        except Exception:
-            pass
+        from signals.tape import candle_prices
+        prices = candle_prices(market, signals if isinstance(signals, dict) else {},
+                               sample_sec=60.0)
+        if len(prices) < 2:
+            prices = list(sv.prices)
         btc_momentum = 0.0
         if len(prices) >= 2 and prices[-1] > 0:
             btc_momentum = (prices[-1] - prices[-2]) / prices[-2]
@@ -414,6 +435,48 @@ class SniperBot(BaseBot):
                     ),
                     signals=contributing, features=features,
                 )
+        _fav_size = 1.0
+        try:
+            from arena.eval_taxes import (
+                high_vol_favorite_mult, mom_drift_fight_mult,
+            )
+            _lab = getattr(_radj, "label", None) if _radj is not None else None
+            if not _lab and isinstance(regime, dict):
+                _lab = regime.get("label")
+            _hv_e, _fav_size = high_vol_favorite_mult(
+                strategy_type=self.strategy_type,
+                regime=_lab,
+                side_mid=side_mid,
+            )
+            min_edge *= float(_hv_e or 1.0)
+            _mom_v = 0.0
+            try:
+                from signals.lab import get_lab
+                from bots.base_bot import _lane_overrides
+                _lanes, _ = get_lab().compute_lanes(
+                    market, signals, overrides=_lane_overrides(),
+                )
+                _mom_v = float((_lanes or {}).get("mom") or 0.0)
+            except Exception:
+                try:
+                    _mom_v = float((signals or {}).get("price_momentum") or 0.0)
+                except (TypeError, ValueError):
+                    _mom_v = 0.0
+            min_edge *= float(mom_drift_fight_mult(
+                mom=_mom_v, drift=drift, regime=_lab,
+            ) or 1.0)
+            if side_edge < min_edge:
+                return strategy_decision(
+                    "skip", side=side,
+                    reasoning=(
+                        f"sniper: eval tax e={side_edge:+.3f}<{min_edge:.3f} "
+                        f"reg={_lab} mid={side_mid:.2f} mom={_mom_v:+.2f}"
+                    ),
+                    signals=contributing, features=features,
+                    skip_reason="high_vol_favorite",
+                )
+        except Exception:
+            _fav_size = 1.0
 
         # Structure confidence (not edge × constant — inversion fix 2026-08).
         try:
@@ -508,6 +571,7 @@ class SniperBot(BaseBot):
                 * _portfolio_weight(self.name)
                 * _risk_size_mult(self.name)
                 * float(_ra.size_mult)
+                * float(_fav_size or 1.0)
                 * _learn_size
                 * late_size
             )

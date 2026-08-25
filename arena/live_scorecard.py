@@ -89,6 +89,44 @@ def _lane_stats(rows: list[dict], lane: str, deadband: float) -> dict:
     }
 
 
+def _price_band(entry) -> str:
+    """Split gate hyp so 50–58¢ skips are not drowned by 90¢ locks."""
+    try:
+        px = float(entry) if entry is not None else None
+    except (TypeError, ValueError):
+        px = None
+    if px is None:
+        return "unknown"
+    lo = float(getattr(config, "GATE_TUNE_MIDBAND_LO", 0.50))
+    hi = float(getattr(config, "GATE_TUNE_MIDBAND_HI", 0.58))
+    cheap = float(getattr(config, "GATE_TUNE_CHEAP_MAX", 0.62))
+    if lo <= px <= hi:
+        return "mid_50_58"
+    if px <= cheap:
+        return "cheap_other"
+    return "expensive"
+
+
+def _summarize_gate_group(grp: list) -> dict:
+    n = len(grp)
+    wins = [g for g in grp if g.get("would_win") is not None]
+    hyps = [float(g["hyp_pnl"]) for g in grp if g.get("hyp_pnl") is not None]
+    entries = [
+        float(g["entry_price"]) for g in grp if g.get("entry_price") is not None
+    ]
+    wr = None
+    if wins:
+        wr = sum(int(g["would_win"]) for g in wins) / len(wins)
+    return {
+        "markets": n,
+        "ticks": n,
+        "wr": wr,
+        "avg_hyp_pnl": (sum(hyps) / len(hyps)) if hyps else None,
+        "avg_entry": (sum(entries) / len(entries)) if entries else None,
+        "n_hyp": len(hyps),
+    }
+
+
 def _gate_stats(rows: list[dict]) -> dict:
     buckets: dict[str, list] = {}
     for r in rows:
@@ -99,23 +137,14 @@ def _gate_stats(rows: list[dict]) -> dict:
         buckets.setdefault(key, []).append(r)
     out = {}
     for key, grp in buckets.items():
-        n = len(grp)
-        wins = [g for g in grp if g.get("would_win") is not None]
-        hyps = [float(g["hyp_pnl"]) for g in grp if g.get("hyp_pnl") is not None]
-        entries = [
-            float(g["entry_price"]) for g in grp if g.get("entry_price") is not None
-        ]
-        wr = None
-        if wins:
-            wr = sum(int(g["would_win"]) for g in wins) / len(wins)
-        out[key] = {
-            "markets": n,
-            "ticks": n,
-            "wr": wr,
-            "avg_hyp_pnl": (sum(hyps) / len(hyps)) if hyps else None,
-            "avg_entry": (sum(entries) / len(entries)) if entries else None,
-            "n_hyp": len(hyps),
+        rec = _summarize_gate_group(grp)
+        bands: dict[str, list] = {}
+        for g in grp:
+            bands.setdefault(_price_band(g.get("entry_price")), []).append(g)
+        rec["by_band"] = {
+            b: _summarize_gate_group(gg) for b, gg in bands.items()
         }
+        out[key] = rec
     return out
 
 
@@ -149,6 +178,41 @@ def _fill_stats(conn, *, hours: float | None = None) -> dict:
     return by_bot
 
 
+def _exchange_side_stats(conn, *, hours: float | None = None) -> dict:
+    """Resolved fill WR/P&L by (exchange, side) for Kalshi NO shadowing."""
+    where = "outcome IN ('win','loss','exit_tp','exit_sl')"
+    params: list = []
+    if hours is not None and hours > 0:
+        from datetime import datetime, timedelta, timezone
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=float(hours)))
+        where += " AND created_at >= ?"
+        params.append(cutoff.strftime("%Y-%m-%d %H:%M:%S"))
+    rows = conn.execute(
+        f"""SELECT CASE WHEN market_id LIKE 'kalshi:%' THEN 'kalshi'
+                        ELSE 'polymarket' END AS ex,
+                   LOWER(side) AS side,
+                   COUNT(*) n,
+                   SUM(CASE WHEN outcome IN ('win','exit_tp') THEN 1 ELSE 0 END) wins,
+                   SUM(pnl) pnl, AVG(entry_price) avg_entry
+            FROM trades WHERE {where}
+            GROUP BY 1, 2""",
+        params,
+    ).fetchall()
+    out: dict = {}
+    for r in rows:
+        n = int(r["n"] or 0)
+        key = f"{r['ex']}_{r['side']}"
+        out[key] = {
+            "exchange": r["ex"],
+            "side": r["side"],
+            "n": n,
+            "wr": (int(r["wins"] or 0) / n) if n else None,
+            "pnl": float(r["pnl"] or 0.0),
+            "avg_entry": float(r["avg_entry"]) if r["avg_entry"] is not None else None,
+        }
+    return out
+
+
 def build_live_scorecard(*, hours: float | None = 72.0,
                          conn=None) -> dict:
     """Return the unique-market lane/gate scorecard (and persist it)."""
@@ -165,6 +229,7 @@ def build_live_scorecard(*, hours: float | None = 72.0,
         lanes = {ln: _lane_stats(rows, ln, deadband) for ln in _LANES}
         gates = _gate_stats(rows)
         fills = _fill_stats(conn, hours=hours)
+        exchange_side = _exchange_side_stats(conn, hours=hours)
         mkts = {r["market_id"] for r in rows}
         # Always show the raw skip mix so a wipe with unresolved rows
         # is not a blank Signal Lab.
@@ -191,6 +256,7 @@ def build_live_scorecard(*, hours: float | None = 72.0,
             "lanes": lanes,
             "gates": gates,
             "fills": fills,
+            "exchange_side": exchange_side,
             "raw_skips": raw_skips,
             "meta": {
                 "hours": hours,

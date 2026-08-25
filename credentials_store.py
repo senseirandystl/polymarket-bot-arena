@@ -94,6 +94,14 @@ CREDENTIAL_LABELS = {
         "Polymarket private key",
         "Live trading only — signs on-chain order transactions. Never logged.",
     ),
+    "kalshi_api_key_id": (
+        "Kalshi API key id",
+        "Kalshi Trade API key id (live orders + authenticated BRTI). Paper discovery is public.",
+    ),
+    "kalshi_private_key_pem": (
+        "Kalshi RSA private key (PEM)",
+        "RSA-PSS signing key for Kalshi REST/WS. Never logged.",
+    ),
     # Optional production alerts (arena/alerts.py) — all optional
     "alert_telegram_bot_token": (
         "Telegram bot token",
