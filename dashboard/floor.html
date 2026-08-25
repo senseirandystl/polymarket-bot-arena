@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Desk Floor</title>
+<style>
+:root{--bg:#050806;--panel:#0a130d;--line:#123322;--dim:#3f6b52;--text:#bff0d2;--hi:#e9fff3;--grn:#00ff9c;--cy:#22e6ff;--mono:ui-monospace,Menlo,monospace}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--text);font-family:var(--mono);font-size:14px;padding:24px}
+h1{color:var(--hi);font-size:18px;margin-bottom:8px}
+.actions{display:flex;gap:8px;margin:12px 0}
+button{background:#08130d;color:var(--hi);border:1px solid var(--line);padding:8px 12px;font-family:inherit;cursor:pointer}
+.pipe,.uni{display:flex;flex-wrap:wrap;gap:8px;margin:8px 0 16px}
+.chip,.pill{border:1px solid var(--line);padding:5px 10px;border-radius:99px;font-size:11px;color:var(--dim)}
+.chip b{color:var(--hi);margin-right:6px}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:12px}
+.card{background:var(--panel);border:1px solid var(--line);padding:12px;min-height:120px}
+.card b{display:block;color:var(--grn);font-size:10px;letter-spacing:.12em;text-transform:uppercase}
+table{width:100%;border-collapse:collapse;margin-top:16px;font-size:12px}
+th,td{text-align:left;padding:8px;border-bottom:1px solid var(--line);vertical-align:top}
+</style>
+</head>
+<body>
+<h1>Trading floor</h1>
+<p>Research → code → backtest → paper → live → autopsy. Roles do not place orders.</p>
+<div class="actions">
+  <button onclick="tick()">Run one cycle now</button>
+  <button onclick="load()">Refresh</button>
+</div>
+<div class="pipe" id="pipe"></div>
+<div class="uni" id="uni"></div>
+<div class="grid" id="roles"></div>
+<table><thead><tr><th>Spec</th><th>Primitive</th><th>Stage</th><th>Thesis</th><th>Result</th></tr></thead>
+<tbody id="hyps"></tbody></table>
+<script>
+function load(){
+  fetch('/api/desk/floor').then(r=>r.json()).then(d=>{
+    const counts=d.pipeline_counts||{};
+    document.getElementById('pipe').innerHTML=Object.keys(counts).map(k=>`<span class="chip"><b>${counts[k]}</b>${k}</span>`).join('')
+      +`<span class="chip"><b>${d.provider||'none'}</b>llm</span>`
+      +`<span class="chip"><b>P${d.universe_phase||1}</b>universe</span>`
+      +`<span class="chip"><b>${d.factory_mode?'ON':'off'}</b>factory</span>`;
+    document.getElementById('uni').innerHTML=(d.universe||[]).map(s=>`<span class="pill">${s.slot_id}${s.tradable?'':' · later'}</span>`).join('');
+    document.getElementById('roles').innerHTML=(d.roles||[]).map(r=>`<div class="card ${r.state||''}"><b>${r.state||'idle'}</b><h3>${r.title}</h3><p>${r.job}</p><p>${r.detail||''}</p></div>`).join('');
+    const rows=d.hypotheses||[];
+    document.getElementById('hyps').innerHTML=rows.length?rows.map(h=>{
+      const spec=h.spec||{}, bt=h.backtest_summary||{}, auto=h.autopsy||{};
+      const result=auto.reason||(bt.reason?('bt '+bt.reason):(h.status||''));
+      return `<tr><td>${h.name||h.spec_id}</td><td>${h.primitive||spec.primitive||''}</td><td>${h.stage}</td><td>${(h.thesis||spec.thesis||'').slice(0,140)}</td><td>${result}</td></tr>`;
+    }).join(''):'<tr><td colspan="5">No hypotheses yet.</td></tr>';
+  }).catch(()=>{});
+}
+function tick(){fetch('/api/desk/tick',{method:'POST'}).then(()=>load());}
+load();
+setInterval(load, 15000);
+</script>
+</body>
+</html>
