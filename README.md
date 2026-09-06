@@ -141,13 +141,14 @@ On first interactive run: **Continue** vs **Start fresh**, then **Default** bots
 <summary><strong>Windows (PowerShell)</strong></summary>
 
 `bin/arena` is a **bash** script — it does **not** run in PowerShell/cmd unless
-you use Git Bash or WSL. On native Windows:
+you use Git Bash or WSL. On native Windows prefer the helper:
 
 ```powershell
-# Terminal 1 — dashboard
-.\.venv\Scripts\python.exe dashboard\server.py
+# Arena only (sets ARENA_NO_DASHBOARD=1). Optional: -WithDashboard
+.\bin\arena.ps1
 
-# Terminal 2 — arena (paper)
+# Or two terminals manually:
+.\.venv\Scripts\python.exe dashboard\server.py
 .\.venv\Scripts\python.exe arena.py
 ```
 
@@ -287,7 +288,7 @@ Paper and live share **identical** pricing, fee, guard, and Kelly math. Only the
 
 ## Default bot slate
 
-Interactive launch (or first non-interactive boot) starts the **lean 6**:
+Interactive launch (or first non-interactive boot) starts the **lean 7**:
 
 | Bot | Type | Character |
 |-----|------|-----------|
@@ -446,6 +447,9 @@ python3 -m venv .venv
 ```
 
 ### Run options
+
+On **Windows native**, use `.\bin\arena.ps1` (see Quickstart) instead of the bash `./bin/arena` wrapper.
+
 
 | Mode | Command | Best for |
 |------|---------|----------|

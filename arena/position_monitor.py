@@ -1,8 +1,9 @@
-"""Position monitor thread — 0.5s SL/TP exit engine for bots that carry
+"""Position monitor thread — ~1s SL/TP exit engine for bots that carry
 an ``exit_strategy``.
 
-Polls the Polymarket CLOB for the prices of markets where bots hold open
-positions (throttled), looks at each bot's open positions, exits at the
+Prefers mids from the market_data warm store; falls back to CLOB/Kalshi
+HTTP only when warm is missing/stale. Looks at each bot's open positions,
+exits at the
 configured stop-loss / take-profit threshold, writes outcome=exit_sl / exit_tp
 on the trade row, and feeds the outcome back into the learning system.
 
@@ -23,10 +24,11 @@ import polymarket_markets
 from learning import extract_features_from_reasoning, record_outcome
 
 
-# SL/TP poll rate. The loop ticks this fast, but the (Polymarket) price fetch is
-# throttled separately (see PositionMonitorThread._PRICE_TTL) so we don't hammer
-# the CLOB — prices for 5-min windows don't move meaningfully sub-second anyway.
-FAST_POLL_INTERVAL = 0.5
+# SL/TP poll rate. Prefer warm-store mids; HTTP fallback is still throttled
+# via PositionMonitorThread._PRICE_TTL so a cold warm path cannot hammer CLOB.
+FAST_POLL_INTERVAL = float(
+    getattr(config, "POSITION_MONITOR_INTERVAL_SEC", 1.0) or 1.0
+)
 
 logger = logging.getLogger("arena.position_monitor")
 
@@ -56,14 +58,11 @@ class PositionMonitorThread(threading.Thread):
     def _fetch_market_prices(self) -> dict:
         """{market_id: current_yes_price} for markets with OPEN positions.
 
-        Polymarket-native: prices come from the CLOB (Up-token mid) per distinct
-        open-position market, throttled to ``_PRICE_TTL`` seconds so the 2Hz
-        monitor loop doesn't hammer the API. Markets with no open position are
-        never fetched.
+        Prefer MarketDataWarmer mids (fresh, in-memory). HTTP to Polymarket
+        CLOB / Kalshi only when warm is missing or stale, and then still
+        throttled by ``_PRICE_TTL``.
         """
         now = time.time()
-        if now - self._price_ts < self._PRICE_TTL and self._price_cache:
-            return self._price_cache
         try:
             with db.get_conn() as conn:
                 rows = conn.execute(
@@ -71,26 +70,56 @@ class PositionMonitorThread(threading.Thread):
                 ).fetchall()
         except Exception:
             return self._price_cache
+
         prices = {}
+        need_http = []
+        try:
+            from arena import market_data
+        except Exception:
+            market_data = None  # type: ignore
+
         for r in rows:
             mid = r["market_id"]
             p = None
-            if str(mid).startswith("kalshi:"):
+            if market_data is not None:
                 try:
-                    import kalshi_markets
-                    from exchanges import native_market_id
-                    p = kalshi_markets.current_up_price(
-                        native_market_id(str(mid)) or str(mid)
-                    )
+                    warm = market_data.store().get(mid)
+                    if market_data.is_warm_fresh(warm):
+                        p = warm.get("yes_price")
                 except Exception:
                     p = None
-            else:
-                p = polymarket_markets.current_up_price(mid)
             if p is not None:
                 prices[mid] = p
+            else:
+                need_http.append(mid)
+
+        if need_http:
+            # Throttle HTTP fallback; reuse prior cache entries when still fresh.
+            http_ok = (now - self._price_ts) >= self._PRICE_TTL or not self._price_cache
+            for mid in need_http:
+                if not http_ok and mid in self._price_cache:
+                    prices[mid] = self._price_cache[mid]
+                    continue
+                p = None
+                if str(mid).startswith("kalshi:"):
+                    try:
+                        import kalshi_markets
+                        from exchanges import native_market_id
+                        p = kalshi_markets.current_up_price(
+                            native_market_id(str(mid)) or str(mid)
+                        )
+                    except Exception:
+                        p = None
+                else:
+                    p = polymarket_markets.current_up_price(mid)
+                if p is not None:
+                    prices[mid] = p
+            if http_ok:
+                self._price_ts = now
+
         self._price_cache = prices
-        self._price_ts = now
         return prices
+
 
     def _check_positions(self, price_map: dict) -> None:
         with self._lock:

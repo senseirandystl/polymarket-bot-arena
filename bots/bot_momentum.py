@@ -11,13 +11,13 @@ DEFAULT_PARAMS = {
     # >0.03%, so momentum now emits a directional lean whenever there is a real
     # trend; the strategy lane is capped at +/-0.043 of fair value, so a frequent
     # lean nudges rather than dominates.
-    "momentum_threshold": 0.0012,
+    "momentum_threshold": 0.0009,  # Pass B (was 0.0012)
     "position_size_pct": 0.05,    # 5% of max position
     "min_confidence": 0.55,
     "trend_strength_weight": 0.7,
     "volume_weight": 0.3,
     # Hold-to-resolution: candle momentum must not fight btc_drift (PTB side).
-    "min_drift_align": 0.05,
+    "min_drift_align": 0.03,  # Pass B (was 0.05)
     # Regime conditioning: confidence scales by (1 + w * (2*trend_score - 1)).
     # Trend-following earns MORE trust on trending tape and LESS in chop
     # (2026-07-19 live: momentum-driven trades in chop ran 47.9% WR / -$74;
@@ -135,20 +135,31 @@ class MomentumBot(BaseBot):
             "market_phase": getattr(sv, "market_phase", "unknown"),
         }
 
-        window = float(market.get("window_sec") or getattr(config, "MARKET_WINDOW_SEC", 300) or 300)
-        try:
-            late_sec = float(getattr(config, "MOMENTUM_LATE_SKIP_SEC", 80))
-        except (TypeError, ValueError):
-            late_sec = 80.0
-        if late_sec < 0:
-            late_sec = 80.0
         try:
             from exchanges import KALSHI, exchange_of as _ex_of
-            if _ex_of(market) == KALSHI:
-                late_sec = float(getattr(config, "KALSHI_MOMENTUM_LATE_SKIP_SEC", 120) or 120)
-                window = float(market.get("window_sec") or getattr(config, "KALSHI_WINDOW_SEC", 900) or 900)
+            _ex = _ex_of(market)
         except Exception:
-            pass
+            _ex = None
+            KALSHI = "kalshi"
+        if _ex == KALSHI:
+            window = float(
+                market.get("window_sec")
+                or getattr(config, "KALSHI_WINDOW_SEC", 900)
+                or 900
+            )
+        else:
+            window = float(
+                market.get("window_sec")
+                or getattr(config, "MARKET_WINDOW_SEC", 300)
+                or 300
+            )
+        try:
+            from arena.market_utils import momentum_late_skip_sec as _late_skip
+            late_sec = float(_late_skip(window, exchange=_ex))
+        except Exception:
+            late_sec = float(getattr(config, "MOMENTUM_LATE_SKIP_SEC", 80) or 80)
+        if late_sec < 0:
+            late_sec = 0.0
         tr = market.get("time_remaining_seconds")
         try:
             remaining = float(tr) if tr is not None else None

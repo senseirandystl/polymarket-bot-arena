@@ -109,13 +109,16 @@ def test_meanrev_default_name():
 
 
 def test_default_slate_uses_meanrev_v1():
-    from arena.startup import build_default_bots
+    """Profit-mode default slate is sniper / arb / sweeper (no meanrev)."""
+    from arena.startup import build_default_bots, DEFAULT_INDICES
     names = [b.name for b in build_default_bots()]
-    assert "meanrev-v1" in names
-    assert "hybrid-v1" in names
-    assert "sweeper-v1" in names
+    assert names == ["sniper-v1", "arbitrage-v1", "sweeper-v1"]
+    assert DEFAULT_INDICES == [4, 7, 13]
+    assert "meanrev-v1" not in names
+    assert "hybrid-v1" not in names
+    assert "lag-residual-v1" not in names
     assert not any("sl25" in n for n in names)
-    assert len(names) == 6
+    assert len(names) == 3
 
 
 def test_db_migration_renames_meanrev(tmp_path, monkeypatch):

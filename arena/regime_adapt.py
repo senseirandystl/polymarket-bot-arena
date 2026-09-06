@@ -40,12 +40,15 @@ class RegimeAdjust:
     mom_lane_scale: float = 1.0
     strat_lane_scale: float = 1.0
     no_edge_mult: float = 1.0
+    # DEPRECATED (Phase 1): always returned as 0.0 — priors may still list
+    # values but adjustments() does not apply them (honesty over fake wire).
     extra_drift_floor: float = 0.0
     # When True, directional bots should skip (arb/makers exempt at call site).
     block_directional: bool = False
     # Strategy-level style skip (this strategy toxic in this regime only).
     block_strategy: bool = False
-    # Extra min |signed drift| for mid in coin-flip favorite band [0.50, 0.58].
+    # DEPRECATED (Phase 1): not a live lever — always None from adjustments().
+    # Mid-band gating lives in base_bot price_quality / dead-zone instead.
     mid_band_drift_min: float | None = None
     # Soft tandem: max distinct bots on same (market, side); None = config default.
     max_bots_side: int | None = None
@@ -507,6 +510,7 @@ def _wr_to_edge_mult(wr: Optional[float]) -> float:
 
 
 def _wr_to_extra_drift(wr: Optional[float]) -> float:
+    """DEPRECATED: extra_drift_floor is forced to 0.0 in adjustments()."""
     if wr is None:
         return 0.0
     bad = float(getattr(config, "REGIME_ADAPT_BAD_WR", 0.48))
@@ -525,6 +529,7 @@ def _wr_to_extra_drift(wr: Optional[float]) -> float:
 
 
 def _wr_to_mid_floor(wr: Optional[float], prior_mid: Optional[float]) -> Optional[float]:
+    """DEPRECATED: mid_band_drift_min is not returned as a live lever."""
     base = float(prior_mid) if prior_mid is not None else float(
         getattr(config, "MID_COINFLIP_DRIFT_MIN", 0.28)
     )
@@ -685,7 +690,6 @@ def adjustments(
             # Fall back to whole-regime cell
             wr_eff = effective_wr(regime_cell(label))
         cont_edge = _wr_to_edge_mult(wr_eff)
-        cont_drift = _wr_to_extra_drift(wr_eff)
         bad = float(getattr(config, "REGIME_ADAPT_BAD_WR", 0.48))
         cont_min = int(getattr(config, "REGIME_ADAPT_CONT_MIN_N", 8))
         if wr_eff is not None and wr_eff < bad and (
@@ -694,7 +698,6 @@ def adjustments(
             strat_soft_bad = True
     except Exception:
         cont_edge = 1.0
-        cont_drift = 0.0
         strat_cell = {}
 
     # Prior edge (seed) × mild regime boost × continuous live tax
@@ -710,12 +713,7 @@ def adjustments(
     if flow_ft is not None:
         flow_ft = float(flow_ft)
 
-    mid_band = prior.get("mid_band_drift_min")
-    if mid_band is not None:
-        mid_band = float(mid_band)
-    mid_band = _wr_to_mid_floor(wr_eff, mid_band)
-
-    bad_mid = float(getattr(config, "MID_COINFLIP_DRIFT_MIN_BAD_REGIME", 0.35))
+    # mid_band_drift_min intentionally not computed (unused live lever).
     size_floor = float(getattr(config, "REGIME_ADAPT_SIZE_MIN", 0.85))
     reg_toxic = False
     no_is_toxic = False
@@ -746,12 +744,6 @@ def adjustments(
     except Exception:
         pass
 
-    if primary == "throttle":
-        if size_m <= size_floor + 0.05:
-            mid_band = max(mid_band or 0.0, bad_mid)
-    elif reg_toxic or strat_soft_bad or size_m <= size_floor + 0.05:
-        mid_band = max(mid_band or 0.0, bad_mid)
-
     # Auto per-regime rules when strategy is soft-bad in this regime:
     # raise min_edge further and taper size (data-driven, not hand-named).
     if wr_eff is not None and strat_soft_bad:
@@ -764,7 +756,6 @@ def adjustments(
     mom_prior = float(prior.get("mom_lane_scale", 1.0))
     strat_prior = float(prior.get("strat_lane_scale", 1.0))
     no_edge = float(prior.get("no_edge_mult", 1.0))
-    extra_drift = float(prior.get("extra_drift_floor", 0.0))
     live_toxic = reg_toxic or strat_soft_bad
     if primary == "style":
         blend = 0.35 if not live_toxic else 0.75
@@ -774,26 +765,13 @@ def adjustments(
             1.60,
             1.0 + blend * (no_edge - 1.0) + (0.15 if live_toxic else 0.0),
         )
-        extra_drift = min(0.12, extra_drift * (0.5 + 0.5 * blend))
     else:
         mom_scale = mom_prior
         strat_scale = strat_prior
 
-    # Continuous drift floor from live WR
-    extra_drift = max(extra_drift, cont_drift)
-    if strat_soft_bad:
-        extra_drift = max(
-            extra_drift,
-            float(getattr(config, "REGIME_ADAPT_CONT_DRIFT_MAX", 0.10)) * 0.6,
-        )
-
     if no_is_toxic:
         no_edge = max(
             no_edge, float(getattr(config, "REGIME_NO_SIDE_EDGE_MULT", 1.55))
-        )
-        extra_drift = max(
-            extra_drift,
-            float(getattr(config, "REGIME_NO_SIDE_EXTRA_DRIFT", 0.06)),
         )
 
     block = bool(blocks.get(label, False))
@@ -851,10 +829,10 @@ def adjustments(
         mom_lane_scale=max(0.0, min(1.5, mom_scale)),
         strat_lane_scale=max(0.0, min(1.5, strat_scale)),
         no_edge_mult=max(1.0, min(2.5, no_edge)),
-        extra_drift_floor=0.0,
+        extra_drift_floor=0.0,  # deprecated — not a live lever
         block_directional=block,
         block_strategy=block_strat,
-        mid_band_drift_min=mid_band,
+        mid_band_drift_min=None,  # deprecated — not a live lever
         max_bots_side=max_bots,
         side_edge_mult=side_m,
         block_side=block_side,

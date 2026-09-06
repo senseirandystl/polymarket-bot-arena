@@ -216,6 +216,6 @@ class TradeResolver(threading.Thread):
             if rid:
                 from signals.regime_detector import get_detector
                 get_detector().record_outcome(rid, pnl, won=won)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("swallowed exception: %s", e)
         return True

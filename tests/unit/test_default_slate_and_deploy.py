@@ -18,24 +18,19 @@ from arena.deploy import process_pending_deploys, unique_bot_name
 
 
 def test_default_indices_include_hybrid_and_sweeper():
-    assert DEFAULT_INDICES == [1, 2, 4, 6, 7, 13]
+    # Profit-mode lean slate: sniper / arb / sweeper only.
+    assert DEFAULT_INDICES == [4, 7, 13]
     bots = build_default_bots()
-    assert len(bots) == 6
+    assert len(bots) == 3
     types = [b.strategy_type for b in bots]
     assert types == [
-        "momentum",
-        "mean_reversion",
         "sniper",
-        "hybrid",
         "arbitrage",
         "sweeper",
     ]
     names = [b.name for b in bots]
     assert names == [
-        "momentum-v1",
-        "meanrev-v1",
         "sniper-v1",
-        "hybrid-v1",
         "arbitrage-v1",
         "sweeper-v1",
     ]
@@ -125,3 +120,93 @@ def test_process_pending_skips_already_active():
     assert any(s["reason"] == "already_active" for s in res["skipped"])
     save.assert_not_called()
     trader.set_bots.assert_not_called()
+
+
+def test_process_pending_lab_skips_param_clone():
+    trader = MagicMock()
+    pos = MagicMock()
+    payload = json.dumps({
+        "strategies": [{
+            "strategy_type": "momentum",
+            "name": "mom-lab",
+            "source": "lab",
+            "spec_id": "mom-0001",
+            "params": {},
+        }],
+    })
+    with patch("arena.deploy.db.get_arena_state", return_value=payload), \
+         patch("arena.deploy.db.set_arena_state"), \
+         patch("arena.deploy.db.get_active_bots", return_value=[
+             {"bot_name": "momentum-v1", "strategy_type": "momentum", "params": {}},
+         ]), \
+         patch("arena.deploy.db.save_bot_config") as save, \
+         patch("arena.portfolio.rebalance"):
+        t, m, res = process_pending_deploys([], [], trader, pos)
+
+    assert res is not None
+    assert res["deployed"] == []
+    assert any(s.get("reason") == "clone" for s in res["skipped"])
+    save.assert_not_called()
+    trader.set_bots.assert_not_called()
+
+
+def test_process_pending_lab_skips_near_clone_lookback():
+    trader = MagicMock()
+    pos = MagicMock()
+    payload = json.dumps({
+        "strategies": [{
+            "strategy_type": "momentum",
+            "name": "mom-plus-one",
+            "source": "lab",
+            "spec_id": "mom-0006",
+            "params": {"lookback_candles": 6},
+        }],
+    })
+    with patch("arena.deploy.db.get_arena_state", return_value=payload), \
+         patch("arena.deploy.db.set_arena_state"), \
+         patch("arena.deploy.db.get_active_bots", return_value=[
+             {"bot_name": "momentum-v1", "strategy_type": "momentum", "params": {}},
+         ]), \
+         patch("arena.deploy.db.save_bot_config") as save, \
+         patch("arena.portfolio.rebalance"):
+        t, m, res = process_pending_deploys([], [], trader, pos)
+
+    assert res is not None
+    assert res["deployed"] == []
+    assert any(s.get("reason") == "clone" for s in res["skipped"])
+    save.assert_not_called()
+    trader.set_bots.assert_not_called()
+
+
+def test_process_pending_lab_allows_distinct_params():
+    trader = MagicMock()
+    pos = MagicMock()
+    payload = json.dumps({
+        "strategies": [{
+            "strategy_type": "momentum",
+            "name": "mom-wide",
+            "source": "lab",
+            "spec_id": "mom-0002",
+            "params": {
+                "lookback_candles": 25,
+                "momentum_threshold": 0.003,
+                "min_confidence": 0.72,
+            },
+        }],
+    })
+    with patch("arena.deploy.db.get_arena_state", return_value=payload), \
+         patch("arena.deploy.db.set_arena_state"), \
+         patch("arena.deploy.db.get_active_bots", return_value=[
+             {"bot_name": "momentum-v1", "strategy_type": "momentum", "params": {}},
+         ]), \
+         patch("arena.deploy.db.save_bot_config"), \
+         patch("arena.deploy.db.set_bot_mode"), \
+         patch("arena.portfolio.rebalance"):
+        t, m, res = process_pending_deploys([], [], trader, pos)
+
+    assert res is not None
+    assert res["ok"] is True
+    assert len(res["deployed"]) == 1
+    assert res["deployed"][0]["strategy_type"] == "momentum"
+    assert len(t) == 1
+    assert t[0].strategy_params.get("lookback_candles") == 25

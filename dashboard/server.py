@@ -20,6 +20,10 @@ import credentials_store
 import db
 import learning
 from arena.market_utils import is_5min_market
+try:
+    from dashboard.lab_routes import register_lab_routes
+except ImportError:  # python dashboard/server.py (script launch)
+    from lab_routes import register_lab_routes
 
 security = HTTPBasic()
 
@@ -191,7 +195,8 @@ def get_bot_balance(trading_mode="paper"):
 @app.get("/", response_class=HTMLResponse)
 def index():
     html_path = Path(__file__).parent / "index.html"
-    return html_path.read_text()
+    html = html_path.read_text(encoding="utf-8")
+    return HTMLResponse(html)
 
 
 @app.get("/api/ops")
@@ -689,24 +694,134 @@ def get_hybrid_meta():
 
 
 @app.get("/api/skips")
-def get_skips():
-    """Skip-reason tally the arena persists (why it sat flat, not just what it
-    traded). Empty until the arena process has flushed at least once."""
+def get_skips(hours: float = 24.0, bot_name: str | None = None):
+    """Skip-reason tally (why the arena sat flat).
+
+    Query params:
+      hours    — lookback window for decision_events slice (default 24).
+      bot_name — optional filter.
+
+    Response keeps a flat ``counts`` map for the existing Overview table, plus
+    ``top_reasons``, optional ``by_bot``, and rates vs decision count. Legacy
+    arena ``skip_counts`` is used as fallback when the window has no rows.
+    """
+    try:
+        hours_f = float(hours) if hours is not None else 24.0
+    except (TypeError, ValueError):
+        hours_f = 24.0
+    if hours_f <= 0:
+        hours_f = 24.0
+    hours_f = min(hours_f, 24.0 * 30)  # cap 30d
+    bot_f = (bot_name or "").strip() or None
+
+    legacy: dict = {}
     raw = db.get_arena_state("skip_counts")
     try:
-        data = json.loads(raw) if raw else {}
-        if not isinstance(data, dict):
-            data = {}
+        legacy = json.loads(raw) if raw else {}
+        if not isinstance(legacy, dict):
+            legacy = {}
     except (json.JSONDecodeError, TypeError):
-        data = {}
-    if not data:
+        legacy = {}
+    if not legacy:
         try:
             sc = json.loads(db.get_arena_state("live_scorecard") or "{}")
-            data = sc.get("raw_skips") if isinstance(sc, dict) else {}
-            data = data if isinstance(data, dict) else {}
+            legacy = sc.get("raw_skips") if isinstance(sc, dict) else {}
+            legacy = legacy if isinstance(legacy, dict) else {}
         except (json.JSONDecodeError, TypeError):
-            data = {}
-    return JSONResponse(data)
+            legacy = {}
+
+    counts: dict = {}
+    by_bot: dict = {}
+    decision_n = 0
+    skip_n = 0
+    source = "legacy"
+    try:
+        # SQLite datetime('now', '-Nh') — hours may be fractional.
+        # Use seconds modifier for precision.
+        secs = int(max(1, hours_f * 3600))
+        mod = f"-{secs} seconds"
+        params: list = [mod]
+        bot_clause = ""
+        if bot_f:
+            bot_clause = " AND bot_name = ?"
+            params.append(bot_f)
+        with db.get_conn() as conn:
+            decision_n = int(conn.execute(
+                f"""SELECT COUNT(*) c FROM decision_events
+                    WHERE created_at >= datetime('now', ?){bot_clause}""",
+                params,
+            ).fetchone()["c"] or 0)
+            rows = conn.execute(
+                f"""SELECT COALESCE(NULLIF(skip_reason, ''), 'skip') AS reason,
+                           COUNT(*) AS n
+                    FROM decision_events
+                    WHERE action = 'skip'
+                      AND created_at >= datetime('now', ?){bot_clause}
+                    GROUP BY reason
+                    ORDER BY n DESC""",
+                params,
+            ).fetchall()
+            for r in rows:
+                counts[str(r["reason"])] = int(r["n"] or 0)
+                skip_n += int(r["n"] or 0)
+            # Per-bot breakdown (cheap; cap reasons kept via outer counts)
+            brow = conn.execute(
+                f"""SELECT bot_name,
+                           COALESCE(NULLIF(skip_reason, ''), 'skip') AS reason,
+                           COUNT(*) AS n
+                    FROM decision_events
+                    WHERE action = 'skip'
+                      AND created_at >= datetime('now', ?){bot_clause}
+                    GROUP BY bot_name, reason
+                    ORDER BY n DESC
+                    LIMIT 200""",
+                params,
+            ).fetchall()
+            for r in brow:
+                bn = str(r["bot_name"] or "?")
+                slot = by_bot.setdefault(bn, {})
+                slot[str(r["reason"])] = int(r["n"] or 0)
+        if counts:
+            source = "decision_events"
+        else:
+            # No windowed rows — fall back to run-lifetime arena tally
+            counts = {
+                str(k): int(v) for k, v in legacy.items()
+                if isinstance(v, (int, float))
+            }
+            skip_n = sum(counts.values())
+            source = "legacy"
+    except Exception:
+        counts = {
+            str(k): int(v) for k, v in legacy.items()
+            if isinstance(v, (int, float))
+        }
+        skip_n = sum(counts.values())
+        source = "legacy"
+
+    top_reasons = [
+        {"reason": r, "count": int(c)}
+        for r, c in sorted(counts.items(), key=lambda kv: -int(kv[1]))[:20]
+    ]
+    skip_rate = (skip_n / decision_n) if decision_n else None
+    return JSONResponse({
+        "counts": counts,
+        "hours": hours_f,
+        "bot_name": bot_f,
+        "top_reasons": top_reasons,
+        "by_bot": by_bot if by_bot else None,
+        "decision_n": decision_n,
+        "skip_n": skip_n,
+        "skip_rate": round(skip_rate, 4) if skip_rate is not None else None,
+        "source": source,
+        # Flat aliases so naive Object.entries clients that ignore nested
+        # shape still see something if they only read unknown keys — the
+        # dashboard updateSkips prefers ``counts``.
+        **{k: v for k, v in counts.items() if k not in {
+            "counts", "hours", "bot_name", "top_reasons", "by_bot",
+            "decision_n", "skip_n", "skip_rate", "source",
+        }},
+    })
 
 
 @app.get("/api/settings/exchanges")
@@ -1406,7 +1521,7 @@ def lane_validation_status(_auth: str = Depends(verify_auth)):
     tail = ""
     try:
         if _VALIDATION_LOG.exists():
-            tail = _VALIDATION_LOG.read_text()[-2000:]
+            tail = _VALIDATION_LOG.read_text(encoding="utf-8", errors="replace")[-2000:]
     except OSError:
         pass
     return JSONResponse({
@@ -2088,6 +2203,12 @@ async def credentials_test(request: Request):
             results["kalshi"] = {"ok": False, "error": str(e)}
 
     return JSONResponse(results)
+
+
+try:
+    register_lab_routes(app, verify_auth=verify_auth)
+except Exception:
+    logger.exception("lab pipeline routes failed to register")
 
 
 if __name__ == "__main__":

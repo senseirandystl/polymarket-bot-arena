@@ -1,12 +1,12 @@
 """Mean Reversion bot with 2x take-profit via intra-window tick tracking.
 
-This bot ALWAYS opens a position on every market. The position monitor
-polls Simmer every 0.5s and closes the position if it ever reaches
-100% profit (2x the initial bet). If it never hits 2x, the position
-holds until the trading window closes and resolves normally.
+Inherits MeanRevBot entry logic (including skips when signals are weak).
+When a buy is placed, the position monitor polls every 0.5s and closes
+early if the position reaches 100% profit (2x the initial bet). If it
+never hits 2x, the position holds until the window resolves normally.
 
-Entry logic: same mean-reversion signals, but NEVER skips a market.
-Exit logic: early close at 2x via PositionMonitorThread, otherwise hold.
+Entry: same mean-reversion signals as MeanRevBot (may skip).
+Exit: early close at 2x via PositionMonitorThread, otherwise hold.
 """
 
 import config

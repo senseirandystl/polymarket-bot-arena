@@ -552,6 +552,9 @@ class RegimeDetector:
         # Soft market-id stamp for rollover notes (no state reset — regime is
         # continuous BTC tape context, not per-window moneyness).
         self._last_market_id: Optional[str] = None
+        # Per-exchange last window id. Dual-venue ticks alternate Polymarket
+        # and Kalshi every second; that is NOT a window rollover.
+        self._last_market_id_by_ex: dict[str, str] = {}
 
     # ------------------------------------------------------------------
     # Persistence
@@ -659,35 +662,43 @@ class RegimeDetector:
     # ------------------------------------------------------------------
 
     def note_market(self, market_id: Optional[str]) -> None:
-        """Soft-annotate a Polymarket window rollover.
+        """Soft-annotate a per-exchange window rollover.
 
-        Logs once when ``market_id`` changes so soaks can align the regime
-        timeline to market boundaries. Does **not** reset EMA, hysteresis,
-        centroids, or confidence — regime describes continuous BTC tape, not
-        a single 5-min window's moneyness.
+        Logs once when ``market_id`` changes **on the same exchange** so soaks
+        can align the regime timeline to market boundaries. Dual-venue ticks
+        that alternate Polymarket and Kalshi are ignored (not a rollover).
+
+        Does **not** reset EMA, hysteresis, centroids, or confidence — regime
+        describes continuous BTC tape, not a single window's moneyness.
         """
         if not market_id:
             return
+        mid = str(market_id)
+        if mid.startswith("kalshi:"):
+            exchange = "kalshi"
+        elif mid.startswith("polymarket:"):
+            exchange = "polymarket"
+        else:
+            # Bare Polymarket condition ids (0x…)
+            exchange = "polymarket"
         with self._lock:
-            prev = self._last_market_id
+            self._last_market_id = mid
+            prev = self._last_market_id_by_ex.get(exchange)
             if prev is None:
-                self._last_market_id = str(market_id)
+                self._last_market_id_by_ex[exchange] = mid
                 return
-            if str(market_id) == prev:
+            if mid == prev:
                 return
-            self._last_market_id = str(market_id)
+            self._last_market_id_by_ex[exchange] = mid
             rid = self._regime
             conf = float(self._confidence)
             ticks = self._ticks
         logger.info(
             "REGIME MARKET ROLLOVER %s -> %s "
             "(soft note; state retained: regime=%s conf=%.2f ticks=%d)",
-            prev, market_id, rid, conf, ticks,
+            prev, mid, rid, conf, ticks,
         )
 
-    # ------------------------------------------------------------------
-    # Online update
-    # ------------------------------------------------------------------
 
     def update(
         self,

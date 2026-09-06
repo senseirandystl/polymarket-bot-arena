@@ -21,7 +21,7 @@ from __future__ import annotations
 import config
 import learning
 import polymarket_fills
-from bots.base_bot import BaseBot, strategy_decision
+from bots.base_bot import BaseBot, strategy_decision, implied_side_prob
 from bots.edge_calibration import quality_confidence
 from bots.maker_utils import maker_kelly_amount, mid_ask_gap_ok, resolve_side_exec
 from signals.lab import SignalView
@@ -115,7 +115,10 @@ class LateWindowMakerBot(BaseBot):
         if not ok:
             return _hold(f"lwm: book integrity — {why}")
 
-        implied_p = 0.5 + 0.5 * abs(drift)
+        # Same Phi(z) / btc_implied_yes path as sniper — never 0.5+0.5*|drift|.
+        implied_p = implied_side_prob(
+            side=side, signals=signals, signed_lane=drift,
+        )
         max_mid_vs = float(p.get("max_mid_vs_implied", 0.02))
         if side_mid > implied_p - max_mid_vs:
             return _hold(

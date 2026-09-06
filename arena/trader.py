@@ -45,6 +45,44 @@ from arena.state import SharedArenaState
 
 logger = logging.getLogger("arena.trader")
 
+# Dashboard toggles change rarely; cache 1-3s (BOT_MODE_CACHE style) so we
+# do not hit SQLite 3x per market per 1Hz tick.
+_TOGGLE_CACHE: dict = {"ts": 0.0, "one": None, "hybrid": None, "lock": None}
+_TOGGLE_CACHE_LOCK = threading.Lock()
+
+
+def _cached_trade_toggles(cfg_mod):
+    """Return (one_per_tick, hybrid_yield, window_lock) with short TTL."""
+    now = time.time()
+    ttl = float(getattr(cfg_mod, "BOT_MODE_CACHE_TTL_SEC", 3) or 3)
+    ttl = max(1.0, min(ttl, 3.0))
+    with _TOGGLE_CACHE_LOCK:
+        hit = _TOGGLE_CACHE
+        if (
+            hit["one"] is not None
+            and (now - float(hit["ts"])) < ttl
+        ):
+            return bool(hit["one"]), bool(hit["hybrid"]), bool(hit["lock"])
+    try:
+        one = bool(db.get_one_trade_per_tick())
+    except Exception:
+        one = bool(getattr(cfg_mod, "ONE_TRADE_PER_TICK", False))
+    try:
+        hybrid = bool(db.get_hybrid_yield())
+    except Exception:
+        hybrid = bool(getattr(cfg_mod, "HYBRID_YIELD_ENABLED", False))
+    try:
+        lock = bool(db.get_directional_window_lock())
+    except Exception:
+        lock = bool(getattr(cfg_mod, "DIRECTIONAL_WINDOW_LOCK", False))
+    with _TOGGLE_CACHE_LOCK:
+        _TOGGLE_CACHE["ts"] = now
+        _TOGGLE_CACHE["one"] = one
+        _TOGGLE_CACHE["hybrid"] = hybrid
+        _TOGGLE_CACHE["lock"] = lock
+    return one, hybrid, lock
+
+
 
 def directional_buy_score(signal: dict) -> float:
     """Rank competing buys by dollar EV: edge / (1 − ask). Ignores conf/weight."""
@@ -125,13 +163,14 @@ class Trader(threading.Thread):
             if is_killed():
                 self._state.note_skip("kill_switch")
                 return
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("trader kill-switch check failed: %s", e)
         markets = {}
         if hasattr(self._discovery, "current_markets_snapshot"):
             try:
                 markets = self._discovery.current_markets_snapshot() or {}
-            except Exception:
+            except Exception as e:
+                logger.warning("trader markets snapshot failed: %s", e)
                 markets = {}
         if not markets:
             market = self._discovery.current_market_snapshot()
@@ -139,9 +178,10 @@ class Trader(threading.Thread):
                 markets = {"polymarket": market}
         with self._bots_lock:
             bots = list(self._bots)
-        for market in markets.values():
+        for exch, market in markets.items():
             try:
-                self._tick_one_market(market, bots, now)
+                peers = {k: v for k, v in markets.items() if k != exch}
+                self._tick_one_market(market, bots, now, peers=peers)
             except Exception as e:
                 log_event(
                     logger, logging.ERROR, f"Trader market tick error: {e}",
@@ -155,7 +195,7 @@ class Trader(threading.Thread):
             except Exception as e:
                 logger.debug(f"skip_counts flush failed: {e}")
 
-    def _tick_one_market(self, market: dict, bots: list, now) -> None:
+    def _tick_one_market(self, market: dict, bots: list, now, peers: dict | None = None) -> None:
         if market is not None:
             market["time_remaining_seconds"] = compute_time_remaining_seconds(
                 market, now
@@ -200,18 +240,28 @@ class Trader(threading.Thread):
         )
         # Warm age for diagnostics / size context (never network).
         combined_signals["warm_age_sec"] = market_data.warm_age_sec(warm)
+        # Cross-venue peer mids for menu-only cross_venue_lag (and diagnostics).
+        if peers:
+            try:
+                peer_ex, peer_m = next(iter(peers.items()))
+                combined_signals["cross_venue"] = {
+                    "peer_exchange": peer_ex,
+                    "peer_yes_mid": peer_m.get("current_price")
+                    or peer_m.get("yes_price"),
+                    "peer_window_sec": peer_m.get("window_sec"),
+                    "local_exchange": market.get("exchange")
+                    or market.get("venue"),
+                    "local_yes_mid": market.get("current_price")
+                    or market.get("yes_price"),
+                    "local_window_sec": market.get("window_sec"),
+                }
+            except Exception as e:
+                logger.warning("cross_venue attach failed: %s", e)
 
         import config as _cfg
         slip_cd = float(getattr(_cfg, "SLIPPAGE_RETRY_COOLDOWN_SEC", 10.0))
         slip_reasons = frozenset({"slippage_band", "slippage_exceeded"})
-        try:
-            one_per_tick = bool(__import__("db").get_one_trade_per_tick())
-        except Exception:
-            one_per_tick = bool(getattr(_cfg, "ONE_TRADE_PER_TICK", False))
-        try:
-            hybrid_yield_on = bool(__import__("db").get_hybrid_yield())
-        except Exception:
-            hybrid_yield_on = bool(getattr(_cfg, "HYBRID_YIELD_ENABLED", False))
+        one_per_tick, hybrid_yield_on, window_lock = _cached_trade_toggles(_cfg)
         # Live fuse: paper-eval open cluster must not follow a bot onto CLOB.
         any_live = any(
             (getattr(b, "trading_mode", "paper") or "paper") == "live"
@@ -224,10 +274,6 @@ class Trader(threading.Thread):
             str(t).lower()
             for t in (getattr(_cfg, "ONE_TRADE_PER_TICK_EXEMPT", ()) or ())
         }
-        try:
-            window_lock = bool(__import__("db").get_directional_window_lock())
-        except Exception:
-            window_lock = bool(getattr(_cfg, "DIRECTIONAL_WINDOW_LOCK", False))
         lock_exempt = {
             str(t).lower()
             for t in (getattr(_cfg, "DIRECTIONAL_WINDOW_LOCK_EXEMPT", ()) or ())
@@ -255,8 +301,8 @@ class Trader(threading.Thread):
                         market_id=market_id,
                         signal=signal,
                     )
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.warning("swallowed exception: %s", e)
                 log_event(
                     logger, logging.DEBUG,
                     f"[{bot.name}] skip | {signal.get('reasoning', '')}",
@@ -274,8 +320,8 @@ class Trader(threading.Thread):
                         market_id=market_id,
                         signal=signal,
                     )
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.warning("swallowed exception: %s", e)
 
         def _execute_one(bot, signal) -> bool:
             """Place one trade; return True on success."""
@@ -305,8 +351,8 @@ class Trader(threading.Thread):
                         trade_id=result.get("trade_id"),
                         force=True,
                     )
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.warning("swallowed exception: %s", e)
                 log_event(
                     logger, logging.INFO,
                     f"[{bot.name}] {signal['side'].upper()} "
@@ -341,8 +387,8 @@ class Trader(threading.Thread):
                         side=str(signal.get("side") or ""),
                         market_id=str(market_id),
                     )
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.warning("swallowed exception: %s", e)
             log_event(
                 logger, logging.DEBUG,
                 f"[{bot.name}] trade not placed on {str(market_id)[:12]}…: "

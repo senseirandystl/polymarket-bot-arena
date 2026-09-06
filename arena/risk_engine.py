@@ -944,7 +944,11 @@ def pre_trade(bot_name: str, mode: str = "paper",
 
 
 def _legacy_daily_check(bot_name: str, mode: str) -> TradeDecision:
-    """When risk engine is disabled, keep the original daily-loss gates."""
+    """When risk engine is disabled, keep daily-loss gates.
+
+    Uses config.get_max_daily_loss_* which resolve to RISK_PAPER_* in
+    paper mode (never the historical 999999 uncapped PAPER_* values).
+    """
     try:
         daily_loss = db.get_bot_daily_loss(bot_name, mode)
         max_daily = config.get_max_daily_loss_per_bot()

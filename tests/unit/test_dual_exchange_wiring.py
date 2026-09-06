@@ -379,3 +379,43 @@ def test_position_monitor_does_not_hit_pm_clob_for_kalshi(monkeypatch, arena_db)
     )
     prices = PositionMonitorThread()._fetch_market_prices()
     assert prices.get("kalshi:KXBTC15M-PMON") == 0.61
+
+
+def test_kalshi_signals_do_not_feed_brti_vol_into_shared_detector(monkeypatch):
+    """Kalshi ticks must not pass BRTI-derived vol/trend into Chainlink EMA."""
+    from arena.signals import build_combined_signals
+    from signals import brti
+
+    captured = {}
+
+    class _Det:
+        def update(self, prices, **kwargs):
+            captured["prices"] = list(prices or [])
+            captured["kwargs"] = dict(kwargs)
+            return {
+                "regime_id": "unknown", "label": "unknown", "legacy": "unknown",
+                "confidence": 0.0, "features": {}, "vol_score": 0.0,
+                "trend_score": 0.0, "known": False, "meta_bucket": "mixed",
+                "mom_score": 0.0, "flow_score": 0.0,
+            }
+
+    monkeypatch.setattr("signals.regime_detector.get_detector", lambda: _Det())
+    for i in range(8):
+        brti.record_tick(2_100_000.0 + i * 60, 78000.0 + i * 5, source="test")
+    market = {
+        "id": "kalshi:KXBTC15M-REGIME",
+        "exchange": "kalshi",
+        "floor_strike": 77900.0,
+        "resolves_at": "2099-01-01T00:00:00Z",
+        "time_remaining_seconds": 400,
+        "window_sec": 900,
+    }
+    build_combined_signals(None, None, None, market, warm={
+        "strike": 77900.0, "obi": 0.0, "cvd": 0.0,
+        "pm_momentum": 0.0, "pm_prices": [],
+    })
+    assert captured, "detector.update was not called"
+    assert captured["kwargs"].get("vol_score") is None
+    assert captured["kwargs"].get("trend_score") is None
+    assert captured["kwargs"].get("realized_vol") is None
+

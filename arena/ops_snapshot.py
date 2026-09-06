@@ -553,4 +553,22 @@ def ops_snapshot() -> dict[str, Any]:
     except Exception as e:
         out["prices"] = {"error": str(e)}
 
+    # Paper gate profile (Pass A) — Overview chip + /api/ops consumers
+    try:
+        import config as _cfg
+        if hasattr(_cfg, "paper_gate_snapshot"):
+            out["paper_gates"] = _cfg.paper_gate_snapshot()
+        else:
+            out["paper_gates"] = {
+                "profile": getattr(_cfg, "PAPER_GATE_PROFILE", "off"),
+                "active": bool(getattr(_cfg, "paper_gates_active", lambda: False)()),
+                "overrides": {},
+            }
+        out["paper_gate_profile"] = out["paper_gates"].get("profile")
+        out["paper_gates_active"] = bool(out["paper_gates"].get("active"))
+    except Exception as e:
+        out["paper_gates"] = {"active": False, "profile": "off", "error": str(e)}
+        out["paper_gate_profile"] = "off"
+        out["paper_gates_active"] = False
+
     return out

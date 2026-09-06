@@ -25,6 +25,23 @@ MAKER_TYPES = frozenset({
 })
 
 
+def _autopsy_lab_skip(spec_id, reason: str, *, source: str = "lab") -> None:
+    """Close a lab hyp that the mid-run queue accepted but deploy refused."""
+    if not spec_id:
+        return
+    try:
+        from signals.strategy_pipeline.postmortem import write_autopsy
+        from signals.strategy_pipeline.store import HypothesisStore
+        write_autopsy(
+            HypothesisStore(), str(spec_id),
+            stage="backtested", reason=str(reason)[:200],
+        )
+    except Exception:
+        logger.warning(
+            "%s hyp autopsy after deploy skip failed spec=%s", source, spec_id,
+        )
+
+
 def unique_bot_name(preferred: str, taken: set[str]) -> str:
     """Return preferred if free, else preferred-2, preferred-3, …"""
     if preferred not in taken:
@@ -90,19 +107,65 @@ def process_pending_deploys(
             skipped.append({"strategy_type": st, "reason": "unknown_strategy"})
             continue
         source = "" if isinstance(item, str) else str((item or {}).get("source") or "")
-        # Desk factory may run two momentums with different genes. Only
-        # collapse duplicates when the operator clicked the catalog deploy.
-        if st in active_types and source != "desk":
+        spec_id = (item or {}).get("spec_id") if isinstance(item, dict) else None
+        # Operator catalog click: one live instance per strategy_type.
+        # Lab may run two momentums *with different genes* — exact-param
+        # clones are still blocked below.
+        if st in active_types and source != "lab":
             skipped.append({"strategy_type": st, "reason": "already_active"})
             continue
         try:
             preferred = catalog[st]["default_name"]
-            if isinstance(item, dict) and item.get("name"):
-                preferred = str(item["name"])
+            spec_params = {}
+            spec_id = None
+            if isinstance(item, dict):
+                if item.get("name"):
+                    preferred = str(item["name"])
+                if isinstance(item.get("params"), dict):
+                    spec_params = item["params"]
+                spec_id = item.get("spec_id")
+
+            if source == "lab":
+                from signals.strategy_pipeline.fingerprint import clone_match
+
+                spec_like = {
+                    "primitive": st,
+                    "params": spec_params,
+                    "spec_id": spec_id,
+                }
+                live_peers = list(trader_bots) + list(maker_bots) + list(active_cfgs)
+                clone = clone_match(spec_like, live_peers)
+                if clone:
+                    skipped.append({
+                        "strategy_type": st,
+                        "reason": "clone",
+                        "clone_of": clone.get("bot_name"),
+                    })
+                    logger.info(
+                        "Lab deploy skipped clone %s of %s",
+                        preferred, clone.get("bot_name"),
+                    )
+                    _autopsy_lab_skip(
+                        spec_id,
+                        f"clone_of_active:{clone.get('bot_name') or st}",
+                        source=source or "lab",
+                    )
+                    continue
+
             bot_name = unique_bot_name(preferred, taken_names)
-            bot = instantiate_strategy(st, name=bot_name)
-            if isinstance(item, dict) and item.get("spec_id"):
-                bot.lineage = f"desk:{item['spec_id']}"
+            if source == "lab":
+                from signals.strategy_pipeline.compiler import compile_bot
+
+                bot, _spec = compile_bot({
+                    "primitive": st,
+                    "name": bot_name,
+                    "spec_id": spec_id or f"deploy-{st}",
+                    "params": spec_params,
+                })
+            else:
+                bot = instantiate_strategy(st, name=bot_name)
+                if spec_id:
+                    bot.lineage = f"lab:{spec_id}"
             db.save_bot_config(
                 bot.name, bot.strategy_type, bot.generation,
                 bot.strategy_params, lineage=getattr(bot, "lineage", None),
@@ -133,6 +196,10 @@ def process_pending_deploys(
         except Exception as e:
             logger.error(f"Deploy failed for {st}: {e}", exc_info=True)
             skipped.append({"strategy_type": st, "reason": str(e)})
+            if source == "lab":
+                _autopsy_lab_skip(
+                    spec_id, f"deploy_failed:{e}", source=source or "lab",
+                )
 
     if trader_changed:
         trader.set_bots(trader_bots)

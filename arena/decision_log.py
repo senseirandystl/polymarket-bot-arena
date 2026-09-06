@@ -413,12 +413,15 @@ def resolve_pending(market_outcomes: dict[str, bool]) -> int:
             side = r["side"]
             would_win = None
             hyp = None
-            if side in ("yes", "no"):
+            entry = r["entry_price"]
+            # Entry-less skips (e.g. no_thesis) must not stamp would_win/hyp_pnl
+            # — direction-only CF polluted WR to 1.0 with null cost.
+            if side in ("yes", "no") and entry is not None:
                 would_win = int(
                     (side == "yes" and market_up)
                     or (side == "no" and not market_up)
                 )
-                hyp = _hyp_pnl(side, market_up, r["entry_price"])
+                hyp = _hyp_pnl(side, market_up, entry)
             conn.execute(
                 """UPDATE decision_events
                    SET market_up=?, would_win=?, hyp_pnl=?,
@@ -696,6 +699,36 @@ def maybe_rollup(force: bool = False) -> Optional[dict]:
         return rollup()
     except Exception as e:
         logger.warning("decision rollup failed: %s", e)
+        return None
+
+
+
+def maybe_prune() -> dict | None:
+    """Infrequent decision_events prune (gated by DECISION_EVENTS_PRUNE_INTERVAL_SEC)."""
+    try:
+        interval = float(getattr(config, "DECISION_EVENTS_PRUNE_INTERVAL_SEC", 3600))
+    except (TypeError, ValueError):
+        interval = 3600.0
+    now = time.time()
+    try:
+        last = float(db.get_arena_state("decision_events_last_prune") or 0)
+    except Exception:
+        last = 0.0
+    if interval > 0 and (now - last) < interval:
+        return None
+    try:
+        result = db.prune_decision_events()
+        db.set_arena_state("decision_events_last_prune", str(now))
+        deleted = int(result.get("deleted_age", 0)) + int(result.get("deleted_cap", 0))
+        if deleted:
+            logger.info(
+                "Pruned decision_events: age=%s cap=%s (max_rows=%s retain_days=%s)",
+                result.get("deleted_age"), result.get("deleted_cap"),
+                result.get("max_rows"), result.get("retain_days"),
+            )
+        return result
+    except Exception as e:
+        logger.debug("decision_events prune failed: %s", e)
         return None
 
 

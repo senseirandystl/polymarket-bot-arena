@@ -45,15 +45,15 @@ from signals.lab import SignalView
 
 DEFAULT_PARAMS = {
     # Minimum |signed drift| toward the chosen side (quiet regime gets a bump).
-    "min_drift": 0.15,
+    "min_drift": 0.15,  # profit-tight (Pass B overlay: 0.12)
     "quiet_drift_bump": 0.05,
     # Net edge floor after fee (probability units).
-    "min_edge": 0.02,
+    "min_edge": 0.022,  # profit-tight dual-gate floor (Pass B overlay: 0.016)
     # Market-lag ceiling: never snipe a side already priced above this mid.
     # Tightened 0.58→0.50 after the 2026-08-18 mid-band bleed.
-    "max_side_mid": 0.58,
+    "max_side_mid": 0.55,  # avoid mid-band favorites
     # Optional absolute floor so we don't buy deep longshots on noise.
-    "min_side_mid": 0.30,
+    "min_side_mid": 0.35,  # avoid underdog junk
     # Extreme drift must still lag (same as base_bot gate).
     "extreme_drift_abs": 0.50,
     "position_size_pct": 0.08,  # fallback if Kelly path unavailable
@@ -63,10 +63,13 @@ DEFAULT_PARAMS = {
 
 class SniperBot(BaseBot):
     def __init__(self, name="sniper-v1", params=None, generation=0, lineage=None):
+        base = params if params is not None else DEFAULT_PARAMS.copy()
+        if params is None:
+            base = config.apply_paper_bot_params("sniper", base)
         super().__init__(
             name=name,
             strategy_type="sniper",
-            params=params or DEFAULT_PARAMS.copy(),
+            params=base,
             generation=generation,
             lineage=lineage,
         )
@@ -97,7 +100,7 @@ class SniperBot(BaseBot):
             d_pct = float(sv.btc_drift_pct or 0.0)
         except Exception:
             d_pct = float(signals.get("btc_drift_pct") or 0.0)
-        min_drift = float(p.get("min_drift", 0.15))
+        min_drift = float(p.get("min_drift", 0.12))
         # Dual gate floors (shared with BaseBot) — sniper is pure lag hunter.
         try:
             from arena.gate_tuner import gate_float as _gf
@@ -111,10 +114,14 @@ class SniperBot(BaseBot):
         try:
             from exchanges import KALSHI, exchange_of as _ex_of
             if _ex_of(market) == KALSHI:
-                min_pct = float(getattr(
-                    config, "KALSHI_DRIFT_MIN_ABS_PCT", min_pct) or min_pct)
-                min_z = float(getattr(
-                    config, "KALSHI_DRIFT_MIN_ABS_Z", min_z) or min_z)
+                min_pct = _gf(
+                    "KALSHI_DRIFT_MIN_ABS_PCT",
+                    float(getattr(config, "KALSHI_DRIFT_MIN_ABS_PCT", min_pct) or min_pct),
+                )
+                min_z = _gf(
+                    "KALSHI_DRIFT_MIN_ABS_Z",
+                    float(getattr(config, "KALSHI_DRIFT_MIN_ABS_Z", min_z) or min_z),
+                )
         except Exception:
             pass
         raw_z = drift_z_from_signals(signals, drift)
@@ -145,15 +152,33 @@ class SniperBot(BaseBot):
             cert = float(sv.twap_certainty or 0.0)
         except (TypeError, ValueError):
             cert = 0.0
-        min_age = 60.0
         try:
             from exchanges import KALSHI, exchange_of as _ex_of
-            if _ex_of(market) == KALSHI:
-                min_age = float(getattr(config, "KALSHI_SNIPER_MIN_AGE_SEC", 90) or 90)
-                min_pct = float(getattr(config, "KALSHI_DRIFT_MIN_ABS_PCT", min_pct) or min_pct)
-                min_z = float(getattr(config, "KALSHI_DRIFT_MIN_ABS_Z", min_z) or min_z)
+            _ex = _ex_of(market)
         except Exception:
-            pass
+            _ex = None
+            KALSHI = "kalshi"
+        if _ex == KALSHI:
+            try:
+                min_pct = _gf(
+                    "KALSHI_DRIFT_MIN_ABS_PCT",
+                    float(getattr(config, "KALSHI_DRIFT_MIN_ABS_PCT", min_pct) or min_pct),
+                )
+                min_z = _gf(
+                    "KALSHI_DRIFT_MIN_ABS_Z",
+                    float(getattr(config, "KALSHI_DRIFT_MIN_ABS_Z", min_z) or min_z),
+                )
+            except Exception:
+                pass
+        try:
+            from arena.market_utils import sniper_min_age_sec as _min_age
+            min_age = float(_min_age(window, exchange=_ex))
+        except Exception:
+            min_age = float(getattr(config, "SNIPER_MIN_AGE_SEC", 60) or 60)
+            if _ex == KALSHI:
+                min_age = float(
+                    getattr(config, "KALSHI_SNIPER_MIN_AGE_SEC", min_age) or min_age
+                )
         if age < min_age and not in_settle:
             _side = "yes" if drift >= 0 else "no"
             _ask = yes_ask if _side == "yes" else no_ask
@@ -239,7 +264,7 @@ class SniperBot(BaseBot):
                     skip_reason="quiet_drift",
                 )
 
-        min_edge = float(p.get("min_edge", 0.02)) * float(min_edge_tax or 1.0)
+        min_edge = float(p.get("min_edge", 0.016)) * float(min_edge_tax or 1.0)
         max_mid = float(p.get("max_side_mid", 0.58))
         # DB still has 0.50 from the band-aid era; lag vs Φ(z) is the cap.
         if max_mid <= 0.51:

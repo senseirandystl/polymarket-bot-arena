@@ -143,8 +143,11 @@ class PriceFeed:
             ws = None
             try:
                 ws = websocket.WebSocket()
-                ws.settimeout(1.0)
+                # Connect needs more than the 1s recv timeout — a 1s connect
+                # budget false-errors as "Connection timed out" on slow paths.
+                ws.settimeout(10.0)
                 ws.connect(RTDS_WS)
+                ws.settimeout(1.0)
                 sub = {
                     "action": "subscribe",
                     "subscriptions": [{
@@ -205,7 +208,10 @@ class PriceFeed:
                     backoff = 2.0
             except Exception as e:
                 after_error = True
-                logger.error(
+                err = str(e).lower()
+                is_timeout = ("timed out" in err) or ("timeout" in err)
+                log = logger.warning if is_timeout else logger.error
+                log(
                     "Chainlink BTC feed error: %s (retry in %.0fs)", e, backoff,
                 )
                 time.sleep(backoff)
@@ -349,8 +355,11 @@ class PriceFeed:
             ws = None
             try:
                 ws = websocket.WebSocket()
-                ws.settimeout(1.0)
+                # Connect needs more than the 1s recv timeout — a 1s connect
+                # budget false-errors as "Connection timed out" on slow paths.
+                ws.settimeout(10.0)
                 ws.connect(RTDS_WS)
+                ws.settimeout(1.0)
                 # filters must be compact JSON, no spaces (Polymarket RTDS API)
                 sub = {
                     "action": "subscribe",

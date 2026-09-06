@@ -279,6 +279,7 @@ def init_db():
         # Migrations
         for migration in [
             "ALTER TABLE bot_configs ADD COLUMN trading_mode TEXT DEFAULT 'paper'",
+            "ALTER TABLE bot_configs ADD COLUMN protected INTEGER DEFAULT 0",
             "ALTER TABLE copytrading_trades ADD COLUMN source_tx_hash TEXT",
             "ALTER TABLE copytrading_wallets ADD COLUMN trading_mode TEXT DEFAULT 'paper'",
             # How a trade was filled: 'local_sim' (priced locally, unlimited —
@@ -306,6 +307,16 @@ def init_db():
                 conn.execute(migration)
             except sqlite3.OperationalError:
                 pass  # Column already exists
+
+        # Phase 3 leftovers: desk_* tables were orphaned after Desk→Lab move.
+        # Safe one-shot DROP IF EXISTS on startup (idempotent). Lab schema is
+        # owned by signals.strategy_pipeline.store.init_lab_tables().
+        for _desk_tbl in ("desk_hypotheses", "desk_events", "desk_specs",
+                          "desk_runs", "desk_autopsies"):
+            try:
+                conn.execute(f"DROP TABLE IF EXISTS {_desk_tbl}")
+            except sqlite3.OperationalError:
+                pass
 
         # Data migration (idempotent): the meanrev slate bot dropped its
         # stop-loss long ago (spec R3) and is now plain mean_reversion —
@@ -884,6 +895,46 @@ def get_risk_events(limit: int = 40, bot_name: str = None) -> list:
                 pass
         out.append(d)
     return out
+
+
+
+def prune_decision_events(
+    max_rows: int | None = None,
+    retain_days: int | None = None,
+) -> dict:
+    """Bound decision_events growth (newest N + optional age cutoff).
+
+    Mirrors ``log_risk_event``'s keep-newest pattern, but intended for an
+    infrequent maintenance path (evolution host / rollup cadence) — not the
+    1s trader hot path.
+    """
+    import config as _cfg
+
+    if max_rows is None:
+        max_rows = int(getattr(_cfg, "DECISION_EVENTS_MAX_ROWS", 50000) or 0)
+    if retain_days is None:
+        retain_days = int(getattr(_cfg, "DECISION_EVENTS_RETAIN_DAYS", 0) or 0)
+
+    deleted_age = 0
+    deleted_cap = 0
+    with get_conn() as conn:
+        if retain_days and retain_days > 0:
+            cur = conn.execute(
+                """DELETE FROM decision_events
+                   WHERE created_at < datetime('now', ?)""",
+                (f"-{int(retain_days)} days",),
+            )
+            deleted_age = cur.rowcount if cur.rowcount is not None else 0
+        if max_rows and max_rows > 0:
+            cur = conn.execute(
+                """DELETE FROM decision_events WHERE id NOT IN (
+                       SELECT id FROM decision_events ORDER BY id DESC LIMIT ?
+                   )""",
+                (int(max_rows),),
+            )
+            deleted_cap = cur.rowcount if cur.rowcount is not None else 0
+    return {"deleted_age": deleted_age, "deleted_cap": deleted_cap, "max_rows": max_rows, "retain_days": retain_days}
+
 
 
 def get_total_daily_loss(mode="paper"):

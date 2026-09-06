@@ -40,11 +40,11 @@ DEFAULT_PARAMS = {
     # pre_settle lead + full TWAP settlement window (config-driven; 20+60=80).
     # Overnight soak 2026-08-07: early 98¢ entries with moderate cert blew
     # the book — require the averaging window / late certainty.
-    "entry_window_sec": 80,
+    "entry_window_sec": 80,  # profit-tight late-only (Pass B overlay: 100)
     # Fundamental certainty proxy (YES-frame TWAP-drift magnitude toward side).
-    "min_drift": 0.32,
+    "min_drift": 0.32,  # profit-tight (Pass B overlay: 0.28)
     # Once inside the TWAP settlement window, require this certainty (0–1).
-    "min_twap_certainty": 0.45,
+    "min_twap_certainty": 0.45,  # profit-tight (Pass B overlay: 0.40)
     # Outside settlement (pre_settle only): need even stronger drift.
     "pre_settle_extra_drift": 0.10,
     # Fee-curve extreme only. Do not lower min_price toward 0.90.
@@ -67,10 +67,13 @@ class SweeperBot(BaseBot):
     """Certainty sweeper — buy locked outcomes still offered under $1."""
 
     def __init__(self, name="sweeper-v1", params=None, generation=0, lineage=None):
+        base = params if params is not None else DEFAULT_PARAMS.copy()
+        if params is None:
+            base = config.apply_paper_bot_params("sweeper", base)
         super().__init__(
             name=name,
             strategy_type="sweeper",
-            params=params or DEFAULT_PARAMS.copy(),
+            params=base,
             generation=generation,
             lineage=lineage,
         )
@@ -206,7 +209,7 @@ class SweeperBot(BaseBot):
             need_imp = float(
                 p.get(
                     "min_implied",
-                    getattr(config, "SWEEPER_MIN_IMPLIED", 0.97),
+                    config.effective_float("SWEEPER_MIN_IMPLIED", getattr(config, "SWEEPER_MIN_IMPLIED", 0.97)),
                 )
             )
             if implied + 1e-12 < need_imp:

@@ -586,6 +586,15 @@ books). Does not write live trades. Full contract: [docs/backtesting.md](./docs/
 Honesty: stale PM mids → optimistic WR; ranking/regime splits only — live DB
 for absolute P&L.
 
+## Strategy Lab (pipeline)
+
+Invent → gate → graduate loop: `signals/strategy_pipeline/`.
+Phase 4 learning spine (`learning_spine.py`) unifies autopsies + durable
+constraints (`arena_state` key `lab_learning_spine`) with Learned Trade Rules
+cell vocabulary. Optional LLM: `llm.py` / `STRATEGY_LAB_LLM_PROVIDER`
+(`none`|`ollama`|`grok`). Loop is fully deterministic when provider is `none`.
+Notes: `_refs/PHASE4_NOTES.md`, `docs/desk-cycle.md`.
+
 ## Key Files
 
 ```

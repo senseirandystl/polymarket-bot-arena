@@ -1,5 +1,6 @@
 """Portfolio capital allocation — metrics, correlation, weights, sizing hooks."""
 
+import json
 from unittest import mock
 
 import pytest
@@ -92,6 +93,156 @@ def test_arbitrage_pinned_to_equal_share():
         manual_overrides={"arbitrage-v1": 0.10},
     )
     assert result2["weights"]["arbitrage-v1"] == pytest.approx(0.10, abs=0.01)
+    # Explicit operator pin is persisted; auto lock-in pins are not.
+    assert result2["manual_overrides"].get("arbitrage-v1") == pytest.approx(0.10, abs=0.01)
+
+
+def test_auto_lockin_not_persisted_as_manual_override():
+    """Auto 1/N lock-in must not leak into manual_overrides (sticky-pin bug)."""
+    names = [
+        "momentum-v1", "sniper-v1", "hybrid-v1",
+        "arbitrage-v1", "sweeper-v1",
+    ]
+    metrics = {
+        n: {"n": 0, "sharpe": 0.0, "expectancy": 0.0,
+            "total_pnl": 0.0, "variance": 1.0, "ready": False}
+        for n in names
+    }
+    with mock.patch.object(portfolio, "compute_metrics", return_value=metrics), \
+         mock.patch.object(portfolio, "_market_returns_by_bot",
+                           return_value={n: {} for n in names}):
+        result = portfolio.allocate(names, method="kelly_portfolio")
+    w = result["weights"]
+    assert w["arbitrage-v1"] == pytest.approx(0.2, abs=0.01)
+    assert w["sweeper-v1"] == pytest.approx(0.2, abs=0.01)
+    ov = result.get("manual_overrides") or {}
+    assert "arbitrage-v1" not in ov
+    assert "sweeper-v1" not in ov
+
+
+def test_stale_lockin_override_refreshes_when_roster_grows():
+    """Leaked 1/5 lock-in pins must not stick after roster grows to 10."""
+    large = [
+        "momentum-v1", "sniper-v1", "hybrid-v1",
+        "arbitrage-v1", "sweeper-v1",
+        "mom-wide", "fade-slow", "sniper-strict",
+        "hybrid-picky", "phantom-desk",
+    ]
+    metrics = {
+        n: {"n": 0, "sharpe": 0.0, "expectancy": 0.0,
+            "total_pnl": 0.0, "variance": 1.0, "ready": False}
+        for n in large
+    }
+    # Simulate the bug: prior rebalance saved auto lock-in 1/5 as overrides.
+    stale_overrides = {"arbitrage-v1": 0.2, "sweeper-v1": 0.2}
+    with mock.patch.object(portfolio, "compute_metrics", return_value=metrics), \
+         mock.patch.object(portfolio, "_market_returns_by_bot",
+                           return_value={n: {} for n in large}):
+        # Without sanitization this would keep 0.2; allocate alone still
+        # respects input overrides — sanitization happens in rebalance.
+        cleaned = portfolio.sanitize_manual_overrides(
+            stale_overrides, manual_lockin_pins=None,
+        )
+        result = portfolio.allocate(
+            large, method="kelly_portfolio", manual_overrides=cleaned,
+        )
+    w = result["weights"]
+    assert w["arbitrage-v1"] == pytest.approx(0.1, abs=0.01)
+    assert w["sweeper-v1"] == pytest.approx(0.1, abs=0.01)
+    # Core equal-split of remaining 80% across 8 bots
+    assert w["momentum-v1"] == pytest.approx(0.1, abs=0.01)
+    assert "arbitrage-v1" not in (result.get("manual_overrides") or {})
+
+
+def test_explicit_lockin_pin_survives_sanitize_when_marked():
+    """Operator lock-in pins (tracked in manual_lockin_pins) still win."""
+    ov = {"arbitrage-v1": 0.15, "momentum-v1": 0.30}
+    cleaned = portfolio.sanitize_manual_overrides(
+        ov, manual_lockin_pins=["arbitrage-v1"],
+    )
+    assert cleaned["arbitrage-v1"] == pytest.approx(0.15)
+    assert cleaned["momentum-v1"] == pytest.approx(0.30)
+    # Unmarked lock-in pin is dropped (treat as leaked auto-pin).
+    dropped = portfolio.sanitize_manual_overrides(
+        ov, manual_lockin_pins=None,
+    )
+    assert "arbitrage-v1" not in dropped
+    assert dropped["momentum-v1"] == pytest.approx(0.30)
+
+
+def test_load_state_strips_leaked_lockin_overrides(monkeypatch):
+    """Persisted sticky arb/sweeper pins without allow-list are dropped on load."""
+    raw = {
+        "enabled": False,
+        "enabled_source": "dashboard",
+        "method": "kelly_portfolio",
+        "window_hours": 48.0,
+        "weights": {"arbitrage-v1": 0.2, "sweeper-v1": 0.2, "momentum-v1": 0.6},
+        "manual_overrides": {"arbitrage-v1": 0.2, "sweeper-v1": 0.2},
+        "manual_lockin_pins": [],
+        "metrics": {},
+        "correlations": {},
+    }
+    monkeypatch.setattr(
+        portfolio.db, "get_arena_state",
+        lambda key: json.dumps(raw) if key == portfolio.STATE_KEY else None,
+    )
+    state = portfolio.load_state()
+    assert state["manual_overrides"] == {}
+    assert state["manual_lockin_pins"] == []
+
+
+def test_set_manual_overrides_marks_and_clears_lockin_pins(monkeypatch):
+    """Dashboard pin of arb sets allow-list; clear-all removes it."""
+    import json as _json
+    store = {
+        "enabled": False,
+        "enabled_source": "dashboard",
+        "method": "equal",
+        "window_hours": 24.0,
+        "weights": {},
+        "manual_overrides": {},
+        "manual_lockin_pins": [],
+        "metrics": {},
+        "correlations": {},
+        "last_rebalance_at": 0.0,
+        "last_regime": "normal",
+    }
+    names = ["arbitrage-v1", "momentum-v1", "sweeper-v1"]
+
+    def fake_get(key):
+        return _json.dumps(store) if key == portfolio.STATE_KEY else None
+
+    def fake_set(key, value):
+        if key == portfolio.STATE_KEY:
+            store.clear()
+            store.update(_json.loads(value) if isinstance(value, str) else value)
+
+    monkeypatch.setattr(portfolio.db, "get_arena_state", fake_get)
+    monkeypatch.setattr(portfolio.db, "set_arena_state", fake_set)
+    monkeypatch.setattr(portfolio, "active_bot_names", lambda: names)
+    monkeypatch.setattr(portfolio, "_current_regime_label", lambda: "normal")
+    metrics = {
+        n: {"n": 0, "sharpe": 0.0, "expectancy": 0.0,
+            "total_pnl": 0.0, "variance": 1.0, "ready": False}
+        for n in names
+    }
+    monkeypatch.setattr(portfolio, "compute_metrics", lambda *a, **k: metrics)
+    monkeypatch.setattr(
+        portfolio, "_market_returns_by_bot",
+        lambda *a, **k: {n: {} for n in names},
+    )
+
+    state = portfolio.set_manual_overrides({"arbitrage-v1": 0.15})
+    assert "arbitrage-v1" in state["manual_lockin_pins"]
+    assert state["manual_overrides"]["arbitrage-v1"] == pytest.approx(0.15)
+    assert state["weights"]["arbitrage-v1"] == pytest.approx(0.15, abs=0.01)
+
+    cleared = portfolio.set_manual_overrides({})
+    assert cleared["manual_lockin_pins"] == []
+    assert "arbitrage-v1" not in (cleared.get("manual_overrides") or {})
+    # Back to auto 1/N
+    assert cleared["weights"]["arbitrage-v1"] == pytest.approx(1.0 / 3.0, abs=0.01)
 
 
 def test_lockin_arb_and_sweeper_pinned_even_at_cold_start():
@@ -746,3 +897,24 @@ def test_execute_does_not_double_scale_kelly_path():
         bot.execute(signal, market)
         amount = place.call_args[0][2]
         assert amount == pytest.approx(10.0)  # unchanged
+
+
+def test_lean_slate_free_mass_not_idle():
+    """n=3 with arb+sweeper lock-ins: sniper absorbs free mass (no ~13% idle)."""
+    names = ["sniper-v1", "arbitrage-v1", "sweeper-v1"]
+    metrics = {
+        n: {
+            "n": 0, "sharpe": 0.0, "expectancy": 0.0,
+            "total_pnl": 0.0, "variance": 1.0, "ready": False,
+        }
+        for n in names
+    }
+    with mock.patch.object(portfolio, "compute_metrics", return_value=metrics), \
+         mock.patch.object(portfolio, "_market_returns_by_bot",
+                           return_value={n: {} for n in names}):
+        result = portfolio.allocate(names, method="kelly_portfolio")
+    w = result["weights"]
+    assert abs(sum(w.values()) - 1.0) < 1e-3
+    assert w["sniper-v1"] >= 0.30 - 1e-3
+    assert abs(w["arbitrage-v1"] - (1.0 / 3.0)) < 1e-2
+    assert abs(w["sweeper-v1"] - (1.0 / 3.0)) < 1e-2

@@ -146,3 +146,81 @@ def compute_time_remaining_seconds(market: dict, now_utc: datetime) -> int:
         except Exception:
             pass
     return time_remaining
+
+
+def _window_or_default(window_sec, default: float = 300.0) -> float:
+    try:
+        w = float(window_sec) if window_sec is not None else float(default)
+    except (TypeError, ValueError):
+        w = float(default)
+    return w if w > 0 else float(default)
+
+
+def momentum_late_skip_sec(window_sec=None, *, exchange: str | None = None) -> float:
+    """Seconds-from-expiry momentum sits out, as a fraction of ``window_sec``.
+
+    Defaults approximate Polymarket 5m soak behavior (80/300 ≈ 0.267). Cap at
+    half the window so a misconfigured fraction cannot idle the whole market.
+    Absolute ``MOMENTUM_LATE_SKIP_SEC`` / ``KALSHI_MOMENTUM_LATE_SKIP_SEC`` are
+    fallbacks when ``window_sec`` is missing.
+    """
+    import config as _cfg
+
+    ex = (exchange or "").lower()
+    default_abs = float(getattr(_cfg, "MOMENTUM_LATE_SKIP_SEC", 80) or 80)
+    if ex == "kalshi":
+        default_abs = float(
+            getattr(_cfg, "KALSHI_MOMENTUM_LATE_SKIP_SEC", default_abs) or default_abs
+        )
+        default_win = float(getattr(_cfg, "KALSHI_WINDOW_SEC", 900) or 900)
+    else:
+        default_win = float(getattr(_cfg, "MARKET_WINDOW_SEC", 300) or 300)
+
+    if window_sec is None:
+        return max(0.0, default_abs)
+
+    window = _window_or_default(window_sec, default_win)
+    try:
+        frac = float(getattr(_cfg, "MOMENTUM_LATE_SKIP_FRAC", 80 / 300) or (80 / 300))
+    except (TypeError, ValueError):
+        frac = 80 / 300
+    if frac < 0:
+        frac = 0.0
+    sec = window * frac
+    # Reasonable cap: never sit out more than half the window.
+    return max(0.0, min(sec, window * 0.5))
+
+
+def sniper_min_age_sec(window_sec=None, *, exchange: str | None = None) -> float:
+    """Minimum window age before sniper may enter, as a fraction of window.
+
+    Defaults approximate Polymarket 5m (60/300 = 0.20) so 5m does not open
+    early. Absolute ``SNIPER_MIN_AGE_SEC`` / ``KALSHI_SNIPER_MIN_AGE_SEC`` are
+    fallbacks when ``window_sec`` is missing.
+    """
+    import config as _cfg
+
+    ex = (exchange or "").lower()
+    default_abs = float(getattr(_cfg, "SNIPER_MIN_AGE_SEC", 60) or 60)
+    if ex == "kalshi":
+        default_abs = float(
+            getattr(_cfg, "KALSHI_SNIPER_MIN_AGE_SEC", default_abs) or default_abs
+        )
+        default_win = float(getattr(_cfg, "KALSHI_WINDOW_SEC", 900) or 900)
+    else:
+        default_win = float(getattr(_cfg, "MARKET_WINDOW_SEC", 300) or 300)
+
+    if window_sec is None:
+        return max(0.0, default_abs)
+
+    window = _window_or_default(window_sec, default_win)
+    try:
+        frac = float(getattr(_cfg, "SNIPER_MIN_AGE_FRAC", 60 / 300) or (60 / 300))
+    except (TypeError, ValueError):
+        frac = 60 / 300
+    if frac < 0:
+        frac = 0.0
+    sec = window * frac
+    # Keep below half-window so sniper still has room after the age gate.
+    return max(0.0, min(sec, window * 0.5))
+

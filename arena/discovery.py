@@ -1,14 +1,14 @@
 """Market discovery + per-market orderflow cache.
 
 Runs as a daemon thread that ticks once every ``config.DISCOVERY_INTERVAL_SEC``
-seconds.  It owns ALL the non-trade-evaluating HTTPS traffic that the old
-``arena.py`` used to make on every 15s iteration:
+seconds.  It owns window-list HTTPS (Gamma / Kalshi discovery). Mid/book HTTP is
+owned by MarketDataWarmer; discovery only selects windows:
 
   - ``/api/sdk/markets?tags=fast-5m``  -- upcoming windows (SDK)
   - ``/api/markets``                   -- currently-live windows (public)
-  - ``/api/sdk/context/{id}``          -- orderflow probability + 24h volume
-                                          (refreshed only for the live
-                                          market, on a per-cycle TTL)
+  - (mids / OBI / books)               -- owned by MarketDataWarmer;
+                                          discovery only lays warm cache
+                                          onto selected windows (no CLOB)
 
 The ``Trader`` thread reads snapshots via ``current_market_snapshot``
 (takes a *deep copy* under the lock so the caller can use the dict
@@ -36,7 +36,6 @@ from typing import Callable, Dict, List, Optional
 
 import config
 import polymarket_markets
-from signals import orderflow_signals
 from arena.market_utils import (
     compute_time_remaining_seconds,
     is_5min_market,
@@ -242,15 +241,11 @@ class MarketDiscovery(threading.Thread):
             if fallback_pool:
                 maker_fallback = fallback_pool[0]
 
-        # Refresh orderflow for the current market AND for the maker
-        # fallback (when present).  When both exist they are guaranteed
-        # distinct markets so we issue two calls.  Total cost: 1-2
-        # HTTPS calls per 20s cycle -- the fallback call only fires
-        # in the no-current-market gap, so the hot path stays at one.
-        #
-        # NOTE: keep these calls LOCK-FREE; _fetch_orderflow_for_market
-        # re-acquires self._lock for its cache writes.  Wrapping this
-        # block in `with self._lock:` would deadlock.
+        # Lay warm mid/OBI onto selected windows when the MarketDataWarmer
+        # already has a fresh snapshot. Discovery must NOT call
+        # refresh_price / get_order_book — that hot path is the warmer's.
+        # Window selection above only needs Gamma/Kalshi list identity +
+        # time remaining.
         if current is not None:
             self._refresh_market_data(current)
         if maker_fallback is not None and maker_fallback is not current:
@@ -263,8 +258,8 @@ class MarketDiscovery(threading.Thread):
             if maker_fallback is not None:
                 maker_fallback = _pm_stamp(maker_fallback)
             non_expired = [_pm_stamp(m) for m in non_expired]
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("swallowed exception: %s", e)
 
         by_ex: Dict[str, dict] = {}
         try:
@@ -309,25 +304,27 @@ class MarketDiscovery(threading.Thread):
             logger.debug(msg)
 
     def _refresh_market_data(self, m: dict) -> None:
-        """Set fresh price + orderflow on a selected market from the CLOB book.
+        """Lay warm mid/OBI onto a selected market — no CLOB HTTP.
 
-        ``current_price`` becomes the live Up-token mid, and ``orderflow`` is
-        populated so the signal stack (which reads ``current_probability`` and
-        ``volume_24h``) has data. Best-effort — leaves the fields untouched if
-        the book is unavailable.
+        MarketDataWarmer owns midpoint + book freshness. Discovery only
+        needs window identity / expiry for selection; if a warm snapshot
+        is available we copy mid/OBI for any discovery-side readers,
+        otherwise leave fields untouched (skip rather than 10s HTTP).
         """
-        polymarket_markets.refresh_price(m)  # sets m["current_price"] from CLOB
-        # Order-book imbalance on the Up/YES token — one extra book call per
-        # discovery cycle (~20s), off the trader hot path. obi > 0 = bid-heavy
-        # (upward/YES pressure). Best-effort: 0.0 when the book is unavailable.
-        obi = 0.0
-        up_tok = m.get("polymarket_token_id")
-        if up_tok:
-            book = polymarket_markets.get_order_book(up_tok)
-            obi = orderflow_signals.order_book_imbalance(book)
-        m["orderflow"] = {
-            "current_probability": m.get("current_price") or 0.5,
-            "volume_24h": m.get("volume_24h", 0) or 0,
-            "obi": obi,
-            "warnings": [],
-        }
+        try:
+            from arena import market_data
+        except Exception:
+            return
+        mid = m.get("id") or m.get("market_id")
+        if not mid:
+            return
+        warm = market_data.store().get(mid)
+        if not market_data.is_warm_fresh(warm):
+            return
+        market_data.lay_warm_onto_market(m, warm)
+        of = dict(m.get("orderflow") or {})
+        of.setdefault("current_probability", m.get("current_price") or 0.5)
+        of.setdefault("volume_24h", m.get("volume_24h", 0) or 0)
+        of.setdefault("obi", warm.get("obi", 0.0) if warm else 0.0)
+        of.setdefault("warnings", [])
+        m["orderflow"] = of

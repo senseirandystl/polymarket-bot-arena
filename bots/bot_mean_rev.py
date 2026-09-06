@@ -20,7 +20,7 @@ DEFAULT_PARAMS = {
     "rsi_oversold": 40,
     "rsi_overbought": 60,
     # Retrace of TWAP toward this window's strike (not a 4-bar z-score).
-    "pullback_min": 0.20,
+    "pullback_min": 0.15,  # Pass B (was 0.20); keep min_drift=0.20
     # Drift-agreement gate (BUG #28): the fade may only fire toward the side
     # a signed btc_drift of at least this magnitude already favors. Ungated,
     # the z-fade was a pure contrarian knife-catcher — 10 of 11 live trades

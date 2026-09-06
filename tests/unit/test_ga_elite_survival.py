@@ -12,14 +12,16 @@ def test_effective_survival_pnl_blend(monkeypatch):
     ) == -20.0
 
 
-def test_early_cull_deep_red():
-    # n=20 < 40 but catastrophic → replaceable
+def test_early_cull_deep_red(monkeypatch):
+    # Baseline cull path (paper gates off). n=20 < 40 but catastrophic.
+    monkeypatch.setattr(config, "PAPER_GATE_PROFILE", "off")
     assert not _survives_legacy_bar({
         "trades": 20, "pnl": -20.0, "be_gap": -0.15, "generation": 1,
     })
 
 
-def test_early_cull_not_triggered_mild():
+def test_early_cull_not_triggered_mild(monkeypatch):
+    monkeypatch.setattr(config, "PAPER_GATE_PROFILE", "off")
     # n=20, only mildly red → still immune
     assert _survives_legacy_bar({
         "trades": 20, "pnl": -5.0, "be_gap": -0.05, "generation": 1,

@@ -12,7 +12,7 @@ Flow (terminal only):
                        existing DB slate).
          ΓÇó Fresh     ΓåÆ wipe DB + logs, then fall through to step 2.
     2. Ask **Default** bots (Enter) or **Manual** selection.
-         · Default   → lean 6 (momentum, meanrev, sniper, hybrid, arb, sweeper).
+         · Default   profit-mode 3 (sniper, arb, sweeper).
          · Manual    → show every strategy, accept a list/range like
                        ``1,3,5`` or ``1-6`` (or a mix) → launch exactly those.
 
@@ -40,15 +40,16 @@ from bots.bot_regime_specialist import RegimeSpecialistBot
 from bots.bot_no_lag import NoLagBot
 from bots.bot_sweeper import SweeperBot
 from bots.bot_true_maker import TrueMakerBot
+from bots.bot_cross_venue_lag import CrossVenueLagBot
 
 logger = logging.getLogger("arena.startup")
 
 # Ordered menu of every launchable strategy: (class, default_name, blurb).
-# The list index (1-based) is what the user selects in manual mode. The maker
-# bots (late-window / fee-zone) are first-class members of the slate: they run
-# on the discovery-cycle (maker) cadence rather than the 1s trader tick, but
-# they are selectable here and included in the default lineup so the Active Bots
-# roster always matches what was launched.
+# The list index (1-based) is what the user selects in manual mode.
+# Maker bots (late-window / fee-zone / true-maker) are menu-only — they run on
+# the discovery-cycle cadence when manually selected or mid-run deployed, but
+# are NOT in DEFAULT_INDICES (profit-mode: sniper / arb / sweeper only).
+# Sentiment was removed from the menu; specialists stay selectable.
 STRATEGY_MENU = [
     (MomentumBot,        "momentum-v1",     "Momentum — rides short-term price trend"),
     (MeanRevBot,         "meanrev-v1",      "Mean reversion — drift anchor + buy-the-dip fade"),
@@ -58,13 +59,13 @@ STRATEGY_MENU = [
     (HybridBot,          "hybrid-v1",       "Hybrid — blended signal stack"),
     (ArbitrageBot,       "arbitrage-v1",    "Arbitrage — market-neutral YES+NO (fees-aware)"),
     (LateWindowMakerBot, "late-window-maker-v1", "Late-window maker — final-120s drift-conviction entry"),
-    (FeeZoneMakerBot,    "fee-zone-maker-v1", "Fee-zone maker — 58-78¢ zone, drift-backed quoting"),
-    # Menu-only specialists (not in DEFAULT_INDICES)
+    (FeeZoneMakerBot,    "fee-zone-maker-v1", "Fee-zone maker — 58-72¢ zone (≤ HPG), drift-backed quoting"),
     (LagResidualBot,     "lag-residual-v1", "Lag residual — pure market-lags-drift"),
     (RegimeSpecialistBot, "regime-specialist-v1", "Regime specialist — trades only allowed regimes"),
     (NoLagBot,           "no-lag-v1",       "NO-lag specialist — strict NO-side lag trades"),
     (SweeperBot,         "sweeper-v1",      "Sweeper — buy locked outcomes still under $1 (fee-curve extreme)"),
     (TrueMakerBot,       "true-maker-v1",   "True maker — limit-first GTC passive quotes"),
+    (CrossVenueLagBot,  "cross-venue-lag-v1", "Cross-venue lag (menu-only) — PM 5m vs Kalshi 15m relative mispricing"),
 ]
 # (The old separate meanrev-sl25 menu entry is gone: with the stop-loss
 # removed it was byte-identical to the base meanrev bot. MeanRevSLBot stays
@@ -73,14 +74,13 @@ STRATEGY_MENU = [
 _ = MeanRevSLBot  # retained for legacy strategy_type resolution
 
 # Lean default slate (1-based indices into STRATEGY_MENU): trend, drift-fade,
-# lag, hybrid ensemble, market-neutral arb, sweeper. Correlated clones
-# (phantom, fee-zone / late-window makers) stay menu-only for mid-run deploy
-# or manual selection.
-DEFAULT_INDICES = [1, 2, 4, 6, 7, 13]  # mom, meanrev, sniper, hybrid, arb, sweeper
+# Profit-mode default: sniper, market-neutral arb, sweeper.
+# Correlated clones / lag-residual stay menu-only until redeployed.
+DEFAULT_INDICES = [4, 7, 13]  # profit-mode: sniper, arb, sweeper
 
 
 def build_default_bots() -> list:
-    """Canonical default slate: mom, meanrev, sniper, hybrid, arb, sweeper."""
+    """Canonical default slate: sniper, arbitrage, sweeper (profit-mode)."""
     return _build_from_indices(DEFAULT_INDICES)
 
 

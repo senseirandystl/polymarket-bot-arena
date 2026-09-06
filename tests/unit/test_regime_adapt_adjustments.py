@@ -76,7 +76,7 @@ def test_low_vol_trend_style_mode_mild(monkeypatch):
     assert "mode=style" in a.reason
 
 
-def test_normal_regime_has_mid_band_prior(monkeypatch):
+def test_normal_regime_deprecated_mid_band_and_extra_drift(monkeypatch):
     class _Det:
         def snapshot(self):
             return {"regime_id": "high_vol_trend", "actionable": True}
@@ -85,8 +85,8 @@ def test_normal_regime_has_mid_band_prior(monkeypatch):
     )
     with _no_live_stats():
         a = adjustments("normal", "momentum")
-    assert a.mid_band_drift_min is not None
-    assert a.mid_band_drift_min >= 0.35
+    # Phase 1 honesty: these are no longer live levers.
+    assert a.mid_band_drift_min is None
     assert a.extra_drift_floor == 0.0
 
 

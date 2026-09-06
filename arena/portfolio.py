@@ -587,6 +587,42 @@ def _is_lockin_bot(name: str) -> bool:
     return n.startswith("sweeper")
 
 
+def sanitize_manual_overrides(
+    overrides: Optional[dict[str, float]],
+    *,
+    manual_lockin_pins: Optional[Sequence[str]] = None,
+) -> dict[str, float]:
+    """Drop leaked auto lock-in pins from persisted manual_overrides.
+
+    Auto lock-in is reapplied every ``allocate()`` at the current ``1/N``.
+    Older builds wrote those pins into ``manual_overrides``, so they stuck
+    after the roster grew (e.g. 0.20 from a 5-bot slate surviving a 10-bot
+    deploy). Only lock-in names listed in ``manual_lockin_pins`` (set by
+    ``set_manual_overrides``) are treated as true operator pins.
+    """
+    allowed = {str(n) for n in (manual_lockin_pins or ())}
+    out: dict[str, float] = {}
+    dropped: list[str] = []
+    for k, v in (overrides or {}).items():
+        try:
+            fv = float(v)
+        except (TypeError, ValueError):
+            continue
+        if fv < 0:
+            continue
+        name = str(k)
+        if _is_lockin_bot(name) and name not in allowed:
+            dropped.append(name)
+            continue
+        out[name] = fv
+    if dropped:
+        logger.info(
+            "Dropped leaked auto lock-in overrides (refresh to 1/N): %s",
+            dropped,
+        )
+    return out
+
+
 def allocate(
     bot_names: Sequence[str],
     method: str = "kelly_portfolio",
@@ -603,14 +639,23 @@ def allocate(
     Lock-in bots (arbitrage + sweeper) are pinned to a fixed ``1/N`` share.
     Core directionals auto-adjust on the remaining mass. Manual overrides
     still win if the operator pins a lock-in bot explicitly.
+
+    Auto lock-in pins are **not** returned in ``manual_overrides`` — only
+    operator-supplied pins are persisted (avoids sticky 1/N across roster
+    growth).
     """
     names = list(dict.fromkeys(bot_names))  # stable unique
     method = method if method in METHODS else "equal"
     hours = float(effective_windows(hours)["long"])
     min_w = float(getattr(config, "PORTFOLIO_MIN_WEIGHT", 0.05))
     max_w = float(getattr(config, "PORTFOLIO_MAX_WEIGHT", 0.45))
-    overrides = {k: float(v) for k, v in (manual_overrides or {}).items()
-                 if k in names and float(v) >= 0}
+    # Operator pins only — auto lock-in is applied below and must not be
+    # written back into persisted manual_overrides.
+    operator_overrides = {
+        k: float(v) for k, v in (manual_overrides or {}).items()
+        if k in names and float(v) >= 0
+    }
+    overrides = dict(operator_overrides)
 
     metrics = compute_metrics(names, hours)
     market_rets = _market_returns_by_bot(names, hours)
@@ -631,6 +676,7 @@ def allocate(
             and not _is_lockin_bot(n)
         ):
             overrides.pop(n, None)
+            operator_overrides.pop(n, None)
 
     # Pin lock-in (arb + sweeper) at 1/N so cold-start is even across the
     # slate and Kelly only moves Core capital. Do not shrink idle arb to
@@ -639,9 +685,11 @@ def allocate(
     equal_share = 1.0 / n_roster
     pin_lockin = bool(getattr(config, "PORTFOLIO_LOCKIN_FIXED_EQUAL",
                               getattr(config, "PORTFOLIO_ARB_FIXED_EQUAL", True)))
+    auto_lockin: set[str] = set()
     for n in names:
         if _is_lockin_bot(n) and n not in overrides and pin_lockin:
             overrides[n] = equal_share
+            auto_lockin.add(n)
 
     # Split locked (manual + arb staple) vs free bots
     locked = {k: overrides[k] for k in overrides}
@@ -808,6 +856,31 @@ def allocate(
     edge_n = int(getattr(config, "PORTFOLIO_EDGE_PROVEN_MIN_N", 20))
     explore_set = set(explorers)
 
+    # Freeze locks (respect global max only) before lean-slate unproven adjust.
+    locked_now = {
+        n: min(float(weights.get(n, 0.0)), max_w) for n in locked
+    }
+    locked_sum_now = sum(locked_now.values())
+    free_mass_now = max(0.0, 1.0 - locked_sum_now)
+
+    # Lean-slate cold-start: with a small roster (esp. one free core) and
+    # lock-ins already pinning ~2/3, do not leave ~13% idle under
+    # PORTFOLIO_UNPROVEN_MAX_WEIGHT. Raise the unproven cap so free mass
+    # is fully absorbable. Founder/lock-in pins stay absolute.
+    n_roster = len(names)
+    free_core = [n for n in free_names if n not in explore_set]
+    if (
+        n_roster <= 3
+        and free_names
+        and free_mass_now > 1e-9
+        and unproven_max > 0
+    ):
+        lockin_heavy = locked_sum_now + 1e-9 >= (2.0 / max(n_roster, 1))
+        sole_or_few = len(free_core) <= 1 or len(free_names) <= 1
+        if lockin_heavy or sole_or_few:
+            n_absorb = max(len(free_core) or len(free_names), 1)
+            unproven_max = max(unproven_max, free_mass_now / n_absorb)
+
     def _bot_cap(n: str) -> float:
         m = metrics.get(n) or {}
         proven = (
@@ -827,13 +900,6 @@ def allocate(
         if n in explore_set:
             cap = min(cap, explore_cap)
         return float(cap)
-
-    # Freeze locks (respect global max only)
-    locked_now = {
-        n: min(float(weights.get(n, 0.0)), max_w) for n in locked
-    }
-    locked_sum_now = sum(locked_now.values())
-    free_mass_now = max(0.0, 1.0 - locked_sum_now)
 
     # Clip free bots to caps, then scale *veterans* to fill free mass
     # (explorers keep their pre-cap allotment ≤ explore_cap).
@@ -929,6 +995,37 @@ def allocate(
     # Ensure every name present
     for n in names:
         weights.setdefault(n, 0.0)
+    # Lean-slate / residual: if caps allow, force sum==1.0 (no idle cash).
+    # Never touch locked pins — only scale free names when locks already set.
+    total_w = sum(float(weights.get(n, 0.0)) for n in names)
+    if abs(total_w - 1.0) > 1e-6 and free_names and total_w > 1e-9:
+        free_sum = sum(float(weights.get(n, 0.0)) for n in free_names)
+        target_free = max(0.0, 1.0 - sum(float(weights.get(n, 0.0)) for n in locked))
+        if free_sum > 1e-12 and target_free > 1e-12:
+            sc = target_free / free_sum
+            for n in free_names:
+                weights[n] = float(weights.get(n, 0.0)) * sc
+            # Re-clip to caps once; leftover idle only if every free bot capped.
+            overflow = 0.0
+            for n in free_names:
+                cap = _bot_cap(n)
+                w = float(weights.get(n, 0.0))
+                if w > cap + 1e-12:
+                    overflow += w - cap
+                    weights[n] = cap
+            if overflow > 1e-9:
+                under = [
+                    n for n in free_names
+                    if float(weights.get(n, 0.0)) + 1e-12 < _bot_cap(n)
+                ]
+                head = {
+                    n: _bot_cap(n) - float(weights.get(n, 0.0)) for n in under
+                }
+                hs = sum(max(0.0, h) for h in head.values()) or 1.0
+                for n in under:
+                    weights[n] = float(weights.get(n, 0.0)) + overflow * (
+                        max(0.0, head[n]) / hs
+                    )
     weights = {k: round(float(v), 6) for k, v in weights.items()}
 
     # Compact correlation for JSON (upper triangle pairs as "a|b")
@@ -939,10 +1036,19 @@ def allocate(
             if abs(rho) >= 0.05:
                 corr_pairs[f"{a}|{b}"] = round(rho, 3)
 
+    # Persist only operator pins. Auto lock-in is recomputed each allocate
+    # at the current 1/N — writing it into manual_overrides made pins sticky
+    # across mid-run deploys (roster 5 → 10 left arb/sweeper at 0.20 each).
+    persisted_overrides = {
+        k: round(float(locked[k]), 6)
+        for k in operator_overrides
+        if k in locked and k not in auto_lockin
+    }
+
     return {
         "weights": weights,
         "auto_weights": {k: round(v, 6) for k, v in auto_weights.items()},
-        "manual_overrides": {k: round(v, 6) for k, v in locked.items()},
+        "manual_overrides": persisted_overrides,
         "metrics": metrics,
         "correlations": corr_pairs,
         "method": method,
@@ -962,6 +1068,9 @@ def _default_state() -> dict[str, Any]:
         "weights": {},
         "auto_weights": {},
         "manual_overrides": {},
+        # Lock-in names explicitly pinned by the operator (dashboard). Auto
+        # 1/N lock-in pins must never land here — see sanitize_manual_overrides.
+        "manual_lockin_pins": [],
         "metrics": {},
         "correlations": {},
         "last_rebalance_at": None,
@@ -1003,6 +1112,15 @@ def load_state() -> dict[str, Any]:
                 "correlations"):
         if not isinstance(base.get(key), dict):
             base[key] = {}
+    pins = base.get("manual_lockin_pins")
+    if not isinstance(pins, list):
+        pins = []
+    base["manual_lockin_pins"] = [str(p) for p in pins]
+    # Drop leaked auto lock-in pins from older builds (sticky 1/N bug).
+    base["manual_overrides"] = sanitize_manual_overrides(
+        base.get("manual_overrides") or {},
+        manual_lockin_pins=base["manual_lockin_pins"],
+    )
     return base
 
 
@@ -1115,7 +1233,12 @@ def rebalance(
     wins = effective_windows(state.get("window_hours"))
     hours = float(wins["long"])
     state["window_hours"] = hours
-    overrides = state.get("manual_overrides") or {}
+    lockin_pins = list(state.get("manual_lockin_pins") or [])
+    overrides = sanitize_manual_overrides(
+        state.get("manual_overrides") or {},
+        manual_lockin_pins=lockin_pins,
+    )
+    state["manual_overrides"] = overrides
     prev_weights = dict(state.get("weights") or {})
 
     # Regime-conditioning (Layer 3): when the toggle is on and the CURRENT
@@ -1171,10 +1294,15 @@ def rebalance(
         regime_edges=regime_edges,
     )
 
+    persisted_ov = dict(result["manual_overrides"] or {})
+    # Keep lock-in allow-list only for pins that still exist after allocate.
     state.update({
         "weights": result["weights"],
         "auto_weights": result["auto_weights"],
-        "manual_overrides": result["manual_overrides"],
+        "manual_overrides": persisted_ov,
+        "manual_lockin_pins": [
+            p for p in lockin_pins if p in persisted_ov
+        ],
         "metrics": result["metrics"],
         "correlations": result["correlations"],
         "method": result["method"],
@@ -1310,7 +1438,11 @@ def set_method(method: str) -> dict[str, Any]:
 
 
 def set_manual_overrides(overrides: dict[str, float], *, merge: bool = False) -> dict[str, Any]:
-    """Set manual weight pins. Pass ``{}`` to clear all. Values in [0, 1]."""
+    """Set manual weight pins. Pass ``{}`` to clear all. Values in [0, 1].
+
+    Lock-in bots (arb/sweeper) included here are marked in
+    ``manual_lockin_pins`` so they are not stripped as leaked auto-pins.
+    """
     state = load_state()
     cleaned: dict[str, float] = {}
     for k, v in (overrides or {}).items():
@@ -1327,8 +1459,26 @@ def set_manual_overrides(overrides: dict[str, float], *, merge: bool = False) ->
             if float(v) <= 0:
                 cur.pop(str(k), None)
         state["manual_overrides"] = cur
+        lockin_pins = {
+            str(p) for p in (state.get("manual_lockin_pins") or [])
+        }
+        for k in cleaned:
+            if _is_lockin_bot(k):
+                lockin_pins.add(k)
+        for k, v in list(overrides.items()):
+            if float(v) <= 0 and _is_lockin_bot(str(k)):
+                lockin_pins.discard(str(k))
+        state["manual_lockin_pins"] = sorted(lockin_pins)
     else:
         state["manual_overrides"] = cleaned
+        state["manual_lockin_pins"] = sorted(
+            k for k in cleaned if _is_lockin_bot(k)
+        )
+    # Sanitize with the (possibly updated) allow-list before rebalance.
+    state["manual_overrides"] = sanitize_manual_overrides(
+        state.get("manual_overrides") or {},
+        manual_lockin_pins=state.get("manual_lockin_pins") or [],
+    )
     save_state(state)
     return rebalance(force=True, reason="manual_override")
 

@@ -71,7 +71,7 @@ DEFAULT_PARAMS = {
     # (signal-level dynamic weighting; drift is never tilted down).
     "signal_regime_tilt": 0.4,
     "position_size_pct": 0.06,
-    "min_confidence": 0.5,
+    "min_confidence": 0.45,  # Pass B (was 0.5)
 }
 
 # Sub-strategy -> (weight param, live bot-name prefix, trend sensitivity).

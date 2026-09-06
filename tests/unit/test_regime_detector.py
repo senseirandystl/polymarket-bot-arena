@@ -471,3 +471,28 @@ def test_regime_conditioned_fitness_penalizes_single_regime_bleed(monkeypatch):
     r2 = multi_objective_fitness(robust2)
     assert t2["pnl"] > r2["pnl"]  # toxic has higher raw P&L
     assert r2["regime_robustness"] > t2["regime_robustness"]
+
+
+def test_dual_venue_ticks_do_not_spam_rollover(monkeypatch, caplog):
+    """Polymarket <-> Kalshi alternation is dual-venue polling, not a rollover."""
+    import logging
+    det = reset_detector()
+    monkeypatch.setattr(det, "_persist", lambda force=False: None)
+    monkeypatch.setattr(det, "_ensure_loaded", lambda: None)
+
+    pm = "0xabc"
+    kalshi = "kalshi:KXBTC15M-TEST"
+    with caplog.at_level(logging.INFO, logger="signals.regime_detector"):
+        for mid in (pm, kalshi, pm, kalshi, pm):
+            det.update(_quiet_range(), cvd=0.0, obi=0.0,
+                       vol_score=0.15, trend_score=0.15, market_id=mid)
+
+    assert not any("REGIME MARKET ROLLOVER" in r.message for r in caplog.records)
+
+    # Same-exchange window change still logs once.
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger="signals.regime_detector"):
+        det.update(_quiet_range(), cvd=0.0, obi=0.0,
+                   vol_score=0.15, trend_score=0.15, market_id="0xdef")
+    assert any("REGIME MARKET ROLLOVER" in r.message for r in caplog.records)
+    assert any("0xabc -> 0xdef" in r.message for r in caplog.records)

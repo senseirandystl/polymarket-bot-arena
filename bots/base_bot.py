@@ -605,8 +605,10 @@ class BaseBot(ABC):
         return raw
 
     def _signal_profile(self) -> dict:
-        return self.STRATEGY_SIGNAL_PROFILE.get(
-            self.strategy_type, self.DEFAULT_SIGNAL_PROFILE)
+        # Class defaults + core-tuner lane_overrides (applied in SignalLab.blend).
+        # Desk does not overlay this — it invents genomes, not lane weights.
+        return dict(self.STRATEGY_SIGNAL_PROFILE.get(
+            self.strategy_type, self.DEFAULT_SIGNAL_PROFILE))
 
     def _model_prob_yes(self, lanes: dict) -> float:
         """Model probability of YES from normalized signal lanes.
@@ -820,9 +822,8 @@ class BaseBot(ABC):
             ).get("total_trades", 0)
             self._perf_cache = (now_ts, total_resolved)
         # Live learning disabled (spec R5): the raw-YES-WR bias was
-        # anti-predictive. Outcomes are still recorded for the redesign, but the
-        # bias contributes 0 to live decisions until the edge-calibrated learner
-        # replaces it.
+        # anti-predictive. When LEARNING_ENABLED is False, bias weight is 0 and
+        # record_outcome skips bot_learning writes (enable for redesign/tests).
         if config.LEARNING_ENABLED:
             learning_weight = min(0.30, 0.05 + total_resolved * 0.005)
         else:
@@ -1044,7 +1045,7 @@ class BaseBot(ABC):
         # Lean and edge use p_yes (Φ / empirical), not the tanh blend.
         model_lean = abs(p_yes - 0.5)
         _combo_used = False
-        lean_min = float(config.MODEL_LEAN_MIN)
+        lean_min = float(config.effective_float("MODEL_LEAN_MIN", config.MODEL_LEAN_MIN))
         try:
             from arena.learned_rules import skip_softening as _skip_soft
             _wl = _skip_soft("weak_lean")
@@ -1192,10 +1193,14 @@ class BaseBot(ABC):
         try:
             from exchanges import KALSHI, exchange_of as _ex_of
             if _ex_of(market) == KALSHI:
-                min_pct = float(getattr(
-                    config, "KALSHI_DRIFT_MIN_ABS_PCT", min_pct) or min_pct)
-                min_z = float(getattr(
-                    config, "KALSHI_DRIFT_MIN_ABS_Z", min_z) or min_z)
+                min_pct = _gf(
+                    "KALSHI_DRIFT_MIN_ABS_PCT",
+                    float(getattr(config, "KALSHI_DRIFT_MIN_ABS_PCT", min_pct) or min_pct),
+                )
+                min_z = _gf(
+                    "KALSHI_DRIFT_MIN_ABS_Z",
+                    float(getattr(config, "KALSHI_DRIFT_MIN_ABS_Z", min_z) or min_z),
+                )
         except Exception:
             pass
         signed_drift = (
@@ -1432,7 +1437,7 @@ class BaseBot(ABC):
         # instead of stepping to full trust at 0.10.
         # Learned GO rules multiply min_edge by edge_mult (<1 eases the bar
         # so historically good contexts can fire on thinner edges).
-        min_edge = self.MIN_EDGE.get(self.strategy_type, config.MIN_EDGE_DEFAULT)
+        min_edge = self.MIN_EDGE.get(self.strategy_type, config.effective_float("MIN_EDGE_DEFAULT", config.MIN_EDGE_DEFAULT))
         mult_max = getattr(config, "FLOW_ONLY_EDGE_MULT_MAX", 2.0)
         full_trust = max(getattr(config, "FLOW_ONLY_DRIFT_FULL_TRUST", 0.25), 1e-6)
         # Regime can raise the |drift| needed for full flow trust (esp.

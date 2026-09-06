@@ -39,15 +39,23 @@ logger = logging.getLogger("bots.arbitrage")
 DEFAULT_PARAMS = {
     "min_margin": config.ARBITRAGE_MIN_MARGIN,
     "target_shares": config.ARBITRAGE_TARGET_SHARES,
+    # Decision requires extra cushion so 1s latency / book walk does not
+    # produce phantom paper fills when edge evaporates before execute.
+    "decision_margin_buffer": 0.005,
+    # Abort execute unless both books still offer at least this many shares.
+    "min_book_shares": 5.0,
 }
 
 
 class ArbitrageBot(BaseBot):
     def __init__(self, name="arbitrage-v1", params=None, generation=0, lineage=None):
+        base = params if params is not None else DEFAULT_PARAMS.copy()
+        if params is None:
+            base = config.apply_paper_bot_params("arbitrage", base)
         super().__init__(
             name=name,
             strategy_type="arbitrage",
-            params=params or DEFAULT_PARAMS.copy(),
+            params=base,
             generation=generation,
             lineage=lineage,
         )
@@ -173,12 +181,18 @@ class ArbitrageBot(BaseBot):
                        "fee_per_pair": fee_per_pair, "shares": shares,
                        "net_cost": net_cost}
 
-        min_margin = self.strategy_params.get("min_margin", config.ARBITRAGE_MIN_MARGIN)
-        if edge < min_margin:
+        min_margin = self.strategy_params.get(
+            "min_margin",
+            config.effective_float("ARBITRAGE_MIN_MARGIN", config.ARBITRAGE_MIN_MARGIN),
+        )
+        buf = float(self.strategy_params.get("decision_margin_buffer", 0.005) or 0.0)
+        decision_floor = float(min_margin) + buf
+        if edge < decision_floor:
             return self._skip(
                 f"arb: no edge (yes_vwap={fy['avg_price']:.3f}+"
                 f"no_vwap={fn['avg_price']:.3f}, edge={edge:+.4f}/pair"
-                f"<{min_margin:.3f}, fees={fee_per_pair:.4f}/pair) "
+                f"<{decision_floor:.3f} (margin={min_margin:.3f}+buf={buf:.3f}), "
+                f"fees={fee_per_pair:.4f}/pair) "
                 f"@ {shares:.1f}sh",
                 edge=edge, signals=arb_signals,
             )
@@ -277,8 +291,14 @@ class ArbitrageBot(BaseBot):
         fn = simulate_fill_shares(no_book, target)
         shares = min(fy["shares"], fn["shares"])
         min_sh = 1 if is_kalshi else config.POLYMARKET_MIN_SHARES
-        if shares < min_sh:
-            return {"success": False, "reason": "arb_depth_gone"}
+        min_book = float(self.strategy_params.get("min_book_shares", 5.0) or 5.0)
+        need = max(float(min_sh), min_book)
+        if shares < need:
+            logger.info(
+                f"[{self.name}] ARB abort: depth {shares:.1f}sh < {need:.1f} "
+                f"(min_book_shares) — clearer book required"
+            )
+            return {"success": False, "reason": "arb_depth_insufficient"}
         # Re-match at the achievable share count on both legs.
         fy = simulate_fill_shares(yes_book, shares)
         fn = simulate_fill_shares(no_book, shares)
@@ -288,7 +308,10 @@ class ArbitrageBot(BaseBot):
 
         net_cost = fy["cost"] + fn["cost"] + fy["fee"] + fn["fee"]
         edge = (shares - net_cost) / shares if shares > 0 else -1.0
-        min_margin = self.strategy_params.get("min_margin", config.ARBITRAGE_MIN_MARGIN)
+        min_margin = self.strategy_params.get(
+            "min_margin",
+            config.effective_float("ARBITRAGE_MIN_MARGIN", config.ARBITRAGE_MIN_MARGIN),
+        )
         if edge < min_margin:
             logger.info(
                 f"[{self.name}] ARB edge gone at fill "

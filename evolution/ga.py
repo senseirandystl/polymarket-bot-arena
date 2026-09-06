@@ -26,6 +26,8 @@ from evolution.diversity import is_diverse_enough
 logger = logging.getLogger("arena")
 
 # Strategy types never culled or mutated by the GA.
+_SKIP_EXEMPT_LOGGED = False
+
 EVOLUTION_EXEMPT_TYPES = frozenset({
     "arbitrage",
     "late_window_maker",
@@ -172,6 +174,30 @@ def effective_min_trades(trade_counts: list[int] | None = None) -> int:
     return mx
 
 
+
+def _early_cull_min_trades() -> int:
+    """Min trades before deep-red early cull may fire.
+
+    Paper Pass A raises the bar (``PAPER_GA_EARLY_CULL_MIN_TRADES``, default 30)
+    so thin samples survive long enough to gather fills. Live / paper-gates-off
+    keep ``GA_EARLY_CULL_MIN_TRADES``.
+    """
+    base = int(getattr(config, "GA_EARLY_CULL_MIN_TRADES", 15) or 15)
+    try:
+        active = bool(config.paper_gates_active())
+    except Exception:
+        active = False
+    if not active:
+        return base
+    paper = getattr(config, "PAPER_GA_EARLY_CULL_MIN_TRADES", None)
+    if paper is None:
+        return max(base, base * 2)
+    try:
+        return max(base, int(paper))
+    except (TypeError, ValueError):
+        return max(base, base * 2)
+
+
 def _survives_legacy_bar(
     ind: dict,
     *,
@@ -198,7 +224,7 @@ def _survives_legacy_bar(
     if n < min_n:
         if (
             bool(getattr(config, "GA_EARLY_CULL_ENABLED", True))
-            and n >= int(getattr(config, "GA_EARLY_CULL_MIN_TRADES", 15))
+            and n >= _early_cull_min_trades()
         ):
             early_pnl = float(getattr(config, "GA_EARLY_CULL_PNL", -15.0))
             early_gap = float(getattr(config, "GA_EARLY_CULL_BE_GAP", -0.10))
@@ -214,7 +240,7 @@ def _survives_legacy_bar(
     if n < configured_cap:
         if (
             bool(getattr(config, "GA_EARLY_CULL_ENABLED", True))
-            and n >= int(getattr(config, "GA_EARLY_CULL_MIN_TRADES", 15))
+            and n >= _early_cull_min_trades()
         ):
             early_pnl = float(getattr(config, "GA_EARLY_CULL_PNL", -15.0))
             early_gap = float(getattr(config, "GA_EARLY_CULL_BE_GAP", -0.10))
@@ -331,7 +357,12 @@ def run_ga_cycle(
     evolving = [b for b in bots if b.strategy_type not in EVOLUTION_EXEMPT_TYPES]
 
     if not evolving:
-        logger.info("  No evolvable bots — skipping GA")
+        global _SKIP_EXEMPT_LOGGED
+        if not _SKIP_EXEMPT_LOGGED:
+            logger.info(
+                "GA: only protected/exempt bots on roster — skipping mutation ceremony"
+            )
+            _SKIP_EXEMPT_LOGGED = True
         report = {
             "cycle": cycle_number,
             "skipped": True,
@@ -770,7 +801,36 @@ def run_ga_cycle(
                 "gate_reason": "all_attempts_failed",
             }
 
+        # Founder lock (Strategy Lab Phase 1): never retire protected bots.
+        try:
+            from signals.strategy_pipeline.founders import ga_may_retire
+            if not ga_may_retire(dead["name"]):
+                logger.info("GA skip retire protected founder %s", dead["name"])
+                continue
+        except Exception:
+            pass
         db.retire_bot(dead["name"])
+        # Phase 4 learning spine: autopsy non-protected retirements.
+        try:
+            from signals.strategy_pipeline.learning_spine import write_autopsy_from_bot
+            write_autopsy_from_bot(
+                {
+                    "name": dead.get("name"),
+                    "strategy_type": dead.get("strategy_type"),
+                    "params": dead.get("params") or {},
+                },
+                verdict="ga_cull",
+                stage="retired",
+                evidence={
+                    "source": "ga",
+                    "fitness": dead.get("fitness"),
+                    "pnl": dead.get("pnl"),
+                    "replaced_by": getattr(evolved, "name", None),
+                },
+                narrate=True,
+            )
+        except Exception as _spine_err:
+            logger.debug("GA spine autopsy skipped: %s", _spine_err)
         db.save_bot_config(
             evolved.name, evolved.strategy_type, evolved.generation,
             evolved.strategy_params, evolved.lineage,

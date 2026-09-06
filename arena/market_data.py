@@ -403,8 +403,8 @@ class MarketDataWarmer(threading.Thread):
             micro = microstructure.compute(yes_book, no_book)
             micro_spread = float(micro.get("micro_spread") or 0.0)
             micro_spread_score = float(micro.get("micro_spread_score") or 0.5)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("swallowed exception: %s", e)
 
         # CVD + PM: throttle while kill-switched.
         now = time.time()
@@ -437,8 +437,8 @@ class MarketDataWarmer(threading.Thread):
                     fc = flow_mod.compute(trades, now)
                     flow_decay = float(fc.get("flow_cvd_decay") or 0.0)
                     flow_whale = float(fc.get("flow_whale") or 0.0)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("swallowed exception: %s", e)
         else:
             cvd = self._last_cvd if self._last_flow_ts else float(prev.get("cvd", 0.0) or 0.0)
             pm = self._last_pm if self._last_flow_ts else {

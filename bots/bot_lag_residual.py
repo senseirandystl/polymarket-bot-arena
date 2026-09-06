@@ -3,7 +3,7 @@
 Collapses the sniper/maker lag thesis into one clean directional policy:
 
 1. Read signed ``btc_drift`` (YES-frame).
-2. Implied P = 0.5 + 0.5 * drift.
+2. Implied P via sniper path: Phi(z) / ``btc_implied_yes`` (``implied_side_prob``).
 3. Residual = implied − side mid (positive → market underprices that side).
 4. Trade only when residual ≥ min_residual, |drift| ≥ min_drift, mid ≤ max_mid.
 
@@ -15,18 +15,20 @@ from __future__ import annotations
 
 import config
 import polymarket_fills
-from bots.base_bot import BaseBot, data_quality_skip, strategy_decision
+from bots.base_bot import (
+    BaseBot, data_quality_skip, strategy_decision, implied_side_prob,
+)
 from bots.edge_calibration import quality_confidence
 from signals.lab import SignalView
 
 DEFAULT_PARAMS = {
-    "min_drift": 0.12,
-    "min_residual": 0.04,      # implied − mid (probability units)
-    "min_edge": 0.018,
+    "min_drift": 0.15,
+    "min_residual": 0.05,      # implied − mid (probability units)
+    "min_edge": 0.025,
     "max_side_mid": 0.58,
-    "min_side_mid": 0.30,
-    "position_size_pct": 0.07,
-    "min_confidence": 0.12,
+    "min_side_mid": 0.48,
+    "position_size_pct": 0.025,
+    "min_confidence": 0.20,
 }
 
 
@@ -60,7 +62,7 @@ class LagResidualBot(BaseBot):
         no_ask = market.get("no_ask") or no_mid
 
         drift = float(sv.btc_drift or 0.0)
-        min_drift = float(p.get("min_drift", 0.12))
+        min_drift = float(p.get("min_drift", 0.15))
         try:
             from arena.regime_adapt import adjustments as _regime_adj
             radj = _regime_adj(
@@ -72,7 +74,7 @@ class LagResidualBot(BaseBot):
                     "skip",
                     reasoning=f"lag: regime hard-skip {radj.label}",
                 )
-            min_drift += float(getattr(radj, "extra_drift_floor", 0.0) or 0.0)
+            # extra_drift_floor intentionally unused (always 0 in adapt).
         except Exception:
             radj = None
 
@@ -82,13 +84,16 @@ class LagResidualBot(BaseBot):
                 reasoning=f"lag: weak drift {drift:+.3f} < {min_drift:.2f}",
             )
 
-        implied_yes = 0.5 + 0.5 * drift
+        # Same Phi(z) / btc_implied_yes path as sniper — never 0.5+0.5*tanh.
+        implied_yes = implied_side_prob(
+            side="yes", signals=signals, signed_lane=drift,
+        )
         residual_yes = implied_yes - yes_mid
         residual_no = (1.0 - implied_yes) - no_mid
-        min_res = float(p.get("min_residual", 0.04))
+        min_res = float(p.get("min_residual", 0.05))
         max_mid = float(p.get("max_side_mid", 0.58))
-        min_mid = float(p.get("min_side_mid", 0.30))
-        min_edge = float(p.get("min_edge", 0.018))
+        min_mid = float(p.get("min_side_mid", 0.48))
+        min_edge = float(p.get("min_edge", 0.025))
 
         candidates = []
         if residual_yes >= min_res and min_mid <= yes_mid <= max_mid and drift > 0:
@@ -127,7 +132,7 @@ class LagResidualBot(BaseBot):
             bankroll = _sizing_bankroll(self.trading_mode)
         except Exception:
             bankroll = float(getattr(config, "PAPER_BANKROLL_DEFAULT", 200.0))
-        pct = float(p.get("position_size_pct", 0.07))
+        pct = float(p.get("position_size_pct", 0.025))
         amount = max(bankroll * pct, config.POLYMARKET_MIN_SHARES * ask * 1.15)
         shares = amount / max(ask, 0.01)
 

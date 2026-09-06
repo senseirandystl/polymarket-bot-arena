@@ -225,9 +225,22 @@ class TestSniper:
             lambda *a, **k: _Flat(),
             raising=False,
         )
-        # Dual-gate |z|≥0.35. Quiet adds quiet_drift_bump to the z floor.
-        drift = 0.37  # clears 0.35; quiet bar = 0.40 skips
-        extra = dict(btc_drift_pct=0.0016, btc_drift_z=0.36)
+        # Dual-gate |z| floor via gate_tuner (paper profile may lower base
+        # 0.35 -> 0.28). Quiet adds quiet_drift_bump to that effective floor.
+        import config as _cfg
+        try:
+            from arena.gate_tuner import gate_float as _gf
+            _min_z = float(_gf(
+                "DRIFT_MIN_ABS_Z",
+                getattr(_cfg, "DRIFT_MIN_ABS_Z", 0.35) or 0.35,
+            ))
+        except Exception:
+            _min_z = float(getattr(_cfg, "DRIFT_MIN_ABS_Z", 0.35) or 0.35)
+        _q_bump = 0.05
+        # z clears base dual-gate but fails quiet bar (min_z + bump).
+        _z = _min_z + (_q_bump * 0.4)  # e.g. 0.35->0.37; 0.28->0.30
+        drift = max(0.37, _min_z + 0.02)
+        extra = dict(btc_drift_pct=0.0016, btc_drift_z=_z)
         quiet = bot.make_decision(_sniper_market(), make_signals(
             btc_drift=drift, vol_regime={"regime": "quiet", "trend_score": 0.2},
             **extra))

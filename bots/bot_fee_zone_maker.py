@@ -11,7 +11,8 @@ not a spread-capture MM.
     "whichever side is in zone" alone (that bought expensive favorites).
   * Edge priced on ask; lag rule: mid must still lag implied_P enough.
   * Size via calibrated Kelly (not flat %); conf from structure not zone depth.
-  * Tighter zone [0.58, 0.78] for better BE after fees.
+  * Zone [0.58, 0.72] clamped to HIGH_PRICE_GUARD so entries aren't
+    rejected by the shared price ceiling after zone membership.
 """
 
 from __future__ import annotations
@@ -19,7 +20,7 @@ from __future__ import annotations
 import config
 import learning
 import polymarket_fills
-from bots.base_bot import BaseBot, strategy_decision
+from bots.base_bot import BaseBot, strategy_decision, implied_side_prob
 from bots.edge_calibration import quality_confidence
 from bots.maker_utils import maker_kelly_amount, mid_ask_gap_ok, resolve_side_exec
 from signals.lab import SignalView
@@ -34,7 +35,7 @@ DEFAULT_PARAMS = {
     # Tighter than the old 0.56–0.86 band: extremes either thin margin or
     # underdog fights. Fee still ≥ ~100 bps through most of this range.
     "min_price_zone": 0.58,
-    "max_price_zone": 0.78,
+    "max_price_zone": 0.72,  # <= HIGH_PRICE_GUARD (was 0.78; avoid zone vs HPG contradiction)
     "min_fee_bps": 90,
     "min_drift": 0.18,          # signed drift toward quoted side
     "min_edge": 0.025,          # implied_P − ask − fee
@@ -119,7 +120,10 @@ class FeeZoneMakerBot(BaseBot):
                 f"fzm: fee {fee_bps:.0f}bps < {min_fee:.0f}bps at ask={side_exec:.2f}")
 
         signed_drift = drift if side == "yes" else -drift
-        implied_p = 0.5 + 0.5 * signed_drift
+        # Same Phi(z) / btc_implied_yes path as sniper — never 0.5+0.5*drift.
+        implied_p = implied_side_prob(
+            side=side, signals=signals, signed_lane=drift,
+        )
         # Lag rule: crowd mid must still sit below implied (market lags drift).
         max_mid_vs = float(p.get("max_mid_vs_implied", 0.02))
         if side_mid > implied_p - max_mid_vs:

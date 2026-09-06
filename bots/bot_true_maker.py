@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import config
 import polymarket_fills
-from bots.base_bot import BaseBot, strategy_decision
+from bots.base_bot import BaseBot, strategy_decision, implied_side_prob
 from bots.edge_calibration import quality_confidence
 from bots.maker_utils import mid_ask_gap_ok, resolve_side_exec
 from signals.lab import SignalView
@@ -85,7 +85,10 @@ class TrueMakerBot(BaseBot):
         if not ok:
             return _hold(f"true_maker: {gap_why}")
 
-        implied = 0.5 + 0.5 * abs(drift)
+        # Same Phi(z) / btc_implied_yes path as sniper — never 0.5+0.5*|drift|.
+        implied = implied_side_prob(
+            side=side, signals=signals, signed_lane=drift,
+        )
         residual = implied - mid
         fee = polymarket_fills.fee_per_share(mid, is_maker=True)  # maker fee ≈ 0
         edge = residual - fee

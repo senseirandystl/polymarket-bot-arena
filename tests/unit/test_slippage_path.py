@@ -99,7 +99,13 @@ def test_without_warm_book_slippage_band_still_rejects_moved_fetch(
 
 def test_late_window_maker_entry_price_uses_ask_not_mid():
     bot = LateWindowMakerBot()
-    signals = {"prices": [100.0, 100.0, 100.2], "btc_drift": 0.5}
+    # Honest Phi path needs btc_implied_yes (not 0.5+0.5*|drift|).
+    signals = {
+        "prices": [100.0, 100.0, 100.2],
+        "btc_drift": 0.5,
+        "btc_implied_yes": 0.85,
+        "btc_drift_z": 2.0,
+    }
     # mid 0.65, ask 0.68 — expected fill is the ask.
     market = {
         "current_price": 0.65,

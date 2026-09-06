@@ -754,7 +754,7 @@ tbody tr:hover{background:rgba(0,255,156,.035)}
             <div class="eyebrow">Research</div>
             <button class="nav-item" data-tab="signal-lab" onclick="switchTab('signal-lab')">
                 <span class="glyph">⚗</span>
-                <span class="nav-text"><b>Signal Lab</b><small>Lanes &amp; validation</small></span>
+                <span class="nav-text"><b>Lab</b><small>Signals &amp; strategies</small></span>
                 <span class="nav-badge" id="badge-signal-lab"></span>
             </button>
         </div>
@@ -808,6 +808,7 @@ tbody tr:hover{background:rgba(0,255,156,.035)}
                 <div class="ops-chip info" id="ops-alloc"><div class="lbl">Allocation</div><div class="val">…</div><div class="sub">—</div></div>
                 <div class="ops-chip info" id="ops-evo"><div class="lbl">Evolution</div><div class="val">…</div><div class="sub">—</div></div>
                 <div class="ops-chip info" id="ops-size"><div class="lbl">Bankroll / Kelly</div><div class="val">…</div><div class="sub">—</div></div>
+                <div class="ops-chip info" id="ops-paper-gates" title="Paper gate profile (Pass A). Live mode always off."><div class="lbl">Paper gates</div><div class="val">…</div><div class="sub">—</div></div>
             </div>
         </div>
 
@@ -995,7 +996,7 @@ tbody tr:hover{background:rgba(0,255,156,.035)}
             </table>
         </div>
 
-        <div class="section-title">Skips <span style="color:#5f9c78;font-size:11px;text-transform:none;letter-spacing:0;">&mdash; why the arena sat flat</span></div>
+        <div class="section-title">Skips <span id="skips-subtitle" style="color:#5f9c78;font-size:11px;text-transform:none;letter-spacing:0;">&mdash; why the arena sat flat</span></div>
         <div class="card">
             <table id="skips-table">
                 <thead><tr><th>Reason</th><th>Count</th></tr></thead>
@@ -1045,8 +1046,14 @@ tbody tr:hover{background:rgba(0,255,156,.035)}
         </div>
     </div>
 
-    <!-- ===== SIGNAL LAB TAB ===== -->
+    <!-- ===== LAB TAB (Signals + Strategies) ===== -->
     <div class="tab-content hidden" id="tab-signal-lab">
+        <div class="chip-btn-row" id="lab-subnav" style="margin-bottom:14px;gap:8px;flex-wrap:wrap;align-items:center">
+            <button type="button" class="chip-btn primary" id="lab-sub-signals" onclick="switchLabSub('signals')">Signals</button>
+            <button type="button" class="chip-btn" id="lab-sub-strategies" onclick="switchLabSub('strategies')">Strategies</button>
+            <span id="lab-sub-hint" style="color:#5f9c78;font-size:12px;margin-left:4px">Lane scorecard, proposals, harness</span>
+        </div>
+        <div id="lab-pane-signals">
         <div class="card" id="auto-approve-card" style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px;margin-bottom:14px">
             <div>
                 <div style="font-weight:600">Closed-loop auto-approve</div>
@@ -1134,6 +1141,43 @@ tbody tr:hover{background:rgba(0,255,156,.035)}
                 <div style="color:#5f9c78">No validation run recorded yet &mdash; click <b>Run Validation</b> above (takes a few minutes; results and any proposals appear here when it finishes).</div>
             </div>
         </details>
+        </div><!-- /lab-pane-signals -->
+
+        <div id="lab-pane-strategies" class="hidden">
+            <div class="card dense" style="margin-bottom:12px">
+                <div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center;justify-content:space-between">
+                    <div style="color:#5f9c78;font-size:12px;max-width:640px">
+                        Strategy Pipeline: research to backtest to (optional paper) to ready to live.
+                        Paper slots default <b>0</b> (hold at backtested). Auto-promote-to-live default <b>off</b>.
+                    </div>
+                    <div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center">
+                        <button type="button" class="chip-btn" id="lab-pipe-pause-btn" onclick="labPipeTogglePause()">Pause pipeline</button>
+                        <button type="button" class="chip-btn primary" onclick="labPipeTick()">Run one cycle</button>
+                        <button type="button" class="chip-btn" onclick="loadStrategyPipeline()">Refresh</button>
+                    </div>
+                </div>
+                <div id="lab-pipe-status" style="color:#5f9c78;font-size:12px;margin-top:8px">Pipeline: ...</div>
+                <div id="lab-pipe-counts" style="display:flex;flex-wrap:wrap;gap:8px;margin-top:10px"></div>
+                <div id="lab-pipe-last" style="color:#5f9c78;font-size:11px;margin-top:8px"></div>
+            </div>
+
+            <div class="section-title">Ready queue <span style="color:#5f9c78;font-size:11px;text-transform:none;letter-spacing:0;">- <b>ready</b> for promote-to-live; also lists <b>backtested</b> (Approve paper when slots &gt; 0)</span></div>
+            <div class="card" id="lab-ready-queue-card">
+                <div style="color:#5f9c78">Loading...</div>
+            </div>
+
+            <div class="section-title">Hypotheses by stage</div>
+            <div class="card" style="overflow-x:auto">
+                <table>
+                    <thead><tr>
+                        <th>Name</th><th>Primitive</th><th>Stage</th><th>Thesis</th><th>Result</th><th></th>
+                    </tr></thead>
+                    <tbody id="lab-hyp-tbody">
+                        <tr><td colspan="6" style="color:#5f9c78">Loading...</td></tr>
+                    </tbody>
+                </table>
+            </div>
+        </div><!-- /lab-pane-strategies -->
     </div>
 
     <!-- ===== SETTINGS TAB ===== -->
@@ -1587,6 +1631,51 @@ tbody tr:hover{background:rgba(0,255,156,.035)}
             </div>
         </div>
 
+        <div class="settings-section" id="strategy-lab-settings">
+            <h3>Strategy Lab</h3>
+            <div class="settings-blurb">
+                Pipeline control plane (<code>strategy_lab_control</code>). Paper slots and auto-promote
+                default off/zero - raise carefully. Founder locks keep sniper / arbitrage / sweeper from
+                Lab/GA retirement. LLM provider is shown as configured vs none (no secrets).
+            </div>
+            <div class="cred-row">
+                <label>Paper slots<small>STRATEGY_LAB_PAPER_SLOTS - current <span id="lab-set-slots-cur">-</span></small></label>
+                <input type="number" id="lab-set-paper-slots" min="0" max="20" step="1" placeholder="0">
+                <button class="btn btn-primary" onclick="saveLabPaperSlots()">Save slots</button>
+            </div>
+            <div class="cred-row">
+                <label>Auto-promote to live<small>STRATEGY_LAB_AUTO_PROMOTE - default off</small></label>
+                <select id="lab-set-auto-promote" style="background:#050806;color:#bff0d2;border:1px solid #16301f;border-radius:6px;padding:8px 10px;font-family:inherit">
+                    <option value="0">Off</option>
+                    <option value="1">On</option>
+                </select>
+                <button class="btn btn-primary" onclick="saveLabAutoPromote()">Save</button>
+            </div>
+            <div class="cred-row">
+                <label>Pause pipeline<small>Stops LabHost ticks</small></label>
+                <select id="lab-set-paused" style="background:#050806;color:#bff0d2;border:1px solid #16301f;border-radius:6px;padding:8px 10px;font-family:inherit">
+                    <option value="0">Running</option>
+                    <option value="1">Paused</option>
+                </select>
+                <button class="btn btn-primary" onclick="saveLabPaused()">Save</button>
+            </div>
+            <div class="cred-row">
+                <label>LLM provider<small>Status only - no API keys shown</small></label>
+                <span id="lab-set-llm-status" class="cred-status missing">...</span>
+                <select id="lab-set-llm" style="background:#050806;color:#bff0d2;border:1px solid #16301f;border-radius:6px;padding:8px 10px;font-family:inherit">
+                    <option value="none">none</option>
+                    <option value="ollama">ollama</option>
+                    <option value="grok">grok</option>
+                </select>
+                <button class="btn btn-secondary" onclick="saveLabLlm()">Set provider</button>
+            </div>
+            <div style="margin-top:12px;color:#5f9c78;font-size:12px;margin-bottom:6px">Founder locks (protected bots)</div>
+            <div id="lab-founder-locks" style="display:flex;flex-direction:column;gap:8px">
+                <div style="color:#5f9c78;font-size:12px">Loading...</div>
+            </div>
+            <div class="test-result" id="lab-settings-result" style="margin-top:8px"></div>
+        </div>
+
         <div class="actions-row" style="border-top: 1px solid #16301f; padding-top: 16px;">
             <button class="btn btn-primary" onclick="saveCredentials()">Save All</button>
             <button class="btn btn-secondary" onclick="refreshSettings()">Reload From Disk</button>
@@ -1756,7 +1845,11 @@ function switchTab(name) {
     if (window.matchMedia('(max-width:880px)').matches) closeNav();
     document.querySelector('.content').scrollTo ? window.scrollTo(0, 0) : null;
     if (name === 'settings') refreshSettings();
-    if (name === 'signal-lab') { loadSignalLab(); loadHybridMeta(); loadLearnedRules(); pollValidation(); }
+    if (name === 'signal-lab') {
+        const sub = window._labSub || 'signals';
+        if (sub === 'strategies') loadStrategyPipeline();
+        else { loadSignalLab(); loadHybridMeta(); loadLearnedRules(); pollValidation(); }
+    }
 }
 
 // Drawer: persistent on desktop, overlay on mobile. `nav-open` on <body> is the
@@ -1976,6 +2069,7 @@ async function refreshSettings() {
     loadTandem();
     loadPortfolio();
     loadAlerts();
+    loadLabSettings();
 }
 
 // ---------- Ops command center / health / quick capital ----------
@@ -2158,9 +2252,38 @@ function updateOps(ops) {
         }
     }
 
+    // Paper gate profile chip (Pass A data-gather)
+    const pg = ops.paper_gates || {};
+    const pgEl = document.getElementById('ops-paper-gates');
+    const pgOv = pg.overrides || {};
+    if (pgEl) {
+        const tipParts = [];
+        for (const [k, v] of Object.entries(pgOv)) {
+            if (!v) continue;
+            const eff = v.effective != null ? v.effective : v;
+            const base = v.base;
+            tipParts.push(v.overridden
+                ? `${k}: ${eff} (base ${base})`
+                : `${k}: ${eff}`);
+        }
+        pgEl.title = tipParts.length
+            ? ('Paper gates overrides: ' + tipParts.join(' | '))
+            : (pg.active ? 'Paper gate profile active' : (pg.reason || 'Paper gates off'));
+    }
+    if (pg.active) {
+        const nOv = Object.values(pgOv).filter(v => v && v.overridden).length;
+        _setOpsChip('ops-paper-gates', 'ok', pg.profile || 'on',
+            nOv ? (nOv + ' override(s)') : 'active');
+    } else {
+        _setOpsChip('ops-paper-gates', 'info', 'off',
+            pg.reason === 'live_mode' ? 'live mode'
+                : (pg.profile && pg.profile !== 'off' ? String(pg.profile) : 'base'));
+    }
+
     // Lane health matrix (sign accuracy by lean side)
     updateLaneHealth(ops.signals || {});
 }
+
 
 /** @type {{mode: string, payload: object|null}} */
 let _laneHealthUI = { mode: 'follow', payload: null };
@@ -3099,7 +3222,18 @@ function updateRisk(r) {
             }).join('');
         }
     }
-    _riskEventsCache = r.events || [];
+    // Default-open bot table when any bot is paused (ops visibility).
+    try {
+        const anyPaused = names.some(n => (bots[n] || {}).status === 'paused');
+        if (anyPaused) {
+            _riskBotsExpanded = true;
+            const wrap = document.getElementById('risk-bots-wrap');
+            const btn = document.getElementById('risk-bots-toggle');
+            if (wrap) wrap.classList.remove('collapsed');
+            if (btn) btn.textContent = 'Hide bots ▴';
+        }
+    } catch (e) { /* ignore */ }
+        _riskEventsCache = r.events || [];
     _renderRiskEvents();
 }
 
@@ -3757,7 +3891,22 @@ function updateEntryBuckets(buckets) {
 }
 
 function updateSkips(skips) {
-    const entries = Object.entries(skips || {}).sort((a, b) => b[1] - a[1]);
+    // New /api/skips shape: {counts, hours, top_reasons, ...}. Flat dict still OK.
+    const payload = skips || {};
+    const counts = (payload.counts && typeof payload.counts === 'object'
+        && !Array.isArray(payload.counts))
+        ? payload.counts
+        : payload;
+    const entries = Object.entries(counts || {})
+        .filter(([, c]) => typeof c === 'number' || (typeof c === 'string' && c !== '' && !isNaN(Number(c))))
+        .sort((a, b) => Number(b[1]) - Number(a[1]));
+    const sub = document.getElementById('skips-subtitle');
+    if (sub) {
+        const hrs = payload.hours != null ? Number(payload.hours) : null;
+        sub.textContent = hrs != null && !isNaN(hrs)
+            ? ('- why the arena sat flat / last ' + hrs + 'h')
+            : '- why the arena sat flat';
+    }
     const tbody = document.querySelector('#skips-table tbody');
     if (tbody) {
         tbody.innerHTML = entries.length
@@ -5347,6 +5496,306 @@ async function pollValidation() {
     loadSignalLab();  // pull in the freshly recorded run + any new proposals
 }
 
+
+﻿// ---------- Lab sub-tabs (Signals | Strategies) ----------
+window._labSub = 'signals';
+window._labPipePaused = false;
+window._labAutoPromote = false;
+
+function switchLabSub(name) {
+    window._labSub = name === 'strategies' ? 'strategies' : 'signals';
+    const sig = document.getElementById('lab-pane-signals');
+    const strat = document.getElementById('lab-pane-strategies');
+    const bSig = document.getElementById('lab-sub-signals');
+    const bStrat = document.getElementById('lab-sub-strategies');
+    const hint = document.getElementById('lab-sub-hint');
+    if (sig) sig.classList.toggle('hidden', window._labSub !== 'signals');
+    if (strat) strat.classList.toggle('hidden', window._labSub !== 'strategies');
+    if (bSig) bSig.classList.toggle('primary', window._labSub === 'signals');
+    if (bStrat) bStrat.classList.toggle('primary', window._labSub === 'strategies');
+    if (hint) {
+        hint.textContent = window._labSub === 'strategies'
+            ? 'Hypothesis pipeline, ready queue, promote / deny'
+            : 'Lane scorecard, proposals, harness';
+    }
+    if (window._labSub === 'strategies') loadStrategyPipeline();
+    else { loadSignalLab(); loadHybridMeta(); loadLearnedRules(); pollValidation(); }
+}
+
+function _labEsc(s) {
+    return String(s == null ? '' : s).replace(/[&<>"']/g, c => (
+        {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]
+    ));
+}
+
+async function labPipePost(path, body) {
+    const r = await fetch(path, {
+        method: 'POST',
+        credentials: 'include',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(body || {}),
+    });
+    let data = {};
+    try { data = await r.json(); } catch (_) {}
+    return { ok: r.ok, status: r.status, data };
+}
+
+async function loadStrategyPipeline() {
+    const statusEl = document.getElementById('lab-pipe-status');
+    const countsEl = document.getElementById('lab-pipe-counts');
+    const lastEl = document.getElementById('lab-pipe-last');
+    const tbody = document.getElementById('lab-hyp-tbody');
+    const readyCard = document.getElementById('lab-ready-queue-card');
+    try {
+        const d = await fetchJSON('/api/lab/pipeline/status');
+        window._labPipePaused = !!d.paused;
+        window._labAutoPromote = !!d.auto_promote;
+        const pauseBtn = document.getElementById('lab-pipe-pause-btn');
+        if (pauseBtn) pauseBtn.textContent = d.paused ? 'Resume pipeline' : 'Pause pipeline';
+
+        const last = d.last_cycle || {};
+        const when = last.ts ? new Date(last.ts * 1000).toLocaleTimeString() : 'never';
+        if (statusEl) {
+            const en = d.enabled !== false;
+            statusEl.textContent =
+                (d.paused ? 'Pipeline: PAUSED' : (en ? 'Pipeline: running (~5 min ticks)' : 'Pipeline: disabled'))
+                + ' · llm ' + (d.provider || 'none')
+                + ' · paper slots ' + (d.paper_slots != null ? d.paper_slots : 0)
+                + ' · auto-promote ' + (d.auto_promote ? 'ON' : 'off');
+        }
+        const counts = d.pipeline_counts || {};
+        if (countsEl) {
+            const keys = Object.keys(counts);
+            const stageKeys = keys.length ? keys : ['idea','researched','coded','backtested','paper','ready','live','rejected'];
+            countsEl.innerHTML = stageKeys.map(k =>
+                '<span class="ops-chip info" style="min-width:auto"><span class="lbl">' + _labEsc(k) +
+                '</span><span class="val">' + (counts[k] != null ? counts[k] : 0) + '</span></span>'
+            ).join('');
+        }
+        if (lastEl) {
+            if (!last.ts) lastEl.textContent = 'Last cycle: never';
+            else lastEl.textContent =
+                'Last cycle ' + when +
+                ' · proposed ' + (last.proposed||0) +
+                ' · coded ' + (last.coded||0) +
+                ' · backtested ' + (last.backtested||0) +
+                ' · held@backtested ' + (last.held_backtested||0) +
+                ' · papered ' + (last.papered||0) +
+                ' · ready ' + (last.ready||0) +
+                ' · promoted ' + (last.promoted_live||0) +
+                ' · rejected ' + (last.rejected||0) +
+                ' · clones blocked ' + (last.clones_blocked||0);
+        }
+
+        const hyps = d.hypotheses || [];
+        const slots = Number(d.paper_slots || 0);
+        const queue = hyps.filter(h => h.stage === 'ready' || h.stage === 'backtested');
+        if (readyCard) {
+            if (!queue.length) {
+                readyCard.innerHTML = '<div style="color:#5f9c78;font-size:12px">No ready / backtested hypotheses in the queue.</div>';
+            } else {
+                readyCard.innerHTML = queue.map(h => {
+                    const spec = h.spec || {};
+                    const bt = h.backtest_summary || {};
+                    const auto = h.autopsy || {};
+                    const sid = _labEsc(h.spec_id);
+                    const stage = h.stage;
+                    let actions = '';
+                    if (stage === 'ready') {
+                        actions =
+                            '<button type="button" class="chip-btn primary" data-spec-id="' + sid +
+                            '" onclick="labPipePromote(this.dataset.specId)">Approve -> live</button>' +
+                            ' <button type="button" class="chip-btn" data-spec-id="' + sid +
+                            '" onclick="labPipeDeny(this.dataset.specId)">Deny</button>';
+                    } else if (stage === 'backtested') {
+                        if (slots > 0) {
+                            actions =
+                                '<button type="button" class="chip-btn primary" data-spec-id="' + sid +
+                                '" onclick="labPipeApprovePaper(this.dataset.specId)">Approve -> paper</button>' +
+                                ' <button type="button" class="chip-btn" data-spec-id="' + sid +
+                                '" onclick="labPipeDeny(this.dataset.specId)">Deny</button>';
+                        } else {
+                            actions =
+                                '<span style="color:#e8c36a;font-size:11px;margin-right:6px">slots=0 (raise in Settings)</span>' +
+                                ' <button type="button" class="chip-btn" data-spec-id="' + sid +
+                                '" onclick="labPipeDeny(this.dataset.specId)">Deny</button>';
+                        }
+                    }
+                    const result = auto.reason || bt.reason || (bt.passed ? 'backtest pass' : '') || '';
+                    return '<div style="display:flex;flex-wrap:wrap;gap:8px;align-items:flex-start;justify-content:space-between;border-bottom:1px solid #16301f;padding:10px 0">' +
+                        '<div style="min-width:200px;flex:1">' +
+                        '<div style="font-weight:600">' + _labEsc(h.name || h.spec_id) +
+                        ' <span style="color:#5f9c78;font-weight:400">· ' + _labEsc(stage) + '</span></div>' +
+                        '<div style="color:#5f9c78;font-size:12px">' + _labEsc(h.primitive || spec.primitive || '') +
+                        ' - ' + _labEsc(String(h.thesis || spec.thesis || '').slice(0,160)) + '</div>' +
+                        (result ? '<div style="color:#8fd4a8;font-size:11px;margin-top:4px">' + _labEsc(result) + '</div>' : '') +
+                        '</div><div style="white-space:nowrap">' + actions + '</div></div>';
+                }).join('');
+            }
+        }
+
+        if (tbody) {
+            tbody.innerHTML = hyps.length ? hyps.map(h => {
+                const spec = h.spec || {};
+                const bt = h.backtest_summary || {};
+                const auto = h.autopsy || {};
+                const result = auto.reason || bt.reason || h.status || '';
+                return '<tr>' +
+                    '<td>' + _labEsc(h.name || h.spec_id) + '</td>' +
+                    '<td>' + _labEsc(h.primitive || spec.primitive || '') + '</td>' +
+                    '<td>' + _labEsc(h.stage) + '</td>' +
+                    '<td>' + _labEsc(String(h.thesis || spec.thesis || '').slice(0,140)) + '</td>' +
+                    '<td>' + _labEsc(result) + '</td>' +
+                    '<td></td></tr>';
+            }).join('') : '<tr><td colspan="6" style="color:#5f9c78">No hypotheses yet - wait for a Lab tick or run one cycle.</td></tr>';
+        }
+    } catch (e) {
+        if (statusEl) statusEl.textContent = 'Pipeline: failed to load (' + e + ')';
+        if (tbody) tbody.innerHTML = '<tr><td colspan="6" style="color:#ff3b5c">Strategy pipeline API failed.</td></tr>';
+        if (readyCard) readyCard.innerHTML = '<div style="color:#ff3b5c">Ready queue failed to load.</div>';
+    }
+}
+
+async function labPipeTick() {
+    const r = await labPipePost('/api/lab/pipeline/tick', {});
+    await loadStrategyPipeline();
+    if (r.status === 409) {
+        const statusEl = document.getElementById('lab-pipe-status');
+        if (statusEl) statusEl.textContent = 'Pipeline: a tick is already running';
+    }
+}
+
+async function labPipeTogglePause() {
+    await labPipePost('/api/lab/pipeline/settings', { paused: !window._labPipePaused });
+    await loadStrategyPipeline();
+    loadLabSettings();
+}
+
+async function labPipePromote(id) {
+    if (!confirm('Promote this ready hypothesis to LIVE trading?')) return;
+    const r = await labPipePost('/api/lab/pipeline/promote', { spec_id: id });
+    if (!r.data || !r.data.ok) alert('Promote failed: ' + ((r.data && r.data.reason) || r.status));
+    await loadStrategyPipeline();
+}
+
+async function labPipeApprovePaper(id) {
+    if (!confirm('Approve this backtested hyp into a paper slot?')) return;
+    const r = await labPipePost('/api/lab/pipeline/approve_paper', { spec_id: id });
+    if (!r.data || !r.data.ok) alert('Approve paper failed: ' + ((r.data && r.data.reason) || r.status));
+    await loadStrategyPipeline();
+}
+
+async function labPipeDeny(id) {
+    if (!confirm('Deny this hypothesis? It will be closed with an autopsy.')) return;
+    const r = await labPipePost('/api/lab/pipeline/reject', { spec_id: id, reason: 'operator_deny' });
+    if (!r.data || !r.data.ok) alert('Deny failed: ' + ((r.data && r.data.reason) || r.status));
+    await loadStrategyPipeline();
+}
+
+async function loadLabSettings() {
+    const res = document.getElementById('lab-settings-result');
+    const locksEl = document.getElementById('lab-founder-locks');
+    try {
+        const d = await fetchJSON('/api/lab/pipeline/settings');
+        const slots = document.getElementById('lab-set-paper-slots');
+        const slotsCur = document.getElementById('lab-set-slots-cur');
+        const ap = document.getElementById('lab-set-auto-promote');
+        const paused = document.getElementById('lab-set-paused');
+        const llm = document.getElementById('lab-set-llm');
+        const llmSt = document.getElementById('lab-set-llm-status');
+        if (slots) slots.value = d.paper_slots != null ? d.paper_slots : 0;
+        if (slotsCur) slotsCur.textContent = String(d.paper_slots != null ? d.paper_slots : 0);
+        if (ap) ap.value = d.auto_promote ? '1' : '0';
+        if (paused) paused.value = d.paused ? '1' : '0';
+        const prov = String(d.llm_provider || 'none').toLowerCase();
+        if (llm) llm.value = ['none','ollama','grok'].includes(prov) ? prov : 'none';
+        if (llmSt) {
+            const configured = prov && prov !== 'none';
+            llmSt.textContent = configured ? ('Configured: ' + prov) : 'none';
+            llmSt.className = 'cred-status ' + (configured ? 'configured' : 'missing');
+        }
+        const locks = d.founder_locks || {};
+        const names = Object.keys(locks).length
+            ? Object.keys(locks)
+            : ['sniper-v1', 'arbitrage-v1', 'sweeper-v1'];
+        if (locksEl) {
+            locksEl.innerHTML = names.map(name => {
+                const meta = locks[name] || {};
+                const on = meta === true || (meta && meta.protected !== false && meta.protected !== 0);
+                const reason = (meta && meta.reason) ? String(meta.reason) : 'founder';
+                return '<div class="cred-row">' +
+                    '<label>' + _labEsc(name) + '<small>' + _labEsc(reason) + '</small></label>' +
+                    '<select data-founder="' + _labEsc(name) + '" class="lab-founder-sel" style="background:#050806;color:#bff0d2;border:1px solid #16301f;border-radius:6px;padding:8px 10px;font-family:inherit">' +
+                    '<option value="1"' + (on ? ' selected' : '') + '>Locked</option>' +
+                    '<option value="0"' + (!on ? ' selected' : '') + '>Unlocked</option>' +
+                    '</select>' +
+                    '<button type="button" class="btn btn-secondary" data-founder="' + _labEsc(name) +
+                    '" onclick="saveLabFounderLock(this.dataset.founder)">Save</button>' +
+                    '</div>';
+            }).join('');
+        }
+        if (res) res.textContent = '';
+    } catch (e) {
+        if (res) res.textContent = 'Lab settings load failed: ' + e;
+        if (locksEl) locksEl.innerHTML = '<div style="color:#ff3b5c">Failed to load founder locks</div>';
+    }
+}
+
+async function saveLabPaperSlots() {
+    const el = document.getElementById('lab-set-paper-slots');
+    const n = Math.max(0, parseInt(el && el.value, 10) || 0);
+    const r = await labPipePost('/api/lab/pipeline/settings', { paper_slots: n });
+    const res = document.getElementById('lab-settings-result');
+    if (res) res.textContent = r.ok ? ('Paper slots -> ' + (r.data.paper_slots != null ? r.data.paper_slots : n)) : 'Save failed';
+    await loadLabSettings();
+}
+
+async function saveLabAutoPromote() {
+    const el = document.getElementById('lab-set-auto-promote');
+    const on = el && el.value === '1';
+    if (on && !confirm('Enable auto-promote-to-live? Ready hyps will flip live without Approve.')) {
+        el.value = '0';
+        return;
+    }
+    const r = await labPipePost('/api/lab/pipeline/settings', { auto_promote: on });
+    const res = document.getElementById('lab-settings-result');
+    if (res) res.textContent = r.ok ? ('Auto-promote -> ' + (on ? 'ON' : 'off')) : 'Save failed';
+    await loadLabSettings();
+}
+
+async function saveLabPaused() {
+    const el = document.getElementById('lab-set-paused');
+    const paused = el && el.value === '1';
+    const r = await labPipePost('/api/lab/pipeline/settings', { paused: paused });
+    const res = document.getElementById('lab-settings-result');
+    if (res) res.textContent = r.ok ? ('Pipeline -> ' + (paused ? 'paused' : 'running')) : 'Save failed';
+    await loadLabSettings();
+}
+
+async function saveLabLlm() {
+    const el = document.getElementById('lab-set-llm');
+    const val = (el && el.value) || 'none';
+    const r = await labPipePost('/api/lab/pipeline/settings', { llm_provider: val });
+    const res = document.getElementById('lab-settings-result');
+    if (res) res.textContent = r.ok ? ('LLM provider -> ' + val) : 'Save failed';
+    await loadLabSettings();
+}
+
+async function saveLabFounderLock(name) {
+    const sel = document.querySelector('select.lab-founder-sel[data-founder="' + name + '"]');
+    const locked = !sel || sel.value === '1';
+    let locks = {};
+    try {
+        const d = await fetchJSON('/api/lab/pipeline/settings');
+        locks = Object.assign({}, d.founder_locks || {});
+    } catch (_) {}
+    locks[name] = { protected: locked, reason: 'founder' };
+    const r = await labPipePost('/api/lab/pipeline/settings', { founder_locks: locks });
+    const res = document.getElementById('lab-settings-result');
+    if (res) res.textContent = r.ok ? (name + ' -> ' + (locked ? 'Locked' : 'Unlocked')) : 'Save failed';
+    await loadLabSettings();
+}
+
 // ---------- Boot ----------
 // Drawer starts open on desktop, closed on narrow screens (overlay mode).
 if (!window.matchMedia('(max-width:880px)').matches) document.body.classList.add('nav-open');
@@ -5359,7 +5808,10 @@ refresh();
 setInterval(refresh, 10000);
 // Keep the Signal Lab fresh while it's the visible tab.
 setInterval(() => {
-    if (!document.getElementById('tab-signal-lab').classList.contains('hidden')) { loadSignalLab(); loadHybridMeta(); loadLearnedRules(); }
+    const lab = document.getElementById('tab-signal-lab');
+    if (!lab || lab.classList.contains('hidden')) return;
+    if ((window._labSub || 'signals') === 'strategies') loadStrategyPipeline();
+    else { loadSignalLab(); loadHybridMeta(); loadLearnedRules(); }
 }, 15000);
 // Market list re-pull every 3s keeps current/next turnover snappy.
 setInterval(fetchMarkets, 3000);

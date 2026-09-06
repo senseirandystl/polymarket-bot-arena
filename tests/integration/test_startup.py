@@ -45,15 +45,12 @@ def test_parse_non_numeric_raises():
 # --- default slate ----------------------------------------------------------
 
 def test_default_slate_includes_hybrid_and_sweeper():
-    """Default: mom / meanrev / sniper / hybrid / arb / sweeper."""
+    """Profit-mode default: sniper / arb / sweeper."""
     bots = startup.build_default_bots()
-    assert len(bots) == 6
+    assert len(bots) == 3
     types = [b.strategy_type for b in bots]
     assert types == [
-        "momentum",
-        "mean_reversion",
         "sniper",
-        "hybrid",
         "arbitrage",
         "sweeper",
     ]
@@ -61,6 +58,8 @@ def test_default_slate_includes_hybrid_and_sweeper():
     assert "phantom" not in types
     assert "late_window_maker" not in types
     assert "fee_zone_maker" not in types
+    assert "momentum" not in types
+    assert "hybrid" not in types
 
 
 def test_manual_selection_builds_exactly_chosen():

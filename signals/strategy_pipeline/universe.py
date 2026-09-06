@@ -1,25 +1,25 @@
-"""Stepwise crypto prediction-market universe.
+"""Stepwise crypto prediction-market universe for Lab research.
 
-Phase 1 is what the arena already trades. Phase 2–3 widen discovery later;
+Phase 1 is what the arena already trades. Phase 2-3 widen discovery later;
 they do not invent settlement math. A slot without a settlement adapter
-stays `tradable=False`.
+stays tradable=False.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, asdict
+from dataclasses import asdict, dataclass
 from typing import Any
 
 
 @dataclass(frozen=True)
 class UniverseSlot:
     slot_id: str
-    venue: str           # polymarket | kalshi
-    asset: str           # btc | eth | sol | xrp | ...
-    window_label: str    # 5m | 15m | 1h | 4h
+    venue: str
+    asset: str
+    window_label: str
     window_sec: int
-    series_key: str      # venue-native series / ticker hint
-    settlement: str      # chainlink_twap60 | brti_last60 | unknown
+    series_key: str
+    settlement: str
     tradable: bool
     phase: int
 
@@ -36,8 +36,6 @@ _SLOTS: tuple[UniverseSlot, ...] = (
         "kalshi:btc_15m", "kalshi", "btc", "15m", 900,
         "KXBTC15M", "brti_last60", True, 1,
     ),
-    # Phase 2 — listed so research can *talk* about them. Discovery wiring
-    # lands per-series; until then tradable=False.
     UniverseSlot(
         "polymarket:eth_5m", "polymarket", "eth", "5m", 300,
         "series:eth_5m_updown", "chainlink_twap60", False, 2,
@@ -66,10 +64,8 @@ _SLOTS: tuple[UniverseSlot, ...] = (
 
 
 def phase_universe(phase: int | None = None) -> list[UniverseSlot]:
-    import config
-
     if phase is None:
-        phase = int(getattr(config, "CRYPTO_UNIVERSE_PHASE", 1) or 1)
+        phase = 1
     phase = max(1, min(int(phase), 3))
     if phase >= 3:
         return list(_SLOTS)

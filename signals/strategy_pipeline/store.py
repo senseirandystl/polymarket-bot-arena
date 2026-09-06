@@ -1,4 +1,4 @@
-"""Hypothesis graph + desk event log (SQLite via db.get_conn)."""
+"""Lab hypothesis graph + event log (lab_hypotheses / lab_events)."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ import db
 
 
 SCHEMA = """
-CREATE TABLE IF NOT EXISTS desk_hypotheses (
+CREATE TABLE IF NOT EXISTS lab_hypotheses (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     spec_id TEXT NOT NULL UNIQUE,
     name TEXT NOT NULL,
@@ -27,9 +27,9 @@ CREATE TABLE IF NOT EXISTS desk_hypotheses (
     created_at TEXT DEFAULT (datetime('now')),
     updated_at TEXT DEFAULT (datetime('now'))
 );
-CREATE INDEX IF NOT EXISTS idx_desk_hyp_stage ON desk_hypotheses(stage, status);
+CREATE INDEX IF NOT EXISTS idx_lab_hyp_stage ON lab_hypotheses(stage, status);
 
-CREATE TABLE IF NOT EXISTS desk_events (
+CREATE TABLE IF NOT EXISTS lab_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     spec_id TEXT,
     role TEXT,
@@ -38,7 +38,7 @@ CREATE TABLE IF NOT EXISTS desk_events (
     detail TEXT,
     created_at TEXT DEFAULT (datetime('now'))
 );
-CREATE INDEX IF NOT EXISTS idx_desk_events_spec ON desk_events(spec_id, id);
+CREATE INDEX IF NOT EXISTS idx_lab_events_spec ON lab_events(spec_id, id);
 """
 
 
@@ -48,20 +48,21 @@ STAGES = (
     "coded",
     "backtested",
     "paper",
+    "ready",
     "live",
     "retired",
     "rejected",
 )
 
 
-def init_desk_tables() -> None:
+def init_lab_tables() -> None:
     with db.get_conn() as conn:
         conn.executescript(SCHEMA)
 
 
 class HypothesisStore:
     def __init__(self) -> None:
-        init_desk_tables()
+        init_lab_tables()
 
     def insert(self, spec: dict[str, Any]) -> dict[str, Any]:
         spec_id = str(spec["spec_id"])
@@ -78,7 +79,7 @@ class HypothesisStore:
         }
         with db.get_conn() as conn:
             conn.execute(
-                """INSERT OR REPLACE INTO desk_hypotheses
+                """INSERT OR REPLACE INTO lab_hypotheses
                    (spec_id, name, primitive, stage, status, spec, thesis,
                     parent_spec_ids, bot_name, updated_at)
                    VALUES (:spec_id, :name, :primitive, :stage, :status, :spec,
@@ -91,12 +92,12 @@ class HypothesisStore:
     def get(self, spec_id: str) -> dict[str, Any] | None:
         with db.get_conn() as conn:
             row = conn.execute(
-                "SELECT * FROM desk_hypotheses WHERE spec_id=?", (spec_id,)
+                "SELECT * FROM lab_hypotheses WHERE spec_id=?", (spec_id,)
             ).fetchone()
         return _row(row) if row else None
 
     def list(self, *, limit: int = 50, stage: str | None = None) -> list[dict]:
-        sql = "SELECT * FROM desk_hypotheses"
+        sql = "SELECT * FROM lab_hypotheses"
         args: list[Any] = []
         if stage:
             sql += " WHERE stage=?"
@@ -113,7 +114,7 @@ class HypothesisStore:
         ph = ",".join("?" * len(stages))
         with db.get_conn() as conn:
             rows = conn.execute(
-                f"""SELECT * FROM desk_hypotheses
+                f"""SELECT * FROM lab_hypotheses
                     WHERE status='open' AND stage IN ({ph})
                     ORDER BY id ASC""",
                 stages,
@@ -123,7 +124,7 @@ class HypothesisStore:
     def counts(self) -> dict[str, int]:
         with db.get_conn() as conn:
             rows = conn.execute(
-                "SELECT stage, COUNT(*) AS n FROM desk_hypotheses GROUP BY stage"
+                "SELECT stage, COUNT(*) AS n FROM lab_hypotheses GROUP BY stage"
             ).fetchall()
         out = {s: 0 for s in STAGES}
         for r in rows:
@@ -166,15 +167,16 @@ class HypothesisStore:
         args.append(spec_id)
         with db.get_conn() as conn:
             conn.execute(
-                f"UPDATE desk_hypotheses SET {', '.join(fields)} WHERE spec_id=?",
+                f"UPDATE lab_hypotheses SET {', '.join(fields)} WHERE spec_id=?",
                 args,
             )
 
     def recent_autopsies(self, limit: int = 20) -> list[dict]:
         with db.get_conn() as conn:
             rows = conn.execute(
-                """SELECT spec_id, name, primitive, stage, status, thesis, autopsy
-                   FROM desk_hypotheses
+                """SELECT spec_id, name, primitive, stage, status, thesis,
+                          spec, bot_name, autopsy
+                   FROM lab_hypotheses
                    WHERE autopsy IS NOT NULL AND autopsy != ''
                    ORDER BY id DESC LIMIT ?""",
                 (int(limit),),
@@ -191,7 +193,7 @@ class HypothesisStore:
     ) -> None:
         with db.get_conn() as conn:
             conn.execute(
-                """INSERT INTO desk_events (spec_id, role, stage, action, detail)
+                """INSERT INTO lab_events (spec_id, role, stage, action, detail)
                    VALUES (?, ?, ?, ?, ?)""",
                 (spec_id, role, stage, action, detail[:2000] if detail else ""),
             )
@@ -199,10 +201,19 @@ class HypothesisStore:
     def events(self, *, limit: int = 40) -> list[dict]:
         with db.get_conn() as conn:
             rows = conn.execute(
-                "SELECT * FROM desk_events ORDER BY id DESC LIMIT ?",
+                "SELECT * FROM lab_events ORDER BY id DESC LIMIT ?",
                 (int(limit),),
             ).fetchall()
         return [_row(r) for r in rows]
+
+    def count_pipeline_paper_bots(self) -> int:
+        """Open paper-stage hyps that originated from the lab pipeline."""
+        with db.get_conn() as conn:
+            row = conn.execute(
+                """SELECT COUNT(*) AS n FROM lab_hypotheses
+                   WHERE status='open' AND stage='paper'""",
+            ).fetchone()
+        return int(row["n"] or 0) if row else 0
 
 
 def _row(row) -> dict[str, Any]:

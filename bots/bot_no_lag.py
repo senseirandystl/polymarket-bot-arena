@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import config
 import polymarket_fills
-from bots.base_bot import BaseBot, data_quality_skip, strategy_decision
+from bots.base_bot import BaseBot, data_quality_skip, strategy_decision, implied_side_prob
 from bots.edge_calibration import quality_confidence
 from signals.lab import SignalView
 
@@ -75,7 +75,10 @@ class NoLagBot(BaseBot):
                 reasoning=f"no_lag: NO mid {no_mid:.2f} outside [{min_mid},{max_mid}]",
             )
 
-        implied_no = 0.5 + 0.5 * signed_toward_no
+        # Same Phi(z) / btc_implied_yes path as sniper — never 0.5+0.5*tanh.
+        implied_no = implied_side_prob(
+            side="no", signals=signals, signed_lane=drift,
+        )
         residual = implied_no - no_mid
         min_res = float(p.get("min_residual", 0.05))
         if residual < min_res:

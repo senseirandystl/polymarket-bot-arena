@@ -222,8 +222,8 @@ def build_combined_signals(
                             expiry_epoch = datetime.fromisoformat(
                                 str(ra).replace("Z", "+00:00")
                             ).timestamp()
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.warning("swallowed exception: %s", e)
 
                 ticks = []
                 if price_feed is not None:
@@ -310,8 +310,8 @@ def build_combined_signals(
             )
             resolution_meta["settlement_policy"] = _pol
             resolution_meta["market_phase"] = _pol.get("phase") or "unknown"
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("swallowed exception: %s", e)
 
     # Per-market settlement tape (Kalshi = BRTI, Polymarket = TWAP/spot).
     # Stateful regime detector stays on Chainlink so dual-exchange ticks
@@ -372,8 +372,8 @@ def build_combined_signals(
         try:
             with price_feed._lock:
                 vol_series = list(price_feed.volumes.get("btc") or [])
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("swallowed exception: %s", e)
 
     # Robust multi-feature regime (online EMA + hysteresis + optional
     # centroids). Continuous: updates every tick, not only at resolution.
@@ -420,13 +420,15 @@ def build_combined_signals(
             xasset_score = float(xasset.get("xasset_score") or 0.0)
         except (TypeError, ValueError, AttributeError):
             xasset_score = None
+        # Shared Chainlink detector: never feed BRTI-derived vol/trend
+        # scores from a Kalshi tick (do not mix indexes — BUG #23 analog).
         market_regime = get_detector().update(
             btc_prices,
             cvd=cvd,
             obi=obi,
-            vol_score=vol_base.get("vol_score"),
-            trend_score=vol_base.get("trend_score"),
-            realized_vol=vol_base.get("realized_vol"),
+            vol_score=None if _kalshi else vol_base.get("vol_score"),
+            trend_score=None if _kalshi else vol_base.get("trend_score"),
+            realized_vol=None if _kalshi else vol_base.get("realized_vol"),
             volumes=vol_series,
             market_id=(
                 (market.get("id") or market.get("market_id"))
@@ -516,8 +518,8 @@ def build_combined_signals(
                 "warm_regime_cell",
                 f"{rid}|mid|{float(yes_mid):.2f}|{float(btc_drift or 0.0):+.2f}",
             )
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("swallowed exception: %s", e)
 
     return {
         **price_signals,

@@ -64,6 +64,7 @@ from bots.bot_lag_residual import LagResidualBot
 from bots.bot_regime_specialist import RegimeSpecialistBot
 from bots.bot_no_lag import NoLagBot
 from bots.bot_sweeper import SweeperBot
+from bots.bot_cross_venue_lag import CrossVenueLagBot
 from bots.bot_true_maker import TrueMakerBot
 from signals.price_feed import get_feed as get_price_feed
 from signals.sentiment import get_feed as get_sentiment_feed
@@ -108,6 +109,7 @@ TAKER_BOT_CLASSES = {
     "regime_specialist": RegimeSpecialistBot,
     "no_lag": NoLagBot,
     "sweeper": SweeperBot,
+    "cross_venue_lag": CrossVenueLagBot,
 }
 
 # Maker strategy types that have a concrete default instance. Used to rebuild
@@ -156,7 +158,9 @@ def create_default_bots():
             # part of the DEFAULT slate — it is not force-injected here, so a
             # manually-selected slate that excluded it stays excluded on restart.
             return bots
-    # First-run fallback (empty DB, non-interactive): lean 6 default slate.
+    # First-run fallback (empty DB, non-interactive): lean default slate
+    # (founders / DEFAULT_INDICES via startup.build_default_bots). Lab pipeline
+    # invents additional genomes; it does not own the empty-roster path.
     from arena import startup
     return startup.build_default_bots()
 
@@ -642,9 +646,10 @@ def _evolution_check_loop(bots, state, pos_monitor, trader, maker_bots=None):
                 # Offline rollup of decision_events (skips + buys) for
                 # counterfactual lane/strategy fine-tuning.
                 try:
-                    from arena.decision_log import maybe_rollup, flush
+                    from arena.decision_log import maybe_rollup, maybe_prune, flush
                     flush()
                     maybe_rollup()
+                    maybe_prune()
                     try:
                         from arena.live_scorecard import maybe_refresh
                         maybe_refresh()
@@ -859,6 +864,7 @@ def start_dashboard() -> None:
 def main_loop(bots):
     """Wire up everything: feeds, shared state, secondary bots, four
     worker threads, then drive the evolution check on this main thread."""
+    lab_host = None
     # Market data + resolution come from Polymarket (public, no keys). Paper
     # mode simulates against real order books; live mode needs Polymarket CLOB
     # credentials, checked lazily when a bot is flipped to live.
@@ -961,6 +967,15 @@ def main_loop(bots):
     trader.set_bots(trader_bots)
     trader.start()
 
+
+    if getattr(config, "STRATEGY_LAB_ENABLED", False):
+        try:
+            from signals.strategy_pipeline.cycle import get_host as get_lab_host
+            lab_host = get_lab_host()
+            lab_host.start()
+        except Exception:
+            logger.exception("strategy lab cycle host failed to start")
+
     # Mark the start of this session so the dashboard's "Current Session"
     # performance row can scope stats to trades placed since this boot.
     # Stored in the same UTC "%Y-%m-%d %H:%M:%S" format as trades.created_at
@@ -994,11 +1009,133 @@ def main_loop(bots):
     finally:
         for w in (trader, resolver, discovery, warmer, pos_monitor, maker_thread):
             w.stop()
+        if lab_host is not None:
+            try:
+                lab_host.stop()
+            except Exception:
+                pass
         time.sleep(0.5)
         logger.info("All workers stopped.")
 
 
+
+# ----------------------------------------------------------------------
+# Single-instance lock (main() only — importing arena modules stays free)
+# ----------------------------------------------------------------------
+
+_INSTANCE_LOCK_FD = None
+_INSTANCE_LOCK_PATH = None
+
+
+def _pid_alive(pid: int) -> bool:
+    """True if *pid* looks like a live OS process (Windows-safe)."""
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        try:
+            import ctypes
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            handle = ctypes.windll.kernel32.OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid),
+            )
+            if handle:
+                ctypes.windll.kernel32.CloseHandle(handle)
+                return True
+            return False
+        except Exception:
+            return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def _release_instance_lock() -> None:
+    global _INSTANCE_LOCK_FD, _INSTANCE_LOCK_PATH
+    fd = _INSTANCE_LOCK_FD
+    _INSTANCE_LOCK_FD = None
+    _INSTANCE_LOCK_PATH = None
+    if fd is None:
+        return
+    try:
+        if os.name == "nt":
+            import msvcrt
+            try:
+                os.lseek(fd, 0, os.SEEK_SET)
+                msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+            except OSError:
+                pass
+        else:
+            import fcntl
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+    except Exception:
+        pass
+    try:
+        os.close(fd)
+    except Exception:
+        pass
+
+
+def _acquire_instance_lock() -> None:
+    """Exclusive lock under LOG_DIR so two arena mains cannot run together."""
+    global _INSTANCE_LOCK_FD, _INSTANCE_LOCK_PATH
+    lock_dir = Path(
+        getattr(config, "LOG_DIR", Path(__file__).resolve().parent / "logs")
+    )
+    try:
+        lock_dir.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+    path = lock_dir / "arena.instance.lock"
+    _INSTANCE_LOCK_PATH = path
+    fd = os.open(str(path), os.O_RDWR | os.O_CREAT)
+    try:
+        if os.name == "nt":
+            import msvcrt
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        holder = "?"
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                holder = (fh.read() or "").strip() or "?"
+        except Exception:
+            pass
+        try:
+            os.close(fd)
+        except Exception:
+            pass
+        alive = False
+        try:
+            alive = _pid_alive(int(str(holder).strip()))
+        except Exception:
+            alive = False
+        msg = (
+            f"Another arena instance appears to be running "
+            f"(lock={path}, pid={holder}"
+            f"{'' if alive else ', possibly stale'}"
+            f"). Exit that process first."
+        )
+        logger.error(msg)
+        raise SystemExit(msg)
+    try:
+        os.ftruncate(fd, 0)
+        os.write(fd, ("%d\n" % os.getpid()).encode("utf-8"))
+    except Exception:
+        pass
+    _INSTANCE_LOCK_FD = fd
+    atexit.register(_release_instance_lock)
+
+
+
 def main() -> None:
+    _acquire_instance_lock()
     parser = argparse.ArgumentParser(description="Polymarket Bot Arena")
     parser.add_argument(
         "--mode", choices=["paper", "live"], default=None,

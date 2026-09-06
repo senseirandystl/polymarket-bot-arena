@@ -1,70 +1,68 @@
-# Desk cycle — research → code → backtest → paper → live → post-mortem → fine-tune
+# Strategy Lab cycle (formerly Desk / Trading Floor)
 
-This is the six-stage loop from the antpalkin map, mapped onto the existing
-arena instead of a cloud agent swarm.
+> **Phase 3 (2026-09-05):** The `desk/` package and Floor UI (`/floor`,
+> `dashboard/desk_*`) were deleted. The invent → gate → graduate loop lives in
+> **`signals/strategy_pipeline/`** and the dashboard **Lab → Strategies** pane
+> (`/api/lab/pipeline/*`).
+>
+> **Phase 4:** Learning is unified in `learning_spine.py` (durable constraints
+> in arena_state `lab_learning_spine`). Optional LLM assist lives in `llm.py`.
+> See `_refs/PHASE4_NOTES.md`.
+
+This is the six-stage loop mapped onto the existing arena.
 
 The hot path (1s trader tick, fills, risk, kill switch) stays deterministic.
-LLMs (local Ollama or xAI Grok API) are optional *research labor*. They never
-place orders and never emit Python that is `exec`'d.
+LLMs (via `STRATEGY_LAB_LLM_PROVIDER`) are optional *research labor*. They never
+place orders and never emit Python that is `exec`'d. With provider `none` the
+Lab loop is fully self-sufficient (analyse → test → learn → improve).
 
 ## Stages
 
 | Stage | Owner | What happens |
 |-------|--------|----------------|
-| 1 Research | `desk/research.py` | Read recent trades, regimes, autopsies, universe. Emit `StrategySpec` JSON. |
-| 2 Code | `desk/compiler.py` | Bind spec to an existing primitive (`momentum`, `mean_reversion`, `sniper`, …) + params + lane weights. |
-| 3 Backtest | `desk/cycle.py` + `evolution/backtest_gate.py` | Replay resolved history. Losers die here and get an autopsy. |
-| 4 Paper / shadow | existing paper venue | Candidate trades real books with `trading_mode=paper`. Promote after **100 resolved trades OR 7 days**, with a floor of 30 trades. |
-| 5 Live | existing live venue + GA | Graduated bots compete. GA still culls losers. |
-| 6 Post-mortem + fine-tune | `desk/postmortem.py` | Every death (backtest / paper / GA) writes an autopsy. Research reads the graph so the next spec does not repeat the same failure. |
+| 1 Research | `signals/strategy_pipeline/research.py` | Load spine `get_constraints()`, recent trades, regimes, autopsies, universe. Emit `StrategySpec` JSON (new **params genomes**, not lane weights). Skip dead fingerprints; bias mutate away from avoid bands; prefer positive factor cells. |
+| 2 Code | `signals/strategy_pipeline/compiler.py` | Bind spec to an existing primitive (`momentum`, `mean_reversion`, `sniper`, …) + params. Lane weights on the spec are thesis notes only. |
+| 3 Backtest | `signals/strategy_pipeline/cycle.py` + `evolution/backtest_gate.py` | Replay resolved history. Must clear Lab backtest mins (`STRATEGY_LAB_BACKTEST_MIN_*`). Replay-without-crash is not a pass. |
+| 4 Paper / shadow | existing paper venue | Candidate trades real books with `trading_mode=paper` when paper slots allow. |
+| 4b Ready | Lab **Promote** | After promote bars (`STRATEGY_LAB_PROMOTE_MIN_*`) and paper P&L > 0, the spec sits in `ready`. Auto-live stays off unless `STRATEGY_LAB_AUTO_PROMOTE`. |
+| 5 Live | existing live venue + GA | Graduated bots compete. GA still culls losers; culls write spine autopsies. Founders stay protected. |
+| 6 Post-mortem + fine-tune | `postmortem.py` → `learning_spine.py` | Every death writes a structured autopsy (fingerprint, factor cells, avoid constraints). Research loads those constraints next tick. Optional LLM narrative is storage-only. |
 
-## Why primitives, not generated source
+## Learning spine vs Learned Trade Rules
 
-5-minute binary markets punish wrong strike, mid-priced decisions, and
-uncapped size. Those bugs are already encoded in `bots/` + guards. A generated
-`analyze()` that bypasses them would reintroduce paid-for loss modes.
+| Surface | State key | Role |
+|---------|-----------|------|
+| Lab spine | `lab_learning_spine` | Genome avoid fingerprints / param bands + prefer/avoid factor cells for research |
+| Lab Signals rules | `learned_trade_rules` | Hot-path skip/go/size from decision_events |
 
-A `StrategySpec` is therefore a **parameterized primitive**, not a new language.
-Future work can add a sandboxed rule DSL; it still has to call `make_decision`.
+Shared cell vocabulary: `regime|price_band|drift_band|side[|strategy_type]`
+(see `_refs/PHASE4_NOTES.md`). Spine folds rules via `fold_learned_rules()`
+without changing the existing mine path.
 
-## Factory mode vs lean-6
+## Ownership (do not let three writers share fields)
 
-`DESK_FACTORY_MODE=True` (default off until you flip it):
+| Writer | Owns | Must not write |
+|--------|------|----------------|
+| Lab (`strategy_pipeline`) | New genomes (`strategy_params` on a new bot) | Live `lane_overrides` / core-lane blend |
+| Core-lane tuner | Live lane mix per `strategy_type` | Strategy params / new bot names |
+| GA / evolution | Mutate/cull of non-founder roster params | Spec `lane_weights` as live overlay |
 
-- Empty DB does **not** auto-launch momentum/meanrev/sniper/hybrid/arb/sweeper.
-- The desk host researches, backtests, and deploys paper candidates via the
-  existing mid-run deploy queue.
-- Continue-from-DB still resumes whatever is already active.
+Spec `lane_weights` are a research note. They are not applied at compile or
+restart. That is the three-writer rule under Lab naming.
 
-Flip it only after you have watched one paper desk cycle.
+## Config
 
-## Market universe (stepwise)
+See `STRATEGY_LAB_*` in `config.py` / `.env.example`. Empty roster always uses
+`arena.startup.build_default_bots()` (founders / DEFAULT_INDICES) — Lab does not
+own the lean fallback path.
 
-`CRYPTO_UNIVERSE_PHASE` in `config.py`:
+Optional LLM: `STRATEGY_LAB_LLM_PROVIDER=none|ollama|grok` plus `OLLAMA_*` or
+`XAI_API_KEY` / `XAI_MODEL`. Overlay from Settings → Strategy Lab wins.
 
-1. Current: Polymarket BTC 5m + Kalshi BTC 15m.
-2. Major-coin short windows (BTC/ETH/SOL/XRP × 5m/15m/1h where the series exists).
-3. All crypto binary prediction markets on both venues (discovery widen).
+## Host
 
-Phase 2–3 change *which windows are discovered*. They do not change edge math.
-Each new series needs a correct strike/settlement adapter before it is traded.
+`LabHost` starts from `arena.py` when `STRATEGY_LAB_ENABLED` is true.
+Dashboard: Lab → Strategies. API: `/api/lab/pipeline/*`.
 
-## LLM providers
-
-```
-DESK_LLM_PROVIDER=none|ollama|grok
-OLLAMA_HOST=http://127.0.0.1:11434
-OLLAMA_MODEL=llama3.1
-XAI_API_KEY=...
-XAI_MODEL=grok-4
-```
-
-`none` is a full heuristic researcher (regime + autopsy + primitive catalog).
-Use that on the $200 stack. Point `ollama` at the Jetson/Umbrel box when you
-want richer theses. Grok API is optional and off the execution path.
-
-## Floor UI
-
-Dashboard tab **Floor** (`/api/desk/floor`) shows the seven roles and the
-hypothesis pipeline in real time. Roles are *views* of this process, not
-separate cloud computers.
+Orphan SQLite tables `desk_hypotheses` / `desk_events` may remain; Lab uses
+`lab_hypotheses` / `lab_events` only.

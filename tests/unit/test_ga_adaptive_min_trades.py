@@ -45,6 +45,7 @@ def test_leader_is_judgeable_at_adaptive_floor(monkeypatch):
 
 def test_mid_sample_uses_early_cull_not_full_bar(monkeypatch):
     """n between adaptive floor and 40: mild red is not a cull."""
+    monkeypatch.setattr(config, "PAPER_GATE_PROFILE", "off")
     monkeypatch.setattr(config, "MIN_TRADES_FOR_JUDGMENT", 40)
     monkeypatch.setattr(config, "GA_EARLY_CULL_ENABLED", True)
     assert _survives_legacy_bar(

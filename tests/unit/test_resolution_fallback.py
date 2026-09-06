@@ -152,4 +152,5 @@ class TestResolverFallback:
                 "WHERE market_id='0xdone'"
             ).fetchone()
         assert int(row["market_up"]) == 1
-        assert int(row["would_win"]) == 1
+        # Entry-less skips intentionally leave would_win NULL (phase3).
+        assert row["would_win"] is None

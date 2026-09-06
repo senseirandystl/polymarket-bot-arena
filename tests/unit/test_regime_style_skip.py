@@ -72,5 +72,5 @@ def test_chop_prior_damps_momentum_mom_scale():
     a = adjustments("high_vol_chop", "momentum")
     # Even in style mode, chop prior should pull mom scale below 1
     assert a.mom_lane_scale < 1.0
-    assert a.mid_band_drift_min is not None
-    assert a.mid_band_drift_min >= 0.30
+    # Phase 1: mid_band_drift_min no longer a live adapt lever.
+    assert a.mid_band_drift_min is None

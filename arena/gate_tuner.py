@@ -75,17 +75,26 @@ def load_overrides() -> dict:
 
 
 def gate_float(name: str, default: float) -> float:
-    """Hot-path read: override if present, else the config default."""
-    ov = load_overrides()
+    """Hot-path read: paper profile → DB override → config default.
+
+    Order: start from ``default`` (usually config.*), apply paper-only
+    ``effective_float`` when active, then any persisted gate-tuner override.
+    """
     if name == "_applied":
         return float(default)
+    base = float(default)
+    try:
+        base = float(config.effective_float(name, base))
+    except Exception:
+        pass
+    ov = load_overrides()
     val = ov.get(name)
     if val is None:
-        return float(default)
+        return base
     try:
         return float(val)
     except (TypeError, ValueError):
-        return float(default)
+        return base
 
 
 def _band(default: float, spec: dict) -> tuple[float, float]:

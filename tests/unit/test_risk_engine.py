@@ -488,3 +488,19 @@ def test_legacy_daily_check_when_disabled(monkeypatch):
     d = risk_engine.pre_trade("b", mode="paper")
     assert d.allow is False
     assert d.reason == "daily_loss_limit"
+
+
+def test_paper_daily_loss_getters_use_risk_paper_floors(monkeypatch):
+    """Engine-off fallback must never see uncapped 999999 paper limits."""
+    monkeypatch.setattr(config, "TRADING_MODE", "paper")
+    monkeypatch.setattr(config, "RISK_PAPER_BOT_DAILY_LOSS", 75.0)
+    monkeypatch.setattr(config, "RISK_PAPER_PORTFOLIO_DAILY_LOSS", 150.0)
+    assert config.get_max_daily_loss_per_bot() == 75.0
+    assert config.get_max_daily_loss_total() == 150.0
+    assert config.PAPER_MAX_DAILY_LOSS_PER_BOT < 1000
+    assert config.PAPER_MAX_DAILY_LOSS_TOTAL < 1000
+
+
+def test_warm_max_age_raised_for_dual_venue():
+    assert float(config.WARM_MAX_AGE_SEC) >= 5.5
+

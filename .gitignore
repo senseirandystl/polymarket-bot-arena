@@ -1,4 +1,4 @@
-# Credentials & secrets
+﻿# Credentials & secrets
 credentials.json
 *.key
 *.pem
@@ -46,3 +46,9 @@ backtest/reports/
 
 # Isolated build worktrees (subagent-driven development)
 .claude/worktrees/
+
+# Local agent scratch / one-shot patch scripts (never ship)
+_refs/
+_audit_tmp/
+/0
+/=

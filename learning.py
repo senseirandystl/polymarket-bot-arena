@@ -27,7 +27,13 @@ _learn_cache_lock = threading.Lock()
 
 
 def _learned_table(bot_name):
-    """Return ``{feature_key: (wins, losses)}`` for a bot, cached briefly."""
+    """Return ``{feature_key: (wins, losses)}`` for a bot, cached briefly.
+
+    Hot path: when learning is disabled, return empty without touching SQLite.
+    Prefer the Lab learning spine for research; this table is legacy bias only.
+    """
+    if not getattr(config, "LEARNING_ENABLED", False):
+        return {}
     now = time.time()
     ttl = getattr(config, "HOTPATH_CACHE_TTL_SEC", 30)
     with _learn_cache_lock:
@@ -41,6 +47,7 @@ def _learned_table(bot_name):
         ).fetchall()
     learned = {r["feature_key"]: (r["wins"], r["losses"]) for r in rows}
     with _learn_cache_lock:
+        # Cache empty tables too so we do not re-query every tick.
         _learn_cache[bot_name] = (now, learned)
     return learned
 
@@ -158,7 +165,13 @@ def get_learned_bias(bot_name, features, prior_yes=0.5):
     Returns:
         float 0.0-1.0 representing how much to lean yes
     """
+    if not getattr(config, "LEARNING_ENABLED", False):
+        return float(prior_yes)
+    if not features:
+        return float(prior_yes)
     learned = _learned_table(bot_name)
+    if not learned:
+        return float(prior_yes)
 
     # Start with prior
     log_odds = math.log(prior_yes / (1 - prior_yes)) if 0 < prior_yes < 1 else 0
@@ -194,6 +207,8 @@ def record_outcome(bot_name, features, side, won):
     If side='yes' and won → increment wins
     If side='no' and won → increment losses (YES lost)
     """
+    if not getattr(config, "LEARNING_ENABLED", False):
+        return
     with db.get_conn() as conn:
         for feat in features:
             if side == "yes":
